@@ -1,0 +1,12 @@
+.venv/
+*.egg-info/
+__pycache__/
+*.pyc
+.DS_Store
+.claude/
+Self_Sustain_Parser_sys_design_v3.md
+configz.code-workspace
+docs/ConfigZ_Skills_Layer_Addendum_v3.1.md
+docs/_from_management_for_open_source.txt
+docs/poojan_notes.txt
+docs/self_sustaining_parser_system_design_v1.md

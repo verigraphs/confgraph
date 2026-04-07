@@ -1,0 +1,81 @@
+# confgraph
+
+Parse network device configs and visualize how everything connects — BGP neighbors, OSPF areas, route-maps, prefix-lists, VRFs — as an interactive dependency graph.
+
+```bash
+uvx confgraph map router.txt
+uvx confgraph map router.txt --lint
+```
+
+![confgraph map output showing protocol dependency graph]
+
+## What it does
+
+Point it at a config file. It parses every protocol, builds a dependency graph, and exports an interactive HTML diagram you can open in any browser. `--lint` flags dangling references and orphaned objects.
+
+## Supported platforms
+
+| OS | Parser |
+|---|---|
+| Cisco IOS / IOS-XE | `IOSParser` |
+| Cisco IOS-XR | `IOSXRParser` |
+| Cisco NX-OS | `NXOSParser` |
+| Arista EOS | `EOSParser` |
+
+## Try it instantly
+
+Pre-generated maps for all supported platforms — open any in your browser, no install needed:
+
+| Platform | Sample config | Interactive map |
+|---|---|---|
+| Cisco IOS | [samples/ios.txt](samples/ios.txt) | [examples/ios.html](examples/ios.html) |
+| Cisco IOS-XE | [samples/ios_xe.txt](samples/ios_xe.txt) | [examples/ios_xe.html](examples/ios_xe.html) |
+| Cisco IOS-XR | [samples/ios_xr.txt](samples/ios_xr.txt) | [examples/ios_xr.html](examples/ios_xr.html) |
+| Cisco NX-OS | [samples/nxos.txt](samples/nxos.txt) | [examples/nxos.html](examples/nxos.html) |
+| Arista EOS | [samples/eos.txt](samples/eos.txt) | [examples/eos.html](examples/eos.html) |
+
+Or run against your own config:
+
+```bash
+uvx confgraph map your-router.txt --output-dir .
+open your-router.html
+```
+
+## Install
+
+```bash
+pip install confgraph
+```
+
+Or run without installing:
+
+```bash
+uvx confgraph map router.txt
+```
+
+## Use as a library
+
+```python
+from confgraph.parsers.ios_parser import IOSParser
+
+parsed = IOSParser(open("router.txt").read()).parse()
+print(parsed.bgp_instances)
+print(parsed.ospf_instances)
+```
+
+## Protocols parsed
+
+VRF · BGP · OSPF · IS-IS · EIGRP · RIP · Route-maps · Prefix-lists · ACLs · Community lists · AS-path lists · Static routes · NTP · SNMP · Syslog · Banners · QoS · NAT · Crypto/IPsec · BFD · IP SLA · EEM · Object tracking · Multicast
+
+## Security & Privacy
+
+**Local-first by design.** confgraph never sends your config files anywhere. All parsing, graph generation, and analysis run entirely on your machine. The HTML output is a self-contained file with no external requests — no CDN, no analytics, no telemetry of any kind.
+
+## Contributing
+
+Contributions welcome — new parsers, bug fixes, additional protocol coverage. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) to get started.
+
+## License
+
+Apache 2.0
+>>>>>>> 64a62af (docs: add README with install, usage, and protocol coverage)

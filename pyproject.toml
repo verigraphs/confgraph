@@ -1,0 +1,17 @@
+[project]
+name = "confgraph"
+version = "0.1.0"
+description = "Local-first network config dependency mapper — parse, visualize, and lint vendor configs"
+requires-python = ">=3.11"
+dependencies = [
+    "ciscoconfparse2>=0.9.16",
+    "networkx>=3.6.1",
+    "pydantic>=2.12.5",
+    "click>=8.1",
+]
+
+[project.scripts]
+confgraph = "confgraph.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["confgraph*"]
