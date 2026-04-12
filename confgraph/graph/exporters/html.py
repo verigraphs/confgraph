@@ -306,7 +306,7 @@ body {{
     background-image:
         linear-gradient(rgba(148,163,184,0.15) 1px, transparent 1px),
         linear-gradient(90deg, rgba(148,163,184,0.15) 1px, transparent 1px);
-    background-size: 24px 24px;
+    background-size: 24px 24px;  /* updated dynamically via JS on zoom/pan */
 }}
 
 /* ── Back button (floating on canvas) ───────────────────────────── */
@@ -511,13 +511,11 @@ body {{
     {{
       selector: '.selected-node',
       style: {{
-        'border-width': 2.5,
-        'border-color': '#1d4ed8',
-        'background-color': '#dbeafe',
+        'border-width': 3,
         'z-index': 9999,
         'shadow-blur': 20,
-        'shadow-color': '#1d4ed8',
-        'shadow-opacity': 0.35,
+        'shadow-color': 'data(color)',
+        'shadow-opacity': 0.5,
         'shadow-offset-x': 0,
         'shadow-offset-y': 0,
       }}
@@ -525,8 +523,7 @@ body {{
     {{
       selector: '.neighbor-node',
       style: {{
-        'border-width': 2,
-        'border-color': '#6366f1',
+        'border-width': 2.5,
         'z-index': 999,
       }}
     }},
@@ -548,28 +545,46 @@ body {{
       style: {{
         'line-color': '#6366f1',
         'target-arrow-color': '#6366f1',
-        'opacity': 1,
-        'width': 2,
+        'opacity': 0.6,
+        'width': 1,
         'z-index': 9999,
       }}
     }},
   ].concat(statusStyleRules);
 
-  // ── Physics layout config (reused for initial + post-drag settle) ───────────
-  const physicsLayout = {{
+  // ── Layout configs ───────────────────────────────────────────────────────────
+  // Initial: randomized start, high repulsion, low gravity → spread nodes out
+  const initialLayout = {{
+    name: 'cose',
+    animate: false,
+    randomize: true,
+    padding: 80,
+    nodeRepulsion: function() {{ return 80000; }},
+    idealEdgeLength: function() {{ return 220; }},
+    edgeElasticity: function() {{ return 60; }},
+    gravity: 0.05,
+    numIter: 3000,
+    initialTemp: 400,
+    coolingFactor: 0.98,
+    minTemp: 1.0,
+    fit: true,
+  }};
+
+  // Drag-settle: no randomize so nodes don't jump; lighter pass
+  const settleLayout = {{
     name: 'cose',
     animate: true,
-    animationDuration: 600,
+    animationDuration: 500,
     animationEasing: 'ease-out-cubic',
     randomize: false,
-    padding: 60,
-    nodeRepulsion: function() {{ return 12000; }},
-    idealEdgeLength: function() {{ return 140; }},
-    edgeElasticity: function() {{ return 80; }},
-    gravity: 0.35,
-    numIter: 800,
-    initialTemp: 150,
-    coolingFactor: 0.97,
+    padding: 80,
+    nodeRepulsion: function() {{ return 80000; }},
+    idealEdgeLength: function() {{ return 220; }},
+    edgeElasticity: function() {{ return 60; }},
+    gravity: 0.05,
+    numIter: 400,
+    initialTemp: 80,
+    coolingFactor: 0.95,
     minTemp: 1.0,
     fit: false,
   }};
@@ -578,7 +593,7 @@ body {{
     container: document.getElementById('cy'),
     elements: elements,
     style: baseStyles,
-    layout: {{ ...physicsLayout, animate: false, fit: true }},
+    layout: initialLayout,
     wheelSensitivity: 0.3,
   }});
 
@@ -587,7 +602,7 @@ body {{
   cy.on('dragfree', 'node', function() {{
     clearTimeout(settleTimer);
     settleTimer = setTimeout(function() {{
-      cy.layout(physicsLayout).run();
+      cy.layout(settleLayout).run();
     }}, 80);
   }});
 
@@ -606,6 +621,19 @@ body {{
     document.getElementById('stat-dangling').textContent = dangling;
   }}
   cy.ready(updateStats);
+
+  // ── Dynamic grid: scales and pans with the canvas ──────────────────────────
+  const cyEl = document.getElementById('cy');
+  const BASE_GRID = 24;
+  function updateGrid() {{
+    const zoom = cy.zoom();
+    const pan  = cy.pan();
+    const size = BASE_GRID * zoom;
+    cyEl.style.backgroundSize = `${{size}}px ${{size}}px`;
+    cyEl.style.backgroundPosition = `${{pan.x % size}}px ${{pan.y % size}}px`;
+  }}
+  cy.on('zoom pan', updateGrid);
+  cy.ready(updateGrid);
 
   // ── Legend ──────────────────────────────────────────────────────────────────
   const legendEl = document.getElementById('legend-nodes');
@@ -730,7 +758,8 @@ body {{
     node.addClass('selected-node');
     hood.nodes().not(node).addClass('neighbor-node');
     hood.edges().addClass('active-edge');
-    cy.fit(hood, 60);
+    cy.fit(hood, 120);
+    if (cy.zoom() > 1.2) cy.zoom(1.2);
     backBtn.style.display = 'block';
     isolated = true;
     showDetail(node);
