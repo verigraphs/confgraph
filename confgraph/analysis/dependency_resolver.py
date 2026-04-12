@@ -521,7 +521,9 @@ class DependencyResolver:
         for cm in self._config.class_maps:
             for match in cm.matches:
                 if "access-group" in match.match_type and match.values:
-                    for acl_name in match.values:
+                    # "match access-group name <acl>" has "name" as a keyword, not an ACL name
+                    acl_values = match.values[1:] if match.values[0] == "name" else match.values
+                    for acl_name in acl_values:
                         links.append(self._link("class_map", cm.name, "match_acl", "acl", acl_name))
         for pm in self._config.policy_maps:
             for cls in pm.classes:

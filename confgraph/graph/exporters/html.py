@@ -749,8 +749,13 @@ body {{
 
   // ── Isolation: show only clicked node + neighbors ─────────────────────────
   const backBtn = document.getElementById('back-btn');
+  let savedPositions = {{}};
 
   function isolateNode(node) {{
+    // Save all positions so we can restore them when going back
+    savedPositions = {{}};
+    cy.nodes().forEach(n => {{ savedPositions[n.id()] = {{ ...n.position() }}; }});
+
     const hood = node.closedNeighborhood();
     cy.elements().not(hood).hide();
     hood.show();
@@ -758,8 +763,24 @@ body {{
     node.addClass('selected-node');
     hood.nodes().not(node).addClass('neighbor-node');
     hood.edges().addClass('active-edge');
-    cy.fit(hood, 120);
-    if (cy.zoom() > 1.2) cy.zoom(1.2);
+
+    // Concentric layout: selected node at center, neighbors equally spaced in a ring
+    hood.layout({{
+      name: 'concentric',
+      animate: true,
+      animationDuration: 400,
+      animationEasing: 'ease-out-cubic',
+      padding: 100,
+      concentric: function(n) {{ return n.same(node) ? 2 : 1; }},
+      levelWidth: function() {{ return 1; }},
+      minNodeSpacing: 80,
+      fit: true,
+    }}).run();
+
+    setTimeout(function() {{
+      if (cy.zoom() > 1.2) cy.zoom({{ level: 1.2, renderedPosition: {{ x: cy.width() / 2, y: cy.height() / 2 }} }});
+    }}, 420);
+
     backBtn.style.display = 'block';
     isolated = true;
     showDetail(node);
@@ -769,11 +790,18 @@ body {{
   function restoreFullGraph() {{
     cy.elements().show();
     cy.elements().removeClass('selected-node neighbor-node active-edge faded');
+    // Restore original positions from before isolation
+    if (Object.keys(savedPositions).length > 0) {{
+      cy.nodes().forEach(n => {{
+        if (savedPositions[n.id()]) n.position(savedPositions[n.id()]);
+      }});
+      savedPositions = {{}};
+    }}
     backBtn.style.display = 'none';
     isolated = false;
     hideDetail();
-    applyGroupFilters();  // re-apply any active group filters
-    cy.fit(undefined, 40);
+    applyGroupFilters();
+    cy.fit(undefined, 80);
     searchInput.value = '';
     searchCount.textContent = '';
     updateStats();
