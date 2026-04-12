@@ -1,0 +1,288 @@
+hostname CORE-RTR-01
+!
+! ── VRFs ───────────────────────────────────────────────────────────────
+vrf definition CUST-A
+ rd 65000:100
+ route-target export 65000:100
+ route-target import 65000:100
+ address-family ipv4
+!
+vrf definition CUST-B
+ rd 65000:200
+ route-target export 65000:200
+ route-target import 65000:200
+ address-family ipv4
+!
+vrf definition MGMT
+ rd 65000:999
+ address-family ipv4
+!
+! ── Interfaces ─────────────────────────────────────────────────────────
+interface Loopback0
+ ip address 10.0.0.1 255.255.255.255
+ no shutdown
+!
+interface Loopback10
+ vrf forwarding CUST-A
+ ip address 10.10.0.1 255.255.255.255
+!
+interface GigabitEthernet0/0
+ description UPLINK-TO-TRANSIT-ISP1
+ ip address 203.0.113.1 255.255.255.252
+ ip access-group INBOUND-ISP1 in
+ ip access-group OUTBOUND-ISP1 out
+ service-policy input QOS-CLASSIFY
+ no shutdown
+!
+interface GigabitEthernet0/1
+ description UPLINK-TO-TRANSIT-ISP2
+ ip address 198.51.100.1 255.255.255.252
+ ip access-group INBOUND-ISP2 in
+ service-policy input QOS-CLASSIFY
+ no shutdown
+!
+interface GigabitEthernet0/2
+ description CUST-A-CE
+ vrf forwarding CUST-A
+ ip address 10.1.1.1 255.255.255.0
+ ip access-group CUST-A-IN in
+ no shutdown
+!
+interface GigabitEthernet0/3
+ description CUST-B-CE
+ vrf forwarding CUST-B
+ ip address 10.2.1.1 255.255.255.0
+ ip access-group CUST-B-IN in
+ no shutdown
+!
+interface GigabitEthernet0/4
+ description MGMT
+ vrf forwarding MGMT
+ ip address 192.168.1.1 255.255.255.0
+ no shutdown
+!
+! ── Prefix Lists ───────────────────────────────────────────────────────
+ip prefix-list PL-DEFAULT seq 5 permit 0.0.0.0/0
+!
+ip prefix-list PL-CUST-A-NETS seq 5 permit 10.10.0.0/16 le 24
+ip prefix-list PL-CUST-A-NETS seq 10 permit 10.10.128.0/17 le 28
+!
+ip prefix-list PL-CUST-B-NETS seq 5 permit 10.20.0.0/16 le 24
+!
+ip prefix-list PL-BOGONS seq 5 deny 10.0.0.0/8 le 32
+ip prefix-list PL-BOGONS seq 10 deny 172.16.0.0/12 le 32
+ip prefix-list PL-BOGONS seq 15 deny 192.168.0.0/16 le 32
+ip prefix-list PL-BOGONS seq 20 deny 0.0.0.0/0
+ip prefix-list PL-BOGONS seq 25 permit 0.0.0.0/0 le 32
+!
+ip prefix-list PL-ISP1-OUT seq 5 permit 203.0.113.0/24
+ip prefix-list PL-ISP1-OUT seq 10 permit 10.10.0.0/16
+ip prefix-list PL-ISP1-OUT seq 15 permit 10.20.0.0/16
+!
+ip prefix-list PL-LOOPBACKS seq 5 permit 10.0.0.0/24 le 32
+!
+! ── AS Path Lists ──────────────────────────────────────────────────────
+ip as-path access-list 10 permit ^$
+ip as-path access-list 20 permit ^65100_
+ip as-path access-list 30 deny .*65200.*
+ip as-path access-list 30 permit .*
+!
+! ── Community Lists ────────────────────────────────────────────────────
+ip community-list standard CUST-A-COMM permit 65000:100
+ip community-list standard CUST-B-COMM permit 65000:200
+ip community-list standard NO-EXPORT permit no-export
+ip community-list expanded BLACKHOLE-COMM permit 65000:666
+!
+! ── ACLs ───────────────────────────────────────────────────────────────
+ip access-list extended INBOUND-ISP1
+ 10 deny ip 10.0.0.0 0.255.255.255 any
+ 20 deny ip 172.16.0.0 0.15.255.255 any
+ 30 deny ip 192.168.0.0 0.0.255.255 any
+ 40 permit ip any any
+!
+ip access-list extended INBOUND-ISP2
+ 10 deny ip 10.0.0.0 0.255.255.255 any
+ 20 permit ip any any
+!
+ip access-list extended OUTBOUND-ISP1
+ 10 permit ip 203.0.113.0 0.0.0.255 any
+ 20 deny ip any any
+!
+ip access-list extended CUST-A-IN
+ 10 permit ip 10.10.0.0 0.0.255.255 any
+ 20 deny ip any any
+!
+ip access-list extended CUST-B-IN
+ 10 permit ip 10.20.0.0 0.0.255.255 any
+ 20 deny ip any any
+!
+ip access-list extended SNMP-ACCESS
+ 10 permit udp 192.168.1.0 0.0.0.255 any eq 161
+ 20 deny udp any any eq 161
+!
+! ── Route Maps ─────────────────────────────────────────────────────────
+route-map RM-ISP1-IN permit 10
+ match ip address prefix-list PL-BOGONS
+ set local-preference 50
+!
+route-map RM-ISP1-IN permit 20
+ match as-path 10
+ set local-preference 200
+ set community 65000:100 additive
+!
+route-map RM-ISP1-IN permit 30
+ match ip address prefix-list PL-DEFAULT
+ set local-preference 100
+!
+route-map RM-ISP1-IN deny 40
+!
+route-map RM-ISP2-IN permit 10
+ match ip address prefix-list PL-BOGONS
+ set local-preference 40
+!
+route-map RM-ISP2-IN permit 20
+ match ip address prefix-list PL-DEFAULT
+ set local-preference 80
+!
+route-map RM-ISP2-IN deny 30
+!
+route-map RM-ISP1-OUT permit 10
+ match ip address prefix-list PL-ISP1-OUT
+ match as-path 10
+ set community no-export
+!
+route-map RM-ISP1-OUT deny 20
+!
+route-map RM-CUST-A-IN permit 10
+ match ip address prefix-list PL-CUST-A-NETS
+ set community 65000:100
+ set local-preference 150
+!
+route-map RM-CUST-A-IN deny 20
+!
+route-map RM-CUST-B-IN permit 10
+ match ip address prefix-list PL-CUST-B-NETS
+ set community 65000:200
+!
+route-map RM-CUST-B-IN deny 20
+!
+route-map RM-REDISTRIBUTE-OSPF permit 10
+ match ip address prefix-list PL-LOOPBACKS
+ set metric 100
+!
+route-map RM-BLACKHOLE permit 10
+ match community BLACKHOLE-COMM
+ set ip next-hop 192.0.2.1
+!
+! ── Class Maps ─────────────────────────────────────────────────────────
+class-map match-any CM-VOICE
+ match dscp ef
+ match dscp cs5
+!
+class-map match-any CM-VIDEO
+ match dscp af41
+ match dscp af42
+!
+class-map match-any CM-CRITICAL-DATA
+ match dscp af31
+ match dscp af32
+ match access-group name CUST-A-IN
+!
+class-map match-any CM-BULK
+ match dscp af11
+!
+class-map match-all CM-SCAVENGER
+ match dscp cs1
+!
+! ── Policy Maps ────────────────────────────────────────────────────────
+policy-map PM-CHILD-QUEUE
+ class CM-VOICE
+  priority percent 20
+ class CM-VIDEO
+  bandwidth percent 15
+ class CM-CRITICAL-DATA
+  bandwidth percent 30
+  queue-limit 64 packets
+ class CM-BULK
+  bandwidth percent 10
+ class CM-SCAVENGER
+  bandwidth percent 2
+ class class-default
+  fair-queue
+!
+policy-map QOS-CLASSIFY
+ class CM-VOICE
+  set dscp ef
+ class CM-VIDEO
+  set dscp af41
+ class CM-CRITICAL-DATA
+  set dscp af31
+ class class-default
+  set dscp default
+  service-policy PM-CHILD-QUEUE
+!
+! ── OSPF ───────────────────────────────────────────────────────────────
+router ospf 1
+ router-id 10.0.0.1
+ passive-interface default
+ no passive-interface GigabitEthernet0/0
+ network 10.0.0.0 0.0.0.255 area 0
+ redistribute bgp 65000 subnets route-map RM-REDISTRIBUTE-OSPF
+ default-information originate always
+!
+! ── BGP ────────────────────────────────────────────────────────────────
+router bgp 65000
+ bgp router-id 10.0.0.1
+ bgp log-neighbor-changes
+ !
+ ! ISP1
+ neighbor 203.0.113.2 remote-as 65100
+ neighbor 203.0.113.2 description ISP1-TRANSIT
+ neighbor 203.0.113.2 route-map RM-ISP1-IN in
+ neighbor 203.0.113.2 route-map RM-ISP1-OUT out
+ neighbor 203.0.113.2 filter-list 30 in
+ !
+ ! ISP2
+ neighbor 198.51.100.2 remote-as 65200
+ neighbor 198.51.100.2 description ISP2-TRANSIT
+ neighbor 198.51.100.2 route-map RM-ISP2-IN in
+ neighbor 198.51.100.2 filter-list 30 in
+ !
+ ! address-family ipv4 unicast
+ address-family ipv4
+  neighbor 203.0.113.2 activate
+  neighbor 198.51.100.2 activate
+  network 203.0.113.0 mask 255.255.255.0
+  redistribute ospf 1 route-map RM-REDISTRIBUTE-OSPF
+ !
+ ! CUST-A VRF
+ address-family ipv4 vrf CUST-A
+  neighbor 10.1.1.2 remote-as 65101
+  neighbor 10.1.1.2 route-map RM-CUST-A-IN in
+  neighbor 10.1.1.2 activate
+ !
+ ! CUST-B VRF
+ address-family ipv4 vrf CUST-B
+  neighbor 10.2.1.2 remote-as 65201
+  neighbor 10.2.1.2 route-map RM-CUST-B-IN in
+  neighbor 10.2.1.2 activate
+ !
+!
+! ── Static Routes ──────────────────────────────────────────────────────
+ip route 0.0.0.0 0.0.0.0 203.0.113.2 10
+ip route 192.168.100.0 255.255.255.0 Null0
+!
+! ── NTP ────────────────────────────────────────────────────────────────
+ntp server 192.168.1.10 prefer
+ntp server 192.168.1.11
+!
+! ── SNMP ───────────────────────────────────────────────────────────────
+snmp-server community PUBLIC ro SNMP-ACCESS
+snmp-server community PRIVATE rw SNMP-ACCESS
+snmp-server host 192.168.1.20 traps PUBLIC
+!
+! ── Syslog ─────────────────────────────────────────────────────────────
+logging host 192.168.1.30
+logging host 192.168.1.31
+logging trap informational
+!

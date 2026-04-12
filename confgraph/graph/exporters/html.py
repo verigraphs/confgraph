@@ -31,12 +31,13 @@ class HTMLExporter(BaseExporter):
     Features
     --------
     * Interactive pan/zoom Cytoscape.js canvas
-    * Node detail panel on click (all attributes)
-    * Color/shape legend per node type; edge legend (resolved vs dangling)
-    * Group filter checkboxes (routing/policy/management/qos/security/infrastructure)
+    * All round (ellipse) nodes
+    * Click a node → isolate view to that node + direct neighbors
+    * Node detail panel: attributes + raw config shown in sidebar
+    * Group filter checkboxes
     * Orphan highlight toggle
-    * Live search (highlights matching nodes)
-    * Layout selector (cose, breadthfirst, circle, grid, concentric)
+    * Live search
+    * Layout selector
     """
 
     def export(self, graph: nx.DiGraph) -> str:
@@ -51,7 +52,6 @@ class HTMLExporter(BaseExporter):
         cytoscape_js = _load_cytoscape()
         elements_json = json.dumps(graph_json["elements"])
 
-        # Collect unique node types for the legend (color/shape come from node data attributes)
         type_styles: dict[str, dict] = {}
         for _, attrs in graph.nodes(data=True):
             t = attrs.get("type", "unknown")
@@ -63,7 +63,6 @@ class HTMLExporter(BaseExporter):
                 }
 
         legend_items_js = json.dumps(type_styles)
-        # Status overlay rules (data selectors — safe with :: in node IDs)
         status_style_rules_js = json.dumps([
             {"selector": "node[status = 'missing']",
              "style": {"border-style": "dashed", "border-opacity": 0.6}},
@@ -173,7 +172,7 @@ body {{
 .filter-label {{ font-size: 12px; color: #334155; }}
 .dot {{
     width: 10px; height: 10px;
-    border-radius: 2px;
+    border-radius: 50%;
     flex-shrink: 0;
 }}
 
@@ -220,8 +219,8 @@ body {{
     margin-bottom: 4px;
 }}
 .legend-swatch {{
-    width: 14px; height: 10px;
-    border-radius: 2px;
+    width: 12px; height: 12px;
+    border-radius: 50%;
     border: 2px solid transparent;
     flex-shrink: 0;
 }}
@@ -258,26 +257,6 @@ body {{
     margin-bottom: 8px;
     word-break: break-all;
 }}
-.detail-tabs {{
-    display: flex;
-    gap: 4px;
-    margin-bottom: 8px;
-}}
-.detail-tab {{
-    padding: 3px 10px;
-    font-size: 11px;
-    border-radius: 3px;
-    cursor: pointer;
-    border: 1px solid #cbd5e1;
-    background: #ffffff;
-    color: #64748b;
-    user-select: none;
-}}
-.detail-tab.active {{
-    background: #1e40af;
-    border-color: #1e40af;
-    color: #fff;
-}}
 .detail-row {{
     display: flex;
     gap: 6px;
@@ -287,15 +266,24 @@ body {{
 }}
 .detail-key {{ color: #94a3b8; min-width: 80px; flex-shrink: 0; }}
 .detail-val {{ color: #1e293b; word-break: break-all; }}
+.raw-config-label {{
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: #94a3b8;
+    margin: 10px 0 6px;
+    padding-top: 8px;
+    border-top: 1px solid #e2e8f0;
+}}
 #detail-raw {{
-    display: none;
     background: #0f172a;
     border-radius: 4px;
     padding: 8px 10px;
-    max-height: 280px;
+    max-height: 220px;
     overflow-y: auto;
     font-family: "SF Mono", "Fira Code", "Cascadia Code", monospace;
-    font-size: 11px;
+    font-size: 10px;
     line-height: 1.6;
     color: #86efac;
     white-space: pre;
@@ -303,17 +291,42 @@ body {{
 }}
 #detail-raw::-webkit-scrollbar {{ width: 4px; }}
 #detail-raw::-webkit-scrollbar-thumb {{ background: #334155; border-radius: 2px; }}
-#detail-attrs {{ display: block; }}
+
+/* ── Canvas wrapper ──────────────────────────────────────────────── */
+#canvas-wrapper {{
+    flex: 1;
+    position: relative;
+}}
 
 /* ── Cytoscape canvas ────────────────────────────────────────────── */
 #cy {{
-    flex: 1;
+    width: 100%;
+    height: 100%;
     background: #f8fafc;
     background-image:
         linear-gradient(rgba(148,163,184,0.15) 1px, transparent 1px),
         linear-gradient(90deg, rgba(148,163,184,0.15) 1px, transparent 1px);
     background-size: 24px 24px;
 }}
+
+/* ── Back button (floating on canvas) ───────────────────────────── */
+#back-btn {{
+    display: none;
+    position: absolute;
+    top: 14px;
+    right: 14px;
+    z-index: 100;
+    padding: 8px 16px;
+    background: #1e40af;
+    color: #fff;
+    border: none;
+    border-radius: 6px;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+}}
+#back-btn:hover {{ background: #1e3a8a; }}
 
 /* ── Buttons ─────────────────────────────────────────────────────── */
 .btn {{
@@ -358,11 +371,8 @@ body {{
       <div class="section-title">Selected Node</div>
       <div id="detail-panel">
         <div id="detail-title"></div>
-        <div class="detail-tabs">
-          <div class="detail-tab active" id="tab-attrs">Attributes</div>
-          <div class="detail-tab" id="tab-raw">Raw Config</div>
-        </div>
         <div id="detail-attrs"></div>
+        <div class="raw-config-label">Raw Config</div>
         <div id="detail-raw"></div>
       </div>
     </div>
@@ -420,7 +430,7 @@ body {{
           <span class="legend-label">Dangling reference</span>
         </div>
         <div class="legend-edge">
-          <div class="dot" style="background:#F9FAFB;border:2px dashed #9CA3AF;border-radius:50%"></div>
+          <div class="dot" style="background:#F9FAFB;border:2px dashed #9CA3AF"></div>
           <span class="legend-label">Missing object (ghost)</span>
         </div>
       </div>
@@ -429,7 +439,10 @@ body {{
   </div><!-- /sidebar-body -->
 </div><!-- /sidebar -->
 
-<div id="cy"></div>
+<div id="canvas-wrapper">
+  <button id="back-btn">← Back to full graph</button>
+  <div id="cy"></div>
+</div>
 
 <script>
 (function() {{
@@ -439,38 +452,51 @@ body {{
   const statusStyleRules = {status_style_rules_js};
 
   // ── Cytoscape style sheet ───────────────────────────────────────────────────
-  // Network-diagram theme: white/light fill, colored border, dark label
   const baseStyles = [
     {{
       selector: 'node',
       style: {{
         'label': 'data(label)',
         'background-color': 'data(fill)',
-        'shape': 'data(shape)',
+        'shape': 'ellipse',
+        'width': 'label',
+        'height': 'label',
+        'padding': '14px',
+        'border-width': 1.5,
+        'border-color': 'data(color)',
+        'border-opacity': 1,
         'font-size': '10px',
         'font-weight': '600',
         'color': '#1e293b',
         'text-valign': 'center',
         'text-halign': 'center',
         'text-wrap': 'wrap',
-        'text-max-width': '90px',
-        'width': 'label',
-        'height': 'label',
-        'padding': '8px',
-        'border-width': 2.5,
-        'border-color': 'data(color)',
-        'border-opacity': 1,
+        'text-max-width': '100px',
+        'min-width': '50px',
+        'min-height': '50px',
+      }}
+    }},
+    {{
+      selector: 'node[status = "missing"]',
+      style: {{
+        'border-style': 'dashed',
+        'border-width': 1,
+        'border-opacity': 0.6,
+        'background-color': '#F9FAFB',
+        'font-size': '9px',
+        'color': '#9CA3AF',
+        'padding': '10px',
       }}
     }},
     {{
       selector: 'edge',
       style: {{
-        'width': 1.5,
+        'width': 1,
         'line-color': '#94a3b8',
         'target-arrow-color': '#94a3b8',
         'target-arrow-shape': 'triangle',
         'curve-style': 'bezier',
-        'opacity': 0.85,
+        'opacity': 0.6,
       }}
     }},
     {{
@@ -479,93 +505,100 @@ body {{
         'line-color': '#DC2626',
         'target-arrow-color': '#DC2626',
         'line-style': 'dashed',
-        'opacity': 0.9,
+        'opacity': 0.75,
       }}
     }},
     {{
-      selector: '.highlighted',
+      selector: '.selected-node',
       style: {{
-        'border-width': 4,
+        'border-width': 2.5,
         'border-color': '#1d4ed8',
-        'border-opacity': 1,
         'background-color': '#dbeafe',
         'z-index': 9999,
+        'shadow-blur': 20,
+        'shadow-color': '#1d4ed8',
+        'shadow-opacity': 0.35,
+        'shadow-offset-x': 0,
+        'shadow-offset-y': 0,
+      }}
+    }},
+    {{
+      selector: '.neighbor-node',
+      style: {{
+        'border-width': 2,
+        'border-color': '#6366f1',
+        'z-index': 999,
       }}
     }},
     {{
       selector: '.faded',
-      style: {{ 'opacity': 0.18 }}
+      style: {{ 'opacity': 0.1 }}
     }},
     {{
       selector: '.orphan-highlighted',
       style: {{
-        'border-width': 4,
+        'border-width': 2,
         'border-color': '#D97706',
         'border-style': 'dashed',
         'border-opacity': 1,
       }}
     }},
     {{
-      selector: 'edge.highlighted',
+      selector: 'edge.active-edge',
       style: {{
-        'line-color': '#1d4ed8',
-        'target-arrow-color': '#1d4ed8',
+        'line-color': '#6366f1',
+        'target-arrow-color': '#6366f1',
         'opacity': 1,
-        'width': 2.5,
+        'width': 2,
         'z-index': 9999,
-      }}
-    }},
-    {{
-      selector: 'node[?isCompound]',
-      style: {{
-        'background-color': '#f8fafc',
-        'background-opacity': 0.45,
-        'border-width': 1,
-        'border-color': '#cbd5e1',
-        'border-style': 'dashed',
-        'label': 'data(label)',
-        'font-size': '10px',
-        'font-weight': '700',
-        'text-valign': 'top',
-        'text-halign': 'center',
-        'color': '#94a3b8',
-        'padding': '20px',
-        'shape': 'roundrectangle',
       }}
     }},
   ].concat(statusStyleRules);
 
-  // ── Compound parent nodes (one container per group) ─────────────────────────
-  const groupLabels = {{
-    routing: 'Routing', policy: 'Policy', infrastructure: 'Infrastructure',
-    qos: 'QoS', security: 'Security', management: 'Management',
-    missing: 'Missing refs', other: 'Other',
-  }};
-  const groupsPresent = [...new Set(elements.nodes.map(n => n.data.group).filter(Boolean))];
-  const compoundNodes = groupsPresent.map(g => ({{
-    data: {{ id: `__grp_${{g}}`, label: groupLabels[g] || g, isCompound: true, group: g }}
-  }}));
-  const augmentedElements = {{
-    nodes: compoundNodes.concat(elements.nodes.map(n => ({{
-      ...n,
-      data: {{ ...n.data, parent: `__grp_${{n.data.group || 'other'}}` }},
-    }}))),
-    edges: elements.edges,
+  // ── Physics layout config (reused for initial + post-drag settle) ───────────
+  const physicsLayout = {{
+    name: 'cose',
+    animate: true,
+    animationDuration: 600,
+    animationEasing: 'ease-out-cubic',
+    randomize: false,
+    padding: 60,
+    nodeRepulsion: function() {{ return 12000; }},
+    idealEdgeLength: function() {{ return 140; }},
+    edgeElasticity: function() {{ return 80; }},
+    gravity: 0.35,
+    numIter: 800,
+    initialTemp: 150,
+    coolingFactor: 0.97,
+    minTemp: 1.0,
+    fit: false,
   }};
 
   const cy = cytoscape({{
     container: document.getElementById('cy'),
-    elements: augmentedElements,
+    elements: elements,
     style: baseStyles,
-    layout: {{ name: 'cose', animate: false, randomize: true, padding: 40 }},
+    layout: {{ ...physicsLayout, animate: false, fit: true }},
     wheelSensitivity: 0.3,
   }});
 
+  // ── Live physics: re-settle after dragging a node ──────────────────────────
+  let settleTimer = null;
+  cy.on('dragfree', 'node', function() {{
+    clearTimeout(settleTimer);
+    settleTimer = setTimeout(function() {{
+      cy.layout(physicsLayout).run();
+    }}, 80);
+  }});
+
+  // ── State ───────────────────────────────────────────────────────────────────
+  let isolated = false;
+
   // ── Stats ───────────────────────────────────────────────────────────────────
   function updateStats() {{
-    const visible = cy.nodes('[!isCompound]:visible').length;
-    const orphans = cy.nodes('[!isCompound][status = "orphan"]').length;
-    const missing = cy.nodes('[!isCompound][status = "missing"]').length;
+    const visible = cy.nodes(':visible').length;
+    const orphans = cy.nodes('[status = "orphan"]').length;
+    const missing = cy.nodes('[status = "missing"]').length;
     const dangling = cy.edges('[resolved = false]').length;
     document.getElementById('stat-visible').textContent = visible;
     document.getElementById('stat-orphan').textContent = orphans;
@@ -579,14 +612,13 @@ body {{
   Object.entries(legendStyles).forEach(([type, style]) => {{
     const row = document.createElement('div');
     row.className = 'legend-item';
-    const radius = style.shape === 'ellipse' ? '50%' : '3px';
     const fill = style.fill || '#ffffff';
-    row.innerHTML = `<div class="legend-swatch" style="background:${{fill}};border:2px solid ${{style.color}};border-radius:${{radius}}"></div>
+    row.innerHTML = `<div class="legend-swatch" style="background:${{fill}};border-color:${{style.color}}"></div>
                      <span class="legend-label">${{type}}</span>`;
     legendEl.appendChild(row);
   }});
 
-  // ── Group filters ────────────────────────────────────────────────────────────
+  // ── Group filters ─────────────────────────────────────────────────────────
   const groups = [...new Set(elements.nodes.map(n => n.data.group).filter(Boolean))].sort();
   const groupColors = {{
     infrastructure: '#1565C0', routing: '#1B5E20', policy: '#7C2D12',
@@ -614,22 +646,24 @@ body {{
     filtersEl.appendChild(row);
   }});
 
-  function applyGroupFilters() {{
+  function getHiddenGroups() {{
     const hidden = new Set();
     document.querySelectorAll('#group-filters input[type=checkbox]').forEach(chk => {{
       if (!chk.checked) hidden.add(chk.dataset.group);
     }});
-    cy.nodes('[!isCompound]').forEach(n => {{
+    return hidden;
+  }}
+
+  function applyGroupFilters() {{
+    if (isolated) return;  // don't interfere with isolated view
+    const hidden = getHiddenGroups();
+    cy.nodes().forEach(n => {{
       if (hidden.has(n.data('group'))) {{
         n.hide(); n.connectedEdges().hide();
       }} else {{
         n.show();
+        // only show edges whose both endpoints are visible
       }}
-    }});
-    // Show/hide compound containers based on whether any children are visible
-    cy.nodes('[?isCompound]').forEach(compound => {{
-      if (compound.children(':visible').length > 0) compound.show();
-      else compound.hide();
     }});
     cy.edges().forEach(e => {{
       if (e.source().visible() && e.target().visible()) e.show();
@@ -652,11 +686,10 @@ body {{
   const searchCount = document.getElementById('search-count');
   searchInput.addEventListener('input', function() {{
     const q = this.value.trim().toLowerCase();
-    cy.elements().removeClass('highlighted faded');
+    cy.elements().removeClass('faded');
     if (!q) {{ searchCount.textContent = ''; return; }}
-    const matched = cy.nodes('[!isCompound]').filter(n => n.data('label').toLowerCase().includes(q));
-    cy.nodes('[!isCompound]').not(matched).addClass('faded');
-    matched.addClass('highlighted');
+    const matched = cy.nodes().filter(n => n.data('label').toLowerCase().includes(q));
+    cy.nodes().not(matched).addClass('faded');
     searchCount.textContent = matched.length + ' match' + (matched.length !== 1 ? 'es' : '');
   }});
 
@@ -665,33 +698,10 @@ body {{
   const detailTitle = document.getElementById('detail-title');
   const detailAttrs = document.getElementById('detail-attrs');
   const detailRaw   = document.getElementById('detail-raw');
-  const SKIP_KEYS = new Set(['id', 'label', 'color', 'shape', 'raw_config']);
+  const SKIP_KEYS = new Set(['id', 'label', 'color', 'fill', 'shape', 'raw_config']);
 
-  function switchTab(tab) {{
-    document.getElementById('tab-attrs').classList.toggle('active', tab === 'attrs');
-    document.getElementById('tab-raw').classList.toggle('active', tab === 'raw');
-    detailAttrs.style.display = tab === 'attrs' ? 'block' : 'none';
-    detailRaw.style.display   = tab === 'raw'   ? 'block' : 'none';
-  }}
-
-  // Wire tab clicks via JS (not inline onclick — switchTab is inside IIFE)
-  document.getElementById('tab-attrs').addEventListener('click', function() {{ switchTab('attrs'); }});
-  document.getElementById('tab-raw').addEventListener('click', function() {{ switchTab('raw'); }});
-
-  cy.on('tap', 'node', function(evt) {{
-    const node = evt.target;
-    if (node.data('isCompound')) return;  // ignore compound container clicks
+  function showDetail(node) {{
     const d = node.data();
-
-    // ── Neighbourhood highlight ───────────────────────────────────────────────
-    cy.elements().removeClass('highlighted faded');
-    const hood = node.closedNeighborhood().not('[?isCompound]');
-    cy.elements('[!isCompound]').not(hood).addClass('faded');
-    hood.addClass('highlighted');
-    // Keep edges inside neighbourhood vivid
-    hood.connectedEdges().removeClass('faded').addClass('highlighted');
-
-    // ── Detail panel ──────────────────────────────────────────────────────────
     detailTitle.textContent = d.label || d.id;
     detailAttrs.innerHTML = '';
     Object.entries(d).forEach(([k, v]) => {{
@@ -701,18 +711,54 @@ body {{
       row.innerHTML = `<span class="detail-key">${{k}}</span><span class="detail-val">${{String(v)}}</span>`;
       detailAttrs.appendChild(row);
     }});
-    const raw = d.raw_config || '';
-    detailRaw.textContent = raw || '(no raw config available)';
+    detailRaw.textContent = d.raw_config || '(no raw config available)';
     detailPanel.classList.add('visible');
-    switchTab('attrs');
+  }}
+
+  function hideDetail() {{
+    detailPanel.classList.remove('visible');
+  }}
+
+  // ── Isolation: show only clicked node + neighbors ─────────────────────────
+  const backBtn = document.getElementById('back-btn');
+
+  function isolateNode(node) {{
+    const hood = node.closedNeighborhood();
+    cy.elements().not(hood).hide();
+    hood.show();
+    cy.elements().removeClass('selected-node neighbor-node active-edge faded');
+    node.addClass('selected-node');
+    hood.nodes().not(node).addClass('neighbor-node');
+    hood.edges().addClass('active-edge');
+    cy.fit(hood, 60);
+    backBtn.style.display = 'block';
+    isolated = true;
+    showDetail(node);
+    updateStats();
+  }}
+
+  function restoreFullGraph() {{
+    cy.elements().show();
+    cy.elements().removeClass('selected-node neighbor-node active-edge faded');
+    backBtn.style.display = 'none';
+    isolated = false;
+    hideDetail();
+    applyGroupFilters();  // re-apply any active group filters
+    cy.fit(undefined, 40);
+    searchInput.value = '';
+    searchCount.textContent = '';
+    updateStats();
+  }}
+
+  backBtn.addEventListener('click', restoreFullGraph);
+
+  cy.on('tap', 'node', function(evt) {{
+    isolateNode(evt.target);
   }});
 
   cy.on('tap', function(evt) {{
     if (evt.target === cy) {{
-      detailPanel.classList.remove('visible');
-      cy.elements().removeClass('highlighted faded');
-      document.getElementById('search').value = '';
-      searchCount.textContent = '';
+      restoreFullGraph();
     }}
   }});
 
