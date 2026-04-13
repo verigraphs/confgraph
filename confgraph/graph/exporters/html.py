@@ -474,6 +474,17 @@ body {{
   // ── Graph data ──────────────────────────────────────────────────────────────
   const elements = {elements_json};
   const legendStyles = {legend_items_js};
+
+  // ── Pre-compute degree per node ─────────────────────────────────────────────
+  const degreeMap = {{}};
+  elements.edges.forEach(e => {{
+    degreeMap[e.data.source] = (degreeMap[e.data.source] || 0) + 1;
+    degreeMap[e.data.target] = (degreeMap[e.data.target] || 0) + 1;
+  }});
+  const maxDegree = Math.max(1, ...Object.values(degreeMap));
+  elements.nodes.forEach(n => {{
+    n.data.degree = degreeMap[n.data.id] || 0;
+  }});
   const statusStyleRules = {status_style_rules_js};
 
   // ── Cytoscape style sheet ───────────────────────────────────────────────────
@@ -595,25 +606,6 @@ body {{
     fit: true,
   }};
 
-  // Drag-settle: no randomize so nodes don't jump; lighter pass
-  const settleLayout = {{
-    name: 'cose',
-    animate: true,
-    animationDuration: 500,
-    animationEasing: 'ease-out-cubic',
-    randomize: false,
-    padding: 80,
-    nodeRepulsion: function() {{ return 80000; }},
-    idealEdgeLength: function() {{ return 220; }},
-    edgeElasticity: function() {{ return 60; }},
-    gravity: 0.05,
-    numIter: 400,
-    initialTemp: 80,
-    coolingFactor: 0.95,
-    minTemp: 1.0,
-    fit: false,
-  }};
-
   const cy = cytoscape({{
     container: document.getElementById('cy'),
     elements: elements,
@@ -622,14 +614,19 @@ body {{
     wheelSensitivity: 0.3,
   }});
 
-  // ── Live physics: re-settle after dragging a node ──────────────────────────
-  let settleTimer = null;
-  cy.on('dragfree', 'node', function() {{
-    clearTimeout(settleTimer);
-    settleTimer = setTimeout(function() {{
-      cy.layout(settleLayout).run();
-    }}, 80);
+  // ── Degree-based sizing (applied post-init per node) ────────────────────────
+  cy.nodes().forEach(function(n) {{
+    if (n.data('status') === 'missing') return;
+    const ratio = Math.min((n.data('degree') || 0) / maxDegree, 1);
+    const padding = Math.round(12 + ratio * 14);
+    const fontSize = (9 + Math.round(ratio * 4)) + 'px';
+    n.style('padding', padding);
+    n.style('font-size', fontSize);
   }});
+
+  // ── Drag tracking: prevent tap firing after a drag ─────────────────────────
+  let wasDragged = false;
+  cy.on('drag', 'node', function() {{ wasDragged = true; }});
 
   // ── State ───────────────────────────────────────────────────────────────────
   let isolated = false;
@@ -835,6 +832,7 @@ body {{
   backBtn.addEventListener('click', restoreFullGraph);
 
   cy.on('tap', 'node', function(evt) {{
+    if (wasDragged) {{ wasDragged = false; return; }}
     isolateNode(evt.target);
   }});
 
