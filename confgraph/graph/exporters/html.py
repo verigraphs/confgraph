@@ -501,7 +501,7 @@ body {{
         'width': 'label',
         'height': 'label',
         'padding': '14px',
-        'border-width': 1.5,
+        'border-width': 0.75,
         'border-color': 'data(color)',
         'border-opacity': 1,
         'font-size': '10px',
