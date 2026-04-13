@@ -103,6 +103,14 @@ class InterfaceConfig(BaseConfigObject):
         default=None,
         description="Source interface for IP unnumbered (references another interface)",
     )
+    acl_in: str | None = Field(
+        default=None,
+        description="Inbound ACL applied via 'ip access-group <name> in'",
+    )
+    acl_out: str | None = Field(
+        default=None,
+        description="Outbound ACL applied via 'ip access-group <name> out'",
+    )
 
     # Physical attributes
     mtu: int | None = Field(

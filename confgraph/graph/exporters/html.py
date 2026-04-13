@@ -510,7 +510,7 @@ body {{
     {{
       selector: 'node',
       style: {{
-        'label': 'data(label)',
+        'label': 'data(display_label)',
         'background-color': 'data(fill)',
         'shape': 'ellipse',
         'width': 'label',
@@ -780,7 +780,7 @@ body {{
   const detailTitle = document.getElementById('detail-title');
   const detailAttrs = document.getElementById('detail-attrs');
   const detailRaw   = document.getElementById('detail-raw');
-  const SKIP_KEYS = new Set(['id', 'label', 'color', 'fill', 'shape', 'raw_config']);
+  const SKIP_KEYS = new Set(['id', 'label', 'display_label', 'color', 'fill', 'shape', 'raw_config']);
 
   function showDetail(node) {{
     const d = node.data();

@@ -8,10 +8,14 @@ from confgraph.models.vrf import VRFConfig
 from confgraph.models.bgp import (
     BGPConfig,
     BGPNeighbor,
+    BGPNeighborAF,
     BGPPeerGroup,
     BGPRedistribute,
     BGPBestpathOptions,
 )
+from confgraph.models.acl import ACLConfig, ACLEntry
+from confgraph.models.static_route import StaticRoute
+from confgraph.models.multicast import MulticastConfig, PIMRPAddress
 from confgraph.models.ospf import (
     OSPFConfig,
     OSPFArea,
@@ -212,6 +216,17 @@ class IOSXRParser(IOSParser):
                     except ValueError:
                         pass
 
+            # IOS-XR: ipv4 access-group <name> ingress|egress
+            for ag_ch in intf_obj.re_search_children(
+                r"^\s+ipv4\s+access-group\s+\S+\s+(ingress|egress)"
+            ):
+                m = re.match(r"^\s+ipv4\s+access-group\s+(\S+)\s+(ingress|egress)", ag_ch.text)
+                if m:
+                    if m.group(2) == "ingress":
+                        intf_cfg.acl_in = m.group(1)
+                    else:
+                        intf_cfg.acl_out = m.group(1)
+
             # IOS-XR: ipv6 address
             ipv6_children = intf_obj.re_search_children(r"^\s+ipv6\s+address\s+(\S+)")
             ipv6_addresses = []
@@ -297,67 +312,55 @@ class IOSXRParser(IOSParser):
             if rd_ch:
                 rd = self._extract_match(rd_ch[0].text, r"^\s+rd\s+(\S+)")
 
-            # VRF neighbors
+            # VRF neighbors — IOS-XR uses block syntax per neighbor
             vrf_neighbors: list[BGPNeighbor] = []
-            neighbor_dict: dict[str, dict] = {}
-
-            for child in vrf_child.all_children:
-                text = child.text.strip()
-                n_match = re.match(r"neighbor\s+(\S+)", text)
-                if not n_match:
+            for nb_child in vrf_child.re_search_children(r"^\s+neighbor\s+(\S+)\s*$"):
+                peer_str = self._extract_match(nb_child.text, r"^\s+neighbor\s+(\S+)\s*$")
+                if not peer_str:
                     continue
-
-                peer_ip_str = n_match.group(1)
-                remaining = text[n_match.end():].strip()
-
-                if peer_ip_str not in neighbor_dict:
-                    neighbor_dict[peer_ip_str] = {
-                        "peer_ip": peer_ip_str,
-                        "remote_as": None,
-                        "description": None,
-                        "route_map_in": None,
-                        "route_map_out": None,
-                    }
-
-                if remaining.startswith("remote-as "):
-                    val = remaining.replace("remote-as ", "").strip()
-                    try:
-                        neighbor_dict[peer_ip_str]["remote_as"] = int(val)
-                    except ValueError:
-                        neighbor_dict[peer_ip_str]["remote_as"] = val
-                elif remaining.startswith("description "):
-                    neighbor_dict[peer_ip_str]["description"] = remaining.replace("description ", "").strip()
-                # IOS-XR: route-policy NAME in / route-policy NAME out
-                elif remaining.startswith("route-policy ") and remaining.endswith(" in"):
-                    neighbor_dict[peer_ip_str]["route_map_in"] = (
-                        remaining.replace("route-policy ", "").replace(" in", "").strip()
-                    )
-                elif remaining.startswith("route-policy ") and remaining.endswith(" out"):
-                    neighbor_dict[peer_ip_str]["route_map_out"] = (
-                        remaining.replace("route-policy ", "").replace(" out", "").strip()
-                    )
-
-            for peer_ip_str, nd in neighbor_dict.items():
                 try:
-                    peer_ip = IPv4Address(peer_ip_str)
+                    peer_ip = IPv4Address(peer_str)
                 except ValueError:
                     try:
-                        peer_ip = IPv6Address(peer_ip_str)
+                        peer_ip = IPv6Address(peer_str)
                     except ValueError:
                         continue
 
+                nd: dict = {
+                    "remote_as": None,
+                    "description": None,
+                    "update_source": None,
+                    "route_map_in": None,
+                    "route_map_out": None,
+                }
+                for child in nb_child.all_children:
+                    text = child.text.strip()
+                    if text.startswith("remote-as "):
+                        val = text.split(None, 1)[1].strip()
+                        try:
+                            nd["remote_as"] = int(val)
+                        except ValueError:
+                            nd["remote_as"] = val
+                    elif text.startswith("description "):
+                        nd["description"] = text.split(None, 1)[1].strip()
+                    elif text.startswith("update-source "):
+                        nd["update_source"] = text.split(None, 1)[1].strip()
+                    # AF-level route-policy (inside address-family block)
+                    elif text.startswith("route-policy ") and text.endswith(" in"):
+                        nd["route_map_in"] = text[len("route-policy "):-3].strip()
+                    elif text.startswith("route-policy ") and text.endswith(" out"):
+                        nd["route_map_out"] = text[len("route-policy "):-4].strip()
+
                 if nd["remote_as"] is None:
                     continue
-
-                vrf_neighbors.append(
-                    BGPNeighbor(
-                        peer_ip=peer_ip,
-                        remote_as=nd["remote_as"],
-                        description=nd["description"],
-                        route_map_in=nd["route_map_in"],
-                        route_map_out=nd["route_map_out"],
-                    )
-                )
+                vrf_neighbors.append(BGPNeighbor(
+                    peer_ip=peer_ip,
+                    remote_as=nd["remote_as"],
+                    description=nd["description"],
+                    update_source=nd["update_source"],
+                    route_map_in=nd["route_map_in"],
+                    route_map_out=nd["route_map_out"],
+                ))
 
             # Redistribution
             redistribute: list[BGPRedistribute] = []
@@ -450,13 +453,7 @@ class IOSXRParser(IOSParser):
             non_passive_interfaces: list[str] = []
 
             # Parse areas — IOS-XR has "area N" stanzas with nested interfaces
-            areas = self._parse_ospf_areas_iosxr(ospf_obj)
-
-            # Collect passive interfaces from area/interface blocks
-            for area in areas:
-                for intf_name in area.interfaces:
-                    # We need to check per-interface passive enable
-                    pass  # Populated during _parse_ospf_areas_iosxr
+            areas, passive_interfaces = self._parse_ospf_areas_iosxr(ospf_obj)
 
             # Redistribution
             redistribute = self._parse_ospf_redistribute_iosxr(ospf_obj)
@@ -510,10 +507,14 @@ class IOSXRParser(IOSParser):
 
         return ospf_instances
 
-    def _parse_ospf_areas_iosxr(self, ospf_obj) -> list[OSPFArea]:
-        """Parse OSPF areas with nested interface blocks (IOS-XR style)."""
+    def _parse_ospf_areas_iosxr(self, ospf_obj) -> tuple[list[OSPFArea], list[str]]:
+        """Parse OSPF areas with nested interface blocks (IOS-XR style).
+
+        Returns a tuple of (areas, passive_interfaces).
+        """
         areas: list[OSPFArea] = []
         area_dict: dict[str, dict] = {}
+        passive_interfaces: list[str] = []
 
         area_children = ospf_obj.re_search_children(r"^\s+area\s+(\S+)")
         for area_child in area_children:
@@ -574,11 +575,15 @@ class IOSXRParser(IOSParser):
                 intf_name = self._extract_match(intf_child.text, r"^\s+interface\s+(\S+)")
                 if intf_name and intf_name not in area_dict[area_id]["interfaces"]:
                     area_dict[area_id]["interfaces"].append(intf_name)
+                # IOS-XR marks passive with "passive enable" inside the interface block
+                if intf_name and intf_child.re_search_children(r"^\s+passive\s+enable"):
+                    if intf_name not in passive_interfaces:
+                        passive_interfaces.append(intf_name)
 
         for area_data in area_dict.values():
             areas.append(OSPFArea(**area_data))
 
-        return areas
+        return areas, passive_interfaces
 
     def _parse_ospf_redistribute_iosxr(self, ospf_obj) -> list[OSPFRedistribute]:
         """Parse OSPF redistribution for IOS-XR (uses route-policy instead of route-map)."""
@@ -859,4 +864,372 @@ class IOSXRParser(IOSParser):
                 )
             )
 
+        # Also parse extcommunity-set blocks (RT/SoO sets)
+        ecs_objs = parse.find_objects(r"^extcommunity-set\s+\S+\s+(\S+)")
+        for ecs_obj in ecs_objs:
+            m = re.match(r"^extcommunity-set\s+\S+\s+(\S+)", ecs_obj.text)
+            if not m:
+                continue
+            ecs_name = m.group(1)
+            raw_lines, line_numbers = self._get_raw_lines_and_line_numbers(ecs_obj)
+            all_communities = []
+            for child in ecs_obj.all_children:
+                text = child.text.strip().rstrip(",")
+                if not text or text in ("end-set",):
+                    continue
+                all_communities.append(text)
+            entries = []
+            if all_communities:
+                entries.append(CommunityListEntry(action="permit", communities=all_communities))
+            community_lists.append(
+                CommunityListConfig(
+                    object_id=f"community_list_{ecs_name}",
+                    raw_lines=raw_lines,
+                    source_os=self.os_type,
+                    line_numbers=line_numbers,
+                    name=ecs_name,
+                    list_type="extended",
+                    entries=entries,
+                )
+            )
+
         return community_lists
+
+    # -----------------------------------------------------------------------
+    # ACLs — "ipv4 access-list NAME" / "ipv6 access-list NAME"
+    # -----------------------------------------------------------------------
+
+    def parse_acls(self) -> list[ACLConfig]:
+        """Parse IOS-XR ACL configurations.
+
+        IOS-XR uses ``ipv4 access-list NAME`` and ``ipv6 access-list NAME``
+        instead of IOS ``ip access-list standard|extended NAME``.
+        """
+        acls = []
+        parse = self._get_parse_obj()
+
+        for keyword in ("ipv4", "ipv6"):
+            acl_objs = parse.find_objects(rf"^{keyword}\s+access-list\s+(\S+)")
+            for acl_obj in acl_objs:
+                acl_name = self._extract_match(acl_obj.text, rf"^{keyword}\s+access-list\s+(\S+)")
+                if not acl_name:
+                    continue
+
+                raw_lines, line_numbers = self._get_raw_lines_and_line_numbers(acl_obj)
+                entries = []
+
+                for entry_child in acl_obj.children:
+                    entry_text = entry_child.text.strip()
+                    parts = entry_text.split()
+                    if not parts:
+                        continue
+
+                    sequence = None
+                    if parts[0].isdigit():
+                        sequence = int(parts[0])
+                        parts = parts[1:]
+
+                    if not parts:
+                        continue
+                    action = parts[0].lower()
+                    if action not in ("permit", "deny", "remark"):
+                        continue
+
+                    if action == "remark":
+                        entries.append(ACLEntry(
+                            action="remark",
+                            sequence=sequence,
+                            remark=" ".join(parts[1:]),
+                        ))
+                    else:
+                        entries.append(ACLEntry(
+                            action=action,
+                            sequence=sequence,
+                            protocol=parts[1] if len(parts) > 1 else None,
+                        ))
+
+                acls.append(ACLConfig(
+                    object_id=f"acl_{acl_name}",
+                    raw_lines=raw_lines,
+                    source_os=self.os_type,
+                    line_numbers=line_numbers,
+                    name=acl_name,
+                    acl_type="extended",
+                    entries=entries,
+                ))
+
+        return acls
+
+    # -----------------------------------------------------------------------
+    # Static routes — "router static" block
+    # -----------------------------------------------------------------------
+
+    def parse_static_routes(self) -> list[StaticRoute]:
+        """Parse IOS-XR static routes from ``router static`` block.
+
+        IOS-XR format::
+
+            router static
+             address-family ipv4 unicast
+              0.0.0.0/0 192.168.1.1
+              10.0.0.0/8 Null0 200
+             !
+             vrf MGMT
+              address-family ipv4 unicast
+               0.0.0.0/0 10.100.100.1
+        """
+        static_routes = []
+        parse = self._get_parse_obj()
+
+        static_objs = parse.find_objects(r"^router\s+static")
+        for static_obj in static_objs:
+            raw_lines, line_numbers = self._get_raw_lines_and_line_numbers(static_obj)
+
+            def _extract_routes(af_obj, vrf: str | None) -> None:
+                for route_child in af_obj.all_children:
+                    text = route_child.text.strip()
+                    m = re.match(r"^(\d+\.\d+\.\d+\.\d+/\d+)\s+(\S+)(.*)", text)
+                    if not m:
+                        continue
+                    prefix_str, next_hop_str = m.group(1), m.group(2)
+                    remaining = m.group(3).strip()
+                    try:
+                        destination = IPv4Network(prefix_str, strict=False)
+                    except ValueError:
+                        continue
+                    next_hop = None
+                    next_hop_interface = None
+                    try:
+                        next_hop = IPv4Address(next_hop_str)
+                    except ValueError:
+                        next_hop_interface = next_hop_str
+                    distance = 1
+                    parts = remaining.split()
+                    if parts and parts[0].isdigit():
+                        distance = int(parts[0])
+                    static_routes.append(StaticRoute(
+                        object_id=f"static_route_{destination}_{next_hop_str}",
+                        raw_lines=raw_lines,
+                        source_os=self.os_type,
+                        line_numbers=line_numbers,
+                        destination=destination,
+                        next_hop=next_hop,
+                        next_hop_interface=next_hop_interface,
+                        distance=distance,
+                        vrf=vrf,
+                    ))
+
+            # Global routes
+            for af_child in static_obj.re_search_children(r"^\s+address-family\s+ipv4\s+unicast"):
+                _extract_routes(af_child, vrf=None)
+
+            # VRF routes
+            for vrf_child in static_obj.re_search_children(r"^\s+vrf\s+(\S+)"):
+                vrf_name = self._extract_match(vrf_child.text, r"^\s+vrf\s+(\S+)")
+                if not vrf_name:
+                    continue
+                for af_child in vrf_child.re_search_children(r"^\s+address-family\s+ipv4\s+unicast"):
+                    _extract_routes(af_child, vrf=vrf_name)
+
+        return static_routes
+
+    # -----------------------------------------------------------------------
+    # BGP neighbors — block syntax "neighbor X\n  remote-as Y"
+    # -----------------------------------------------------------------------
+
+    def _parse_bgp_neighbors(self, bgp_obj) -> list[BGPNeighbor]:
+        """Parse BGP neighbors from IOS-XR block-style syntax.
+
+        IOS-XR uses a block per neighbor instead of flat ``neighbor X cmd`` lines::
+
+            neighbor 203.0.113.1
+             remote-as 65001
+             description ISP1-PEER
+             address-family ipv4 unicast
+              route-policy ISP1-IN in
+        """
+        neighbors = []
+        neighbor_blocks = bgp_obj.re_search_children(r"^\s+neighbor\s+(\S+)\s*$")
+
+        for nb_child in neighbor_blocks:
+            peer_str = self._extract_match(nb_child.text, r"^\s+neighbor\s+(\S+)\s*$")
+            if not peer_str:
+                continue
+
+            try:
+                peer_ip = IPv4Address(peer_str)
+            except ValueError:
+                try:
+                    peer_ip = IPv6Address(peer_str)
+                except ValueError:
+                    continue
+
+            nd: dict = {
+                "remote_as": None,
+                "peer_group": None,
+                "description": None,
+                "update_source": None,
+                "ebgp_multihop": None,
+                "password": None,
+                "route_map_in": None,
+                "route_map_out": None,
+            }
+
+            for child in nb_child.all_children:
+                text = child.text.strip()
+                if text.startswith("remote-as "):
+                    val = text.split(None, 1)[1].strip()
+                    try:
+                        nd["remote_as"] = int(val)
+                    except ValueError:
+                        nd["remote_as"] = val
+                elif text.startswith("description "):
+                    nd["description"] = text.split(None, 1)[1].strip()
+                elif text.startswith("update-source "):
+                    nd["update_source"] = text.split(None, 1)[1].strip()
+                elif text.startswith("ebgp-multihop "):
+                    parts = text.split()
+                    if len(parts) > 1 and parts[1].isdigit():
+                        nd["ebgp_multihop"] = int(parts[1])
+                elif text.startswith("use neighbor-group "):
+                    nd["peer_group"] = text.split(None, 2)[2].strip()
+
+            if nd["remote_as"] is None and nd["peer_group"] is None:
+                continue
+
+            remote_as = nd["remote_as"] if nd["remote_as"] is not None else "inherited"
+            neighbors.append(BGPNeighbor(
+                peer_ip=peer_ip,
+                remote_as=remote_as,
+                peer_group=nd["peer_group"],
+                description=nd["description"],
+                update_source=nd["update_source"],
+                ebgp_multihop=nd["ebgp_multihop"],
+                password=nd["password"],
+                route_map_in=nd["route_map_in"],
+                route_map_out=nd["route_map_out"],
+            ))
+
+        return neighbors
+
+    # -----------------------------------------------------------------------
+    # BGP AF neighbor policies — "route-policy NAME in|out"
+    # -----------------------------------------------------------------------
+
+    def _apply_bgp_af_neighbor_policies(self, bgp_obj, neighbors: list) -> None:
+        """Populate neighbor AF policies from IOS-XR nested neighbor blocks.
+
+        IOS-XR nests AF policy under each neighbor block::
+
+            neighbor 192.0.2.1
+             address-family ipv4 unicast
+              route-policy ISP-IN in
+              route-policy ISP-OUT out
+        """
+        nb_index = {str(nb.peer_ip): nb for nb in neighbors}
+
+        neighbor_blocks = bgp_obj.re_search_children(r"^\s+neighbor\s+(\S+)\s*$")
+        for nb_child in neighbor_blocks:
+            peer_str = self._extract_match(nb_child.text, r"^\s+neighbor\s+(\S+)\s*$")
+            if not peer_str or peer_str not in nb_index:
+                continue
+
+            nb = nb_index[peer_str]
+            af_children = nb_child.re_search_children(
+                r"^\s+address-family\s+(ipv4|ipv6)\s+unicast"
+            )
+            for af_child in af_children:
+                m = re.search(r"^\s+address-family\s+(ipv4|ipv6)\s+unicast", af_child.text)
+                if not m:
+                    continue
+                afi, safi = m.group(1), "unicast"
+                af_data: dict = {
+                    "activate": True,
+                    "route_map_in": None,
+                    "route_map_out": None,
+                    "prefix_list_in": None,
+                    "prefix_list_out": None,
+                    "filter_list_in": None,
+                    "filter_list_out": None,
+                    "default_originate_route_map": None,
+                }
+                for policy_child in af_child.all_children:
+                    cmd = policy_child.text.strip()
+                    if cmd.startswith("route-policy ") and cmd.endswith(" in"):
+                        af_data["route_map_in"] = cmd[len("route-policy "):-3].strip()
+                    elif cmd.startswith("route-policy ") and cmd.endswith(" out"):
+                        af_data["route_map_out"] = cmd[len("route-policy "):-4].strip()
+                    elif cmd.startswith("prefix-set ") and cmd.endswith(" in"):
+                        af_data["prefix_list_in"] = cmd[len("prefix-set "):-3].strip()
+                    elif cmd.startswith("prefix-set ") and cmd.endswith(" out"):
+                        af_data["prefix_list_out"] = cmd[len("prefix-set "):-4].strip()
+
+                if any(v for v in af_data.values() if v and v is not True):
+                    nb.address_families.append(BGPNeighborAF(afi=afi, safi=safi, **af_data))
+
+    # -----------------------------------------------------------------------
+    # Multicast — "router pim" block
+    # -----------------------------------------------------------------------
+
+    def parse_multicast(self) -> MulticastConfig | None:
+        """Parse IOS-XR multicast configuration from ``router pim`` block.
+
+        IOS-XR format::
+
+            router pim
+             address-family ipv4
+              rp-address 10.0.0.1
+              ssm range RFC1918
+        """
+        parse = self._get_parse_obj()
+        pim_objs = parse.find_objects(r"^router\s+pim")
+        multicast_routing_objs = parse.find_objects(r"^multicast-routing")
+
+        if not pim_objs and not multicast_routing_objs:
+            return None
+
+        raw_lines: list[str] = []
+        line_numbers: list[int] = []
+        for obj in pim_objs + multicast_routing_objs:
+            rl, ln = self._get_raw_lines_and_line_numbers(obj)
+            raw_lines.extend(rl)
+            line_numbers.extend(ln)
+
+        multicast_routing_enabled = bool(multicast_routing_objs)
+        pim_rp_addresses: list[PIMRPAddress] = []
+        pim_ssm_range: str | None = None
+        pim_autorp = False
+
+        for pim_obj in pim_objs:
+            for af_child in pim_obj.re_search_children(r"^\s+address-family\s+ipv4"):
+                for child in af_child.all_children:
+                    text = child.text.strip()
+                    rp_m = re.match(r"^rp-address\s+(\S+)(.*)", text)
+                    if rp_m:
+                        try:
+                            rp_addr = IPv4Address(rp_m.group(1))
+                            rest = rp_m.group(2).strip()
+                            acl = rest if rest and not rest.startswith("bidir") and not rest.startswith("override") else None
+                            pim_rp_addresses.append(PIMRPAddress(
+                                rp_address=rp_addr,
+                                acl=acl,
+                                override="override" in rest,
+                                bidir="bidir" in rest,
+                            ))
+                        except ValueError:
+                            pass
+                    elif text.startswith("ssm range "):
+                        pim_ssm_range = text.split(None, 2)[2] if len(text.split()) > 2 else None
+                    elif "auto-rp" in text.lower():
+                        pim_autorp = True
+
+        return MulticastConfig(
+            object_id="multicast",
+            raw_lines=raw_lines,
+            source_os=self.os_type,
+            line_numbers=line_numbers,
+            multicast_routing_enabled=multicast_routing_enabled,
+            pim_rp_addresses=pim_rp_addresses,
+            pim_ssm_range=pim_ssm_range,
+            pim_autorp=pim_autorp,
+        )

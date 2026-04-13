@@ -513,6 +513,17 @@ class IOSParser(BaseParser):
                 v = self._extract_match(iqmr_ch[0].text, r"^\s+ip\s+igmp\s+query-max-response-time\s+(\d+)")
                 if v:
                     igmp_query_max_response_time = int(v)
+            # ip access-group applied to interface (inbound / outbound)
+            acl_in = None
+            acl_out = None
+            for ag_ch in intf_obj.re_search_children(r"^\s+ip\s+access-group\s+\S+\s+(in|out)"):
+                m = re.match(r"^\s+ip\s+access-group\s+(\S+)\s+(in|out)", ag_ch.text)
+                if m:
+                    if m.group(2) == "in":
+                        acl_in = m.group(1)
+                    else:
+                        acl_out = m.group(1)
+
             igmp_access_group = None
             iag_ch = intf_obj.re_search_children(r"^\s+ip\s+igmp\s+access-group\s+(\S+)")
             if iag_ch:
@@ -602,6 +613,8 @@ class IOSParser(BaseParser):
                     igmp_version=igmp_version,
                     igmp_query_interval=igmp_query_interval,
                     igmp_query_max_response_time=igmp_query_max_response_time,
+                    acl_in=acl_in,
+                    acl_out=acl_out,
                     igmp_access_group=igmp_access_group,
                     igmp_join_groups=igmp_join_groups,
                     igmp_static_groups=igmp_static_groups,

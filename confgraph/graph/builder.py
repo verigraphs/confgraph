@@ -152,6 +152,7 @@ class GraphBuilder:
                     style = _style_for("missing")
                     g.add_node(tgt_id, **{
                         "label": f"?:{link.ref_name}",
+                        "display_label": f"?\n{link.ref_name}",
                         "type": "missing",
                         "group": "missing",
                         "status": "missing",
@@ -203,6 +204,7 @@ class GraphBuilder:
             prefix = NODE_LABEL_PREFIX.get(node_type, node_type)
             attrs = {
                 "label": f"{prefix}:{name}",
+                "display_label": f"{prefix}\n{name}",
                 "type": node_type,
                 "group": style["group"],
                 "status": status,

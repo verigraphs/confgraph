@@ -302,6 +302,10 @@ class DependencyResolver:
                 links.append(self._link(
                     "interface", iface.name, "unnumbered_source", "interface", iface.unnumbered_source,
                 ))
+            if iface.acl_in:
+                links.append(self._link("interface", iface.name, "acl_in", "acl", iface.acl_in))
+            if iface.acl_out:
+                links.append(self._link("interface", iface.name, "acl_out", "acl", iface.acl_out))
         return links
 
     # ------------------------------------------------------------------
