@@ -388,6 +388,10 @@ body {{
       <div class="section-title">Search</div>
       <input id="search" type="text" placeholder="Filter nodes by name…">
       <div id="search-count"></div>
+      <div style="margin-top:8px;display:flex;align-items:center;gap:8px;user-select:none;">
+        <input type="checkbox" id="chk-isolates" style="accent-color:#1e40af;cursor:pointer;">
+        <label for="chk-isolates" style="font-size:12px;color:#334155;cursor:pointer;">Show unconnected nodes</label>
+      </div>
     </div>
 
     <!-- Detail panel -->
@@ -475,13 +479,12 @@ body {{
   const elements = {elements_json};
   const legendStyles = {legend_items_js};
 
-  // ── Pre-compute degree per node ─────────────────────────────────────────────
+  // ── Pre-compute degree per node (used for isolate detection) ────────────────
   const degreeMap = {{}};
   elements.edges.forEach(e => {{
     degreeMap[e.data.source] = (degreeMap[e.data.source] || 0) + 1;
     degreeMap[e.data.target] = (degreeMap[e.data.target] || 0) + 1;
   }});
-  const maxDegree = Math.max(1, ...Object.values(degreeMap));
   elements.nodes.forEach(n => {{
     n.data.degree = degreeMap[n.data.id] || 0;
   }});
@@ -614,14 +617,18 @@ body {{
     wheelSensitivity: 0.3,
   }});
 
-  // ── Degree-based sizing (applied post-init per node) ────────────────────────
+  // ── Type-based sizing: protocol/service nodes are slightly larger ─────────────
+  // These are "anchor" objects that other config objects reference into.
+  const LARGE_TYPES = new Set([
+    'bgp_instance', 'ospf_instance', 'eigrp_instance', 'rip_instance', 'isis_instance',
+    'policy_map', 'snmp', 'ntp', 'syslog', 'crypto', 'nat', 'multicast',
+  ]);
   cy.nodes().forEach(function(n) {{
     if (n.data('status') === 'missing') return;
-    const ratio = Math.min((n.data('degree') || 0) / maxDegree, 1);
-    const padding = Math.round(12 + ratio * 14);
-    const fontSize = (9 + Math.round(ratio * 4)) + 'px';
-    n.style('padding', padding);
-    n.style('font-size', fontSize);
+    if (LARGE_TYPES.has(n.data('type'))) {{
+      n.style('padding', 20);
+      n.style('font-size', '12px');
+    }}
   }});
 
   // ── Drag tracking: prevent tap firing after a drag ─────────────────────────
@@ -707,12 +714,13 @@ body {{
   function applyGroupFilters() {{
     if (isolated) return;  // don't interfere with isolated view
     const hidden = getHiddenGroups();
+    const showIsolates = document.getElementById('chk-isolates').checked;
     cy.nodes().forEach(n => {{
-      if (hidden.has(n.data('group'))) {{
+      const isIsolate = (n.data('degree') || 0) === 0;
+      if (hidden.has(n.data('group')) || (isIsolate && !showIsolates)) {{
         n.hide(); n.connectedEdges().hide();
       }} else {{
         n.show();
-        // only show edges whose both endpoints are visible
       }}
     }});
     cy.edges().forEach(e => {{
@@ -721,6 +729,10 @@ body {{
     }});
     updateStats();
   }}
+
+  // ── Hide unconnected nodes on load; toggle via checkbox ──────────────────────
+  document.getElementById('chk-isolates').addEventListener('change', applyGroupFilters);
+  applyGroupFilters();
 
   // ── Orphan highlight ─────────────────────────────────────────────────────────
   document.getElementById('chk-orphan').addEventListener('change', function() {{
