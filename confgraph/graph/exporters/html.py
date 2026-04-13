@@ -187,6 +187,30 @@ body {{
 #orphan-toggle input {{ accent-color: #1e40af; cursor: pointer; }}
 #orphan-toggle label {{ font-size: 12px; color: #334155; cursor: pointer; }}
 
+/* ── Hover tooltip ───────────────────────────────────────────────── */
+#tooltip {{
+    position: fixed;
+    display: none;
+    pointer-events: none;
+    background: #1e293b;
+    color: #f1f5f9;
+    padding: 7px 11px;
+    border-radius: 6px;
+    font-size: 11px;
+    line-height: 1.6;
+    box-shadow: 0 4px 14px rgba(0,0,0,0.3);
+    z-index: 9999;
+    max-width: 260px;
+}}
+#tooltip .tip-meta {{
+    font-size: 10px;
+    color: #94a3b8;
+}}
+#tooltip .tip-name {{
+    font-weight: 700;
+    word-break: break-all;
+}}
+
 /* ── Layout selector ─────────────────────────────────────────────── */
 #layout-select {{
     width: 100%;
@@ -442,6 +466,7 @@ body {{
 <div id="canvas-wrapper">
   <button id="back-btn">← Back to full graph</button>
   <div id="cy"></div>
+  <div id="tooltip"></div>
 </div>
 
 <script>
@@ -817,6 +842,52 @@ body {{
     if (evt.target === cy) {{
       restoreFullGraph();
     }}
+  }});
+
+  // ── Hover tooltip ────────────────────────────────────────────────────────────
+  const tooltip = document.getElementById('tooltip');
+
+  function placeTooltip(clientX, clientY) {{
+    const pad = 14;
+    const tw = tooltip.offsetWidth;
+    const th = tooltip.offsetHeight;
+    const left = clientX + pad + tw > window.innerWidth  ? clientX - tw - pad : clientX + pad;
+    const top  = clientY + pad + th > window.innerHeight ? clientY - th - pad : clientY + pad;
+    tooltip.style.left = left + 'px';
+    tooltip.style.top  = top  + 'px';
+  }}
+
+  cy.on('mouseover', 'node', function(evt) {{
+    const d = evt.target.data();
+    const name = (d.label || d.id).split(':').slice(1).join(':') || d.label || d.id;
+    const deg  = evt.target.degree();
+    tooltip.innerHTML =
+      `<div class="tip-meta">${{d.type || ''}} &nbsp;·&nbsp; ${{deg}} connection${{deg !== 1 ? 's' : ''}}</div>` +
+      `<div class="tip-name">${{name}}</div>`;
+    tooltip.style.display = 'block';
+    placeTooltip(evt.originalEvent.clientX, evt.originalEvent.clientY);
+  }});
+  cy.on('mousemove', 'node', function(evt) {{
+    placeTooltip(evt.originalEvent.clientX, evt.originalEvent.clientY);
+  }});
+  cy.on('mouseout', 'node', function() {{
+    tooltip.style.display = 'none';
+  }});
+
+  cy.on('mouseover', 'edge', function(evt) {{
+    const d = evt.target.data();
+    const resolved = d.resolved !== 0 && d.resolved !== false;
+    tooltip.innerHTML =
+      `<div class="tip-meta">${{resolved ? 'resolved ref' : '⚠ dangling ref'}}</div>` +
+      `<div class="tip-name">${{d.field || ''}}</div>`;
+    tooltip.style.display = 'block';
+    placeTooltip(evt.originalEvent.clientX, evt.originalEvent.clientY);
+  }});
+  cy.on('mousemove', 'edge', function(evt) {{
+    placeTooltip(evt.originalEvent.clientX, evt.originalEvent.clientY);
+  }});
+  cy.on('mouseout', 'edge', function() {{
+    tooltip.style.display = 'none';
   }});
 
   // ── Layout selector ───────────────────────────────────────────────────────────
