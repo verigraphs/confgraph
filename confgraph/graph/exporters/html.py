@@ -513,6 +513,11 @@ body {{
         'text-max-width': '100px',
         'min-width': '50px',
         'min-height': '50px',
+        'shadow-blur': 8,
+        'shadow-color': 'data(color)',
+        'shadow-opacity': 0.12,
+        'shadow-offset-x': 0,
+        'shadow-offset-y': 2,
       }}
     }},
     {{
