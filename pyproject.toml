@@ -15,3 +15,6 @@ confgraph = "confgraph.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["confgraph*"]
+
+[tool.setuptools.package-data]
+confgraph = ["graph/assets/*.js"]

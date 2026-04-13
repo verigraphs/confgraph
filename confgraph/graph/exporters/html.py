@@ -18,11 +18,21 @@ from confgraph.graph.exporters.json import JSONExporter
 # Path to the bundled Cytoscape.js asset (resolved relative to this file)
 _ASSETS_DIR = Path(__file__).parent.parent / "assets"
 _CYTOSCAPE_JS = _ASSETS_DIR / "cytoscape.min.js"
+_DAGRE_JS = _ASSETS_DIR / "dagre.min.js"
+_CYTOSCAPE_DAGRE_JS = _ASSETS_DIR / "cytoscape-dagre.min.js"
 
 
 def _load_cytoscape() -> str:
     """Return the inlined Cytoscape.js source."""
     return _CYTOSCAPE_JS.read_text(encoding="utf-8")
+
+
+def _load_dagre() -> str:
+    """Return inlined dagre + cytoscape-dagre sources."""
+    return (
+        _DAGRE_JS.read_text(encoding="utf-8") + "\n" +
+        _CYTOSCAPE_DAGRE_JS.read_text(encoding="utf-8")
+    )
 
 
 class HTMLExporter(BaseExporter):
@@ -50,6 +60,7 @@ class HTMLExporter(BaseExporter):
         edge_count = graph.number_of_edges()
 
         cytoscape_js = _load_cytoscape()
+        dagre_js = _load_dagre()
         elements_json = json.dumps(graph_json["elements"])
 
         type_styles: dict[str, dict] = {}
@@ -77,6 +88,7 @@ class HTMLExporter(BaseExporter):
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>confgraph — {hostname}</title>
 <script>{cytoscape_js}</script>
+<script>{dagre_js}</script>
 <style>
 * {{ box-sizing: border-box; margin: 0; padding: 0; }}
 body {{
@@ -424,7 +436,10 @@ body {{
     <div class="section">
       <div class="section-title">Layout</div>
       <select id="layout-select">
-        <option value="cose">Cose (default)</option>
+        <option value="cose">Force-directed (Cose)</option>
+        <option value="dagre">Hierarchical (Dagre)</option>
+        <option value="directed">Directed top-down</option>
+        <option value="concentric-group">Concentric by group</option>
         <option value="breadthfirst">Breadth-first</option>
         <option value="circle">Circle</option>
         <option value="concentric">Concentric</option>
@@ -906,8 +921,70 @@ body {{
   }});
 
   // ── Layout selector ───────────────────────────────────────────────────────────
+  // ── Layout configs per option ─────────────────────────────────────────────────
+  const layoutConfigs = {{
+    'dagre': {{
+      name: 'dagre', animate: true, animationDuration: 500,
+      rankDir: 'TB',       // top-to-bottom
+      ranker: 'network-simplex',
+      nodeSep: 60,         // horizontal spacing between nodes in same rank
+      rankSep: 80,         // vertical spacing between ranks
+      edgeSep: 20,
+      padding: 60, fit: true,
+    }},
+    'cose': {{
+      name: 'cose', animate: true, animationDuration: 500,
+      randomize: true, padding: 80,
+      nodeRepulsion: function() {{ return 80000; }},
+      idealEdgeLength: function() {{ return 220; }},
+      edgeElasticity: function() {{ return 60; }},
+      gravity: 0.05, numIter: 2000, fit: true,
+    }},
+    'directed': {{
+      name: 'breadthfirst', animate: true, animationDuration: 500,
+      directed: true, spacingFactor: 0.9, padding: 60, fit: true,
+      // Routing/protocol nodes as roots so they appear at the top
+      roots: cy.nodes().filter(n => ['bgp_instance','ospf_instance','eigrp_instance',
+        'rip_instance','isis_instance','policy_map','snmp','ntp','syslog',
+        'crypto','nat','multicast'].includes(n.data('type'))),
+    }},
+    'concentric-group': {{
+      name: 'concentric', animate: true, animationDuration: 500,
+      padding: 60, fit: true, minNodeSpacing: 20,
+      // Protocol/service nodes in centre, policy next, infra outer
+      concentric: function(n) {{
+        const t = n.data('type');
+        if (['bgp_instance','ospf_instance','eigrp_instance','rip_instance',
+             'isis_instance','policy_map','snmp','ntp','syslog','crypto',
+             'nat','multicast'].includes(t)) return 4;
+        if (['route_map','prefix_list','acl','community_list','as_path_list',
+             'class_map'].includes(t)) return 3;
+        if (['interface','vrf','static_route'].includes(t)) return 2;
+        return 1;
+      }},
+      levelWidth: function() {{ return 1; }},
+    }},
+    'breadthfirst': {{
+      name: 'breadthfirst', animate: true, animationDuration: 500,
+      spacingFactor: 1.6, padding: 80, fit: true,
+    }},
+    'circle': {{
+      name: 'circle', animate: true, animationDuration: 500,
+      padding: 80, fit: true,
+    }},
+    'concentric': {{
+      name: 'concentric', animate: true, animationDuration: 500,
+      padding: 80, fit: true, minNodeSpacing: 30,
+    }},
+    'grid': {{
+      name: 'grid', animate: true, animationDuration: 500,
+      padding: 80, fit: true,
+    }},
+  }};
+
   document.getElementById('layout-select').addEventListener('change', function() {{
-    cy.layout({{ name: this.value, animate: true, animationDuration: 400, padding: 40 }}).run();
+    const cfg = layoutConfigs[this.value];
+    if (cfg) cy.layout(cfg).run();
   }});
 
   // ── Fit to screen ─────────────────────────────────────────────────────────────
