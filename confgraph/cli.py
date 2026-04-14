@@ -35,7 +35,8 @@ from confgraph.parsers.base import ParseError
 _DEVICE_COLS  = {"device_name", "device", "devicename", "hostname", "host_name"}
 _OS_COLS      = {"os_type", "ostype", "os-type"}
 _OS_ALIAS     = {"iosxr": "ios_xr", "ios_xr": "ios_xr", "ios": "ios",
-                 "nxos": "nxos", "nx-os": "nxos", "eos": "eos"}
+                 "nxos": "nxos", "nx-os": "nxos", "eos": "eos",
+                 "junos": "junos"}
 
 
 def _load_inventory() -> dict[str, str]:
@@ -105,6 +106,12 @@ def _detect_os(text: str) -> OSType:
         if sig in text:
             return OSType.NXOS
 
+    # JunOS signals
+    for sig in ("system {", "interfaces {", "protocols {",
+                "routing-options {", "set system host-name"):
+        if sig in text:
+            return OSType.JUNOS
+
     # IOS-XR signals
     for sig in ("RP/0/", "route-policy\n", "prefix-set\n",
                 "ipv4 address ", "neighbor-group "):
@@ -163,6 +170,9 @@ def _load_and_parse(config_path: Path, os_type: str | None):
     elif detected == OSType.IOS_XR:
         from confgraph.parsers.iosxr_parser import IOSXRParser
         parsed = IOSXRParser(text).parse()
+    elif detected == OSType.JUNOS:
+        from confgraph.parsers.junos_parser import JunOSParser
+        parsed = JunOSParser(text).parse()
     else:
         from confgraph.parsers.ios_parser import IOSParser
         parsed = IOSParser(text).parse()
@@ -186,7 +196,7 @@ def main() -> None:
 
 @main.command("map")
 @click.argument("config_file", type=click.Path(exists=True, path_type=Path))
-@click.option("--os", "os_type", type=click.Choice(["eos", "ios", "nxos", "iosxr"]),
+@click.option("--os", "os_type", type=click.Choice(["eos", "ios", "nxos", "iosxr", "junos"]),
               default=None, help="OS type (auto-detected if omitted)")
 @click.option("--out", "output_format", type=click.Choice(["html", "json", "both"]),
               default="html", show_default=True, help="Output format")
@@ -288,7 +298,7 @@ def _print_lint(filename: str, report, severity: str) -> None:
 
 @main.command("info")
 @click.argument("config_file", type=click.Path(exists=True, path_type=Path))
-@click.option("--os", "os_type", type=click.Choice(["eos", "ios", "nxos", "iosxr"]),
+@click.option("--os", "os_type", type=click.Choice(["eos", "ios", "nxos", "iosxr", "junos"]),
               default=None, help="OS type (auto-detected if omitted)")
 def cmd_info(config_file: Path, os_type):
     """Print a summary of parsed objects in a config file."""

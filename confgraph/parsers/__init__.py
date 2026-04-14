@@ -5,6 +5,7 @@ from confgraph.parsers.ios_parser import IOSParser
 from confgraph.parsers.eos_parser import EOSParser
 from confgraph.parsers.nxos_parser import NXOSParser
 from confgraph.parsers.iosxr_parser import IOSXRParser
+from confgraph.parsers.junos_parser import JunOSParser
 
 __all__ = [
     "BaseParser",
@@ -13,4 +14,5 @@ __all__ = [
     "EOSParser",
     "NXOSParser",
     "IOSXRParser",
+    "JunOSParser",
 ]

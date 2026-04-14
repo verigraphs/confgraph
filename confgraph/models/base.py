@@ -33,6 +33,7 @@ class OSType(str, Enum):
     IOS_XR = "ios_xr"
     NXOS = "nxos"
     EOS = "eos"
+    JUNOS = "junos"
 
 
 class BaseConfigObject(BaseModel):
