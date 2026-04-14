@@ -2,13 +2,34 @@
 name = "confgraph"
 version = "0.1.0"
 description = "Local-first network config dependency mapper — parse, visualize, and lint vendor configs"
+readme = "README.md"
 requires-python = ">=3.11"
+license = "Apache-2.0"
+authors = [
+    { name = "Poojan Patel", email = "poojanpatel42@gmail.com" },
+]
+keywords = ["network", "cisco", "arista", "config", "graph", "visualization", "bgp", "ospf"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: System Administrators",
+    "Intended Audience :: Telecommunications Industry",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: System :: Networking",
+    "Topic :: Utilities",
+]
 dependencies = [
     "ciscoconfparse2>=0.9.16",
     "networkx>=3.6.1",
     "pydantic>=2.12.5",
     "click>=8.1",
 ]
+
+[project.urls]
+Homepage = "https://github.com/verigraphs/confgraph"
+Repository = "https://github.com/verigraphs/confgraph"
+"Bug Tracker" = "https://github.com/verigraphs/confgraph/issues"
 
 [project.scripts]
 confgraph = "confgraph.cli:main"
