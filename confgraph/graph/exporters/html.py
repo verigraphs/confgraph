@@ -437,7 +437,7 @@ body {{
       <div class="section-title">Layout</div>
       <select id="layout-select">
         <option value="cose">Force-directed (Cose)</option>
-        <option value="dagre">Hierarchical (Dagre)</option>
+        <option value="dagre" selected>Hierarchical (Dagre)</option>
         <option value="directed">Directed top-down</option>
         <option value="concentric-group">Concentric by group</option>
         <option value="breadthfirst">Breadth-first</option>
@@ -612,20 +612,16 @@ body {{
   ].concat(statusStyleRules);
 
   // ── Layout configs ───────────────────────────────────────────────────────────
-  // Initial: randomized start, high repulsion, low gravity → spread nodes out
+  // Initial: hierarchical top-to-bottom via Dagre
   const initialLayout = {{
-    name: 'cose',
+    name: 'dagre',
     animate: false,
-    randomize: true,
-    padding: 80,
-    nodeRepulsion: function() {{ return 80000; }},
-    idealEdgeLength: function() {{ return 220; }},
-    edgeElasticity: function() {{ return 60; }},
-    gravity: 0.05,
-    numIter: 3000,
-    initialTemp: 400,
-    coolingFactor: 0.98,
-    minTemp: 1.0,
+    rankDir: 'TB',
+    ranker: 'network-simplex',
+    nodeSep: 60,
+    rankSep: 80,
+    edgeSep: 20,
+    padding: 60,
     fit: true,
   }};
 
