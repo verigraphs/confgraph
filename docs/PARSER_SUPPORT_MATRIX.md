@@ -15,9 +15,9 @@ This document provides a comprehensive overview of parser support across all net
 | **Cisco IOS** | ✅ **Complete** | IOS 15.0+ | ✅ `samples/ios.txt` | ✅ [IOS_PARSER_SUPPORT.md](IOS_PARSER_SUPPORT.md) | ✅ High |
 | **Cisco IOS-XE** | ✅ **Complete** | IOS-XE 3.x, 16.x, 17.x | ✅ `samples/ios_xe.txt` | ✅ [IOS_PARSER_SUPPORT.md](IOS_PARSER_SUPPORT.md) | ✅ High |
 | **Arista EOS** | ✅ **Complete** | EOS 4.20+, 4.30+, 4.35+ | ✅ `samples/eos.txt` | ✅ [EOS_PARSER_SUPPORT.md](EOS_PARSER_SUPPORT.md) | ✅ High |
-| **Cisco IOS-XR** | ❌ **Not Implemented** | N/A | ✅ `samples/ios_xr.txt` | ❌ None | ❌ None |
-| **Cisco NX-OS** | ❌ **Not Implemented** | N/A | ✅ `samples/nxos.txt` | ❌ None | ❌ None |
-| **Juniper JunOS** | ❌ **Excluded** | N/A | ❌ None | ❌ None | ❌ None |
+| **Cisco IOS-XR** | ✅ **Complete** | IOS-XR 6.x, 7.x | ✅ `samples/iosxr_test.cfg` | ✅ [IOSXR_PARSER_SUPPORT.md](IOSXR_PARSER_SUPPORT.md) | ⚠️ Medium |
+| **Cisco NX-OS** | ✅ **Complete** | NX-OS 9.x | ✅ `samples/nxos.txt` | ⚠️ See matrix | ⚠️ Medium |
+| **Juniper JunOS** | ✅ **Complete** | JunOS 20.x, 21.x, 22.x | ✅ `samples/junos_test.cfg` | ✅ [JUNOS_PARSER_SUPPORT.md](JUNOS_PARSER_SUPPORT.md) | ⚠️ Medium |
 
 **Legend:**
 - ✅ Complete/Available

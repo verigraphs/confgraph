@@ -21,6 +21,7 @@ Point it at a config file. It parses every protocol, builds a dependency graph, 
 | Cisco IOS-XR | `IOSXRParser` |
 | Cisco NX-OS | `NXOSParser` |
 | Arista EOS | `EOSParser` |
+| Juniper JunOS | `JunOSParser` |
 
 ## Try it instantly
 
@@ -33,6 +34,7 @@ Pre-generated maps for all supported platforms — open any in your browser, no 
 | Cisco IOS-XR | [samples/ios_xr.txt](samples/ios_xr.txt) | [examples/ios_xr.html](examples/ios_xr.html) |
 | Cisco NX-OS | [samples/nxos.txt](samples/nxos.txt) | [examples/nxos.html](examples/nxos.html) |
 | Arista EOS | [samples/eos.txt](samples/eos.txt) | [examples/eos.html](examples/eos.html) |
+| Juniper JunOS | [samples/junos_test.cfg](samples/junos_test.cfg) | |
 
 Or run against your own config:
 
@@ -63,6 +65,14 @@ print(parsed.bgp_instances)
 print(parsed.ospf_instances)
 ```
 
+```python
+from confgraph.parsers.junos_parser import JunOSParser
+
+parsed = JunOSParser(open("router.conf").read()).parse()
+print(parsed.vrfs)          # routing-instances
+print(parsed.route_maps)    # policy-statements
+```
+
 ## Protocols parsed
 
 VRF · BGP · OSPF · IS-IS · EIGRP · RIP · Route-maps · Prefix-lists · ACLs · Community lists · AS-path lists · Static routes · NTP · SNMP · Syslog · Banners · QoS · NAT · Crypto/IPsec · BFD · IP SLA · EEM · Object tracking · Multicast
@@ -78,4 +88,3 @@ Contributions welcome — new parsers, bug fixes, additional protocol coverage. 
 ## License
 
 Apache 2.0
->>>>>>> 64a62af (docs: add README with install, usage, and protocol coverage)
