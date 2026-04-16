@@ -417,6 +417,13 @@ body {{
       </div>
     </div>
 
+    <!-- Protocol Clusters -->
+    <div class="section">
+      <div class="section-title">Protocol Clusters</div>
+      <div id="cluster-filters"></div>
+      <div id="cluster-none" style="font-size:11px;color:#94a3b8;margin-top:4px;display:none;">No protocol clusters found</div>
+    </div>
+
     <!-- Filters -->
     <div class="section">
       <div class="section-title">Groups</div>
@@ -448,16 +455,6 @@ body {{
       <button class="btn" id="btn-fit" style="margin-top:6px">Fit to screen</button>
     </div>
 
-    <!-- Stats -->
-    <div class="section">
-      <div class="section-title">Statistics</div>
-      <div class="stat-row"><span>Total nodes</span><span id="stat-total">{node_count}</span></div>
-      <div class="stat-row"><span>Visible</span><span id="stat-visible">—</span></div>
-      <div class="stat-row"><span>Orphaned</span><span id="stat-orphan">—</span></div>
-      <div class="stat-row"><span>Missing refs</span><span id="stat-missing">—</span></div>
-      <div class="stat-row"><span>Total edges</span><span id="stat-edges">{edge_count}</span></div>
-      <div class="stat-row"><span>Dangling edges</span><span id="stat-dangling">—</span></div>
-    </div>
 
     <!-- Legend -->
     <div class="section">
@@ -654,18 +651,7 @@ body {{
   // ── State ───────────────────────────────────────────────────────────────────
   let isolated = false;
 
-  // ── Stats ───────────────────────────────────────────────────────────────────
-  function updateStats() {{
-    const visible = cy.nodes(':visible').length;
-    const orphans = cy.nodes('[status = "orphan"]').length;
-    const missing = cy.nodes('[status = "missing"]').length;
-    const dangling = cy.edges('[resolved = false]').length;
-    document.getElementById('stat-visible').textContent = visible;
-    document.getElementById('stat-orphan').textContent = orphans;
-    document.getElementById('stat-missing').textContent = missing;
-    document.getElementById('stat-dangling').textContent = dangling;
-  }}
-  cy.ready(updateStats);
+  function updateStats() {{}}  // no-op: statistics section removed
 
   // ── Dynamic grid: scales and pans with the canvas ──────────────────────────
   const cyEl = document.getElementById('cy');
@@ -690,6 +676,127 @@ body {{
                      <span class="legend-label">${{type}}</span>`;
     legendEl.appendChild(row);
   }});
+
+  // ── Protocol Clusters ────────────────────────────────────────────────────────
+  // Each cluster is defined by a root node type. Membership is computed at
+  // runtime by bidirectional graph traversal from all roots of that type.
+  const CLUSTER_DEFS = [
+    {{ id: 'bgp',    label: 'BGP',    rootType: 'bgp_instance',   color: '#1B5E20' }},
+    {{ id: 'ospf',   label: 'OSPF',   rootType: 'ospf_instance',  color: '#166534' }},
+    {{ id: 'eigrp',  label: 'EIGRP',  rootType: 'eigrp_instance', color: '#14532D' }},
+    {{ id: 'isis',   label: 'IS-IS',  rootType: 'isis_instance',  color: '#15803D' }},
+    {{ id: 'rip',    label: 'RIP',    rootType: 'rip_instance',   color: '#16a34a' }},
+    {{ id: 'nat',    label: 'NAT',    rootType: 'nat',            color: '#7F1D1D' }},
+    {{ id: 'crypto', label: 'Crypto / VPN', rootType: 'crypto',  color: '#991B1B' }},
+    {{ id: 'qos',    label: 'QoS',    rootType: 'policy_map',     color: '#134E4A' }},
+  ];
+
+  // Build cluster node-id sets via BFS from all root nodes of each type
+  function buildCluster(rootType) {{
+    const roots = cy.nodes(`[type = "${{rootType}}"]`);
+    if (roots.length === 0) return null;
+    const visited = new Set();
+    const queue = [];
+    roots.forEach(r => {{ visited.add(r.id()); queue.push(r); }});
+    while (queue.length > 0) {{
+      const n = queue.shift();
+      n.neighborhood('node').forEach(nb => {{
+        if (!visited.has(nb.id())) {{
+          visited.add(nb.id());
+          queue.push(nb);
+        }}
+      }});
+    }}
+    return visited;  // Set of node IDs
+  }}
+
+  // Pre-compute clusters at startup
+  const clusterMap = {{}};   // id → Set<nodeId>
+  const activeClusters = new Set();  // currently selected cluster ids
+
+  const clusterFiltersEl = document.getElementById('cluster-filters');
+  let clusterCount = 0;
+
+  CLUSTER_DEFS.forEach(def => {{
+    const nodeSet = buildCluster(def.rootType);
+    if (!nodeSet) return;  // protocol not present in config
+    clusterMap[def.id] = nodeSet;
+    clusterCount++;
+
+    const row = document.createElement('label');
+    row.className = 'filter-row';
+    const chk = document.createElement('input');
+    chk.type = 'checkbox';
+    chk.checked = false;
+    chk.dataset.cluster = def.id;
+    chk.addEventListener('change', applyClusterFilters);
+    const dot = document.createElement('div');
+    dot.className = 'dot';
+    dot.style.background = def.color;
+    const lbl = document.createElement('span');
+    lbl.className = 'filter-label';
+    lbl.textContent = `${{def.label}} (${{nodeSet.size}})`;
+    row.appendChild(chk);
+    row.appendChild(dot);
+    row.appendChild(lbl);
+    clusterFiltersEl.appendChild(row);
+  }});
+
+  if (clusterCount === 0) {{
+    document.getElementById('cluster-none').style.display = 'block';
+  }}
+
+  function applyClusterFilters() {{
+    activeClusters.clear();
+    document.querySelectorAll('#cluster-filters input[type=checkbox]').forEach(chk => {{
+      if (chk.checked) activeClusters.add(chk.dataset.cluster);
+    }});
+
+    if (activeClusters.size === 0) {{
+      // No cluster selected → restore normal group filter view
+      restoreFullGraph();
+      return;
+    }}
+
+    // Union of all node IDs across selected clusters
+    const visibleIds = new Set();
+    activeClusters.forEach(cid => {{
+      if (clusterMap[cid]) clusterMap[cid].forEach(id => visibleIds.add(id));
+    }});
+
+    // Save positions if not already saved
+    if (Object.keys(savedPositions).length === 0) {{
+      cy.nodes().forEach(n => {{ savedPositions[n.id()] = {{ ...n.position() }}; }});
+    }}
+
+    cy.elements().removeClass('selected-node neighbor-node active-edge faded');
+    cy.nodes().forEach(n => {{
+      if (visibleIds.has(n.id())) {{ n.show(); }}
+      else {{ n.hide(); n.connectedEdges().hide(); }}
+    }});
+    cy.edges().forEach(e => {{
+      if (e.source().visible() && e.target().visible()) e.show();
+      else e.hide();
+    }});
+
+    backBtn.style.display = 'block';
+    isolated = true;
+
+    const visibleEles = cy.elements(':visible');
+    visibleEles.layout({{
+      name: 'dagre',
+      animate: true,
+      animationDuration: 400,
+      rankDir: 'TB',
+      ranker: 'network-simplex',
+      nodeSep: 60,
+      rankSep: 80,
+      fit: true,
+      padding: 60,
+    }}).run();
+
+    updateStats();
+  }}
 
   // ── Group filters ─────────────────────────────────────────────────────────
   const groups = [...new Set(elements.nodes.map(n => n.data.group).filter(Boolean))].sort();
@@ -838,6 +945,12 @@ body {{
   }}
 
   function restoreFullGraph() {{
+    // Clear any active cluster selections
+    document.querySelectorAll('#cluster-filters input[type=checkbox]').forEach(chk => {{
+      chk.checked = false;
+    }});
+    activeClusters.clear();
+
     cy.elements().show();
     cy.elements().removeClass('selected-node neighbor-node active-edge faded');
     // Restore original positions from before isolation
