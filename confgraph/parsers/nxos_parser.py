@@ -1,7 +1,7 @@
 """Cisco NX-OS configuration parser."""
 
 import re
-from ipaddress import IPv4Interface, IPv6Interface
+from ipaddress import IPv4Address, IPv4Interface, IPv4Network, IPv6Interface
 
 from confgraph.models.base import OSType
 from confgraph.models.vrf import VRFConfig
@@ -13,6 +13,7 @@ from confgraph.models.bgp import (
     BGPBestpathOptions,
 )
 from confgraph.models.ospf import OSPFConfig
+from confgraph.models.static_route import StaticRoute
 from confgraph.parsers.base import _BASE_KNOWN_PATTERNS
 from confgraph.parsers.ios_parser import IOSParser
 
@@ -64,6 +65,11 @@ class NXOSParser(IOSParser):
         parse = self._get_parse_obj()
 
         vrf_objs = parse.find_objects(r"^vrf\s+context\s+(\S+)")
+
+        # Deduplicate: NX-OS may split the same VRF context into multiple blocks
+        # (e.g., one with `rd` and one with `address-family`). Merge by name.
+        vrf_map: dict[str, dict] = {}
+
         for vrf_obj in vrf_objs:
             vrf_name = self._extract_match(vrf_obj.text, r"^vrf\s+context\s+(\S+)")
             if not vrf_name:
@@ -71,55 +77,61 @@ class NXOSParser(IOSParser):
 
             raw_lines, line_numbers = self._get_raw_lines_and_line_numbers(vrf_obj)
 
-            # RD
-            rd = None
-            rd_ch = vrf_obj.re_search_children(r"^\s+rd\s+(\S+)")
-            if rd_ch:
-                rd = self._extract_match(rd_ch[0].text, r"^\s+rd\s+(\S+)")
+            if vrf_name not in vrf_map:
+                vrf_map[vrf_name] = {
+                    "raw_lines": raw_lines,
+                    "line_numbers": line_numbers,
+                    "rd": None,
+                    "rt_import": [],
+                    "rt_export": [],
+                    "rt_both": [],
+                    "route_map_import": None,
+                    "route_map_export": None,
+                }
+            else:
+                vrf_map[vrf_name]["raw_lines"].extend(raw_lines)
+                vrf_map[vrf_name]["line_numbers"].extend(line_numbers)
 
-            # Route-targets — NX-OS style under address-family ipv4 unicast block
-            rt_import: list[str] = []
-            rt_export: list[str] = []
-            rt_both: list[str] = []
+            entry = vrf_map[vrf_name]
+
+            # RD
+            rd_ch = vrf_obj.re_search_children(r"^\s+rd\s+(\S+)")
+            if rd_ch and entry["rd"] is None:
+                entry["rd"] = self._extract_match(rd_ch[0].text, r"^\s+rd\s+(\S+)")
 
             for child in vrf_obj.all_children:
                 text = child.text.strip()
                 if text.startswith("route-target import "):
                     val = self._extract_match(text, r"route-target\s+import\s+(\S+)")
-                    if val:
-                        rt_import.append(val)
+                    if val and val not in entry["rt_import"]:
+                        entry["rt_import"].append(val)
                 elif text.startswith("route-target export "):
                     val = self._extract_match(text, r"route-target\s+export\s+(\S+)")
-                    if val:
-                        rt_export.append(val)
+                    if val and val not in entry["rt_export"]:
+                        entry["rt_export"].append(val)
                 elif text.startswith("route-target both "):
                     val = self._extract_match(text, r"route-target\s+both\s+(\S+)")
-                    if val:
-                        rt_both.append(val)
-
-            # Route-map import/export (under address-family)
-            route_map_import = None
-            route_map_export = None
-            for child in vrf_obj.all_children:
-                text = child.text.strip()
-                if text.startswith("route-map") and "import" in text:
-                    route_map_import = self._extract_match(text, r"route-map\s+(\S+)\s+import")
+                    if val and val not in entry["rt_both"]:
+                        entry["rt_both"].append(val)
+                elif text.startswith("route-map") and "import" in text:
+                    entry["route_map_import"] = self._extract_match(text, r"route-map\s+(\S+)\s+import")
                 elif text.startswith("route-map") and "export" in text:
-                    route_map_export = self._extract_match(text, r"route-map\s+(\S+)\s+export")
+                    entry["route_map_export"] = self._extract_match(text, r"route-map\s+(\S+)\s+export")
 
+        for vrf_name, entry in vrf_map.items():
             vrfs.append(
                 VRFConfig(
                     object_id=f"vrf_{vrf_name}",
-                    raw_lines=raw_lines,
+                    raw_lines=entry["raw_lines"],
                     source_os=self.os_type,
-                    line_numbers=line_numbers,
+                    line_numbers=entry["line_numbers"],
                     name=vrf_name,
-                    rd=rd,
-                    route_target_import=rt_import,
-                    route_target_export=rt_export,
-                    route_target_both=rt_both,
-                    route_map_import=route_map_import,
-                    route_map_export=route_map_export,
+                    rd=entry["rd"],
+                    route_target_import=entry["rt_import"],
+                    route_target_export=entry["rt_export"],
+                    route_target_both=entry["rt_both"],
+                    route_map_import=entry["route_map_import"],
+                    route_map_export=entry["route_map_export"],
                 )
             )
 
@@ -130,10 +142,18 @@ class NXOSParser(IOSParser):
     # -----------------------------------------------------------------------
 
     def _extract_interface_vrf(self, intf_obj) -> str | None:
-        """Extract VRF from interface. NX-OS uses ``vrf member NAME``."""
+        """Extract VRF from interface.
+
+        NX-OS uses ``vrf member NAME`` (NX-OS native) or bare ``vrf NAME``
+        (seen in some NX-OS configs and older-style templates).
+        """
         vrf_ch = intf_obj.re_search_children(r"^\s+vrf\s+member\s+(\S+)")
         if vrf_ch:
             return self._extract_match(vrf_ch[0].text, r"^\s+vrf\s+member\s+(\S+)")
+        # Fallback: bare "vrf NAME" (without member keyword)
+        vrf_bare = intf_obj.re_search_children(r"^\s+vrf\s+(?!member\s)(\S+)")
+        if vrf_bare:
+            return self._extract_match(vrf_bare[0].text, r"^\s+vrf\s+(?!member\s)(\S+)")
         return None
 
     # -----------------------------------------------------------------------
@@ -194,16 +214,16 @@ class NXOSParser(IOSParser):
     # -----------------------------------------------------------------------
 
     def _parse_bgp_peer_groups(self, bgp_obj) -> list[BGPPeerGroup]:
-        """Parse BGP peer-groups. NX-OS uses ``template peer NAME`` blocks."""
+        """Parse BGP peer-groups.
+
+        Handles both NX-OS native ``template peer NAME`` blocks and
+        IOS-style ``neighbor NAME peer-group`` declarations that some
+        NX-OS configs also use.
+        """
         peer_groups = []
+        seen: set[str] = set()
 
-        # NX-OS: template peer NAME (top-level under router bgp)
-        template_children = bgp_obj.re_search_children(r"^\s+template\s+peer\s+(\S+)")
-        for tmpl_child in template_children:
-            pg_name = self._extract_match(tmpl_child.text, r"^\s+template\s+peer\s+(\S+)")
-            if not pg_name:
-                continue
-
+        def _build_pg(pg_name: str, children_iter) -> BGPPeerGroup:
             pg_data: dict = {
                 "name": pg_name,
                 "remote_as": None,
@@ -211,9 +231,12 @@ class NXOSParser(IOSParser):
                 "update_source": None,
                 "route_reflector_client": False,
                 "send_community": False,
+                "route_map_in": None,
+                "route_map_out": None,
+                "prefix_list_in": None,
+                "prefix_list_out": None,
             }
-
-            for child in tmpl_child.all_children:
+            for child in children_iter:
                 text = child.text.strip()
                 if text.startswith("remote-as "):
                     val = text.replace("remote-as ", "").strip()
@@ -234,8 +257,54 @@ class NXOSParser(IOSParser):
                         pg_data["send_community"] = "extended"
                     else:
                         pg_data["send_community"] = True
+                elif text.startswith("route-map ") and " in" in text:
+                    m = re.search(r"route-map\s+(\S+)\s+in", text)
+                    if m:
+                        pg_data["route_map_in"] = m.group(1)
+                elif text.startswith("route-map ") and " out" in text:
+                    m = re.search(r"route-map\s+(\S+)\s+out", text)
+                    if m:
+                        pg_data["route_map_out"] = m.group(1)
+                elif text.startswith("prefix-list ") and " in" in text:
+                    m = re.search(r"prefix-list\s+(\S+)\s+in", text)
+                    if m:
+                        pg_data["prefix_list_in"] = m.group(1)
+                elif text.startswith("prefix-list ") and " out" in text:
+                    m = re.search(r"prefix-list\s+(\S+)\s+out", text)
+                    if m:
+                        pg_data["prefix_list_out"] = m.group(1)
+            return BGPPeerGroup(**pg_data)
 
-            peer_groups.append(BGPPeerGroup(**pg_data))
+        # NX-OS native: template peer NAME blocks
+        for tmpl_child in bgp_obj.re_search_children(r"^\s+template\s+peer\s+(\S+)"):
+            pg_name = self._extract_match(tmpl_child.text, r"^\s+template\s+peer\s+(\S+)")
+            if not pg_name or pg_name in seen:
+                continue
+            seen.add(pg_name)
+            peer_groups.append(_build_pg(pg_name, tmpl_child.all_children))
+
+        # IOS-style: neighbor NAME peer-group (declaration line)
+        for pg_decl in bgp_obj.re_search_children(r"^\s+neighbor\s+(\S+)\s+peer-group\s*$"):
+            pg_name = self._extract_match(pg_decl.text, r"^\s+neighbor\s+(\S+)\s+peer-group\s*$")
+            if not pg_name or pg_name in seen:
+                continue
+            seen.add(pg_name)
+            # Gather all config lines for this peer-group name
+            pg_config = bgp_obj.re_search_children(
+                rf"^\s+neighbor\s+{re.escape(pg_name)}\s+(.+)"
+            )
+
+            class _FakeChild:
+                def __init__(self, t):
+                    self.text = t
+
+            fake_children = []
+            for cfg_child in pg_config:
+                m = re.search(rf"^\s+neighbor\s+{re.escape(pg_name)}\s+(.+)", cfg_child.text)
+                if m:
+                    fake_children.append(_FakeChild("  " + m.group(1)))
+
+            peer_groups.append(_build_pg(pg_name, fake_children))
 
         return peer_groups
 
@@ -357,3 +426,139 @@ class NXOSParser(IOSParser):
             )
 
         return vrf_instances
+
+    # -----------------------------------------------------------------------
+    # BGP — peer-group attribute inheritance
+    # -----------------------------------------------------------------------
+
+    def parse_bgp(self) -> list[BGPConfig]:
+        """Parse BGP, then inherit route-maps/prefix-lists from peer-groups to neighbors."""
+        instances = super().parse_bgp()
+        for inst in instances:
+            pg_map = {pg.name: pg for pg in inst.peer_groups}
+            for neighbor in inst.neighbors:
+                if not neighbor.peer_group or neighbor.peer_group not in pg_map:
+                    continue
+                pg = pg_map[neighbor.peer_group]
+                if neighbor.route_map_in is None and pg.route_map_in:
+                    neighbor.route_map_in = pg.route_map_in
+                if neighbor.route_map_out is None and pg.route_map_out:
+                    neighbor.route_map_out = pg.route_map_out
+                if neighbor.prefix_list_in is None and pg.prefix_list_in:
+                    neighbor.prefix_list_in = pg.prefix_list_in
+                if neighbor.prefix_list_out is None and pg.prefix_list_out:
+                    neighbor.prefix_list_out = pg.prefix_list_out
+                if neighbor.remote_as in (None, "inherited") and pg.remote_as is not None:
+                    neighbor.remote_as = pg.remote_as
+                if neighbor.update_source is None and pg.update_source:
+                    neighbor.update_source = pg.update_source
+        return instances
+
+    # -----------------------------------------------------------------------
+    # OSPF — "router ospf N vrf NAME"
+    # -----------------------------------------------------------------------
+
+    def parse_ospf(self) -> list[OSPFConfig]:
+        """Parse OSPF. Inherits IOS logic but extracts VRF from ``router ospf N vrf NAME``."""
+        instances = super().parse_ospf()
+        parse = self._get_parse_obj()
+
+        # Re-scan to pick up VRF from the process header line
+        ospf_objs = parse.find_objects(r"^router\s+ospf\s+(\d+)")
+        for ospf_obj in ospf_objs:
+            m = re.search(r"^router\s+ospf\s+(\d+)\s+vrf\s+(\S+)", ospf_obj.text)
+            if not m:
+                continue
+            process_id = int(m.group(1))
+            vrf_name = m.group(2)
+            for inst in instances:
+                if inst.process_id == process_id and inst.vrf is None:
+                    inst.vrf = vrf_name
+                    break
+
+        return instances
+
+    # -----------------------------------------------------------------------
+    # Static routes — inside "vrf context NAME" blocks
+    # -----------------------------------------------------------------------
+
+    def parse_static_routes(self) -> list[StaticRoute]:
+        """Parse static routes from both global scope and ``vrf context NAME`` blocks."""
+        # Global ip route statements (handled by IOS parser)
+        routes = super().parse_static_routes()
+
+        parse = self._get_parse_obj()
+        vrf_objs = parse.find_objects(r"^vrf\s+context\s+(\S+)")
+
+        for vrf_obj in vrf_objs:
+            vrf_name = self._extract_match(vrf_obj.text, r"^vrf\s+context\s+(\S+)")
+            if not vrf_name:
+                continue
+
+            for child in vrf_obj.all_children:
+                text = child.text.strip()
+                # NX-OS: ip route DEST/PREFIX NEXTHOP  (CIDR)
+                #        ip route DEST MASK NEXTHOP     (traditional)
+                m_cidr = re.match(
+                    r"ip\s+route\s+(\d+\.\d+\.\d+\.\d+/\d+)\s+(\S+)(.*)", text
+                )
+                m_trad = re.match(
+                    r"ip\s+route\s+(\d+\.\d+\.\d+\.\d+)\s+(\d+\.\d+\.\d+\.\d+)\s+(\S+)(.*)",
+                    text,
+                )
+
+                destination = None
+                next_hop = None
+                next_hop_interface = None
+                remaining = ""
+
+                if m_cidr:
+                    try:
+                        destination = IPv4Network(m_cidr.group(1), strict=False)
+                    except ValueError:
+                        continue
+                    next_hop_str = m_cidr.group(2)
+                    remaining = m_cidr.group(3).strip()
+                    try:
+                        next_hop = IPv4Address(next_hop_str)
+                    except ValueError:
+                        next_hop_interface = next_hop_str
+                elif m_trad:
+                    try:
+                        destination = IPv4Network(
+                            f"{m_trad.group(1)}/{m_trad.group(2)}", strict=False
+                        )
+                    except ValueError:
+                        continue
+                    next_hop_str = m_trad.group(3)
+                    remaining = m_trad.group(4).strip()
+                    try:
+                        next_hop = IPv4Address(next_hop_str)
+                    except ValueError:
+                        next_hop_interface = next_hop_str
+                else:
+                    continue
+
+                raw_lines, line_numbers = self._get_raw_lines_and_line_numbers(child)
+                obj_id = f"static_route_{destination}_{next_hop or next_hop_interface}_vrf_{vrf_name}"
+
+                distance = 1
+                parts = remaining.split()
+                if parts and parts[0].isdigit():
+                    distance = int(parts[0])
+
+                routes.append(
+                    StaticRoute(
+                        object_id=obj_id,
+                        raw_lines=raw_lines,
+                        source_os=self.os_type,
+                        line_numbers=line_numbers,
+                        destination=destination,
+                        next_hop=next_hop,
+                        next_hop_interface=next_hop_interface,
+                        distance=distance,
+                        vrf=vrf_name,
+                    )
+                )
+
+        return routes

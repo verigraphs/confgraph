@@ -106,11 +106,17 @@ def _detect_os(text: str) -> OSType:
         if sig in text:
             return OSType.NXOS
 
-    # JunOS signals
+    # JunOS signals — brace-style and set-style
     for sig in ("system {", "interfaces {", "protocols {",
                 "routing-options {", "set system host-name"):
         if sig in text:
             return OSType.JUNOS
+    # set-style JunOS: require at least 2 characteristic set prefixes
+    set_junos_sigs = ("set routing-instances ", "set policy-options ",
+                      "set protocols bgp ", "set protocols ospf ",
+                      "set interfaces ", "set routing-options ")
+    if sum(1 for s in set_junos_sigs if s in text) >= 2:
+        return OSType.JUNOS
 
     # IOS-XR signals
     for sig in ("RP/0/", "route-policy\n", "prefix-set\n",

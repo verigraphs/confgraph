@@ -26,15 +26,115 @@ from typing import Any
 # ---------------------------------------------------------------------------
 
 def parse_junos_config(text: str) -> dict[str, Any]:
-    """Parse JunOS brace-style config *text* into a nested dict.
+    """Parse JunOS config *text* — auto-detects brace-style vs ``set``-style.
 
     Returns a ``dict[str, Any]`` where values are:
-    - ``str``   — leaf statement value
-    - ``dict``  — child block
-    - ``list``  — multiple values for the same keyword (leaves or blocks)
+    - ``str``   — leaf statement value (brace-style only)
+    - ``dict``  — child block / named block
+    - ``list``  — multiple values for the same keyword (brace-style)
+
+    In set-style output every node is a ``dict``; leaf values are single-key
+    dicts, e.g. ``{'peer-as': {'65006': {}}}`` instead of ``{'peer-as': '65006'}``.
+    Use ``_str_val()`` in the parser layer to transparently handle both shapes.
     """
+    if _is_set_style(text):
+        return _parse_set_style(text)
     tokens = _tokenize(text)
     result, _ = _parse_block(tokens, 0)
+    return result
+
+
+def _is_set_style(text: str) -> bool:
+    """Return True if *text* looks like JunOS ``set``-style (flat set commands)."""
+    set_count = 0
+    brace_count = 0
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("set "):
+            set_count += 1
+        if "{" in stripped or "}" in stripped:
+            brace_count += 1
+        if set_count >= 3:
+            return True
+        if brace_count >= 3:
+            return False
+    return set_count > 0
+
+
+def _tokenize_set_line(line: str) -> list[str]:
+    """Tokenize a single set-style line into a list of string tokens.
+
+    Handles quoted strings like ``set system host-name "my router"``.
+    """
+    tokens: list[str] = []
+    i = 0
+    n = len(line)
+    while i < n:
+        ch = line[i]
+        if ch in " \t":
+            i += 1
+            continue
+        if ch == '"':
+            j = i + 1
+            while j < n:
+                if line[j] == "\\" and j + 1 < n:
+                    j += 2
+                    continue
+                if line[j] == '"':
+                    break
+                j += 1
+            # Strip surrounding quotes
+            tokens.append(line[i + 1 : j])
+            i = j + 1
+            continue
+        j = i
+        while j < n and line[j] not in " \t\"":
+            j += 1
+        tokens.append(line[i:j])
+        i = j
+    return [t for t in tokens if t]
+
+
+def _parse_set_style(text: str) -> dict[str, Any]:
+    """Convert JunOS ``set``-style config into the same nested dict as brace-style.
+
+    Each ``set A B C … Z`` line becomes a path ``A → B → C → … → Z`` of nested
+    dicts.  The last token is stored as a key pointing to ``{}`` so that the
+    caller can always use ``.get(key)`` and get either a dict of children or an
+    empty dict representing the presence of a leaf.
+
+    The parser layer uses :func:`_str_val` to extract a scalar from either a
+    plain string (brace-style leaf) or the first key of such a dict (set-style).
+    """
+    result: dict[str, Any] = {}
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        # Strip inline ## comments
+        comment_idx = line.find("##")
+        if comment_idx != -1:
+            line = line[:comment_idx].strip()
+        if not line.startswith("set "):
+            continue
+
+        parts = _tokenize_set_line(line[4:])  # strip leading 'set '
+        if not parts:
+            continue
+
+        # Navigate / create nested dicts for each token in the path
+        node = result
+        for part in parts[:-1]:
+            if part not in node or not isinstance(node[part], dict):
+                node[part] = {}
+            node = node[part]
+
+        # Last token: insert as key → {} (merges if already present as dict)
+        last = parts[-1]
+        if last not in node:
+            node[last] = {}
+        elif not isinstance(node[last], dict):
+            node[last] = {}  # overwrite stray scalar (shouldn't happen)
+
     return result
 
 

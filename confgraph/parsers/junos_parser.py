@@ -44,7 +44,7 @@ from confgraph.models.acl import ACLConfig, ACLEntry
 from confgraph.models.static_route import StaticRoute
 
 from confgraph.parsers.base import BaseParser
-from confgraph.parsers.junos_hierarchy import parse_junos_config
+from confgraph.parsers.junos_hierarchy import parse_junos_config, _is_set_style
 
 
 class JunOSParser(BaseParser):
@@ -58,6 +58,8 @@ class JunOSParser(BaseParser):
         self._hier: dict[str, Any] | None = None
         # Populated by parse_vrfs(); consumed by parse_interfaces()
         self._vrf_of_intf: dict[str, str] = {}
+        self._is_set_style: bool = _is_set_style(config_text)
+        self._config_lines: list[str] = config_text.splitlines()
 
     # ------------------------------------------------------------------
     # Hierarchy access
@@ -85,6 +87,45 @@ class JunOSParser(BaseParser):
     def _collect_unrecognized_blocks(self) -> list[UnrecognizedBlock]:
         """JunOS uses a different structure; skip CiscoConfParse-based scan."""
         return []
+
+    def _raw_lines_for(self, *path_tokens: str) -> list[str]:
+        """Return raw config lines relevant to a given object path.
+
+        For set-style: returns all ``set <path_tokens...>`` lines whose prefix
+        matches the full token sequence.
+
+        For brace-style: returns all lines inside the named block identified by
+        the last token in path_tokens (heuristic: finds the first ``NAME {``
+        occurrence and collects until its matching ``}``).
+        """
+        if self._is_set_style:
+            prefix = "set " + " ".join(path_tokens)
+            return [
+                line for line in self._config_lines
+                if line.strip().startswith(prefix)
+            ]
+        else:
+            # Brace-style: find the block whose header contains the last path token
+            target = path_tokens[-1] if path_tokens else ""
+            result: list[str] = []
+            depth = 0
+            inside = False
+            for line in self._config_lines:
+                stripped = line.strip()
+                if not inside:
+                    # Detect block header: last token followed by optional name + '{'
+                    if target in stripped and stripped.endswith("{"):
+                        inside = True
+                        depth = 1
+                        result.append(line)
+                        continue
+                else:
+                    result.append(line)
+                    depth += stripped.count("{") - stripped.count("}")
+                    if depth <= 0:
+                        inside = False
+                        break
+            return result
 
     # ------------------------------------------------------------------
     # Interface parsing (Stage 3)
@@ -217,7 +258,7 @@ class JunOSParser(BaseParser):
 
         return InterfaceConfig(
             object_id=f"interface_{full_name}",
-            raw_lines=[],
+            raw_lines=self._raw_lines_for("interfaces", base_name),
             source_os=self.os_type,
             line_numbers=[],
             name=full_name,
@@ -277,9 +318,18 @@ class JunOSParser(BaseParser):
             rt_import: list[str] = []
             rt_export: list[str] = []
 
-            # vrf-target target:X  → both import and export
+            # vrf-target — brace-style: scalar / list of "target:X"
+            #              set-style: dict with "import" / "export" sub-keys
             vt = vrf_data.get("vrf-target")
-            if vt:
+            if isinstance(vt, dict) and ("import" in vt or "export" in vt):
+                # set-style: vrf-target import target:X / export target:Y
+                vt_import = _str_val(vt.get("import")) or ""
+                vt_export = _str_val(vt.get("export")) or ""
+                if vt_import:
+                    rt_import.append(vt_import.replace("target:", ""))
+                if vt_export:
+                    rt_export.append(vt_export.replace("target:", ""))
+            elif vt:
                 for v in (vt if isinstance(vt, list) else [vt]):
                     v = _str_val(v) or ""
                     v = v.replace("target:", "")
@@ -302,9 +352,17 @@ class JunOSParser(BaseParser):
                         rt_export.append(v)
 
             # Member interfaces
+            # Brace-style: interface = "ge-0/0/0.0" (scalar) or list
+            # Set-style:   interface = {"ge-0/0/0.0": {}} (dict with intf names as keys)
             intf_members: list[str] = []
             intf_val = vrf_data.get("interface")
-            if intf_val:
+            if isinstance(intf_val, dict):
+                for iv in intf_val.keys():
+                    iv = iv.strip('"')
+                    if iv:
+                        intf_members.append(iv)
+                        self._vrf_of_intf[iv] = vrf_name
+            elif intf_val:
                 for iv in (intf_val if isinstance(intf_val, list) else [intf_val]):
                     iv = _str_val(iv) or ""
                     if iv:
@@ -313,7 +371,7 @@ class JunOSParser(BaseParser):
 
             vrfs.append(VRFConfig(
                 object_id=f"vrf_{vrf_name}",
-                raw_lines=[],
+                raw_lines=self._raw_lines_for("routing-instances", vrf_name),
                 source_os=self.os_type,
                 line_numbers=[],
                 name=vrf_name,
@@ -398,7 +456,7 @@ class JunOSParser(BaseParser):
 
             result.append(PrefixListConfig(
                 object_id=f"prefix_list_{pl_name}",
-                raw_lines=[],
+                raw_lines=self._raw_lines_for("policy-options", "prefix-list", pl_name),
                 source_os=self.os_type,
                 line_numbers=[],
                 name=pl_name,
@@ -459,7 +517,7 @@ class JunOSParser(BaseParser):
     def _make_community(self, name: str, communities: list[str]) -> CommunityListConfig:
         return CommunityListConfig(
             object_id=f"community_list_{name}",
-            raw_lines=[],
+            raw_lines=self._raw_lines_for("policy-options", "community", name),
             source_os=self.os_type,
             line_numbers=[],
             name=name,
@@ -509,7 +567,7 @@ class JunOSParser(BaseParser):
     def _make_as_path(self, name: str, regex: str) -> ASPathListConfig:
         return ASPathListConfig(
             object_id=f"as_path_list_{name}",
-            raw_lines=[],
+            raw_lines=self._raw_lines_for("policy-options", "as-path", name),
             source_os=self.os_type,
             line_numbers=[],
             name=name,
@@ -568,25 +626,26 @@ class JunOSParser(BaseParser):
 
                 from_block = term_data.get("from", {})
                 if isinstance(from_block, dict):
-                    # prefix-list reference
-                    pl_ref = from_block.get("prefix-list")
-                    if pl_ref:
+                    # prefix-list reference — search recursively (set-style nests
+                    # it under family.inet.prefix-list)
+                    pl_ref = _find_in_block(from_block, "prefix-list")
+                    if pl_ref is not None:
                         pl_names = pl_ref if isinstance(pl_ref, list) else [pl_ref]
                         match_clauses.append(RouteMapMatch(
                             match_type="ip address prefix-list",
                             values=[_str_val(p) or "" for p in pl_names],
                         ))
                     # community reference
-                    comm_ref = from_block.get("community")
-                    if comm_ref:
+                    comm_ref = _find_in_block(from_block, "community")
+                    if comm_ref is not None:
                         comms = comm_ref if isinstance(comm_ref, list) else [comm_ref]
                         match_clauses.append(RouteMapMatch(
                             match_type="community",
                             values=[_str_val(c) or "" for c in comms],
                         ))
                     # as-path reference
-                    asp_ref = from_block.get("as-path")
-                    if asp_ref:
+                    asp_ref = _find_in_block(from_block, "as-path")
+                    if asp_ref is not None:
                         asps = asp_ref if isinstance(asp_ref, list) else [asp_ref]
                         match_clauses.append(RouteMapMatch(
                             match_type="as-path",
@@ -595,6 +654,7 @@ class JunOSParser(BaseParser):
 
                 then_block = term_data.get("then", {})
                 # then can be a dict or a scalar (e.g. "then accept;")
+                # Set-style: then.accept = {} or then.reject = {}
                 if isinstance(then_block, str):
                     action_str = then_block.strip()
                     action = "permit" if action_str in ("accept",) else "deny"
@@ -628,7 +688,7 @@ class JunOSParser(BaseParser):
 
             result.append(RouteMapConfig(
                 object_id=f"route_map_{ps_name}",
-                raw_lines=[],
+                raw_lines=self._raw_lines_for("policy-options", "policy-statement", ps_name),
                 source_os=self.os_type,
                 line_numbers=[],
                 name=ps_name,
@@ -790,9 +850,13 @@ class JunOSParser(BaseParser):
             except ValueError:
                 pass
 
+        if vrf:
+            _bgp_raw = self._raw_lines_for("routing-instances", vrf, "protocols", "bgp")
+        else:
+            _bgp_raw = self._raw_lines_for("protocols", "bgp")
         return BGPConfig(
             object_id=f"bgp_{asn}" + (f"_vrf_{vrf}" if vrf else ""),
-            raw_lines=[],
+            raw_lines=_bgp_raw,
             source_os=self.os_type,
             line_numbers=[],
             asn=asn,
@@ -868,7 +932,7 @@ class JunOSParser(BaseParser):
 
             result.append(StaticRoute(
                 object_id=f"static_{prefix_str}" + (f"_vrf_{vrf}" if vrf else ""),
-                raw_lines=[],
+                raw_lines=self._raw_lines_for("routing-options", "static") if not vrf else self._raw_lines_for("routing-instances", vrf, "routing-options", "static"),
                 source_os=self.os_type,
                 line_numbers=[],
                 destination=destination,
@@ -908,7 +972,7 @@ class JunOSParser(BaseParser):
 
         return [OSPFConfig(
             object_id="ospf_1",
-            raw_lines=[],
+            raw_lines=self._raw_lines_for("protocols", "ospf"),
             source_os=self.os_type,
             line_numbers=[],
             process_id=1,
@@ -957,7 +1021,7 @@ class JunOSParser(BaseParser):
 
             result.append(ACLConfig(
                 object_id=f"acl_{filter_name}",
-                raw_lines=[],
+                raw_lines=self._raw_lines_for("firewall", "filter", filter_name),
                 source_os=self.os_type,
                 line_numbers=[],
                 name=filter_name,
@@ -993,7 +1057,7 @@ class JunOSParser(BaseParser):
             return None
         return NTPConfig(
             object_id="ntp",
-            raw_lines=[],
+            raw_lines=self._raw_lines_for("system", "ntp"),
             source_os=self.os_type,
             line_numbers=[],
             servers=servers,
@@ -1029,7 +1093,7 @@ class JunOSParser(BaseParser):
             return None
         return SNMPConfig(
             object_id="snmp",
-            raw_lines=[],
+            raw_lines=self._raw_lines_for("snmp"),
             source_os=self.os_type,
             line_numbers=[],
             communities=communities,
@@ -1057,7 +1121,7 @@ class JunOSParser(BaseParser):
             return None
         return SyslogConfig(
             object_id="syslog",
-            raw_lines=[],
+            raw_lines=self._raw_lines_for("system", "syslog"),
             source_os=self.os_type,
             line_numbers=[],
             hosts=hosts,
@@ -1068,14 +1132,45 @@ class JunOSParser(BaseParser):
 # Module-level helpers
 # ---------------------------------------------------------------------------
 
+def _find_in_block(d: dict[str, Any], key: str) -> Any:
+    """Return the value for *key* from *d* or any nested dict child.
+
+    Needed for set-style configs where ``from family inet prefix-list PL_X``
+    nests ``prefix-list`` under ``family.inet`` rather than directly under
+    ``from``.  Direct lookup wins; nested lookup is a fallback.
+    """
+    if not isinstance(d, dict):
+        return None
+    if key in d:
+        return d[key]
+    for v in d.values():
+        if isinstance(v, dict):
+            found = _find_in_block(v, key)
+            if found is not None:
+                return found
+    return None
+
+
 def _str_val(v: Any) -> str | None:
-    """Return *v* as a plain string, stripping quotes, or None."""
+    """Return *v* as a plain string, stripping quotes, or None.
+
+    Handles three shapes produced by the hierarchy parsers:
+    - ``str``  — brace-style leaf value (``peer-as 65006;`` → ``'65006'``)
+    - ``dict`` — set-style leaf (``{'65006': {}}`` → ``'65006'``)
+    - ``list`` — repeated brace-style values (takes first element)
+    """
     if v is None:
         return None
     if isinstance(v, list):
         v = v[0] if v else None
     if v is None:
         return None
+    if isinstance(v, dict):
+        # Set-style: the scalar value is the first (usually only) key
+        keys = [k for k in v if k != ""]
+        if not keys:
+            return None
+        return str(keys[0]).strip('"') or None
     return str(v).strip('"')
 
 
