@@ -96,7 +96,9 @@ body {{
     display: flex;
     height: 100vh;
     overflow: hidden;
-    background: #f1f5f9;
+    background-color: #f8fafc;
+    background-image: radial-gradient(#e2e8f0 1px, transparent 1px);
+    background-size: 20px 20px;
     color: #1e293b;
 }}
 
@@ -105,13 +107,15 @@ body {{
     width: 300px;
     min-width: 220px;
     max-width: 400px;
-    background: #ffffff;
+    background: rgba(255, 255, 255, 0.82);
+    backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
     border-right: 1px solid #e2e8f0;
     display: flex;
     flex-direction: column;
     overflow: hidden;
     flex-shrink: 0;
-    box-shadow: 2px 0 8px rgba(0,0,0,0.06);
+    box-shadow: 2px 0 16px rgba(0,0,0,0.07);
 }}
 #sidebar-header {{
     padding: 14px 16px 10px;
@@ -176,17 +180,46 @@ body {{
     display: flex;
     align-items: center;
     gap: 8px;
-    margin-bottom: 5px;
+    margin-bottom: 6px;
     cursor: pointer;
     user-select: none;
 }}
-.filter-row input[type=checkbox] {{ accent-color: #1e40af; cursor: pointer; }}
-.filter-label {{ font-size: 12px; color: #334155; }}
+.filter-label {{ font-size: 12px; color: #334155; flex: 1; }}
 .dot {{
     width: 10px; height: 10px;
-    border-radius: 50%;
+    border-radius: 3px;
     flex-shrink: 0;
 }}
+
+/* ── Toggle switch ───────────────────────────────────────────────── */
+.toggle {{
+    position: relative;
+    display: inline-block;
+    width: 30px;
+    height: 17px;
+    flex-shrink: 0;
+}}
+.toggle input {{ opacity: 0; width: 0; height: 0; position: absolute; }}
+.toggle-track {{
+    position: absolute;
+    inset: 0;
+    background: #cbd5e1;
+    border-radius: 9px;
+    cursor: pointer;
+    transition: background 0.2s;
+}}
+.toggle-track::before {{
+    content: '';
+    position: absolute;
+    width: 11px; height: 11px;
+    left: 3px; top: 3px;
+    background: #fff;
+    border-radius: 50%;
+    transition: transform 0.2s;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.2);
+}}
+.toggle input:checked + .toggle-track {{ background: #1e40af; }}
+.toggle input:checked + .toggle-track::before {{ transform: translateX(13px); }}
 
 /* ── Orphan toggle ───────────────────────────────────────────────── */
 #orphan-toggle {{
@@ -196,7 +229,6 @@ body {{
     cursor: pointer;
     user-select: none;
 }}
-#orphan-toggle input {{ accent-color: #1e40af; cursor: pointer; }}
 #orphan-toggle label {{ font-size: 12px; color: #334155; cursor: pointer; }}
 
 /* ── Hover tooltip ───────────────────────────────────────────────── */
@@ -237,16 +269,6 @@ body {{
 }}
 #layout-select:focus {{ border-color: #1e40af; }}
 
-/* ── Stats ────────────────────────────────────────────────────────── */
-.stat-row {{
-    display: flex;
-    justify-content: space-between;
-    font-size: 12px;
-    padding: 3px 0;
-    color: #64748b;
-}}
-.stat-row span:last-child {{ color: #1e293b; font-weight: 600; }}
-
 /* ── Legend ──────────────────────────────────────────────────────── */
 .legend-item {{
     display: flex;
@@ -256,7 +278,7 @@ body {{
 }}
 .legend-swatch {{
     width: 12px; height: 12px;
-    border-radius: 50%;
+    border-radius: 3px;
     border: 2px solid transparent;
     flex-shrink: 0;
 }}
@@ -338,11 +360,7 @@ body {{
 #cy {{
     width: 100%;
     height: 100%;
-    background: #f8fafc;
-    background-image:
-        linear-gradient(rgba(148,163,184,0.15) 1px, transparent 1px),
-        linear-gradient(90deg, rgba(148,163,184,0.15) 1px, transparent 1px);
-    background-size: 24px 24px;  /* updated dynamically via JS on zoom/pan */
+    background: transparent;
 }}
 
 /* ── Back button (floating on canvas) ───────────────────────────── */
@@ -401,7 +419,7 @@ body {{
       <input id="search" type="text" placeholder="Filter nodes by name…">
       <div id="search-count"></div>
       <div style="margin-top:8px;display:flex;align-items:center;gap:8px;user-select:none;">
-        <input type="checkbox" id="chk-isolates" style="accent-color:#1e40af;cursor:pointer;">
+        <label class="toggle"><input type="checkbox" id="chk-isolates"><span class="toggle-track"></span></label>
         <label for="chk-isolates" style="font-size:12px;color:#334155;cursor:pointer;">Show unconnected nodes</label>
       </div>
     </div>
@@ -434,7 +452,7 @@ body {{
     <div class="section">
       <div class="section-title">Highlighting</div>
       <div id="orphan-toggle">
-        <input type="checkbox" id="chk-orphan">
+        <label class="toggle"><input type="checkbox" id="chk-orphan"><span class="toggle-track"></span></label>
         <label for="chk-orphan">Highlight orphaned nodes</label>
       </div>
     </div>
@@ -509,11 +527,12 @@ body {{
       style: {{
         'label': 'data(display_label)',
         'background-color': 'data(fill)',
-        'shape': 'ellipse',
+        'shape': 'round-rectangle',
+        'corner-radius': 8,
         'width': 'label',
         'height': 'label',
-        'padding': '14px',
-        'border-width': 0.75,
+        'padding': '12px',
+        'border-width': 1.5,
         'border-color': 'data(color)',
         'border-opacity': 1,
         'font-size': '10px',
@@ -522,14 +541,16 @@ body {{
         'text-valign': 'center',
         'text-halign': 'center',
         'text-wrap': 'wrap',
-        'text-max-width': '100px',
+        'text-max-width': '80px',
         'min-width': '50px',
-        'min-height': '50px',
-        'shadow-blur': 8,
+        'min-height': '36px',
+        'shadow-blur': 6,
         'shadow-color': 'data(color)',
-        'shadow-opacity': 0.12,
+        'shadow-opacity': 0.10,
         'shadow-offset-x': 0,
         'shadow-offset-y': 2,
+        'transition-property': 'opacity, background-color, border-color',
+        'transition-duration': '0.15s',
       }}
     }},
     {{
@@ -538,21 +559,23 @@ body {{
         'border-style': 'dashed',
         'border-width': 1,
         'border-opacity': 0.6,
-        'background-color': '#F9FAFB',
+        'background-color': '#f8fafc',
         'font-size': '9px',
-        'color': '#9CA3AF',
+        'color': '#94a3b8',
         'padding': '10px',
       }}
     }},
     {{
       selector: 'edge',
       style: {{
-        'width': 1,
+        'width': 1.5,
         'line-color': '#94a3b8',
         'target-arrow-color': '#94a3b8',
-        'target-arrow-shape': 'triangle',
+        'target-arrow-shape': 'triangle-tee',
         'curve-style': 'bezier',
-        'opacity': 0.6,
+        'opacity': 0.55,
+        'transition-property': 'opacity, line-color',
+        'transition-duration': '0.15s',
       }}
     }},
     {{
@@ -653,19 +676,6 @@ body {{
 
   function updateStats() {{}}  // no-op: statistics section removed
 
-  // ── Dynamic grid: scales and pans with the canvas ──────────────────────────
-  const cyEl = document.getElementById('cy');
-  const BASE_GRID = 24;
-  function updateGrid() {{
-    const zoom = cy.zoom();
-    const pan  = cy.pan();
-    const size = BASE_GRID * zoom;
-    cyEl.style.backgroundSize = `${{size}}px ${{size}}px`;
-    cyEl.style.backgroundPosition = `${{pan.x % size}}px ${{pan.y % size}}px`;
-  }}
-  cy.on('zoom pan', updateGrid);
-  cy.ready(updateGrid);
-
   // ── Legend ──────────────────────────────────────────────────────────────────
   const legendEl = document.getElementById('legend-nodes');
   Object.entries(legendStyles).forEach(([type, style]) => {{
@@ -725,18 +735,24 @@ body {{
 
     const row = document.createElement('label');
     row.className = 'filter-row';
+    const toggleLabel = document.createElement('label');
+    toggleLabel.className = 'toggle';
     const chk = document.createElement('input');
     chk.type = 'checkbox';
     chk.checked = false;
     chk.dataset.cluster = def.id;
     chk.addEventListener('change', applyClusterFilters);
+    const track = document.createElement('span');
+    track.className = 'toggle-track';
+    toggleLabel.appendChild(chk);
+    toggleLabel.appendChild(track);
     const dot = document.createElement('div');
     dot.className = 'dot';
     dot.style.background = def.color;
     const lbl = document.createElement('span');
     lbl.className = 'filter-label';
     lbl.textContent = `${{def.label}} (${{nodeSet.size}})`;
-    row.appendChild(chk);
+    row.appendChild(toggleLabel);
     row.appendChild(dot);
     row.appendChild(lbl);
     clusterFiltersEl.appendChild(row);
@@ -801,26 +817,32 @@ body {{
   // ── Group filters ─────────────────────────────────────────────────────────
   const groups = [...new Set(elements.nodes.map(n => n.data.group).filter(Boolean))].sort();
   const groupColors = {{
-    infrastructure: '#1565C0', routing: '#1B5E20', policy: '#7C2D12',
-    qos: '#134E4A', security: '#7F1D1D', management: '#374151',
-    missing: '#9CA3AF', other: '#6B7280',
+    infrastructure: '#3b82f6', routing: '#10b981', policy: '#f59e0b',
+    qos: '#14b8a6', security: '#ef4444', management: '#64748b',
+    missing: '#94a3b8', other: '#64748b',
   }};
   const filtersEl = document.getElementById('group-filters');
   groups.forEach(group => {{
     const row = document.createElement('label');
     row.className = 'filter-row';
+    const toggleLabel = document.createElement('label');
+    toggleLabel.className = 'toggle';
     const chk = document.createElement('input');
     chk.type = 'checkbox';
     chk.checked = true;
     chk.dataset.group = group;
     chk.addEventListener('change', applyGroupFilters);
+    const track = document.createElement('span');
+    track.className = 'toggle-track';
+    toggleLabel.appendChild(chk);
+    toggleLabel.appendChild(track);
     const dot = document.createElement('div');
     dot.className = 'dot';
-    dot.style.background = groupColors[group] || '#AAB7B8';
+    dot.style.background = groupColors[group] || '#94a3b8';
     const lbl = document.createElement('span');
     lbl.className = 'filter-label';
     lbl.textContent = group;
-    row.appendChild(chk);
+    row.appendChild(toggleLabel);
     row.appendChild(dot);
     row.appendChild(lbl);
     filtersEl.appendChild(row);
@@ -997,6 +1019,11 @@ body {{
   }}
 
   cy.on('mouseover', 'node', function(evt) {{
+    if (!isolated) {{
+      const sel = evt.target;
+      cy.elements().addClass('faded');
+      sel.neighborhood().add(sel).removeClass('faded');
+    }}
     const d = evt.target.data();
     const name = (d.label || d.id).split(':').slice(1).join(':') || d.label || d.id;
     const deg  = evt.target.degree();
@@ -1010,6 +1037,7 @@ body {{
     placeTooltip(evt.originalEvent.clientX, evt.originalEvent.clientY);
   }});
   cy.on('mouseout', 'node', function() {{
+    if (!isolated) cy.elements().removeClass('faded');
     tooltip.style.display = 'none';
   }});
 

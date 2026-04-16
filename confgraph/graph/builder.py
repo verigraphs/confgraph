@@ -22,44 +22,44 @@ from confgraph.analysis.dependency_resolver import DependencyReport, DependencyR
 # fill   = background fill      (light tint of the group color)
 NODE_STYLE: dict[str, dict[str, str]] = {
     # ── Infrastructure ───────────────────────────────────────────────────────
-    "interface":      {"shape": "ellipse", "color": "#1565C0", "fill": "#DBEAFE", "group": "infrastructure"},
-    "vrf":            {"shape": "ellipse", "color": "#1565C0", "fill": "#DBEAFE", "group": "infrastructure"},
-    "bfd":            {"shape": "ellipse", "color": "#1565C0", "fill": "#DBEAFE", "group": "infrastructure"},
-    "ip_sla":         {"shape": "ellipse", "color": "#1565C0", "fill": "#DBEAFE", "group": "infrastructure"},
-    "object_track":   {"shape": "ellipse", "color": "#1565C0", "fill": "#DBEAFE", "group": "infrastructure"},
-    "eem_applet":     {"shape": "ellipse", "color": "#1565C0", "fill": "#DBEAFE", "group": "infrastructure"},
+    "interface":      {"shape": "round-rectangle", "color": "#3b82f6", "fill": "#eff6ff", "group": "infrastructure"},
+    "vrf":            {"shape": "round-rectangle", "color": "#3b82f6", "fill": "#eff6ff", "group": "infrastructure"},
+    "bfd":            {"shape": "round-rectangle", "color": "#3b82f6", "fill": "#eff6ff", "group": "infrastructure"},
+    "ip_sla":         {"shape": "round-rectangle", "color": "#3b82f6", "fill": "#eff6ff", "group": "infrastructure"},
+    "object_track":   {"shape": "round-rectangle", "color": "#3b82f6", "fill": "#eff6ff", "group": "infrastructure"},
+    "eem_applet":     {"shape": "round-rectangle", "color": "#3b82f6", "fill": "#eff6ff", "group": "infrastructure"},
     # ── Routing ──────────────────────────────────────────────────────────────
-    "bgp_instance":   {"shape": "ellipse", "color": "#1B5E20", "fill": "#DCFCE7", "group": "routing"},
-    "ospf_instance":  {"shape": "ellipse", "color": "#1B5E20", "fill": "#DCFCE7", "group": "routing"},
-    "eigrp_instance": {"shape": "ellipse", "color": "#1B5E20", "fill": "#DCFCE7", "group": "routing"},
-    "rip_instance":   {"shape": "ellipse", "color": "#1B5E20", "fill": "#DCFCE7", "group": "routing"},
-    "isis_instance":  {"shape": "ellipse", "color": "#1B5E20", "fill": "#DCFCE7", "group": "routing"},
-    "static_route":   {"shape": "ellipse", "color": "#1B5E20", "fill": "#DCFCE7", "group": "routing"},
-    "multicast":      {"shape": "ellipse", "color": "#1B5E20", "fill": "#DCFCE7", "group": "routing"},
+    "bgp_instance":   {"shape": "round-rectangle", "color": "#10b981", "fill": "#ecfdf5", "group": "routing"},
+    "ospf_instance":  {"shape": "round-rectangle", "color": "#10b981", "fill": "#ecfdf5", "group": "routing"},
+    "eigrp_instance": {"shape": "round-rectangle", "color": "#10b981", "fill": "#ecfdf5", "group": "routing"},
+    "rip_instance":   {"shape": "round-rectangle", "color": "#10b981", "fill": "#ecfdf5", "group": "routing"},
+    "isis_instance":  {"shape": "round-rectangle", "color": "#10b981", "fill": "#ecfdf5", "group": "routing"},
+    "static_route":   {"shape": "round-rectangle", "color": "#10b981", "fill": "#ecfdf5", "group": "routing"},
+    "multicast":      {"shape": "round-rectangle", "color": "#10b981", "fill": "#ecfdf5", "group": "routing"},
     # ── Policy ───────────────────────────────────────────────────────────────
-    "route_map":      {"shape": "ellipse", "color": "#7C2D12", "fill": "#FEE2E2", "group": "policy"},
-    "prefix_list":    {"shape": "ellipse", "color": "#92400E", "fill": "#FEF3C7", "group": "policy"},
-    "acl":            {"shape": "ellipse", "color": "#7C2D12", "fill": "#FEE2E2", "group": "policy"},
-    "community_list": {"shape": "ellipse", "color": "#581C87", "fill": "#F3E8FF", "group": "policy"},
-    "as_path_list":   {"shape": "ellipse", "color": "#581C87", "fill": "#F3E8FF", "group": "policy"},
+    "route_map":      {"shape": "round-rectangle", "color": "#f59e0b", "fill": "#fffbeb", "group": "policy"},
+    "prefix_list":    {"shape": "round-rectangle", "color": "#f59e0b", "fill": "#fffbeb", "group": "policy"},
+    "acl":            {"shape": "round-rectangle", "color": "#f59e0b", "fill": "#fffbeb", "group": "policy"},
+    "community_list": {"shape": "round-rectangle", "color": "#f59e0b", "fill": "#fffbeb", "group": "policy"},
+    "as_path_list":   {"shape": "round-rectangle", "color": "#f59e0b", "fill": "#fffbeb", "group": "policy"},
     # ── QoS ──────────────────────────────────────────────────────────────────
-    "class_map":      {"shape": "ellipse", "color": "#134E4A", "fill": "#CCFBF1", "group": "qos"},
-    "policy_map":     {"shape": "ellipse", "color": "#134E4A", "fill": "#CCFBF1", "group": "qos"},
+    "class_map":      {"shape": "round-rectangle", "color": "#14b8a6", "fill": "#f0fdfa", "group": "qos"},
+    "policy_map":     {"shape": "round-rectangle", "color": "#14b8a6", "fill": "#f0fdfa", "group": "qos"},
     # ── Management ───────────────────────────────────────────────────────────
-    "ntp":            {"shape": "ellipse", "color": "#374151", "fill": "#F3F4F6", "group": "management"},
-    "snmp":           {"shape": "ellipse", "color": "#374151", "fill": "#F3F4F6", "group": "management"},
-    "syslog":         {"shape": "ellipse", "color": "#374151", "fill": "#F3F4F6", "group": "management"},
-    "banners":        {"shape": "ellipse", "color": "#374151", "fill": "#F3F4F6", "group": "management"},
-    "lines":          {"shape": "ellipse", "color": "#374151", "fill": "#F3F4F6", "group": "management"},
+    "ntp":            {"shape": "round-rectangle", "color": "#64748b", "fill": "#f8fafc", "group": "management"},
+    "snmp":           {"shape": "round-rectangle", "color": "#64748b", "fill": "#f8fafc", "group": "management"},
+    "syslog":         {"shape": "round-rectangle", "color": "#64748b", "fill": "#f8fafc", "group": "management"},
+    "banners":        {"shape": "round-rectangle", "color": "#64748b", "fill": "#f8fafc", "group": "management"},
+    "lines":          {"shape": "round-rectangle", "color": "#64748b", "fill": "#f8fafc", "group": "management"},
     # ── Security ─────────────────────────────────────────────────────────────
-    "crypto":         {"shape": "ellipse", "color": "#7F1D1D", "fill": "#FEE2E2", "group": "security"},
-    "nat":            {"shape": "ellipse", "color": "#7F1D1D", "fill": "#FEE2E2", "group": "security"},
+    "crypto":         {"shape": "round-rectangle", "color": "#ef4444", "fill": "#fef2f2", "group": "security"},
+    "nat":            {"shape": "round-rectangle", "color": "#ef4444", "fill": "#fef2f2", "group": "security"},
     # ── Ghost (missing/dangling) ─────────────────────────────────────────────
-    "missing":        {"shape": "ellipse", "color": "#9CA3AF", "fill": "#F9FAFB", "group": "missing"},
+    "missing":        {"shape": "round-rectangle", "color": "#94a3b8", "fill": "#f8fafc", "group": "missing"},
 }
 
 # Fallback for unknown types
-_DEFAULT_STYLE = {"shape": "rectangle", "color": "#6B7280", "fill": "#F9FAFB", "group": "other"}
+_DEFAULT_STYLE = {"shape": "round-rectangle", "color": "#64748b", "fill": "#f8fafc", "group": "other"}
 
 # Short prefix shown on node labels: "rm:ISP1_IN", "bgp:65000", etc.
 NODE_LABEL_PREFIX: dict[str, str] = {
