@@ -52,11 +52,13 @@ Pre-generated maps for all supported platforms — open any in your browser, no 
 
 ## Install
 
+Requires [pip](https://packaging.python.org/en/latest/tutorials/installing-packages/):
+
 ```bash
 pip install confgraph
 ```
 
-Or run without installing:
+Or run without installing via [uv](https://docs.astral.sh/uv/getting-started/installation/#homebrew):
 
 ```bash
 uvx confgraph map router.txt
