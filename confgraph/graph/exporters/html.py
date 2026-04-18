@@ -605,7 +605,9 @@ body {{
       style: {{
         'line-color': '#DC2626',
         'target-arrow-color': '#DC2626',
+        'target-arrow-shape': 'hollow-triangle',
         'line-style': 'dashed',
+        'line-dash-pattern': [6, 3],
         'opacity': 0.75,
       }}
     }},
