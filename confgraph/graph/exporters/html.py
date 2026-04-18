@@ -76,7 +76,7 @@ class HTMLExporter(BaseExporter):
         legend_items_js = json.dumps(type_styles)
         status_style_rules_js = json.dumps([
             {"selector": "node[status = 'missing']",
-             "style": {"border-style": "dashed", "border-opacity": 0.6}},
+             "style": {"border-style": "dashed", "border-opacity": 0.7, "opacity": 0.45}},
             {"selector": "node[status = 'orphan']",
              "style": {"border-width": 4, "border-color": "#D97706", "border-opacity": 1}},
         ])
@@ -334,6 +334,9 @@ body {{
     padding-top: 8px;
     border-top: 1px solid #e2e8f0;
 }}
+#detail-raw-wrapper {{
+    position: relative;
+}}
 #detail-raw {{
     background: #0f172a;
     border-radius: 4px;
@@ -349,6 +352,22 @@ body {{
 }}
 #detail-raw::-webkit-scrollbar {{ width: 4px; }}
 #detail-raw::-webkit-scrollbar-thumb {{ background: #334155; border-radius: 2px; }}
+#copy-raw-btn {{
+    position: absolute;
+    top: 5px;
+    right: 5px;
+    background: rgba(255,255,255,0.08);
+    border: 1px solid rgba(255,255,255,0.15);
+    border-radius: 4px;
+    color: #94a3b8;
+    font-size: 10px;
+    padding: 2px 7px;
+    cursor: pointer;
+    line-height: 1.6;
+    transition: background 0.15s, color 0.15s;
+}}
+#copy-raw-btn:hover {{ background: rgba(255,255,255,0.16); color: #e2e8f0; }}
+#copy-raw-btn.copied {{ color: #86efac; border-color: #86efac; }}
 
 /* ── Canvas wrapper ──────────────────────────────────────────────── */
 #canvas-wrapper {{
@@ -431,7 +450,10 @@ body {{
         <div id="detail-title"></div>
         <div id="detail-attrs"></div>
         <div class="raw-config-label">Raw Config</div>
-        <div id="detail-raw"></div>
+        <div id="detail-raw-wrapper">
+          <button id="copy-raw-btn">Copy</button>
+          <div id="detail-raw"></div>
+        </div>
       </div>
     </div>
 
@@ -905,7 +927,21 @@ body {{
   const detailTitle = document.getElementById('detail-title');
   const detailAttrs = document.getElementById('detail-attrs');
   const detailRaw   = document.getElementById('detail-raw');
+  const copyRawBtn  = document.getElementById('copy-raw-btn');
   const SKIP_KEYS = new Set(['id', 'label', 'display_label', 'color', 'fill', 'shape', 'raw_config']);
+
+  copyRawBtn.addEventListener('click', function() {{
+    const text = detailRaw.textContent;
+    if (!text || text === '(no raw config available)') return;
+    navigator.clipboard.writeText(text).then(() => {{
+      copyRawBtn.textContent = 'Copied!';
+      copyRawBtn.classList.add('copied');
+      setTimeout(() => {{
+        copyRawBtn.textContent = 'Copy';
+        copyRawBtn.classList.remove('copied');
+      }}, 1800);
+    }});
+  }});
 
   function showDetail(node) {{
     const d = node.data();
