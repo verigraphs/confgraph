@@ -7,6 +7,8 @@ uvx confgraph map router.txt
 uvx confgraph map router.txt --lint
 ```
 
+![confgraph default view](docs/default_view.png)
+
 ## What it does
 
 Point it at a config file. It parses every protocol, builds a dependency graph, and exports an interactive HTML diagram you can open in any browser. `--lint` flags dangling references and orphaned objects.
