@@ -7,8 +7,6 @@ uvx confgraph map router.txt
 uvx confgraph map router.txt --lint
 ```
 
-![confgraph map output showing protocol dependency graph]
-
 ## What it does
 
 Point it at a config file. It parses every protocol, builds a dependency graph, and exports an interactive HTML diagram you can open in any browser. `--lint` flags dangling references and orphaned objects.
@@ -16,7 +14,7 @@ Point it at a config file. It parses every protocol, builds a dependency graph, 
 ## Supported platforms
 
 | OS | Parser |
-|---|---|
+| --- | --- |
 | Cisco IOS / IOS-XE | `IOSParser` |
 | Cisco IOS-XR | `IOSXRParser` |
 | Cisco NX-OS | `NXOSParser` |
@@ -28,13 +26,13 @@ Point it at a config file. It parses every protocol, builds a dependency graph, 
 Pre-generated maps for all supported platforms — open any in your browser, no install needed:
 
 | Platform | Sample config | Interactive map |
-|---|---|---|
-| Cisco IOS | [samples/ios.txt](samples/ios.txt) | [examples/ios.html](examples/ios.html) |
-| Cisco IOS-XE | [samples/ios_xe.txt](samples/ios_xe.txt) | [examples/ios_xe.html](examples/ios_xe.html) |
-| Cisco IOS-XR | [samples/ios_xr.txt](samples/ios_xr.txt) | [examples/ios_xr.html](examples/ios_xr.html) |
-| Cisco NX-OS | [samples/nxos.txt](samples/nxos.txt) | [examples/nxos.html](examples/nxos.html) |
-| Arista EOS | [samples/eos.txt](samples/eos.txt) | [examples/eos.html](examples/eos.html) |
-| Juniper JunOS | [samples/junos_test.cfg](samples/junos_test.cfg) | |
+| --- | --- | --- |
+| Cisco IOS | [samples/ios.txt](samples/ios.txt) | [samples/ios.html](samples/ios.html) |
+| Cisco IOS-XE | [samples/ios_xe.txt](samples/ios_xe.txt) | [samples/ios_xe.html](samples/ios_xe.html) |
+| Cisco IOS-XR | [samples/ios_xr.txt](samples/ios_xr.txt) | [samples/ios_xr.html](samples/ios_xr.html) |
+| Cisco NX-OS | [samples/nxos.txt](samples/nxos.txt) | [samples/nxos.html](samples/nxos.html) |
+| Arista EOS | [samples/eos.txt](samples/eos.txt) | [samples/eos.html](samples/eos.html) |
+| Juniper JunOS | [samples/junos_test.cfg](samples/junos_test.cfg) | [samples/junos_test.html](samples/junos_test.html) |
 
 Or run against your own config:
 
