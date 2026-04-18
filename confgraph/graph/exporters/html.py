@@ -106,7 +106,7 @@ body {{
 #sidebar {{
     width: 300px;
     min-width: 220px;
-    max-width: 400px;
+    max-width: 480px;
     background: rgba(255, 255, 255, 0.82);
     backdrop-filter: blur(10px);
     -webkit-backdrop-filter: blur(10px);
@@ -116,7 +116,51 @@ body {{
     overflow: hidden;
     flex-shrink: 0;
     box-shadow: 2px 0 16px rgba(0,0,0,0.07);
+    transition: width 0.25s ease, min-width 0.25s ease;
+    position: relative;
 }}
+#sidebar.collapsed {{
+    width: 0 !important;
+    min-width: 0 !important;
+    border-right: none;
+}}
+/* Resize handle */
+#sidebar-resize {{
+    position: absolute;
+    top: 0; right: 0;
+    width: 5px;
+    height: 100%;
+    cursor: col-resize;
+    z-index: 10;
+    background: transparent;
+}}
+#sidebar-resize:hover {{ background: rgba(59,130,246,0.2); }}
+/* Collapse toggle button */
+#sidebar-toggle {{
+    position: fixed;
+    top: 50%;
+    left: 300px;
+    transform: translateY(-50%);
+    z-index: 100;
+    width: 18px;
+    height: 48px;
+    background: rgba(255,255,255,0.92);
+    border: 1px solid #e2e8f0;
+    border-left: none;
+    border-radius: 0 6px 6px 0;
+    box-shadow: 2px 0 8px rgba(0,0,0,0.08);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #64748b;
+    font-size: 11px;
+    transition: left 0.25s ease, background 0.15s;
+    user-select: none;
+    padding: 0;
+    line-height: 1;
+}}
+#sidebar-toggle:hover {{ background: #f1f5f9; color: #1e40af; }}
 #sidebar-header {{
     padding: 14px 16px 10px;
     border-bottom: 1px solid #e2e8f0;
@@ -420,7 +464,10 @@ body {{
 </head>
 <body>
 
+<button id="sidebar-toggle" title="Toggle sidebar">‹</button>
+
 <div id="sidebar">
+  <div id="sidebar-resize"></div>
   <div id="sidebar-header">
     <h1>confgraph</h1>
     <div class="meta">
@@ -1175,6 +1222,57 @@ body {{
     cy.fit(undefined, 120);
     cy.zoom(cy.zoom() * 0.82);
     cy.center();
+  }});
+
+  // ── Sidebar collapse toggle ────────────────────────────────────────────────────
+  const sidebar = document.getElementById('sidebar');
+  const toggleBtn = document.getElementById('sidebar-toggle');
+  let sidebarWidth = 300;
+
+  function updateTogglePos() {{
+    const w = sidebar.classList.contains('collapsed') ? 0 : sidebar.offsetWidth;
+    toggleBtn.style.left = w + 'px';
+    toggleBtn.textContent = sidebar.classList.contains('collapsed') ? '›' : '‹';
+  }}
+
+  toggleBtn.addEventListener('click', function() {{
+    if (sidebar.classList.contains('collapsed')) {{
+      sidebar.classList.remove('collapsed');
+      sidebar.style.width = sidebarWidth + 'px';
+    }} else {{
+      sidebarWidth = sidebar.offsetWidth;
+      sidebar.classList.add('collapsed');
+    }}
+    setTimeout(function() {{ updateTogglePos(); cy.resize(); }}, 260);
+  }});
+
+  // ── Sidebar resize drag ────────────────────────────────────────────────────────
+  const resizeHandle = document.getElementById('sidebar-resize');
+  let isResizing = false;
+  let startX, startWidth;
+
+  resizeHandle.addEventListener('mousedown', function(e) {{
+    isResizing = true;
+    startX = e.clientX;
+    startWidth = sidebar.offsetWidth;
+    document.body.style.cursor = 'col-resize';
+    document.body.style.userSelect = 'none';
+  }});
+
+  document.addEventListener('mousemove', function(e) {{
+    if (!isResizing) return;
+    const newWidth = Math.min(480, Math.max(220, startWidth + e.clientX - startX));
+    sidebar.style.width = newWidth + 'px';
+    sidebarWidth = newWidth;
+    updateTogglePos();
+  }});
+
+  document.addEventListener('mouseup', function() {{
+    if (!isResizing) return;
+    isResizing = false;
+    document.body.style.cursor = '';
+    document.body.style.userSelect = '';
+    cy.resize();
   }});
 
 }})();
