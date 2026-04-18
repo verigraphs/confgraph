@@ -51,12 +51,12 @@ Pre-generated maps for all supported platforms — open any in your browser, no 
 
 | Platform | Sample config | Interactive map |
 | --- | --- | --- |
-| Cisco IOS | [samples/ios.txt](samples/ios.txt) | [samples/ios.html](samples/ios.html) |
-| Cisco IOS-XE | [samples/ios_xe.txt](samples/ios_xe.txt) | [samples/ios_xe.html](samples/ios_xe.html) |
-| Cisco IOS-XR | [samples/ios_xr.txt](samples/ios_xr.txt) | [samples/ios_xr.html](samples/ios_xr.html) |
-| Cisco NX-OS | [samples/nxos.txt](samples/nxos.txt) | [samples/nxos.html](samples/nxos.html) |
-| Arista EOS | [samples/eos.txt](samples/eos.txt) | [samples/eos.html](samples/eos.html) |
-| Juniper JunOS | [samples/junos_test.cfg](samples/junos_test.cfg) | [samples/junos_test.html](samples/junos_test.html) |
+| Cisco IOS | [samples/ios.txt](samples/ios.txt) | [Live demo](https://verigraphs.github.io/confgraph/samples/ios.html) |
+| Cisco IOS-XE | [samples/ios_xe.txt](samples/ios_xe.txt) | [Live demo](https://verigraphs.github.io/confgraph/samples/ios_xe.html) |
+| Cisco IOS-XR | [samples/ios_xr.txt](samples/ios_xr.txt) | [Live demo](https://verigraphs.github.io/confgraph/samples/ios_xr.html) |
+| Cisco NX-OS | [samples/nxos.txt](samples/nxos.txt) | [Live demo](https://verigraphs.github.io/confgraph/samples/nxos.html) |
+| Arista EOS | [samples/eos.txt](samples/eos.txt) | [Live demo](https://verigraphs.github.io/confgraph/samples/eos.html) |
+| Juniper JunOS | [samples/junos_test.cfg](samples/junos_test.cfg) | [Live demo](https://verigraphs.github.io/confgraph/samples/junos_test.html) |
 
 ## Install
 
