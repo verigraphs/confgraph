@@ -595,6 +595,7 @@ body {{
         'target-arrow-color': '#94a3b8',
         'target-arrow-shape': 'triangle-tee',
         'curve-style': 'bezier',
+        'edge-distances': 'node-position',
         'opacity': 0.55,
         'transition-property': 'opacity, line-color',
         'transition-duration': '0.15s',
@@ -676,6 +677,13 @@ body {{
     layout: initialLayout,
     wheelSensitivity: 0.3,
   }});
+
+  // Zoom out slightly after layout so the graph has breathing room
+  setTimeout(function() {{
+    cy.fit(undefined, 120);
+    cy.zoom(cy.zoom() * 0.82);
+    cy.center();
+  }}, 0);
 
   // ── Type-based sizing: protocol/service nodes are slightly larger ─────────────
   // These are "anchor" objects that other config objects reference into.
@@ -1164,7 +1172,9 @@ body {{
 
   // ── Fit to screen ─────────────────────────────────────────────────────────────
   document.getElementById('btn-fit').addEventListener('click', function() {{
-    cy.fit(undefined, 40);
+    cy.fit(undefined, 120);
+    cy.zoom(cy.zoom() * 0.82);
+    cy.center();
   }});
 
 }})();
