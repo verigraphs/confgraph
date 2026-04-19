@@ -90,6 +90,10 @@ print(parsed.route_maps)
 
 **Local-first by design.** confgraph never sends your config files anywhere. All parsing, graph generation, and analysis run entirely on your machine. The output is a single self-contained HTML file with no external requests — no CDN, no analytics, no telemetry. This means it can be safely moved to and used within air-gapped management jump-hosts where internet access is prohibited.
 
+## CLI Reference
+
+See [`docs/CLI_USAGE.md`](docs/CLI_USAGE.md) for all commands, options, and examples.
+
 ## Contributing
 
 Contributions welcome — new parsers, bug fixes, additional protocol coverage. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) to get started.
