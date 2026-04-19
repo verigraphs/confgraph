@@ -47,12 +47,6 @@ interface GigabitEthernet0/0/0/1
  ipv4 address 10.1.2.1 255.255.255.252
  no shutdown
 !
-interface GigabitEthernet0/0/0/2
- description VRF Customer A
- vrf CUSTOMER_A
- ipv4 address 172.16.1.1 255.255.255.0
- no shutdown
-!
 interface GigabitEthernet0/0/0/3
  description ISP Uplink
  ipv4 address 10.100.1.2 255.255.255.252
