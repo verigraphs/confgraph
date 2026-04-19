@@ -191,7 +191,7 @@ def _load_and_parse(config_path: Path, os_type: str | None):
 # ---------------------------------------------------------------------------
 
 @click.group()
-@click.version_option(version="0.1.0", prog_name="confgraph")
+@click.version_option(version="0.2.0", prog_name="confgraph")
 def main() -> None:
     """confgraph — local-first network config dependency mapper."""
 
