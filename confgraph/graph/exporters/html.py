@@ -776,11 +776,17 @@ body {{
     {{ id: 'isis',   label: 'IS-IS',  rootType: 'isis_instance',  color: '#15803D' }},
     {{ id: 'rip',    label: 'RIP',    rootType: 'rip_instance',   color: '#16a34a' }},
     {{ id: 'nat',    label: 'NAT',    rootType: 'nat',            color: '#7F1D1D' }},
-    {{ id: 'crypto', label: 'Crypto / VPN', rootType: 'crypto',  color: '#991B1B' }},
-    {{ id: 'qos',    label: 'QoS',    rootType: 'policy_map',     color: '#134E4A' }},
+    {{ id: 'crypto',    label: 'Crypto / VPN', rootType: 'crypto',    color: '#991B1B' }},
+    {{ id: 'multicast', label: 'Multicast',    rootType: 'multicast', color: '#6d28d9' }},
+    {{ id: 'qos',       label: 'QoS',          rootType: 'policy_map', color: '#134E4A' }},
   ];
 
-  // Build cluster node-id sets via BFS from all root nodes of each type
+  // Build cluster node-id sets via BFS from all root nodes of each type.
+  // Interface nodes are included as direct neighbors but are NOT used as
+  // bridges — BFS stops at them to prevent bleeding into unrelated protocols
+  // that share the same interface.
+  const BRIDGE_STOP_TYPES = new Set(['interface']);
+
   function buildCluster(rootType) {{
     const roots = cy.nodes(`[type = "${{rootType}}"]`);
     if (roots.length === 0) return null;
@@ -789,6 +795,8 @@ body {{
     roots.forEach(r => {{ visited.add(r.id()); queue.push(r); }});
     while (queue.length > 0) {{
       const n = queue.shift();
+      // Don't expand further from bridge-stop nodes (e.g. interfaces)
+      if (BRIDGE_STOP_TYPES.has(n.data('type')) && !roots.has(n)) continue;
       n.neighborhood('node').forEach(nb => {{
         if (!visited.has(nb.id())) {{
           visited.add(nb.id());
@@ -1155,10 +1163,10 @@ body {{
   const layoutConfigs = {{
     'dagre': {{
       name: 'dagre', animate: true, animationDuration: 500,
-      rankDir: 'TB',       // top-to-bottom
+      rankDir: 'TB',
       ranker: 'network-simplex',
-      nodeSep: 60,         // horizontal spacing between nodes in same rank
-      rankSep: 80,         // vertical spacing between ranks
+      nodeSep: 60,
+      rankSep: 80,
       edgeSep: 20,
       padding: 60, fit: true,
     }},
