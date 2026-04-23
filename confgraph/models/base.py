@@ -34,6 +34,7 @@ class OSType(str, Enum):
     NXOS = "nxos"
     EOS = "eos"
     JUNOS = "junos"
+    PANOS = "panos"
 
 
 class BaseConfigObject(BaseModel):

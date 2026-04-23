@@ -60,6 +60,7 @@ from confgraph.models.ipsla import IPSLAOperation
 from confgraph.models.eem import EEMApplet
 from confgraph.models.object_tracking import ObjectTrack
 from confgraph.models.multicast import MulticastConfig
+from confgraph.models.panos_zone import PANOSZoneConfig
 
 
 # Top-level config line patterns that are "claimed" by a parse_* method.
@@ -360,6 +361,10 @@ class BaseParser(ABC):
         """Parse IP multicast configuration."""
         return None
 
+    def parse_zones(self) -> list[PANOSZoneConfig]:
+        """Parse PAN-OS security zone configurations."""
+        return []
+
     def _collect_unrecognized_blocks(self) -> list[UnrecognizedBlock]:
         """Collect top-level config blocks not claimed by any parse_* method.
 
@@ -426,6 +431,7 @@ class BaseParser(ABC):
         ("eem_applets",        "parse_eem"),
         ("object_tracks",      "parse_object_tracks"),
         ("multicast",          "parse_multicast"),
+        ("zones",              "parse_zones"),
     ]
 
     def _find_error_context(self, exc: Exception) -> tuple[int, str]:

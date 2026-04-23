@@ -1,0 +1,775 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Realistic PAN-OS 10.x running-config sample for confgraph demo
+     Device: PA-3260 edge firewall
+     Covers: virtual-routers, interfaces, BGP, OSPF, static routes,
+             security zones, security policies, NAT, IPsec/IKE
+-->
+<config version="10.2.3">
+  <devices>
+    <entry name="localhost.localdomain">
+
+      <!-- ================================================================
+           Device / System Settings
+           ================================================================ -->
+      <deviceconfig>
+        <system>
+          <hostname>pa-edge-fw01</hostname>
+          <domain>corp.example.com</domain>
+          <ip-address>10.0.0.1</ip-address>
+          <netmask>255.255.255.0</netmask>
+          <default-gateway>10.0.0.254</default-gateway>
+          <dns-setting>
+            <servers>
+              <primary>8.8.8.8</primary>
+              <secondary>8.8.4.4</secondary>
+            </servers>
+          </dns-setting>
+          <ntp-servers>
+            <primary-ntp-server>
+              <ntp-server-address>pool.ntp.org</ntp-server-address>
+            </primary-ntp-server>
+          </ntp-servers>
+        </system>
+      </deviceconfig>
+
+      <!-- ================================================================
+           Network — Interfaces
+           ================================================================ -->
+      <network>
+
+        <interface>
+          <ethernet>
+            <!-- ethernet1/1: Untrust (Internet-facing) -->
+            <entry name="ethernet1/1">
+              <layer3>
+                <ip>
+                  <entry name="203.0.113.2/30"/>
+                </ip>
+                <mtu>1500</mtu>
+              </layer3>
+              <link-speed>1000</link-speed>
+              <link-duplex>full</link-duplex>
+              <comment>ISP Uplink - Provider A</comment>
+            </entry>
+
+            <!-- ethernet1/2: DMZ -->
+            <entry name="ethernet1/2">
+              <layer3>
+                <ip>
+                  <entry name="172.16.10.1/24"/>
+                </ip>
+                <mtu>1500</mtu>
+              </layer3>
+              <comment>DMZ - Web Servers</comment>
+            </entry>
+
+            <!-- ethernet1/3: Trust (Internal LAN) -->
+            <entry name="ethernet1/3">
+              <layer3>
+                <ip>
+                  <entry name="10.10.0.1/24"/>
+                </ip>
+                <mtu>1500</mtu>
+              </layer3>
+              <comment>Trust LAN</comment>
+            </entry>
+
+            <!-- ethernet1/4: WAN secondary (for IPsec) -->
+            <entry name="ethernet1/4">
+              <layer3>
+                <ip>
+                  <entry name="198.51.100.2/30"/>
+                </ip>
+                <mtu>1500</mtu>
+              </layer3>
+              <comment>ISP Uplink - Provider B (IPsec)</comment>
+            </entry>
+
+            <!-- ethernet1/5: OSPF peering with core -->
+            <entry name="ethernet1/5">
+              <layer3>
+                <ip>
+                  <entry name="192.168.100.1/30"/>
+                </ip>
+              </layer3>
+              <comment>Core Router OSPF Peering</comment>
+            </entry>
+          </ethernet>
+
+          <loopback>
+            <units>
+              <entry name="loopback.1">
+                <ip>
+                  <entry name="10.255.255.1/32"/>
+                </ip>
+                <comment>BGP Router-ID / Loopback</comment>
+              </entry>
+            </units>
+          </loopback>
+
+          <tunnel>
+            <units>
+              <entry name="tunnel.1">
+                <ip>
+                  <entry name="10.100.1.1/30"/>
+                </ip>
+                <comment>IPsec tunnel to Branch-A (BGP over VPN)</comment>
+              </entry>
+              <entry name="tunnel.2">
+                <ip>
+                  <entry name="10.100.2.1/30"/>
+                </ip>
+                <comment>IPsec tunnel to Branch-B (BGP over VPN)</comment>
+              </entry>
+            </units>
+          </tunnel>
+        </interface>
+
+        <!-- ================================================================
+             Virtual Routers
+             ================================================================ -->
+        <virtual-router>
+          <!-- Primary / default VR -->
+          <entry name="default">
+            <interface>
+              <member>ethernet1/1</member>
+              <member>ethernet1/2</member>
+              <member>ethernet1/3</member>
+              <member>ethernet1/4</member>
+              <member>ethernet1/5</member>
+              <member>loopback.1</member>
+              <member>tunnel.1</member>
+              <member>tunnel.2</member>
+            </interface>
+
+            <!-- Static routes -->
+            <routing-table>
+              <ip>
+                <static-route>
+                  <entry name="default-route">
+                    <destination>0.0.0.0/0</destination>
+                    <nexthop>
+                      <ip-address>203.0.113.1</ip-address>
+                    </nexthop>
+                    <metric>10</metric>
+                  </entry>
+                  <entry name="backup-default">
+                    <destination>0.0.0.0/0</destination>
+                    <nexthop>
+                      <ip-address>198.51.100.1</ip-address>
+                    </nexthop>
+                    <metric>20</metric>
+                  </entry>
+                  <entry name="internal-summary">
+                    <destination>10.0.0.0/8</destination>
+                    <nexthop>
+                      <ip-address>192.168.100.2</ip-address>
+                    </nexthop>
+                    <metric>1</metric>
+                  </entry>
+                  <entry name="branch-a-lan">
+                    <destination>172.20.0.0/16</destination>
+                    <nexthop>
+                      <ip-address>192.168.100.2</ip-address>
+                    </nexthop>
+                    <metric>1</metric>
+                  </entry>
+                  <!-- Tunnel IP addressing for BGP over IPsec -->
+                  <entry name="tunnel1-remote">
+                    <destination>10.100.1.2/32</destination>
+                    <nexthop>
+                      <ip-address>10.100.1.2</ip-address>
+                    </nexthop>
+                    <interface>tunnel.1</interface>
+                    <metric>1</metric>
+                  </entry>
+                  <entry name="tunnel2-remote">
+                    <destination>10.100.2.2/32</destination>
+                    <nexthop>
+                      <ip-address>10.100.2.2</ip-address>
+                    </nexthop>
+                    <interface>tunnel.2</interface>
+                    <metric>1</metric>
+                  </entry>
+                </static-route>
+              </ip>
+            </routing-table>
+
+            <!-- OSPF -->
+            <protocol>
+              <ospf>
+                <enable>yes</enable>
+                <router-id>10.255.255.1</router-id>
+                <area>
+                  <entry name="0.0.0.0">
+                    <interface>
+                      <entry name="ethernet1/5">
+                        <enable>yes</enable>
+                        <passive>no</passive>
+                        <metric>10</metric>
+                        <hello-interval>10</hello-interval>
+                        <dead-counts>4</dead-counts>
+                      </entry>
+                      <entry name="loopback.1">
+                        <enable>yes</enable>
+                        <passive>yes</passive>
+                      </entry>
+                    </interface>
+                  </entry>
+                </area>
+                <export-rules>
+                  <entry name="connected">
+                    <action>
+                      <allow>
+                        <update>
+                          <metric-type>ext-2</metric-type>
+                          <metric>20</metric>
+                        </update>
+                      </allow>
+                    </action>
+                  </entry>
+                  <entry name="static">
+                    <action>
+                      <allow/>
+                    </action>
+                  </entry>
+                </export-rules>
+              </ospf>
+
+              <!-- BGP -->
+              <bgp>
+                <enable>yes</enable>
+                <router-id>10.255.255.1</router-id>
+                <local-as>65001</local-as>
+                <install-route>yes</install-route>
+                <peer-group>
+                  <entry name="UPSTREAM-ISP">
+                    <type>
+                      <ebgp>
+                        <remove-private-as>yes</remove-private-as>
+                      </ebgp>
+                    </type>
+                    <peer>
+                      <entry name="ISP-A-Peer">
+                        <enable>yes</enable>
+                        <peer-address>
+                          <ip>203.0.113.1</ip>
+                        </peer-address>
+                        <connection-options>
+                          <remote-as>64512</remote-as>
+                          <keep-alive-interval>30</keep-alive-interval>
+                          <hold-time>90</hold-time>
+                        </connection-options>
+                        <local-address>
+                          <ip>203.0.113.2</ip>
+                          <interface>ethernet1/1</interface>
+                        </local-address>
+                      </entry>
+                      <entry name="ISP-B-Peer">
+                        <enable>yes</enable>
+                        <peer-address>
+                          <ip>198.51.100.1</ip>
+                        </peer-address>
+                        <connection-options>
+                          <remote-as>64513</remote-as>
+                          <keep-alive-interval>30</keep-alive-interval>
+                          <hold-time>90</hold-time>
+                        </connection-options>
+                        <local-address>
+                          <ip>198.51.100.2</ip>
+                          <interface>ethernet1/4</interface>
+                        </local-address>
+                      </entry>
+                    </peer>
+                  </entry>
+                  <entry name="INTERNAL-RR">
+                    <type>
+                      <ibgp/>
+                    </type>
+                    <peer>
+                      <entry name="Core-RR">
+                        <enable>yes</enable>
+                        <peer-address>
+                          <ip>192.168.100.2</ip>
+                        </peer-address>
+                        <connection-options>
+                          <remote-as>65001</remote-as>
+                          <keep-alive-interval>10</keep-alive-interval>
+                          <hold-time>30</hold-time>
+                        </connection-options>
+                        <local-address>
+                          <ip>10.255.255.1</ip>
+                          <interface>loopback.1</interface>
+                        </local-address>
+                      </entry>
+                    </peer>
+                  </entry>
+
+                  <!-- BGP over IPsec tunnels — branch sites -->
+                  <entry name="BRANCH-VPN">
+                    <type>
+                      <ebgp>
+                        <remove-private-as>no</remove-private-as>
+                      </ebgp>
+                    </type>
+                    <peer>
+                      <entry name="Branch-A">
+                        <enable>yes</enable>
+                        <peer-address>
+                          <ip>10.100.1.2</ip>
+                        </peer-address>
+                        <connection-options>
+                          <remote-as>65101</remote-as>
+                          <keep-alive-interval>30</keep-alive-interval>
+                          <hold-time>90</hold-time>
+                        </connection-options>
+                        <!-- BGP session sourced from tunnel interface (IPsec) -->
+                        <local-address>
+                          <ip>10.100.1.1</ip>
+                          <interface>tunnel.1</interface>
+                        </local-address>
+                      </entry>
+                      <entry name="Branch-B">
+                        <enable>yes</enable>
+                        <peer-address>
+                          <ip>10.100.2.2</ip>
+                        </peer-address>
+                        <connection-options>
+                          <remote-as>65102</remote-as>
+                          <keep-alive-interval>30</keep-alive-interval>
+                          <hold-time>90</hold-time>
+                        </connection-options>
+                        <!-- BGP session sourced from tunnel interface (IPsec) -->
+                        <local-address>
+                          <ip>10.100.2.1</ip>
+                          <interface>tunnel.2</interface>
+                        </local-address>
+                      </entry>
+                    </peer>
+                  </entry>
+                </peer-group>
+
+                <redistribution-rules>
+                  <entry name="connected">
+                    <address-family-identifier>connected</address-family-identifier>
+                    <enable>yes</enable>
+                  </entry>
+                </redistribution-rules>
+              </bgp>
+            </protocol>
+          </entry>
+        </virtual-router>
+
+        <!-- ================================================================
+             IKE / IPsec
+             ================================================================ -->
+        <ike>
+          <crypto-profiles>
+            <ike-crypto-profiles>
+              <entry name="IKEv2-AES256-SHA256-DH14">
+                <encryption>
+                  <member>aes-256-cbc</member>
+                </encryption>
+                <hash>
+                  <member>sha256</member>
+                </hash>
+                <dh-group>
+                  <member>group14</member>
+                </dh-group>
+                <lifetime>
+                  <hours>8</hours>
+                </lifetime>
+              </entry>
+            </ike-crypto-profiles>
+
+            <ipsec-crypto-profiles>
+              <entry name="IPSec-AES256-SHA256">
+                <esp>
+                  <encryption>
+                    <member>aes-256-cbc</member>
+                  </encryption>
+                  <authentication>
+                    <member>sha256</member>
+                  </authentication>
+                </esp>
+                <dh-group>group14</dh-group>
+                <lifetime>
+                  <hours>1</hours>
+                </lifetime>
+              </entry>
+            </ipsec-crypto-profiles>
+          </crypto-profiles>
+
+          <gateway>
+            <entry name="GW-Branch-A">
+              <authentication>
+                <pre-shared-key>
+                  <key>$9$secretkeyBranchA</key>
+                </pre-shared-key>
+              </authentication>
+              <protocol>
+                <ikev2>
+                  <ike-crypto-profile>IKEv2-AES256-SHA256-DH14</ike-crypto-profile>
+                </ikev2>
+              </protocol>
+              <local-address>
+                <ip>198.51.100.2</ip>
+                <interface>ethernet1/4</interface>
+              </local-address>
+              <peer-address>
+                <ip>198.51.100.10</ip>
+              </peer-address>
+              <ike-crypto-profile>IKEv2-AES256-SHA256-DH14</ike-crypto-profile>
+            </entry>
+
+            <entry name="GW-Branch-B">
+              <authentication>
+                <pre-shared-key>
+                  <key>$9$secretkeyBranchB</key>
+                </pre-shared-key>
+              </authentication>
+              <protocol>
+                <ikev2>
+                  <ike-crypto-profile>IKEv2-AES256-SHA256-DH14</ike-crypto-profile>
+                </ikev2>
+              </protocol>
+              <local-address>
+                <ip>198.51.100.2</ip>
+                <interface>ethernet1/4</interface>
+              </local-address>
+              <peer-address>
+                <ip>198.51.100.20</ip>
+              </peer-address>
+              <ike-crypto-profile>IKEv2-AES256-SHA256-DH14</ike-crypto-profile>
+            </entry>
+          </gateway>
+        </ike>
+
+        <tunnel>
+          <ipsec>
+            <entry name="IPSEC-Branch-A">
+              <auto-key>
+                <ike-gateway>
+                  <entry name="GW-Branch-A"/>
+                </ike-gateway>
+                <ipsec-crypto-profile>IPSec-AES256-SHA256</ipsec-crypto-profile>
+              </auto-key>
+              <tunnel-interface>tunnel.1</tunnel-interface>
+            </entry>
+
+            <entry name="IPSEC-Branch-B">
+              <auto-key>
+                <ike-gateway>
+                  <entry name="GW-Branch-B"/>
+                </ike-gateway>
+                <ipsec-crypto-profile>IPSec-AES256-SHA256</ipsec-crypto-profile>
+              </auto-key>
+              <tunnel-interface>tunnel.2</tunnel-interface>
+            </entry>
+          </ipsec>
+        </tunnel>
+
+      </network><!-- /network -->
+
+      <!-- ================================================================
+           Virtual Systems (vsys1)
+           ================================================================ -->
+      <vsys>
+        <entry name="vsys1">
+
+          <!-- ============================================================
+               Security Zones
+               ============================================================ -->
+          <zone>
+            <entry name="untrust">
+              <network>
+                <layer3>
+                  <member>ethernet1/1</member>
+                  <member>ethernet1/4</member>
+                </layer3>
+                <zone-protection-profile>Zone-Protect-Strict</zone-protection-profile>
+              </network>
+              <log-setting>default</log-setting>
+            </entry>
+
+            <entry name="trust">
+              <network>
+                <layer3>
+                  <member>ethernet1/3</member>
+                </layer3>
+              </network>
+              <log-setting>default</log-setting>
+            </entry>
+
+            <entry name="dmz">
+              <network>
+                <layer3>
+                  <member>ethernet1/2</member>
+                </layer3>
+                <zone-protection-profile>Zone-Protect-DMZ</zone-protection-profile>
+              </network>
+              <log-setting>default</log-setting>
+            </entry>
+
+            <entry name="vpn-tunnels">
+              <network>
+                <tunnel>
+                  <member>tunnel.1</member>
+                  <member>tunnel.2</member>
+                </tunnel>
+              </network>
+            </entry>
+          </zone>
+
+          <!-- ============================================================
+               Security Policies (Rulebase)
+               ============================================================ -->
+          <rulebase>
+            <security>
+              <rules>
+
+                <!-- Rule 1: Trust → Internet -->
+                <entry name="trust-to-internet">
+                  <from>
+                    <member>trust</member>
+                  </from>
+                  <to>
+                    <member>untrust</member>
+                  </to>
+                  <source>
+                    <member>10.10.0.0/24</member>
+                  </source>
+                  <destination>
+                    <member>any</member>
+                  </destination>
+                  <application>
+                    <member>web-browsing</member>
+                    <member>ssl</member>
+                    <member>dns</member>
+                  </application>
+                  <service>
+                    <member>application-default</member>
+                  </service>
+                  <action>allow</action>
+                  <profile-setting>
+                    <profiles>
+                      <url-filtering>
+                        <member>default</member>
+                      </url-filtering>
+                    </profiles>
+                  </profile-setting>
+                  <log-end>yes</log-end>
+                </entry>
+
+                <!-- Rule 2: DMZ web servers → Internet (updates) -->
+                <entry name="dmz-to-internet-updates">
+                  <from>
+                    <member>dmz</member>
+                  </from>
+                  <to>
+                    <member>untrust</member>
+                  </to>
+                  <source>
+                    <member>172.16.10.0/24</member>
+                  </source>
+                  <destination>
+                    <member>any</member>
+                  </destination>
+                  <application>
+                    <member>apt-get</member>
+                    <member>yum</member>
+                    <member>dns</member>
+                  </application>
+                  <service>
+                    <member>application-default</member>
+                  </service>
+                  <action>allow</action>
+                  <log-end>yes</log-end>
+                </entry>
+
+                <!-- Rule 3: Internet → DMZ HTTPS -->
+                <entry name="internet-to-dmz-https">
+                  <from>
+                    <member>untrust</member>
+                  </from>
+                  <to>
+                    <member>dmz</member>
+                  </to>
+                  <source>
+                    <member>any</member>
+                  </source>
+                  <destination>
+                    <member>172.16.10.10</member>
+                    <member>172.16.10.11</member>
+                  </destination>
+                  <application>
+                    <member>ssl</member>
+                    <member>web-browsing</member>
+                  </application>
+                  <service>
+                    <member>service-https</member>
+                  </service>
+                  <action>allow</action>
+                  <log-start>yes</log-start>
+                  <log-end>yes</log-end>
+                </entry>
+
+                <!-- Rule 4: VPN branches → Trust -->
+                <entry name="vpn-to-trust">
+                  <from>
+                    <member>vpn-tunnels</member>
+                  </from>
+                  <to>
+                    <member>trust</member>
+                  </to>
+                  <source>
+                    <member>172.20.0.0/16</member>
+                  </source>
+                  <destination>
+                    <member>10.10.0.0/24</member>
+                  </destination>
+                  <application>
+                    <member>any</member>
+                  </application>
+                  <service>
+                    <member>any</member>
+                  </service>
+                  <action>allow</action>
+                  <log-end>yes</log-end>
+                </entry>
+
+                <!-- Rule 5: Trust → DMZ (internal access) -->
+                <entry name="trust-to-dmz">
+                  <from>
+                    <member>trust</member>
+                  </from>
+                  <to>
+                    <member>dmz</member>
+                  </to>
+                  <source>
+                    <member>10.10.0.0/24</member>
+                  </source>
+                  <destination>
+                    <member>172.16.10.0/24</member>
+                  </destination>
+                  <application>
+                    <member>ssh</member>
+                    <member>web-browsing</member>
+                    <member>ssl</member>
+                  </application>
+                  <service>
+                    <member>application-default</member>
+                  </service>
+                  <action>allow</action>
+                  <log-end>yes</log-end>
+                </entry>
+
+                <!-- Rule 6: Deny all (catch-all) -->
+                <entry name="deny-all">
+                  <from>
+                    <member>any</member>
+                  </from>
+                  <to>
+                    <member>any</member>
+                  </to>
+                  <source>
+                    <member>any</member>
+                  </source>
+                  <destination>
+                    <member>any</member>
+                  </destination>
+                  <application>
+                    <member>any</member>
+                  </application>
+                  <service>
+                    <member>any</member>
+                  </service>
+                  <action>deny</action>
+                  <log-start>yes</log-start>
+                  <log-end>yes</log-end>
+                </entry>
+
+              </rules>
+            </security>
+
+            <!-- ===========================================================
+                 NAT Policies
+                 =========================================================== -->
+            <nat>
+              <rules>
+
+                <!-- Rule 1: Trust → Internet SNAT (PAT via ethernet1/1) -->
+                <entry name="trust-snat-to-internet">
+                  <from>
+                    <member>trust</member>
+                  </from>
+                  <to>
+                    <member>untrust</member>
+                  </to>
+                  <source>
+                    <member>10.10.0.0/24</member>
+                  </source>
+                  <destination>
+                    <member>any</member>
+                  </destination>
+                  <service>any</service>
+                  <source-translation>
+                    <dynamic-ip-and-port>
+                      <interface-address>
+                        <interface>ethernet1/1</interface>
+                        <ip>203.0.113.2/30</ip>
+                      </interface-address>
+                    </dynamic-ip-and-port>
+                  </source-translation>
+                </entry>
+
+                <!-- Rule 2: Internet → DMZ web server DNAT -->
+                <entry name="dnat-web-server">
+                  <from>
+                    <member>untrust</member>
+                  </from>
+                  <to>
+                    <member>untrust</member>
+                  </to>
+                  <source>
+                    <member>any</member>
+                  </source>
+                  <destination>
+                    <member>203.0.113.2</member>
+                  </destination>
+                  <service>service-https</service>
+                  <destination-translation>
+                    <translated-address>172.16.10.10</translated-address>
+                    <translated-port>443</translated-port>
+                  </destination-translation>
+                </entry>
+
+                <!-- Rule 3: VPN branches → Trust (no NAT) -->
+                <entry name="no-nat-vpn-to-trust">
+                  <from>
+                    <member>vpn-tunnels</member>
+                  </from>
+                  <to>
+                    <member>trust</member>
+                  </to>
+                  <source>
+                    <member>172.20.0.0/16</member>
+                  </source>
+                  <destination>
+                    <member>10.10.0.0/24</member>
+                  </destination>
+                  <service>any</service>
+                  <!-- No translation — pass through -->
+                </entry>
+
+              </rules>
+            </nat>
+
+          </rulebase><!-- /rulebase -->
+
+        </entry><!-- /vsys1 -->
+      </vsys><!-- /vsys -->
+
+    </entry><!-- /devices/entry -->
+  </devices>
+</config>

@@ -54,6 +54,7 @@ NODE_STYLE: dict[str, dict[str, str]] = {
     # ── Security ─────────────────────────────────────────────────────────────
     "crypto":         {"shape": "round-rectangle", "color": "#ef4444", "fill": "#fef2f2", "group": "security"},
     "nat":            {"shape": "round-rectangle", "color": "#ef4444", "fill": "#fef2f2", "group": "security"},
+    "zone":           {"shape": "round-rectangle", "color": "#ef4444", "fill": "#fef2f2", "group": "security"},
     # ── Ghost (missing/dangling) ─────────────────────────────────────────────
     "missing":        {"shape": "round-rectangle", "color": "#94a3b8", "fill": "#f8fafc", "group": "missing"},
 }
@@ -91,6 +92,7 @@ NODE_LABEL_PREFIX: dict[str, str] = {
     "object_track":   "track",
     "eem_applet":     "eem",
     "missing":        "?",
+    "zone":           "zone",
 }
 
 
@@ -305,3 +307,11 @@ class GraphBuilder:
             _add("object_track", str(track.track_id), {"track_type": track.track_type}, obj=track)
         for applet in p.eem_applets:
             _add("eem_applet", applet.name, obj=applet)
+
+        # PAN-OS security zones
+        for zone in p.zones:
+            _add("zone", zone.name, {
+                "vsys": zone.vsys,
+                "zone_type": zone.zone_type,
+                "interfaces": ",".join(zone.interfaces),
+            }, obj=zone)

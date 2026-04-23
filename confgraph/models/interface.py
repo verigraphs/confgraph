@@ -272,6 +272,10 @@ class InterfaceConfig(BaseConfigObject):
     # Crypto
     crypto_map: str | None = Field(default=None, description="Crypto map applied to this interface")
 
+    # PAN-OS specific
+    zone: str | None = Field(default=None, description="PAN-OS security zone this interface belongs to")
+    virtual_router: str | None = Field(default=None, description="PAN-OS virtual router this interface is assigned to")
+
     class Config:
         """Pydantic model configuration."""
         use_enum_values = True

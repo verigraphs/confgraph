@@ -132,6 +132,7 @@ class DependencyResolver:
         links.extend(self._resolve_ipsla())
         links.extend(self._resolve_object_tracking())
         links.extend(self._resolve_multicast())
+        links.extend(self._resolve_zones())
 
         orphaned = self._find_orphans()
         return DependencyReport(links=links, orphaned=orphaned)
@@ -658,4 +659,16 @@ class DependencyResolver:
                 ))
         if mc.vrf:
             links.append(self._link("multicast", "multicast", "vrf", "vrf", mc.vrf))
+        return links
+
+    # ------------------------------------------------------------------
+    # PAN-OS Zones
+    # ------------------------------------------------------------------
+
+    def _resolve_zones(self) -> list[DependencyLink]:
+        """Emit zone → interface edges for PAN-OS zone configurations."""
+        links: list[DependencyLink] = []
+        for zone in self._config.zones:
+            for iface_name in zone.interfaces:
+                links.append(self._link("zone", zone.name, "interface", "interface", iface_name))
         return links

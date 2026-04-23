@@ -27,6 +27,7 @@ from confgraph.models.ipsla import IPSLAOperation
 from confgraph.models.eem import EEMApplet
 from confgraph.models.object_tracking import ObjectTrack
 from confgraph.models.multicast import MulticastConfig
+from confgraph.models.panos_zone import PANOSZoneConfig
 
 
 class ParsedConfig(BaseModel):
@@ -152,6 +153,10 @@ class ParsedConfig(BaseModel):
     multicast: MulticastConfig | None = Field(
         default=None,
         description="IP multicast configuration",
+    )
+    zones: list[PANOSZoneConfig] = Field(
+        default_factory=list,
+        description="PAN-OS security zone configurations",
     )
     raw_config: str = Field(
         default="",

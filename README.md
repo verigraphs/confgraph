@@ -44,6 +44,7 @@ Troubleshooting a BGP flap? The BGP cluster automatically pulls in related route
 | Cisco NX-OS | `NXOSParser` |
 | Arista EOS | `EOSParser` |
 | Juniper JunOS | `JunOSParser` |
+| Palo Alto PAN-OS | `PANOSParser` |
 
 ## Try it instantly
 
@@ -58,6 +59,7 @@ Pre-generated maps for all supported platforms — open any in your browser, no 
 | Arista EOS | [samples/eos.txt](samples/eos.txt) | [Live demo](https://verigraphs.github.io/confgraph/samples/eos.html) |
 | Juniper JunOS | [samples/junos_test.cfg](samples/junos_test.cfg) | [Live demo](https://verigraphs.github.io/confgraph/samples/junos_test.html) |
 | Cisco IOS (full) | [samples/ios01.txt](samples/ios01.txt) | [Live demo](https://verigraphs.github.io/confgraph/samples/ios01.html) |
+| Palo Alto PAN-OS | [samples/panos_sample.xml](samples/panos_sample.xml) | [Live demo](https://verigraphs.github.io/confgraph/samples/panos_sample.html) |
 
 ## Install
 
@@ -75,7 +77,7 @@ uvx confgraph map router.txt
 
 ## Protocols parsed
 
-**BGP** · **OSPF** · **ACLs** · **NAT** · VRF · IS-IS · EIGRP · RIP · Route-maps · Prefix-lists · Community lists · AS-path lists · Static routes · NTP · SNMP · Syslog · Banners · QoS · Crypto/IPsec · BFD · IP SLA · EEM · Object tracking · Multicast
+**BGP** · **OSPF** · **ACLs** · **NAT** · **Crypto/IPsec** · VRF · IS-IS · EIGRP · RIP · Route-maps · Prefix-lists · Community lists · AS-path lists · Static routes · NTP · SNMP · Syslog · Banners · QoS · BFD · IP SLA · EEM · Object tracking · Multicast · Security zones (PAN-OS)
 
 ## Use as a library
 

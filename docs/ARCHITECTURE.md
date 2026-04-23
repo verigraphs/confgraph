@@ -2,218 +2,210 @@
 
 ## Overview
 
-`confgraph` is a Python library that parses vendor network device CLI configurations (plain text) into typed, validated Pydantic data models.
+confgraph parses vendor network device configurations into typed Pydantic models, resolves cross-references between protocol objects, builds a directed dependency graph, and exports a self-contained interactive HTML file.
 
 ---
 
 ## High-Level Flow
 
+```text
+Config file (text / XML)
+        │
+        ▼
+   OS Parser                  IOSParser / EOSParser / IOSXRParser /
+   (BaseParser subclass)      NXOSParser / JunOSParser / PANOSParser
+        │
+        │  parse_vrfs(), parse_interfaces(), parse_bgp(), ...
+        ▼
+   ParsedConfig               Pydantic container: all protocol objects
+        │
+        ├──► DependencyResolver   resolves string cross-refs → DependencyReport
+        │                         (dangling refs, orphaned objects, edge list)
+        │
+        ├──► GraphBuilder         ParsedConfig + DependencyReport → nx.DiGraph
+        │
+        └──► Exporter
+               ├── HTMLExporter   self-contained interactive HTML (Cytoscape.js)
+               └── JSONExporter   graph as JSON
 ```
-Raw CLI Text (show running-config)
-            │
-            ▼
-    ┌───────────────┐
-    │  OS Parser    │  IOSParser / EOSParser
-    │               │
-    │  1. Segments config via ciscoconfparse2
-    │  2. Calls parse_*() per protocol      │
-    │  3. Captures unrecognized blocks      │
-    └───────┬───────┘
-            │
-            ▼
-    ┌───────────────────────────────────────┐
-    │           ParsedConfig                │
-    │  (top-level container, Pydantic)      │
-    │                                       │
-    │  vrfs, interfaces, bgp_instances,     │
-    │  ospf_instances, isis_instances,      │
-    │  route_maps, prefix_lists,            │
-    │  static_routes, acls,                 │
-    │  community_lists, as_path_lists,      │
-    │  unrecognized_blocks                  │
-    └───────────────────────────────────────┘
-```
+
+---
+
+## Parser Patterns
+
+There are three parsing approaches, chosen by config format:
+
+| Pattern | Used by | Underlying engine |
+| --- | --- | --- |
+| IOS-style (extend `IOSParser`) | EOS, NX-OS | `CiscoConfParse` |
+| Custom tokenizer (extend `BaseParser`) | JunOS | `junos_hierarchy.parse_junos_config()` |
+| XML (extend `BaseParser`) | PAN-OS | `xml.etree.ElementTree` via `panos_xml` |
 
 ---
 
 ## Class Hierarchy
 
-```
+```text
 BaseParser  (abc)
-    │   _KNOWN_TOP_LEVEL_PATTERNS  ← class-level, overrideable
-    │   _BEST_GUESS_KEYWORDS       ← class-level, overrideable
-    │   _collect_unrecognized_blocks()
-    │   parse()  → ParsedConfig
-    │
-    ├── IOSParser
-    │       parse_vrfs()           → list[VRFConfig]
-    │       parse_interfaces()     → list[InterfaceConfig]
-    │       parse_bgp()            → list[BGPConfig]
-    │       parse_ospf()           → list[OSPFConfig]
-    │       parse_route_maps()     → list[RouteMapConfig]
-    │       parse_prefix_lists()   → list[PrefixListConfig]
-    │       parse_static_routes()  → list[StaticRoute]
-    │       parse_acls()           → list[ACLConfig]
-    │       parse_community_lists()→ list[CommunityListConfig]
-    │       parse_as_path_lists()  → list[ASPathListConfig]
-    │       parse_isis()           → list[ISISConfig]
-    │
-    └── EOSParser  (extends IOSParser)
-            Overrides _KNOWN_TOP_LEVEL_PATTERNS
-                - swaps "vrf definition" → "vrf instance"
-                - adds EOS: management api, daemon, event-handler, policy-map
-            Overrides _BEST_GUESS_KEYWORDS (adds EOS-specific labels)
-            Overrides parse_vrfs()           EOS: "vrf instance NAME"
-            Overrides parse_prefix_lists()   EOS: CIDR notation
-            Overrides parse_static_routes()  EOS: CIDR notation
-            Overrides parse_acls()           EOS: ACL syntax differences
-            Overrides parse_community_lists()
-            Overrides parse_as_path_lists()
-            Overrides parse_isis()
-            Overrides parse_bgp()            EOS: "peer group" (space, not hyphen)
+│   _KNOWN_TOP_LEVEL_PATTERNS  ← class-level, overrideable
+│   _BEST_GUESS_KEYWORDS       ← class-level, overrideable
+│   _PARSE_STEPS               ← ordered list of (field, method) pairs
+│   _collect_unrecognized_blocks()
+│   parse()  → ParsedConfig
+│
+├── IOSParser                  CiscoConfParse, IOS/IOS-XE syntax
+│     parse_vrfs()  parse_interfaces()  parse_bgp()  parse_ospf()
+│     parse_isis()  parse_eigrp()  parse_rip()  parse_route_maps()
+│     parse_prefix_lists()  parse_static_routes()  parse_acls()
+│     parse_community_lists()  parse_as_path_lists()
+│     parse_ntp()  parse_snmp()  parse_syslog()  parse_banners()
+│     parse_lines()  parse_class_maps()  parse_policy_maps()
+│     parse_nat()  parse_crypto()  parse_bfd()  parse_ip_sla()
+│     parse_eem()  parse_object_tracks()  parse_multicast()
+│
+│   ├── EOSParser              Extends IOSParser — overrides EOS syntax differences
+│   │     Overrides: parse_vrfs, parse_prefix_lists, parse_static_routes,
+│   │                parse_acls, parse_community_lists, parse_as_path_lists,
+│   │                parse_bgp, parse_isis
+│   │
+│   ├── NXOSParser             Extends IOSParser — NX-OS feature/vrf syntax
+│   │
+│   └── IOSXRParser            Extends IOSParser — IOS-XR hierarchical syntax,
+│                              route-policies, prefix-sets, neighbor-groups
+│
+├── JunOSParser                Custom tokenizer, no CiscoConfParse
+│     _extract_hostname()      system { host-name X; }
+│     _collect_unrecognized_blocks() → []
+│     All parse_*() navigate nested dict from junos_hierarchy tokenizer
+│
+└── PANOSParser                XML, no CiscoConfParse
+      _extract_hostname()      <deviceconfig><system><hostname>
+      _collect_unrecognized_blocks() → []
+      All parse_*() navigate ElementTree via panos_xml helpers
 ```
 
 ---
 
 ## Data Models
 
-```
+```text
 confgraph/models/
 │
 ├── base.py
-│     OSType            enum: IOS | IOS_XE | IOS_XR | NXOS | EOS
-│     BaseConfigObject  base Pydantic class (object_id, raw_lines, source_os, line_numbers)
+│     OSType            IOS | IOS_XE | IOS_XR | NXOS | EOS | JUNOS | PANOS
+│     BaseConfigObject  object_id, raw_lines, source_os, line_numbers
 │     UnrecognizedBlock block_header, raw_lines, best_guess
 │
 ├── parsed_config.py
-│     ParsedConfig      top-level container — holds all protocol lists + unrecognized_blocks
+│     ParsedConfig      top-level container — all protocol lists
 │
-├── bgp.py
-│     BGPNeighborBase   shared neighbor fields (remote_as, route_map_in/out, timers, ...)
-│     BGPNeighbor       per-neighbor config (extends BGPNeighborBase)
-│     BGPPeerGroup      peer-group config (extends BGPNeighborBase)
-│     BGPAddressFamily  address-family config
-│     BGPConfig         top-level BGP instance (asn, router_id, neighbors, peer_groups, ...)
+├── interface.py        InterfaceConfig (L2, L3, OSPF, FHRP, tunnel, QoS, NAT,
+│                       crypto, PIM, IGMP, CDP/LLDP, zone, virtual_router)
 │
-├── ospf.py
-│     OSPFArea          area config (area_id, networks, virtual_links, ...)
-│     OSPFRedistribute  redistribution config
-│     OSPFConfig        top-level OSPF instance (process_id, vrf, areas, ...)
-│
-├── isis.py
-│     ISISInterface     per-interface IS-IS config
-│     ISISRedistribute  redistribution config
-│     ISISConfig        top-level IS-IS instance
-│
-├── interface.py
-│     InterfaceType     enum: PHYSICAL | LOOPBACK | SVI | PORTCHANNEL | TUNNEL | MANAGEMENT | VLAN | NULL
-│     HSRPGroup         HSRP group (priority, virtual_ip, timers, track_objects)
-│     VRRPGroup         VRRP group (priority, virtual_ip, timers)
-│     InterfaceConfig   full interface model (L2, L3, OSPF embedded, FHRP, tunnel, CDP/LLDP)
-│
-├── vrf.py
-│     VRFConfig         name, rd, route_targets, description
-│
-├── route_map.py
-│     RouteMapEntry     sequence, action, match/set clauses
-│     RouteMapConfig    name + list[RouteMapEntry]
-│
-├── prefix_list.py
-│     PrefixListEntry   sequence, action, prefix (IPv4Network | IPv6Network), le/ge
-│     PrefixListConfig  name + list[PrefixListEntry]
-│
-├── acl.py
-│     ACLEntry          sequence, action, protocol, src/dst, ports
-│     ACLConfig         name, acl_type + list[ACLEntry]
-│
-├── static_route.py
-│     StaticRoute       prefix, next_hop, vrf, distance, tag, name
-│
-└── community_list.py
-      CommunityListEntry  sequence, action, communities
-      CommunityListConfig name + list[CommunityListEntry]
-      ASPathListEntry     sequence, action, regex
-      ASPathListConfig    name + list[ASPathListEntry]
+├── vrf.py              VRFConfig (name, rd, route-targets)
+├── bgp.py              BGPConfig, BGPNeighbor, BGPPeerGroup, BGPAddressFamily
+├── ospf.py             OSPFConfig, OSPFArea, OSPFRedistribute
+├── isis.py             ISISConfig
+├── eigrp.py            EIGRPConfig
+├── rip.py              RIPConfig
+├── route_map.py        RouteMapConfig, RouteMapSequence, RouteMapMatch, RouteMapSet
+├── prefix_list.py      PrefixListConfig, PrefixListEntry
+├── acl.py              ACLConfig, ACLEntry
+├── static_route.py     StaticRoute
+├── community_list.py   CommunityListConfig, ASPathListConfig
+├── nat.py              NATConfig, NATStaticEntry, NATDynamicEntry, NATPool
+├── crypto.py           CryptoConfig, IKEv1Policy, IKEv2Proposal, IPSecTransformSet, CryptoMap
+├── qos.py              ClassMapConfig, PolicyMapConfig
+├── ntp.py              NTPConfig, NTPServer
+├── snmp.py             SNMPConfig, SNMPCommunity
+├── logging_config.py   SyslogConfig, LoggingHost
+├── banner.py           BannerConfig
+├── line.py             LineConfig
+├── bfd.py              BFDConfig
+├── ipsla.py            IPSLAOperation
+├── eem.py              EEMApplet
+├── object_tracking.py  ObjectTrack
+├── multicast.py        MulticastConfig
+└── panos_zone.py       PANOSZoneConfig  (PAN-OS only)
 ```
 
 ---
 
-## Unrecognized Block Capture
+## Dependency Resolution
 
-Any top-level config block not matched by a `parse_*` method is preserved in `ParsedConfig.unrecognized_blocks` instead of being silently dropped.
-
-```
-Config text
-    │
-    ├── router bgp 65000   ← claimed by parse_bgp()
-    ├── interface Eth1     ← claimed by parse_interfaces()
-    ├── ntp server 1.1.1.1 ← NOT claimed → UnrecognizedBlock(best_guess="ntp")
-    ├── aaa new-model      ← NOT claimed → UnrecognizedBlock(best_guess="aaa")
-    └── snmp-server ...    ← NOT claimed → UnrecognizedBlock(best_guess="snmp")
-```
-
-**Pattern matching is OS-aware:**
-
-| Parser | `vrf` pattern |
-|---|---|
-| `IOSParser` | `^vrf definition` |
-| `EOSParser` | `^vrf instance` (overrides base) |
-
-Subclasses extend or replace `_KNOWN_TOP_LEVEL_PATTERNS` and `_BEST_GUESS_KEYWORDS` at the class level — no runtime cost.
-
----
-
-## Cross-References (current state)
-
-Protocol objects reference each other by **name strings only** — links are not resolved into object pointers.
-
-```
-BGPNeighbor.route_map_in  = "RM-PEER-IN"   ← string, not RouteMapConfig
-BGPNeighbor.prefix_list_in = "PL-ALLOWED"  ← string, not PrefixListConfig
-InterfaceConfig.vrf        = "MGMT"         ← string, not VRFConfig
-BGPConfig.vrf              = "MGMT"         ← string, not VRFConfig
-```
-
-`ParsedConfig` provides lookup helpers:
+`DependencyResolver` walks every parsed object and emits `DependencyLink` records for every string cross-reference (e.g., `BGPNeighbor.route_map_in = "RM-IN"`). It tracks which named objects are referenced to identify orphans.
 
 ```python
-parsed.get_route_map_by_name("RM-PEER-IN")    → RouteMapConfig | None
-parsed.get_prefix_list_by_name("PL-ALLOWED")  → PrefixListConfig | None
-parsed.get_vrf_by_name("MGMT")                → VRFConfig | None
-parsed.get_interface_by_name("Ethernet1")     → InterfaceConfig | None
-parsed.get_bgp_by_asn(65000)                  → BGPConfig | None
-parsed.get_ospf_by_process_id(1)              → OSPFConfig | None
+report = DependencyResolver(parsed).resolve()
+report.links          # all edges (resolved + dangling)
+report.dangling_refs  # references with no matching target
+report.orphaned       # defined objects never referenced by anything
 ```
 
-Full dependency resolution (resolving strings → objects, detecting dangling refs) is not yet implemented.
+All references remain strings in the data models — resolution happens exclusively in `DependencyResolver`, keeping models simple.
+
+---
+
+## Graph Builder
+
+`GraphBuilder` converts `ParsedConfig` + `DependencyReport` into a `networkx.DiGraph`.
+
+- **Nodes** — one per parsed object; attributes include `type`, `label`, `color`, `fill`, `status` (`ok` / `orphan` / `missing`), `raw_config`
+- **Edges** — one per `DependencyLink`; ghost nodes are added for dangling targets
+- **Node styles** — defined in `NODE_STYLE` dict in `builder.py` (shape, color, fill, group); shared by all exporters
+
+Node groups: `infrastructure` · `routing` · `policy` · `qos` · `management` · `security` · `missing`
+
+---
+
+## HTML Exporter
+
+The HTML exporter (`confgraph/graph/exporters/html.py`) renders the graph client-side using **Cytoscape.js** embedded in a single self-contained HTML file with no external dependencies.
+
+Key frontend features:
+
+- **Protocol clusters** — sidebar toggles that highlight all nodes reachable from a protocol root (BGP, OSPF, NAT, Crypto/VPN, Zones, etc.) via BFS; interface nodes are traversal stops, not transit points
+- **Node isolation** — clicking a node dims everything not directly connected
+- **Raw config panel** — sidebar shows original config lines for the selected node
+- **Layout options** — Dagre (hierarchical), Cose-Bilkent (force-directed), Breadthfirst, Concentric
+- **Collapsible/resizable sidebar** — drag handle + collapse toggle
 
 ---
 
 ## Directory Structure
 
-```
+```text
 confgraph/
 ├── confgraph/
-│   ├── models/
-│   │   ├── base.py           OSType, BaseConfigObject, UnrecognizedBlock
-│   │   ├── parsed_config.py  ParsedConfig (top-level container)
-│   │   ├── bgp.py
-│   │   ├── ospf.py
-│   │   ├── isis.py
-│   │   ├── interface.py
-│   │   ├── vrf.py
-│   │   ├── route_map.py
-│   │   ├── prefix_list.py
-│   │   ├── acl.py
-│   │   ├── static_route.py
-│   │   └── community_list.py
-│   └── parsers/
-│       ├── base.py           BaseParser (abstract)
-│       ├── ios_parser.py     IOSParser  (2,244 lines)
-│       └── eos_parser.py     EOSParser  (inherits IOSParser, ~841 lines)
-└── docs/
-    ├── ARCHITECTURE.md       (this file)
-    ├── PARSER_SUPPORT_MATRIX.md
-    ├── IOS_PARSER_SUPPORT.md
-    └── EOS_PARSER_SUPPORT.md
+│   ├── models/              Pydantic data models (one file per protocol)
+│   ├── parsers/
+│   │   ├── base.py          BaseParser (abstract), ParseError
+│   │   ├── ios_parser.py    IOSParser  (~4,200 lines)
+│   │   ├── eos_parser.py    EOSParser  (~900 lines, extends IOSParser)
+│   │   ├── nxos_parser.py   NXOSParser (~560 lines, extends IOSParser)
+│   │   ├── iosxr_parser.py  IOSXRParser (~1,240 lines, extends IOSParser)
+│   │   ├── junos_parser.py  JunOSParser (~1,190 lines, custom tokenizer)
+│   │   ├── junos_hierarchy.py  JunOS brace-style tokenizer
+│   │   ├── panos_parser.py  PANOSParser (~680 lines, XML)
+│   │   └── panos_xml.py     PAN-OS XML navigation helpers
+│   ├── graph/
+│   │   ├── builder.py       GraphBuilder → nx.DiGraph
+│   │   └── exporters/
+│   │       ├── html.py      HTMLExporter (Cytoscape.js)
+│   │       └── json.py      JSONExporter
+│   ├── analysis/
+│   │   └── dependency_resolver.py  DependencyResolver → DependencyReport
+│   └── cli.py               Click CLI (map + info commands)
+├── samples/                 Sample configs + pre-generated HTML per OS
+└── docs/                    Architecture, parser support docs, CLI usage
 ```
+
+---
+
+## Adding a New Parser
+
+See [ADDING_NEW_OS_SUPPORT.md](ADDING_NEW_OS_SUPPORT.md) for a step-by-step guide and file checklist.
+
+---
+
+**Last Updated:** 2026-04-22

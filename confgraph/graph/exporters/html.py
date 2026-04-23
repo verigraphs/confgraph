@@ -736,7 +736,7 @@ body {{
   // These are "anchor" objects that other config objects reference into.
   const LARGE_TYPES = new Set([
     'bgp_instance', 'ospf_instance', 'eigrp_instance', 'rip_instance', 'isis_instance',
-    'policy_map', 'snmp', 'ntp', 'syslog', 'crypto', 'nat', 'multicast',
+    'policy_map', 'snmp', 'ntp', 'syslog', 'crypto', 'nat', 'multicast', 'zone',
   ]);
   cy.nodes().forEach(function(n) {{
     if (n.data('status') === 'missing') return;
@@ -779,6 +779,7 @@ body {{
     {{ id: 'crypto',    label: 'Crypto / VPN', rootType: 'crypto',    color: '#991B1B' }},
     {{ id: 'multicast', label: 'Multicast',    rootType: 'multicast', color: '#6d28d9' }},
     {{ id: 'qos',       label: 'QoS',          rootType: 'policy_map', color: '#134E4A' }},
+    {{ id: 'zones',     label: 'Zones',         rootType: 'zone',       color: '#7C2D12' }},
   ];
 
   // Build cluster node-id sets via BFS from all root nodes of each type.
@@ -1184,7 +1185,7 @@ body {{
       // Routing/protocol nodes as roots so they appear at the top
       roots: cy.nodes().filter(n => ['bgp_instance','ospf_instance','eigrp_instance',
         'rip_instance','isis_instance','policy_map','snmp','ntp','syslog',
-        'crypto','nat','multicast'].includes(n.data('type'))),
+        'crypto','nat','multicast','zone'].includes(n.data('type'))),
     }},
     'concentric-group': {{
       name: 'concentric', animate: true, animationDuration: 500,
@@ -1194,7 +1195,7 @@ body {{
         const t = n.data('type');
         if (['bgp_instance','ospf_instance','eigrp_instance','rip_instance',
              'isis_instance','policy_map','snmp','ntp','syslog','crypto',
-             'nat','multicast'].includes(t)) return 4;
+             'nat','multicast','zone'].includes(t)) return 4;
         if (['route_map','prefix_list','acl','community_list','as_path_list',
              'class_map'].includes(t)) return 3;
         if (['interface','vrf','static_route'].includes(t)) return 2;

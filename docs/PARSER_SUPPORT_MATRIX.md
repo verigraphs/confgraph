@@ -18,6 +18,7 @@ This document provides a comprehensive overview of parser support across all net
 | **Cisco IOS-XR** | ✅ **Complete** | IOS-XR 6.x, 7.x | ✅ `samples/iosxr_test.cfg` | ✅ [IOSXR_PARSER_SUPPORT.md](IOSXR_PARSER_SUPPORT.md) | ⚠️ Medium |
 | **Cisco NX-OS** | ✅ **Complete** | NX-OS 9.x | ✅ `samples/nxos.txt` | ⚠️ See matrix | ⚠️ Medium |
 | **Juniper JunOS** | ✅ **Complete** | JunOS 20.x, 21.x, 22.x | ✅ `samples/junos_test.cfg` | ✅ [JUNOS_PARSER_SUPPORT.md](JUNOS_PARSER_SUPPORT.md) | ⚠️ Medium |
+| **Palo Alto PAN-OS** | ✅ **Complete** | PAN-OS 9.x, 10.x | ✅ `samples/panos_sample.xml` | ✅ [PANOS_PARSER_SUPPORT.md](PANOS_PARSER_SUPPORT.md) | ⚠️ Medium |
 
 **Legend:**
 - ✅ Complete/Available
