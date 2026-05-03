@@ -34,6 +34,9 @@ Repository = "https://github.com/verigraphs/confgraph"
 [project.scripts]
 confgraph = "confgraph.cli:main"
 
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
 [tool.setuptools.packages.find]
 include = ["confgraph*"]
 

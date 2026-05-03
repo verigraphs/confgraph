@@ -6,6 +6,7 @@ from ipaddress import IPv4Address, IPv4Interface, IPv4Network, IPv6Address, IPv6
 from confgraph.parsers.ios_parser import IOSParser
 from confgraph.parsers.base import _BASE_KNOWN_PATTERNS, _BASE_BEST_GUESS_KEYWORDS
 from confgraph.models.base import OSType
+from confgraph.models.bgp import BGPAddressFamily
 from confgraph.models.vrf import VRFConfig
 from confgraph.models.prefix_list import PrefixListConfig, PrefixListEntry
 from confgraph.models.static_route import StaticRoute
@@ -710,6 +711,55 @@ class EOSParser(IOSParser):
             )
 
         return as_path_lists
+
+    def _parse_bgp_address_families(self, bgp_obj) -> list[BGPAddressFamily]:
+        """Parse BGP address-families for EOS.
+
+        EOS places ``maximum-paths`` at the global ``router bgp`` level rather
+        than inside individual ``address-family`` blocks.  The parent method
+        handles AF-level networks/redistribute/aggregate; this override reads
+        global max-paths and stamps them onto every AF that doesn't have its
+        own value.  When no AFs are configured but global max-paths are set,
+        a synthetic ipv4 unicast AF is created to carry them.
+        """
+        address_families = super()._parse_bgp_address_families(bgp_obj)
+
+        # EOS: maximum-paths N  (global, eBGP)
+        global_mp: int | None = None
+        mp_ch = bgp_obj.re_search_children(r"^\s+maximum-paths\s+(?!ibgp)(\d+)")
+        if mp_ch:
+            v = self._extract_match(mp_ch[0].text, r"^\s+maximum-paths\s+(\d+)")
+            if v:
+                global_mp = int(v)
+
+        # EOS: maximum-paths ibgp N  (global)
+        global_mp_ibgp: int | None = None
+        mp_ibgp_ch = bgp_obj.re_search_children(r"^\s+maximum-paths\s+ibgp\s+(\d+)")
+        if mp_ibgp_ch:
+            v = self._extract_match(mp_ibgp_ch[0].text, r"^\s+maximum-paths\s+ibgp\s+(\d+)")
+            if v:
+                global_mp_ibgp = int(v)
+
+        if global_mp is None and global_mp_ibgp is None:
+            return address_families
+
+        if address_families:
+            for af in address_families:
+                if af.maximum_paths is None and global_mp is not None:
+                    af.maximum_paths = global_mp
+                if af.maximum_paths_ibgp is None and global_mp_ibgp is not None:
+                    af.maximum_paths_ibgp = global_mp_ibgp
+        else:
+            # No AF blocks configured — synthesize ipv4 unicast to carry max-paths
+            address_families.append(BGPAddressFamily(
+                afi="ipv4",
+                safi="unicast",
+                vrf=None,
+                maximum_paths=global_mp,
+                maximum_paths_ibgp=global_mp_ibgp,
+            ))
+
+        return address_families
 
     def parse_isis(self) -> list[ISISConfig]:
         """Parse IS-IS configurations for EOS.

@@ -1324,6 +1324,7 @@ class IOSParser(BaseParser):
                     "prefix_list_in": None,
                     "prefix_list_out": None,
                     "maximum_prefix": None,
+                    "route_reflector_client": False,
                 }
 
             # Parse commands
@@ -1360,6 +1361,8 @@ class IOSParser(BaseParser):
                 parts = command.replace("maximum-prefix ", "").split()
                 if parts:
                     neighbor_dict[peer_ip_str]["maximum_prefix"] = int(parts[0])
+            elif command == "route-reflector-client":
+                neighbor_dict[peer_ip_str]["route_reflector_client"] = True
 
         # Create BGPNeighbor objects
         for peer_ip_str, neighbor_data in neighbor_dict.items():
@@ -1393,6 +1396,7 @@ class IOSParser(BaseParser):
                     prefix_list_in=neighbor_data["prefix_list_in"],
                     prefix_list_out=neighbor_data["prefix_list_out"],
                     maximum_prefix=neighbor_data["maximum_prefix"],
+                    route_reflector_client=neighbor_data["route_reflector_client"],
                 )
             )
 
@@ -1672,6 +1676,21 @@ class IOSParser(BaseParser):
                     except ValueError:
                         pass
 
+            # Parse maximum-paths (eBGP) and maximum-paths ibgp
+            maximum_paths = None
+            mp_children = af_child.re_search_children(r"^\s+maximum-paths\s+(?!ibgp)(\d+)")
+            if mp_children:
+                v = self._extract_match(mp_children[0].text, r"^\s+maximum-paths\s+(\d+)")
+                if v:
+                    maximum_paths = int(v)
+
+            maximum_paths_ibgp = None
+            mp_ibgp_children = af_child.re_search_children(r"^\s+maximum-paths\s+ibgp\s+(\d+)")
+            if mp_ibgp_children:
+                v = self._extract_match(mp_ibgp_children[0].text, r"^\s+maximum-paths\s+ibgp\s+(\d+)")
+                if v:
+                    maximum_paths_ibgp = int(v)
+
             address_families.append(
                 BGPAddressFamily(
                     afi=afi,
@@ -1680,6 +1699,8 @@ class IOSParser(BaseParser):
                     networks=networks,
                     redistribute=redistribute,
                     aggregate_addresses=aggregates,
+                    maximum_paths=maximum_paths,
+                    maximum_paths_ibgp=maximum_paths_ibgp,
                 )
             )
 

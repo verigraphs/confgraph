@@ -6,6 +6,7 @@ from ipaddress import IPv4Address, IPv4Interface, IPv4Network, IPv6Address, IPv6
 from confgraph.models.base import OSType
 from confgraph.models.vrf import VRFConfig
 from confgraph.models.bgp import (
+    BGPAddressFamily,
     BGPConfig,
     BGPNeighbor,
     BGPNeighborAF,
@@ -402,6 +403,56 @@ class IOSXRParser(IOSParser):
             )
 
         return vrf_instances
+
+    # -----------------------------------------------------------------------
+    # BGP address-families — "address-family ipv4 unicast" + "maximum-paths ebgp N"
+    # -----------------------------------------------------------------------
+
+    def _parse_bgp_address_families(self, bgp_obj) -> list[BGPAddressFamily]:
+        """Parse BGP address-families for IOS-XR.
+
+        IOS-XR differences from IOS:
+        - AF header: ``address-family ipv4 unicast`` (requires ``unicast`` keyword)
+        - max-paths eBGP: ``maximum-paths ebgp N`` (not plain ``maximum-paths N``)
+        - max-paths iBGP: ``maximum-paths ibgp N`` (same as IOS)
+        """
+        address_families: list[BGPAddressFamily] = []
+
+        af_children = bgp_obj.re_search_children(
+            r"^\s+address-family\s+(ipv4|ipv6)\s+unicast"
+        )
+        for af_child in af_children:
+            m = re.search(r"^\s+address-family\s+(ipv4|ipv6)\s+unicast", af_child.text)
+            if not m:
+                continue
+
+            afi = m.group(1)
+
+            # IOS-XR: maximum-paths ebgp N
+            maximum_paths: int | None = None
+            mp_ch = af_child.re_search_children(r"^\s+maximum-paths\s+ebgp\s+(\d+)")
+            if mp_ch:
+                v = self._extract_match(mp_ch[0].text, r"^\s+maximum-paths\s+ebgp\s+(\d+)")
+                if v:
+                    maximum_paths = int(v)
+
+            # IOS-XR: maximum-paths ibgp N
+            maximum_paths_ibgp: int | None = None
+            mp_ibgp_ch = af_child.re_search_children(r"^\s+maximum-paths\s+ibgp\s+(\d+)")
+            if mp_ibgp_ch:
+                v = self._extract_match(mp_ibgp_ch[0].text, r"^\s+maximum-paths\s+ibgp\s+(\d+)")
+                if v:
+                    maximum_paths_ibgp = int(v)
+
+            address_families.append(BGPAddressFamily(
+                afi=afi,
+                safi="unicast",
+                vrf=None,
+                maximum_paths=maximum_paths,
+                maximum_paths_ibgp=maximum_paths_ibgp,
+            ))
+
+        return address_families
 
     # -----------------------------------------------------------------------
     # OSPF — interfaces nested under area blocks

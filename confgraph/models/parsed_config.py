@@ -199,6 +199,20 @@ class ParsedConfig(BaseModel):
                 return prefix_list
         return None
 
+    def get_community_list_by_name(self, name: str) -> CommunityListConfig | None:
+        """Get community-list by name."""
+        for cl in self.community_lists:
+            if cl.name == name:
+                return cl
+        return None
+
+    def get_as_path_list_by_name(self, name: str) -> ASPathListConfig | None:
+        """Get AS-path access-list by name."""
+        for apl in self.as_path_lists:
+            if apl.name == name:
+                return apl
+        return None
+
     def get_bgp_by_asn(self, asn: int, vrf: str | None = None) -> BGPConfig | None:
         """Get BGP instance by ASN and VRF."""
         for bgp in self.bgp_instances:

@@ -850,6 +850,26 @@ class JunOSParser(BaseParser):
             except ValueError:
                 pass
 
+        # JunOS ECMP: "multipath;" at global BGP or group level
+        # No explicit path count — JunOS default is 16; use 64 as a
+        # high-water mark indicating "multipath enabled".
+        multipath_enabled = (
+            "multipath" in bgp_data
+            or any(
+                "multipath" in grp_data
+                for grp_data in groups.values()
+                if isinstance(grp_data, dict)
+            )
+        )
+        address_families: list[BGPAddressFamily] = []
+        if multipath_enabled:
+            address_families.append(BGPAddressFamily(
+                afi="ipv4",
+                safi="unicast",
+                vrf=None,
+                maximum_paths=64,
+            ))
+
         if vrf:
             _bgp_raw = self._raw_lines_for("routing-instances", vrf, "protocols", "bgp")
         else:
@@ -864,6 +884,7 @@ class JunOSParser(BaseParser):
             vrf=vrf,
             neighbors=neighbors,
             peer_groups=peer_groups,
+            address_families=address_families,
         )
 
     # ------------------------------------------------------------------

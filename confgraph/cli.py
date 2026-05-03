@@ -371,3 +371,5 @@ def cmd_info(config_file: Path, os_type):
     else:
         click.echo("  No dependency issues found.")
     click.echo(f"{'─' * 40}\n")
+
+
