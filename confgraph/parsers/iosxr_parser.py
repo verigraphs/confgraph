@@ -32,6 +32,7 @@ from confgraph.models.community_list import (
     ASPathListConfig,
     ASPathListEntry,
 )
+from confgraph.models.isis import ISISConfig, ISISInterface, ISISRedistribute
 from confgraph.parsers.base import _BASE_KNOWN_PATTERNS
 from confgraph.parsers.ios_parser import IOSParser
 
@@ -1284,3 +1285,86 @@ class IOSXRParser(IOSParser):
             pim_ssm_range=pim_ssm_range,
             pim_autorp=pim_autorp,
         )
+
+    # -----------------------------------------------------------------------
+    # IS-IS — interface stanzas nested under "router isis NAME"
+    # -----------------------------------------------------------------------
+
+    def parse_isis(self) -> list[ISISConfig]:
+        """Parse IS-IS configurations for IOS-XR.
+
+        IOS-XR nests per-interface IS-IS config under the ``router isis`` block::
+
+            router isis CORE
+             is-type level-2-only
+             net 49.0001.0000.0000.0001.00
+             interface GigabitEthernet0/0/0/1
+              metric 20
+              circuit-type level-2-only
+             !
+             interface Loopback0
+              passive
+        """
+        # Use parent to get the process-level config (net, is-type, passive, etc.)
+        isis_instances = super().parse_isis()
+        parse = self._get_parse_obj()
+
+        for isis_cfg in isis_instances:
+            tag = isis_cfg.tag
+            pattern = rf"^router\s+isis\s+{re.escape(tag)}" if tag else r"^router\s+isis\s*$"
+            isis_objs = parse.find_objects(pattern)
+            if not isis_objs:
+                continue
+            isis_obj = isis_objs[0]
+
+            isis_interfaces: list[ISISInterface] = []
+
+            for intf_child in isis_obj.re_search_children(r"^\s+interface\s+(\S+)"):
+                intf_name = self._extract_match(intf_child.text, r"^\s+interface\s+(\S+)")
+                if not intf_name:
+                    continue
+
+                # Global metric: metric N  (no level qualifier)
+                isis_metric: int | None = None
+                m_ch = intf_child.re_search_children(r"^\s+metric\s+(\d+)\s*$")
+                if m_ch:
+                    v = self._extract_match(m_ch[0].text, r"^\s+metric\s+(\d+)")
+                    if v:
+                        isis_metric = int(v)
+
+                # Level-specific metrics
+                isis_metric_l1: int | None = None
+                m1_ch = intf_child.re_search_children(r"^\s+metric\s+(\d+)\s+level-1")
+                if m1_ch:
+                    v = self._extract_match(m1_ch[0].text, r"^\s+metric\s+(\d+)")
+                    if v:
+                        isis_metric_l1 = int(v)
+
+                isis_metric_l2: int | None = None
+                m2_ch = intf_child.re_search_children(r"^\s+metric\s+(\d+)\s+level-2")
+                if m2_ch:
+                    v = self._extract_match(m2_ch[0].text, r"^\s+metric\s+(\d+)")
+                    if v:
+                        isis_metric_l2 = int(v)
+
+                # Circuit type
+                circuit_type: str | None = None
+                ct_ch = intf_child.re_search_children(r"^\s+circuit-type\s+(\S+)")
+                if ct_ch:
+                    circuit_type = self._extract_match(ct_ch[0].text, r"^\s+circuit-type\s+(\S+)")
+
+                # Passive — IOS-XR uses "passive" keyword directly
+                isis_passive = bool(intf_child.re_search_children(r"^\s+passive"))
+
+                isis_interfaces.append(ISISInterface(
+                    name=intf_name,
+                    circuit_type=circuit_type,
+                    metric=isis_metric,
+                    level_1_metric=isis_metric_l1,
+                    level_2_metric=isis_metric_l2,
+                    passive=isis_passive,
+                ))
+
+            isis_cfg.interfaces = isis_interfaces
+
+        return isis_instances

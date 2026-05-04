@@ -138,3 +138,7 @@ class ISISConfig(BaseConfigObject):
         default=None,
         description="SPF calculation interval (seconds)",
     )
+    interfaces: list[ISISInterface] = Field(
+        default_factory=list,
+        description="Per-interface IS-IS configuration (metric, circuit-type, passive)",
+    )

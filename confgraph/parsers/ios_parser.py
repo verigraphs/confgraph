@@ -50,7 +50,7 @@ from confgraph.models.community_list import (
     ASPathListConfig,
     ASPathListEntry,
 )
-from confgraph.models.isis import ISISConfig, ISISRedistribute
+from confgraph.models.isis import ISISConfig, ISISInterface, ISISRedistribute
 from confgraph.models.eigrp import EIGRPConfig, EIGRPNetwork, EIGRPRedistribute, EIGRPMetric
 from confgraph.models.rip import RIPConfig, RIPRedistribute, RIPTimers
 from confgraph.models.ntp import NTPConfig, NTPServer, NTPAuthKey
@@ -2492,6 +2492,70 @@ class IOSParser(BaseParser):
             if spf_children:
                 spf_interval = int(self._extract_match(spf_children[0].text, r"^\s+spf-interval\s+(\d+)"))
 
+            # Per-interface IS-IS config — IOS stores this in the interface block.
+            # Scan all interfaces for "ip router isis [TAG]" membership, then collect
+            # isis metric / circuit-type / passive commands for this instance.
+            isis_interfaces: list[ISISInterface] = []
+            for intf_obj in parse.find_objects(r"^interface\s+"):
+                # Check if this interface is in this IS-IS instance
+                isis_ref_ch = intf_obj.re_search_children(r"^\s+ip\s+router\s+isis\s*(\S*)")
+                if not isis_ref_ch:
+                    continue
+                ref_tag = self._extract_match(
+                    isis_ref_ch[0].text, r"^\s+ip\s+router\s+isis\s*(\S*)"
+                ) or None
+                # Match: tagless "ip router isis" matches the default (tag=None) instance;
+                # named tag must match exactly.
+                if ref_tag != tag:
+                    continue
+
+                intf_name = self._extract_match(intf_obj.text, r"^interface\s+(\S+)")
+                if not intf_name:
+                    continue
+
+                # Global metric: isis metric N  (no level qualifier)
+                isis_metric: int | None = None
+                m_ch = intf_obj.re_search_children(r"^\s+isis\s+metric\s+(\d+)\s*$")
+                if m_ch:
+                    v = self._extract_match(m_ch[0].text, r"^\s+isis\s+metric\s+(\d+)")
+                    if v:
+                        isis_metric = int(v)
+
+                # Level-specific metrics
+                isis_metric_l1: int | None = None
+                m1_ch = intf_obj.re_search_children(r"^\s+isis\s+metric\s+(\d+)\s+level-1")
+                if m1_ch:
+                    v = self._extract_match(m1_ch[0].text, r"^\s+isis\s+metric\s+(\d+)")
+                    if v:
+                        isis_metric_l1 = int(v)
+
+                isis_metric_l2: int | None = None
+                m2_ch = intf_obj.re_search_children(r"^\s+isis\s+metric\s+(\d+)\s+level-2")
+                if m2_ch:
+                    v = self._extract_match(m2_ch[0].text, r"^\s+isis\s+metric\s+(\d+)")
+                    if v:
+                        isis_metric_l2 = int(v)
+
+                # Circuit type
+                circuit_type: str | None = None
+                ct_ch = intf_obj.re_search_children(r"^\s+isis\s+circuit-type\s+(\S+)")
+                if ct_ch:
+                    circuit_type = self._extract_match(
+                        ct_ch[0].text, r"^\s+isis\s+circuit-type\s+(\S+)"
+                    )
+
+                # Passive
+                isis_passive = bool(intf_obj.re_search_children(r"^\s+isis\s+passive"))
+
+                isis_interfaces.append(ISISInterface(
+                    name=intf_name,
+                    circuit_type=circuit_type,
+                    metric=isis_metric,
+                    level_1_metric=isis_metric_l1,
+                    level_2_metric=isis_metric_l2,
+                    passive=isis_passive,
+                ))
+
             isis_instances.append(
                 ISISConfig(
                     object_id=f"isis_{tag if tag else 'default'}",
@@ -2512,6 +2576,7 @@ class IOSParser(BaseParser):
                     max_lsp_lifetime=max_lsp_lifetime,
                     lsp_refresh_interval=lsp_refresh_interval,
                     spf_interval=spf_interval,
+                    interfaces=isis_interfaces,
                 )
             )
 
