@@ -373,3 +373,126 @@ def cmd_info(config_file: Path, os_type):
     click.echo(f"{'─' * 40}\n")
 
 
+# ---------------------------------------------------------------------------
+# topology command
+# ---------------------------------------------------------------------------
+
+@main.command("topology")
+@click.option("--inventory", "inventory_path", required=True,
+              type=click.Path(exists=True, path_type=Path),
+              help="CSV inventory file (hostname, os_type columns)")
+@click.option("--configs-dir", "configs_dir", required=True,
+              type=click.Path(exists=True, file_okay=False, path_type=Path),
+              help="Directory containing device config files")
+@click.option("--cdp", "cdp_path", default=None,
+              type=click.Path(exists=True, path_type=Path),
+              help="CDP neighbors CSV (local_device, local_port, remote_device, remote_port)")
+@click.option("--lldp", "lldp_path", default=None,
+              type=click.Path(exists=True, path_type=Path),
+              help="LLDP neighbors CSV (local_device, local_port, remote_device, remote_port)")
+@click.option("--mac-arp", "mac_arp_path", default=None,
+              type=click.Path(exists=True, path_type=Path),
+              help="MAC-ARP CSV for supplementary validation (device, interface, mac_address, ip_address)")
+@click.option("--output", "html_path", default="topology.html",
+              type=click.Path(path_type=Path),
+              help="Output HTML file path [default: topology.html]")
+@click.option("--json", "json_path", default=None,
+              type=click.Path(path_type=Path),
+              help="Output JSON file path (optional; consumed by enterprise simulator)")
+@click.option("--title", default="Network Topology",
+              help="Title shown in the HTML graph")
+def cmd_topology(
+    inventory_path: Path,
+    configs_dir: Path,
+    cdp_path: Path | None,
+    lldp_path: Path | None,
+    mac_arp_path: Path | None,
+    html_path: Path,
+    json_path: Path | None,
+    title: str,
+) -> None:
+    """Build a multi-device topology graph from configs + optional discovery data.
+
+    Produces a static HTML graph showing physical links, BGP sessions, and
+    IGP adjacencies across all devices in the inventory.  Optionally exports
+    a JSON file for use with the enterprise simulator (--json).
+    """
+    import csv as _csv
+    from confgraph.topology.graph import TopologyGraphBuilder
+    from confgraph.topology.exporters import export_topology_html, export_topology_json
+    from confgraph.topology.ingest import load_physical_topology
+
+    # --- Load inventory ---
+    inventory: dict[str, str] = {}
+    with open(inventory_path, newline="", encoding="utf-8") as fh:
+        reader = _csv.DictReader(fh)
+        for row in reader:
+            row_lower = {k.strip().lower(): v.strip() for k, v in row.items()}
+            host = (
+                row_lower.get("hostname")
+                or row_lower.get("device_name")
+                or row_lower.get("device")
+                or ""
+            )
+            os_raw = row_lower.get("os_type") or row_lower.get("os") or ""
+            os_val = _OS_ALIAS.get(os_raw.lower())
+            if host and os_val:
+                inventory[host] = os_val
+
+    if not inventory:
+        click.echo("Error: inventory is empty or columns not recognized.", err=True)
+        raise SystemExit(1)
+
+    click.echo(f"Loaded {len(inventory)} devices from inventory.", err=True)
+
+    # --- Parse all device configs ---
+    devices: dict = {}
+    for hostname, os_type in inventory.items():
+        for ext in (".txt", ".cfg", ".conf", ""):
+            cfg_file = configs_dir / f"{hostname}{ext}"
+            if cfg_file.exists():
+                try:
+                    parsed, _ = _load_and_parse(cfg_file, os_type)
+                    devices[hostname] = parsed
+                    click.echo(f"  Parsed: {hostname} ({os_type})", err=True)
+                except Exception as exc:
+                    click.echo(f"  Warning: Could not parse {cfg_file.name}: {exc}", err=True)
+                break
+
+    if not devices:
+        click.echo("Error: no device configs could be parsed.", err=True)
+        raise SystemExit(1)
+
+    # --- Load physical topology (optional) ---
+    physical = None
+    if cdp_path or lldp_path:
+        try:
+            physical = load_physical_topology(
+                inventory=set(devices.keys()),
+                devices=devices,
+                cdp_path=cdp_path,
+                lldp_path=lldp_path,
+            )
+            click.echo(f"  Physical links loaded: {len(physical)}", err=True)
+        except Exception as exc:
+            click.echo(f"  Warning: Could not load physical topology: {exc}", err=True)
+
+    # --- Build graph ---
+    g = TopologyGraphBuilder(devices, physical_topology=physical).build()
+    click.echo(
+        f"  Graph: {g.number_of_nodes()} devices, {g.number_of_edges()} edges",
+        err=True,
+    )
+
+    # --- Export HTML ---
+    html_path.parent.mkdir(parents=True, exist_ok=True)
+    html_path.write_text(export_topology_html(g, title=title), encoding="utf-8")
+    click.echo(f"  Written: {html_path}")
+
+    # --- Export JSON (optional) ---
+    if json_path is not None:
+        json_path.parent.mkdir(parents=True, exist_ok=True)
+        json_path.write_text(export_topology_json(g), encoding="utf-8")
+        click.echo(f"  Written: {json_path}")
+
+
