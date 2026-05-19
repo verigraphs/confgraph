@@ -61,6 +61,13 @@ from confgraph.models.eem import EEMApplet
 from confgraph.models.object_tracking import ObjectTrack
 from confgraph.models.multicast import MulticastConfig
 from confgraph.models.panos_zone import PANOSZoneConfig
+from confgraph.models.aaa import AAAConfig
+from confgraph.models.dns import DNSConfig
+from confgraph.models.dhcp import DHCPConfig
+from confgraph.models.lldp import LLDPConfig
+from confgraph.models.cdp import CDPConfig
+from confgraph.models.stp import STPConfig
+from confgraph.models.vlan import VLANEntry
 
 
 # Top-level config line patterns that are "claimed" by a parse_* method.
@@ -109,6 +116,28 @@ _BASE_KNOWN_PATTERNS: list[str] = [
     r"^ip pim",
     r"^ip msdp",
     r"^ip igmp\s+snooping",
+    # AAA
+    r"^aaa",
+    r"^tacacs-server",
+    r"^tacacs\s+server",
+    r"^radius-server",
+    r"^radius\s+server",
+    r"^aaa\s+group\s+server",
+    # DNS
+    r"^ip\s+domain",
+    r"^ip\s+name-server",
+    r"^ip\s+domain-name",
+    r"^ip\s+domain-lookup",
+    # DHCP
+    r"^ip\s+dhcp",
+    # LLDP
+    r"^lldp",
+    # CDP
+    r"^cdp",
+    # Spanning Tree
+    r"^spanning-tree",
+    # VLAN database
+    r"^vlan\s+\d",
     # Metadata / global service lines — not config objects
     r"^hostname",
     r"^version",
@@ -135,6 +164,8 @@ _BASE_BEST_GUESS_KEYWORDS: list[tuple[str, str]] = [
     ("ip vrf",         "vrf"),
     ("ip dhcp",        "dhcp"),
     ("spanning-tree",  "spanning_tree"),
+    ("lldp",           "lldp"),
+    ("cdp",            "cdp"),
     ("line con",       "console"),
     ("line vty",       "vty"),
     ("boot",           "boot"),
@@ -365,6 +396,34 @@ class BaseParser(ABC):
         """Parse PAN-OS security zone configurations."""
         return []
 
+    def parse_aaa(self) -> AAAConfig | None:
+        """Parse AAA configuration."""
+        return None
+
+    def parse_dns(self) -> DNSConfig | None:
+        """Parse DNS / name-resolution configuration."""
+        return None
+
+    def parse_dhcp(self) -> DHCPConfig | None:
+        """Parse DHCP server / relay / snooping configuration."""
+        return None
+
+    def parse_lldp(self) -> LLDPConfig | None:
+        """Parse LLDP global configuration."""
+        return None
+
+    def parse_cdp(self) -> CDPConfig | None:
+        """Parse CDP global configuration."""
+        return None
+
+    def parse_spanning_tree(self) -> STPConfig | None:
+        """Parse Spanning Tree Protocol global configuration."""
+        return None
+
+    def parse_vlans(self) -> list[VLANEntry]:
+        """Parse VLAN database entries."""
+        return []
+
     def _collect_unrecognized_blocks(self) -> list[UnrecognizedBlock]:
         """Collect top-level config blocks not claimed by any parse_* method.
 
@@ -432,7 +491,23 @@ class BaseParser(ABC):
         ("object_tracks",      "parse_object_tracks"),
         ("multicast",          "parse_multicast"),
         ("zones",              "parse_zones"),
+        ("aaa",                "parse_aaa"),
+        ("dns",                "parse_dns"),
+        ("dhcp",               "parse_dhcp"),
+        ("lldp",               "parse_lldp"),
+        ("cdp",                "parse_cdp"),
+        ("spanning_tree",      "parse_spanning_tree"),
+        ("vlans",              "parse_vlans"),
+        ("no_commands",        "parse_deletion_commands"),
     ]
+
+    def parse_deletion_commands(self) -> list[str]:
+        """Parse top-level 'no' deletion commands into tombstone strings.
+
+        Returns strings like 'static:10.0.0.0/8'.  Overridden by platform
+        parsers that support incremental/partial proposals (IOS, NX-OS, …).
+        """
+        return []
 
     def _find_error_context(self, exc: Exception) -> tuple[int, str]:
         """Extract the best-guess line number and text from a parse exception.

@@ -28,6 +28,13 @@ from confgraph.models.eem import EEMApplet
 from confgraph.models.object_tracking import ObjectTrack
 from confgraph.models.multicast import MulticastConfig
 from confgraph.models.panos_zone import PANOSZoneConfig
+from confgraph.models.aaa import AAAConfig
+from confgraph.models.dns import DNSConfig
+from confgraph.models.dhcp import DHCPConfig
+from confgraph.models.lldp import LLDPConfig
+from confgraph.models.cdp import CDPConfig
+from confgraph.models.stp import STPConfig
+from confgraph.models.vlan import VLANEntry
 
 
 class ParsedConfig(BaseModel):
@@ -157,6 +164,38 @@ class ParsedConfig(BaseModel):
     zones: list[PANOSZoneConfig] = Field(
         default_factory=list,
         description="PAN-OS security zone configurations",
+    )
+    aaa: AAAConfig | None = Field(
+        default=None,
+        description="AAA (authentication, authorization, accounting) configuration",
+    )
+    dns: DNSConfig | None = Field(
+        default=None,
+        description="DNS / name-resolution configuration",
+    )
+    dhcp: DHCPConfig | None = Field(
+        default=None,
+        description="DHCP server / relay / snooping configuration",
+    )
+    lldp: LLDPConfig | None = Field(
+        default=None,
+        description="LLDP global configuration",
+    )
+    cdp: CDPConfig | None = Field(
+        default=None,
+        description="CDP global configuration",
+    )
+    spanning_tree: STPConfig | None = Field(
+        default=None,
+        description="Spanning Tree Protocol global configuration",
+    )
+    vlans: list[VLANEntry] = Field(
+        default_factory=list,
+        description="VLAN database entries",
+    )
+    no_commands: list[str] = Field(
+        default_factory=list,
+        description="Top-level deletion tombstones produced by 'no' commands (e.g. 'static:10.0.0.0/8')",
     )
     raw_config: str = Field(
         default="",

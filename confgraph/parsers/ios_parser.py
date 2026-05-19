@@ -72,6 +72,13 @@ from confgraph.models.ipsla import IPSLAOperation, IPSLASchedule, IPSLAReaction
 from confgraph.models.eem import EEMApplet, EEMEvent, EEMAction
 from confgraph.models.object_tracking import ObjectTrack, TrackListObject
 from confgraph.models.multicast import MulticastConfig, PIMRPAddress, MSDPPeer
+from confgraph.models.aaa import AAAConfig, AAAAuthList, AAAAuthorList, AAAAcctList, TacacsServer, RadiusServer
+from confgraph.models.dns import DNSConfig
+from confgraph.models.dhcp import DHCPConfig, DHCPExcludedRange, DHCPPool
+from confgraph.models.lldp import LLDPConfig
+from confgraph.models.cdp import CDPConfig
+from confgraph.models.stp import STPConfig, STPVlanConfig
+from confgraph.models.vlan import VLANEntry
 
 
 class IOSParser(BaseParser):
@@ -166,6 +173,34 @@ class IOSParser(BaseParser):
 
         return vrfs
 
+    def _parse_iface_bfd(self, intf_obj) -> tuple[int | None, int | None, int | None, str | None]:
+        """Return (bfd_interval, bfd_min_rx, bfd_multiplier, bfd_template) for an interface.
+
+        IOS / EOS / NX-OS syntax::
+
+            bfd interval 300 min_rx 300 multiplier 3
+            bfd template MY-TEMPLATE
+
+        Override this in platform-specific subclasses for different syntax.
+        """
+        bfd_interval = bfd_min_rx = bfd_multiplier = bfd_template = None
+        bfd_ch = intf_obj.re_search_children(r"^\s+bfd\s+interval\s+")
+        if bfd_ch:
+            m = re.match(
+                r"^\s+bfd\s+interval\s+(\d+)\s+min_rx\s+(\d+)\s+multiplier\s+(\d+)",
+                bfd_ch[0].text,
+            )
+            if m:
+                bfd_interval = int(m.group(1))
+                bfd_min_rx = int(m.group(2))
+                bfd_multiplier = int(m.group(3))
+        tmpl_ch = intf_obj.re_search_children(r"^\s+bfd\s+template\s+")
+        if tmpl_ch:
+            v = self._extract_match(tmpl_ch[0].text, r"^\s+bfd\s+template\s+(\S+)")
+            if v:
+                bfd_template = v
+        return bfd_interval, bfd_min_rx, bfd_multiplier, bfd_template
+
     def parse_interfaces(self) -> list[InterfaceConfig]:
         """Parse interface configurations."""
         interfaces = []
@@ -185,12 +220,15 @@ class IOSParser(BaseParser):
             intf_type = self._determine_interface_type(intf_name)
 
             # Basic attributes
+            iface_no_commands: list[str] = []
             description = None
             desc_children = intf_obj.re_search_children(r"^\s+description\s+(.+)")
             if desc_children:
                 description = self._extract_match(
                     desc_children[0].text, r"^\s+description\s+(.+)"
                 )
+            elif intf_obj.re_search_children(r"^\s+no\s+description"):
+                iface_no_commands.append(f"field:interface:{intf_name}:description")
 
             enabled = not self._is_shutdown(intf_obj)
 
@@ -333,6 +371,7 @@ class IOSParser(BaseParser):
             ospf_authentication = None
             ospf_authentication_key = None
             ospf_message_digest_keys = {}
+            ospf_mtu_ignore = False
 
             # ip ospf <process> area <area>
             ospf_area_children = intf_obj.re_search_children(
@@ -353,6 +392,8 @@ class IOSParser(BaseParser):
                 ospf_cost = int(
                     self._extract_match(ospf_cost_children[0].text, r"^\s+ip\s+ospf\s+cost\s+(\d+)")
                 )
+            elif intf_obj.re_search_children(r"^\s+no\s+ip\s+ospf\s+cost"):
+                iface_no_commands.append(f"field:interface:{intf_name}:ospf_cost")
 
             # ip ospf priority
             ospf_priority_children = intf_obj.re_search_children(
@@ -418,6 +459,10 @@ class IOSParser(BaseParser):
                     key_id = int(match.group(1))
                     key_str = match.group(2)
                     ospf_message_digest_keys[key_id] = key_str
+
+            # ip ospf mtu-ignore
+            if intf_obj.re_search_children(r"^\s+ip\s+ospf\s+mtu-ignore"):
+                ospf_mtu_ignore = True
 
             # Tunnel attributes
             tunnel_source = None
@@ -493,6 +538,9 @@ class IOSParser(BaseParser):
                 if v:
                     pim_query_interval = int(v)
             pim_bfd = bool(intf_obj.re_search_children(r"^\s+ip\s+pim\s+bfd"))
+
+            # BFD per-interface (platform-specific hook)
+            bfd_interval, bfd_min_rx, bfd_multiplier, bfd_template = self._parse_iface_bfd(intf_obj)
 
             # IGMP per-interface
             igmp_version = None
@@ -602,6 +650,7 @@ class IOSParser(BaseParser):
                     ospf_authentication=ospf_authentication,
                     ospf_authentication_key=ospf_authentication_key,
                     ospf_message_digest_keys=ospf_message_digest_keys,
+                    ospf_mtu_ignore=ospf_mtu_ignore,
                     helper_addresses=helper_addresses,
                     tunnel_source=tunnel_source,
                     tunnel_destination=tunnel_destination,
@@ -610,6 +659,10 @@ class IOSParser(BaseParser):
                     pim_dr_priority=pim_dr_priority,
                     pim_query_interval=pim_query_interval,
                     pim_bfd=pim_bfd,
+                    bfd_interval=bfd_interval,
+                    bfd_min_rx=bfd_min_rx,
+                    bfd_multiplier=bfd_multiplier,
+                    bfd_template=bfd_template,
                     igmp_version=igmp_version,
                     igmp_query_interval=igmp_query_interval,
                     igmp_query_max_response_time=igmp_query_max_response_time,
@@ -622,6 +675,7 @@ class IOSParser(BaseParser):
                     service_policy_output=service_policy_output,
                     nat_direction=nat_direction,
                     crypto_map=crypto_map_name,
+                    no_commands=iface_no_commands,
                 )
             )
 
@@ -670,6 +724,9 @@ class IOSParser(BaseParser):
             neighbors = self._parse_bgp_neighbors(bgp_obj)
             peer_groups = self._parse_bgp_peer_groups(bgp_obj)
 
+            # 'no neighbor X' tombstones (full removal + field-level resets)
+            bgp_no_commands: list[str] = self._parse_bgp_neighbor_tombstones(bgp_obj)
+
             # Populate per-neighbor AF policies from address-family blocks
             self._apply_bgp_af_neighbor_policies(bgp_obj, neighbors)
 
@@ -697,6 +754,7 @@ class IOSParser(BaseParser):
                     address_families=address_families,
                     networks=networks,
                     redistribute=redistribute,
+                    no_commands=bgp_no_commands,
                 )
             )
 
@@ -784,6 +842,28 @@ class IOSParser(BaseParser):
                 if intf_name:
                     non_passive_interfaces.append(intf_name)
 
+            # Network statements: "network <addr> <wildcard> area <area-id>"
+            # Wildcard is the inverse of the subnet mask — convert to IPv4Network.
+            network_statements: list[tuple[IPv4Network, str]] = []
+            net_children = ospf_obj.re_search_children(
+                r"^\s+network\s+\S+\s+\S+\s+area\s+\S+"
+            )
+            for nc in net_children:
+                m = re.match(
+                    r"^\s+network\s+(\S+)\s+(\S+)\s+area\s+(\S+)", nc.text
+                )
+                if m:
+                    addr_str, wildcard_str, area_id = m.group(1), m.group(2), m.group(3)
+                    try:
+                        addr = IPv4Address(addr_str)
+                        wildcard = IPv4Address(wildcard_str)
+                        # Invert wildcard to get subnet mask, then build prefix
+                        mask = IPv4Address(int(wildcard) ^ 0xFFFFFFFF)
+                        net = IPv4Network(f"{addr}/{mask}", strict=False)
+                        network_statements.append((net, area_id))
+                    except ValueError:
+                        pass
+
             # Parse areas
             areas = self._parse_ospf_areas(ospf_obj)
 
@@ -829,6 +909,7 @@ class IOSParser(BaseParser):
                     passive_interface_default=passive_interface_default,
                     passive_interfaces=passive_interfaces,
                     non_passive_interfaces=non_passive_interfaces,
+                    network_statements=network_statements,
                     areas=areas,
                     redistribute=redistribute,
                     default_information_originate=default_info_originate,
@@ -1282,6 +1363,98 @@ class IOSParser(BaseParser):
             ) > 0,
         )
 
+    # ------------------------------------------------------------------
+    # BGP neighbor tombstone parser (universal field-reset pattern)
+    # ------------------------------------------------------------------
+
+    # Maps the IOS command text that follows "no neighbor <peer> " to the
+    # BGPNeighbor Pydantic field name that should be reset to its default.
+    # Entries are checked in order; use the most specific pattern first.
+    _BGP_NEIGHBOR_NO_FIELD_MAP: list[tuple[str, str]] = [
+        # Boolean flags
+        ("shutdown",                "shutdown"),
+        ("next-hop-self",           "next_hop_self"),
+        ("route-reflector-client",  "route_reflector_client"),
+        ("fall-over bfd",           "fall_over_bfd"),
+        ("disable-connected-check", "disable_connected_check"),
+        ("local-as",                "local_as"),
+        # Strings with optional trailing arguments
+        ("description",             "description"),
+        ("update-source",           "update_source"),
+        ("ebgp-multihop",           "ebgp_multihop"),
+        ("password",                "password"),
+        ("timers",                  "timers"),
+        # send-community accepts an optional type qualifier
+        ("send-community",          "send_community"),
+        # Directional route-map / prefix-list / filter-list
+        ("route-map",               None),      # handled below — needs direction
+        ("prefix-list",             None),
+        ("filter-list",             None),
+        ("maximum-prefix",          "maximum_prefix"),
+        ("peer-group",              "peer_group"),
+    ]
+
+    def _parse_bgp_neighbor_tombstones(self, bgp_or_af_obj) -> list[str]:
+        """Parse 'no neighbor X ...' lines under a BGP process or AF block.
+
+        Returns a list of tombstone strings using two formats:
+
+          ``neighbor:<peer>``
+              Full neighbor removal ("no neighbor X" with no trailing attribute).
+
+          ``field:neighbor:<peer>:<field_name>``
+              Field-level reset (universal field-reset pattern, MERGE-7).
+              The merger will reset the named field to its Pydantic default
+              after applying the field-level merge from the proposal.
+
+        This also fixes a pre-existing parser bug: previously any line matching
+        "no neighbor X..." was treated as a full neighbor removal tombstone,
+        which incorrectly removed the entire neighbor when only a single field
+        was being cleared (e.g. "no neighbor 1.1.1.1 shutdown").
+        """
+        tombstones: list[str] = []
+
+        for nc in bgp_or_af_obj.re_search_children(r"^\s+no\s+neighbor\s+\S+"):
+            m = re.search(r"^\s+no\s+neighbor\s+(\S+)(?:\s+(.+))?$", nc.text)
+            if not m:
+                continue
+
+            peer = m.group(1)
+            attr = (m.group(2) or "").strip()
+
+            if not attr:
+                # "no neighbor X" — full neighbor removal
+                tombstones.append(f"neighbor:{peer}")
+                continue
+
+            # Directional policy objects: attribute starts with keyword + name + direction
+            if attr.startswith("route-map "):
+                field = "route_map_in" if attr.endswith(" in") else "route_map_out" if attr.endswith(" out") else None
+                if field:
+                    tombstones.append(f"field:neighbor:{peer}:{field}")
+                continue
+            if attr.startswith("prefix-list "):
+                field = "prefix_list_in" if attr.endswith(" in") else "prefix_list_out" if attr.endswith(" out") else None
+                if field:
+                    tombstones.append(f"field:neighbor:{peer}:{field}")
+                continue
+            if attr.startswith("filter-list "):
+                field = "filter_list_in" if attr.endswith(" in") else "filter_list_out" if attr.endswith(" out") else None
+                if field:
+                    tombstones.append(f"field:neighbor:{peer}:{field}")
+                continue
+
+            # Simple prefix-match table
+            for prefix, field_name in self._BGP_NEIGHBOR_NO_FIELD_MAP:
+                if prefix in ("route-map", "prefix-list", "filter-list"):
+                    continue  # already handled above
+                if attr == prefix or attr.startswith(prefix + " "):
+                    tombstones.append(f"field:neighbor:{peer}:{field_name}")
+                    break
+            # Unrecognised attribute — skip silently (do not emit a full-removal tombstone)
+
+        return tombstones
+
     def _parse_bgp_neighbors(self, bgp_obj) -> list[BGPNeighbor]:
         """Parse BGP neighbors."""
         neighbors = []
@@ -1477,6 +1650,8 @@ class IOSParser(BaseParser):
                     "area_type": OSPFAreaType.NORMAL,
                     "stub_no_summary": False,
                     "nssa_no_summary": False,
+                    "nssa_default_information_originate": False,
+                    "nssa_default_information_originate_always": False,
                     "authentication": None,
                     "ranges": [],
                 }
@@ -1487,6 +1662,10 @@ class IOSParser(BaseParser):
                     area_dict[area_id]["nssa_no_summary"] = True
                 else:
                     area_dict[area_id]["area_type"] = OSPFAreaType.NSSA
+                if "default-information-originate" in command:
+                    area_dict[area_id]["nssa_default_information_originate"] = True
+                    if "always" in command:
+                        area_dict[area_id]["nssa_default_information_originate_always"] = True
             elif "stub" in command:
                 if "no-summary" in command:
                     area_dict[area_id]["area_type"] = OSPFAreaType.TOTALLY_STUB
@@ -1921,6 +2100,9 @@ class IOSParser(BaseParser):
                         )
                     )
 
+            # 'no neighbor X ...' tombstones for VRF instance
+            vrf_no_commands = self._parse_bgp_neighbor_tombstones(vrf_af_child)
+
             # Create VRF BGP instance
             vrf_instances.append(
                 BGPConfig(
@@ -1937,6 +2119,7 @@ class IOSParser(BaseParser):
                     peer_groups=[],
                     address_families=[],
                     redistribute=redistribute,
+                    no_commands=vrf_no_commands,
                 )
             )
 
@@ -2033,6 +2216,114 @@ class IOSParser(BaseParser):
             )
 
         return static_routes
+
+    def parse_deletion_commands(self) -> list[str]:
+        """Parse top-level 'no' deletion commands into tombstone strings.
+
+        Handles:
+          - ``no ip route [vrf NAME] DEST MASK``         → ``static:DEST/PLEN``
+          - ``no router ospf <id>``                       → ``process:ospf:<id>``
+          - ``no router bgp <asn>``                       → ``process:bgp:<asn>``
+          - ``no router isis [<tag>]``                    → ``process:isis:<tag>``
+          - ``no router eigrp <asn>``                     → ``process:eigrp:<asn>``
+          - ``no ip access-list (standard|extended) <n>`` → ``acl:<name>``
+          - ``no route-map <name> (permit|deny) <seq>``  → ``route-map:<name>:seq:<seq>``
+          - ``no ip prefix-list <name> seq <num>``        → ``prefix-list:<name>:seq:<num>``
+          - ``no <seq>`` inside ip access-list blocks    → ``acl-seq:<name>:<seq>``
+        """
+        tombstones: list[str] = []
+        parse = self._get_parse_obj()
+
+        # --- static route deletions ---
+        # Tombstone format: "static:<vrf>:<dest/plen>" where vrf="" for global.
+        # The VRF is preserved so _apply_deletions() can do a VRF-exact match
+        # and avoid deleting the same prefix from a different routing table.
+        for obj in parse.find_objects(r"^no\s+ip\s+route\s+"):
+            m = re.search(
+                r"^no\s+ip\s+route\s+(?:vrf\s+(\S+)\s+)?(\S+)\s+(\S+)",
+                obj.text,
+            )
+            if not m:
+                continue
+            try:
+                vrf = m.group(1) or ""
+                dest = IPv4Network(f"{m.group(2)}/{m.group(3)}", strict=False)
+                tombstones.append(f"static:{vrf}:{dest}")
+            except ValueError:
+                pass
+
+        # --- process-level deletions ---
+        for obj in parse.find_objects(r"^no\s+router\s+ospf\s+"):
+            m = re.search(r"^no\s+router\s+ospf\s+(\S+)", obj.text)
+            if m:
+                tombstones.append(f"process:ospf:{m.group(1)}")
+
+        for obj in parse.find_objects(r"^no\s+router\s+bgp\s+"):
+            m = re.search(r"^no\s+router\s+bgp\s+(\S+)", obj.text)
+            if m:
+                tombstones.append(f"process:bgp:{m.group(1)}")
+
+        for obj in parse.find_objects(r"^no\s+router\s+isis"):
+            m = re.search(r"^no\s+router\s+isis(?:\s+(\S+))?", obj.text)
+            tag = m.group(1) if (m and m.group(1)) else ""
+            tombstones.append(f"process:isis:{tag}")
+
+        for obj in parse.find_objects(r"^no\s+router\s+eigrp\s+"):
+            m = re.search(r"^no\s+router\s+eigrp\s+(\S+)", obj.text)
+            if m:
+                tombstones.append(f"process:eigrp:{m.group(1)}")
+
+        # --- ACL: whole-ACL deletion ---
+        for obj in parse.find_objects(r"^no\s+ip\s+access-list\s+"):
+            m = re.search(
+                r"^no\s+ip\s+access-list\s+(?:standard|extended)\s+(\S+)", obj.text
+            )
+            if m:
+                tombstones.append(f"acl:{m.group(1)}")
+
+        # --- route-map sequence deletion ---
+        for obj in parse.find_objects(r"^no\s+route-map\s+"):
+            m = re.search(
+                r"^no\s+route-map\s+(\S+)\s+(?:permit|deny)\s+(\d+)", obj.text
+            )
+            if m:
+                tombstones.append(f"route-map:{m.group(1)}:seq:{m.group(2)}")
+
+        # --- prefix-list sequence deletion ---
+        for obj in parse.find_objects(r"^no\s+ip\s+prefix-list\s+"):
+            m = re.search(
+                r"^no\s+ip\s+prefix-list\s+(\S+)\s+seq\s+(\d+)", obj.text
+            )
+            if m:
+                tombstones.append(f"prefix-list:{m.group(1)}:seq:{m.group(2)}")
+
+        # --- singleton protocol removals ---
+        if parse.find_objects(r"^no\s+snmp-server"):
+            tombstones.append("singleton:snmp")
+        if parse.find_objects(r"^no\s+ntp\s+"):
+            tombstones.append("singleton:ntp")
+        if parse.find_objects(r"^no\s+logging\s+"):
+            tombstones.append("singleton:syslog")
+        if parse.find_objects(r"^no\s+ip\s+multicast-routing"):
+            tombstones.append("singleton:multicast")
+
+        # --- ACE-level deletions: "no <seq>" inside ip access-list blocks ---
+        for acl_obj in parse.find_objects(
+            r"^ip\s+access-list\s+(?:standard|extended)\s+"
+        ):
+            m = re.search(
+                r"^ip\s+access-list\s+(?:standard|extended)\s+(\S+)", acl_obj.text
+            )
+            if not m:
+                continue
+            acl_name = m.group(1)
+            for child in acl_obj.children:
+                child_text = child.text.strip()
+                m2 = re.match(r"^no\s+(\d+)$", child_text)
+                if m2:
+                    tombstones.append(f"acl-seq:{acl_name}:{m2.group(1)}")
+
+        return tombstones
 
     def parse_acls(self) -> list[ACLConfig]:
         """Parse ACL configurations."""
@@ -4251,3 +4542,606 @@ class IOSParser(BaseParser):
             msdp_peers=msdp_peers,
             msdp_originator_id=msdp_originator_id,
         )
+
+    # -----------------------------------------------------------------------
+    # AAA
+    # -----------------------------------------------------------------------
+
+    def parse_aaa(self) -> AAAConfig | None:
+        """Parse AAA configuration.
+
+        Handles::
+
+            aaa new-model
+            aaa authentication login default local tacacs+
+            aaa authentication enable default enable
+            aaa authorization exec default local
+            aaa authorization commands 15 default local
+            aaa accounting exec default start-stop group tacacs+
+            tacacs server TACACS_SRV
+             address ipv4 10.0.0.1
+             key Secret
+            tacacs-server host 10.0.0.2 key Secret
+            radius server RAD_SRV
+             address ipv4 10.0.0.3 auth-port 1812 acct-port 1813
+             key Secret
+        """
+        parse = self._get_parse_obj()
+        aaa_objs = parse.find_objects(r"^aaa\s+")
+        tacacs_named = parse.find_objects(r"^tacacs\s+server\s+")
+        tacacs_legacy = parse.find_objects(r"^tacacs-server\s+host\s+")
+        radius_named = parse.find_objects(r"^radius\s+server\s+")
+        radius_legacy = parse.find_objects(r"^radius-server\s+host\s+")
+        group_objs = parse.find_objects(r"^aaa\s+group\s+server\s+")
+
+        if not aaa_objs and not tacacs_named and not tacacs_legacy and not radius_named and not radius_legacy:
+            return None
+
+        new_model = False
+        auth_lists: list[AAAAuthList] = []
+        author_lists: list[AAAAuthorList] = []
+        acct_lists: list[AAAAcctList] = []
+        tacacs_servers: list[TacacsServer] = []
+        radius_servers: list[RadiusServer] = []
+        raw_lines: list[str] = []
+        line_numbers: list[int] = []
+
+        for obj in aaa_objs:
+            raw_lines.append(obj.text)
+            line_numbers.append(obj.linenum)
+            t = obj.text.strip()
+
+            if t == "aaa new-model":
+                new_model = True
+            elif re.match(r"^aaa\s+authentication\s+", t):
+                m = re.match(r"^aaa\s+authentication\s+(\S+)\s+(\S+)\s+(.*)", t)
+                if m:
+                    service, name, methods_str = m.group(1), m.group(2), m.group(3)
+                    methods = methods_str.split()
+                    auth_lists.append(AAAAuthList(name=name, service=service, methods=methods))
+            elif re.match(r"^aaa\s+authorization\s+", t):
+                m = re.match(r"^aaa\s+authorization\s+(\S+)(?:\s+(\d+))?\s+(\S+)\s+(.*)", t)
+                if m:
+                    service, priv, name, methods_str = m.group(1), m.group(2), m.group(3), m.group(4)
+                    methods = methods_str.split()
+                    author_lists.append(AAAAuthorList(
+                        name=name, service=service,
+                        privilege_level=int(priv) if priv else None,
+                        methods=methods,
+                    ))
+            elif re.match(r"^aaa\s+accounting\s+", t):
+                m = re.match(r"^aaa\s+accounting\s+(\S+)(?:\s+(\d+))?\s+(\S+)\s+(start-stop|stop-only|none)\s+(.*)", t)
+                if m:
+                    service, priv, name, trigger, methods_str = m.group(1), m.group(2), m.group(3), m.group(4), m.group(5)
+                    methods = re.findall(r"\S+", methods_str.replace("group", ""))
+                    acct_lists.append(AAAAcctList(
+                        name=name, service=service,
+                        privilege_level=int(priv) if priv else None,
+                        trigger=trigger, methods=methods,
+                    ))
+
+        # Named TACACS+ servers ("tacacs server NAME" block)
+        for obj in tacacs_named:
+            raw_lines.append(obj.text)
+            line_numbers.append(obj.linenum)
+            address = None
+            port = None
+            timeout_val = None
+            key = None
+            vrf = None
+            for child in obj.children:
+                raw_lines.append(child.text)
+                line_numbers.append(child.linenum)
+                ct = child.text.strip()
+                am = re.match(r"address\s+ipv[46]\s+(\S+)(?:\s+port\s+(\d+))?", ct)
+                if am:
+                    address = am.group(1)
+                    port = int(am.group(2)) if am.group(2) else None
+                elif ct.startswith("key "):
+                    key = ct.split(None, 1)[1]
+                elif ct.startswith("timeout "):
+                    v = self._extract_match(ct, r"timeout\s+(\d+)")
+                    if v:
+                        timeout_val = int(v)
+                elif ct.startswith("vrf "):
+                    vrf = ct.split(None, 1)[1]
+            if address:
+                tacacs_servers.append(TacacsServer(address=address, port=port, timeout=timeout_val, key=key, vrf=vrf))
+
+        # Legacy single-line TACACS ("tacacs-server host ADDR")
+        for obj in tacacs_legacy:
+            raw_lines.append(obj.text)
+            line_numbers.append(obj.linenum)
+            t = obj.text.strip()
+            m = re.match(r"tacacs-server\s+host\s+(\S+)(?:\s+port\s+(\d+))?(?:\s+timeout\s+(\d+))?(?:\s+key\s+(\S+))?", t)
+            if m:
+                tacacs_servers.append(TacacsServer(
+                    address=m.group(1),
+                    port=int(m.group(2)) if m.group(2) else None,
+                    timeout=int(m.group(3)) if m.group(3) else None,
+                    key=m.group(4),
+                ))
+
+        # Named RADIUS servers ("radius server NAME" block)
+        for obj in radius_named:
+            raw_lines.append(obj.text)
+            line_numbers.append(obj.linenum)
+            address = None
+            auth_port = acct_port = timeout_val = None
+            key = vrf = None
+            for child in obj.children:
+                raw_lines.append(child.text)
+                line_numbers.append(child.linenum)
+                ct = child.text.strip()
+                am = re.match(r"address\s+ipv[46]\s+(\S+)(?:\s+auth-port\s+(\d+))?(?:\s+acct-port\s+(\d+))?", ct)
+                if am:
+                    address = am.group(1)
+                    auth_port = int(am.group(2)) if am.group(2) else None
+                    acct_port = int(am.group(3)) if am.group(3) else None
+                elif ct.startswith("key "):
+                    key = ct.split(None, 1)[1]
+                elif ct.startswith("timeout "):
+                    v = self._extract_match(ct, r"timeout\s+(\d+)")
+                    if v:
+                        timeout_val = int(v)
+            if address:
+                radius_servers.append(RadiusServer(address=address, auth_port=auth_port, acct_port=acct_port, timeout=timeout_val, key=key))
+
+        # Legacy single-line RADIUS ("radius-server host ADDR")
+        for obj in radius_legacy:
+            raw_lines.append(obj.text)
+            line_numbers.append(obj.linenum)
+            t = obj.text.strip()
+            m = re.match(r"radius-server\s+host\s+(\S+)(?:\s+auth-port\s+(\d+))?(?:\s+acct-port\s+(\d+))?(?:\s+key\s+(\S+))?", t)
+            if m:
+                radius_servers.append(RadiusServer(
+                    address=m.group(1),
+                    auth_port=int(m.group(2)) if m.group(2) else None,
+                    acct_port=int(m.group(3)) if m.group(3) else None,
+                    key=m.group(4),
+                ))
+
+        for obj in group_objs:
+            raw_lines.append(obj.text)
+            line_numbers.append(obj.linenum)
+
+        local_auth = any("local" in al.methods for al in auth_lists)
+
+        return AAAConfig(
+            object_id="aaa",
+            raw_lines=raw_lines,
+            source_os=self.os_type,
+            line_numbers=line_numbers,
+            new_model=new_model,
+            authentication_lists=auth_lists,
+            authorization_lists=author_lists,
+            accounting_lists=acct_lists,
+            tacacs_servers=tacacs_servers,
+            radius_servers=radius_servers,
+            local_auth_enabled=local_auth,
+        )
+
+    # -----------------------------------------------------------------------
+    # DNS
+    # -----------------------------------------------------------------------
+
+    def parse_dns(self) -> DNSConfig | None:
+        """Parse DNS / name-resolution configuration.
+
+        Handles::
+
+            ip domain name example.com          (IOS)
+            ip domain-name example.com          (alternate form)
+            ip domain list corp.example.com
+            ip name-server 8.8.8.8 8.8.4.4
+            no ip domain lookup
+        """
+        parse = self._get_parse_obj()
+        domain_objs = parse.find_objects(r"^ip\s+domain")
+        ns_objs = parse.find_objects(r"^ip\s+name-server")
+        lookup_disabled = bool(parse.find_objects(r"^no\s+ip\s+domain.lookup"))
+
+        if not domain_objs and not ns_objs and not lookup_disabled:
+            return None
+
+        domain_name: str | None = None
+        domain_list: list[str] = []
+        name_servers: list[str] = []
+        raw_lines: list[str] = []
+        line_numbers: list[int] = []
+
+        for obj in domain_objs:
+            raw_lines.append(obj.text)
+            line_numbers.append(obj.linenum)
+            t = obj.text.strip()
+            # "ip domain name DOMAIN" or "ip domain-name DOMAIN"
+            m = re.match(r"^ip\s+domain(?:-|\s+)name\s+(\S+)", t)
+            if m and domain_name is None:
+                domain_name = m.group(1)
+                continue
+            # "ip domain list DOMAIN"
+            m = re.match(r"^ip\s+domain\s+list\s+(\S+)", t)
+            if m:
+                domain_list.append(m.group(1))
+
+        for obj in ns_objs:
+            raw_lines.append(obj.text)
+            line_numbers.append(obj.linenum)
+            # "ip name-server A B C ..." — multiple IPs on one line
+            t = obj.text.strip()
+            parts = re.split(r"\s+", t)[2:]
+            name_servers.extend(parts)
+
+        return DNSConfig(
+            object_id="dns",
+            raw_lines=raw_lines,
+            source_os=self.os_type,
+            line_numbers=line_numbers,
+            lookup_enabled=not lookup_disabled,
+            domain_name=domain_name,
+            domain_list=domain_list,
+            name_servers=name_servers,
+        )
+
+    # -----------------------------------------------------------------------
+    # DHCP
+    # -----------------------------------------------------------------------
+
+    def parse_dhcp(self) -> DHCPConfig | None:
+        """Parse DHCP server / relay / snooping configuration.
+
+        Handles::
+
+            ip dhcp excluded-address 192.168.1.1 192.168.1.10
+            ip dhcp pool VLAN10
+             network 192.168.1.0 255.255.255.0
+             default-router 192.168.1.1
+             dns-server 8.8.8.8 8.8.4.4
+             domain-name example.com
+             lease 1
+            ip dhcp snooping
+            ip dhcp snooping vlan 10,20
+        """
+        parse = self._get_parse_obj()
+        dhcp_objs = parse.find_objects(r"^ip\s+dhcp\s+")
+        if not dhcp_objs:
+            return None
+
+        excluded: list[DHCPExcludedRange] = []
+        pools: list[DHCPPool] = []
+        snooping_enabled = False
+        snooping_vlans: list[str] = []
+        relay_opt = True
+        raw_lines: list[str] = []
+        line_numbers: list[int] = []
+
+        for obj in dhcp_objs:
+            raw_lines.append(obj.text)
+            line_numbers.append(obj.linenum)
+            t = obj.text.strip()
+
+            if re.match(r"^ip\s+dhcp\s+excluded-address\s+", t):
+                m = re.match(r"^ip\s+dhcp\s+excluded-address\s+(\S+)(?:\s+(\S+))?", t)
+                if m:
+                    excluded.append(DHCPExcludedRange(low=m.group(1), high=m.group(2)))
+            elif re.match(r"^ip\s+dhcp\s+pool\s+", t):
+                pool_name = self._extract_match(t, r"^ip\s+dhcp\s+pool\s+(\S+)")
+                network = default_routers = dns_srvs = domain = None
+                default_routers = []
+                dns_srvs = []
+                lease_days = lease_hours = lease_mins = None
+                lease_inf = False
+                for child in obj.children:
+                    raw_lines.append(child.text)
+                    line_numbers.append(child.linenum)
+                    ct = child.text.strip()
+                    if ct.startswith("network "):
+                        network = ct[len("network "):].strip()
+                    elif ct.startswith("default-router "):
+                        default_routers = ct.split()[1:]
+                    elif ct.startswith("dns-server "):
+                        dns_srvs = ct.split()[1:]
+                    elif ct.startswith("domain-name "):
+                        domain = ct.split(None, 1)[1]
+                    elif ct.startswith("lease "):
+                        parts = ct.split()
+                        if len(parts) >= 2 and parts[1] == "infinite":
+                            lease_inf = True
+                        else:
+                            if len(parts) >= 2:
+                                lease_days = int(parts[1])
+                            if len(parts) >= 3:
+                                lease_hours = int(parts[2])
+                            if len(parts) >= 4:
+                                lease_mins = int(parts[3])
+                if pool_name:
+                    pools.append(DHCPPool(
+                        name=pool_name, network=network,
+                        default_router=default_routers, dns_servers=dns_srvs,
+                        domain_name=domain,
+                        lease_days=lease_days, lease_hours=lease_hours,
+                        lease_minutes=lease_mins, lease_infinite=lease_inf,
+                    ))
+            elif re.match(r"^ip\s+dhcp\s+snooping\s+vlan\s+", t):
+                vlan_str = self._extract_match(t, r"^ip\s+dhcp\s+snooping\s+vlan\s+(\S+)")
+                if vlan_str:
+                    snooping_vlans.append(vlan_str)
+            elif re.match(r"^ip\s+dhcp\s+snooping\s*$", t):
+                snooping_enabled = True
+            elif "no ip dhcp relay information option" in t:
+                relay_opt = False
+
+        return DHCPConfig(
+            object_id="dhcp",
+            raw_lines=raw_lines,
+            source_os=self.os_type,
+            line_numbers=line_numbers,
+            excluded_ranges=excluded,
+            pools=pools,
+            snooping_enabled=snooping_enabled,
+            snooping_vlans=snooping_vlans,
+            relay_information_option=relay_opt,
+        )
+
+    # -----------------------------------------------------------------------
+    # LLDP
+    # -----------------------------------------------------------------------
+
+    def parse_lldp(self) -> LLDPConfig | None:
+        """Parse LLDP global configuration.
+
+        Handles::
+
+            lldp run
+            no lldp run
+            lldp timer 30
+            lldp holdtime 120
+            lldp reinit 2
+            lldp tlv-select system-description
+        """
+        parse = self._get_parse_obj()
+        lldp_objs = parse.find_objects(r"^(?:no\s+)?lldp\s+")
+        if not lldp_objs:
+            return None
+
+        enabled = True
+        timer = holdtime = reinit = None
+        tlv_select: list[str] = []
+        raw_lines: list[str] = []
+        line_numbers: list[int] = []
+
+        for obj in lldp_objs:
+            raw_lines.append(obj.text)
+            line_numbers.append(obj.linenum)
+            t = obj.text.strip()
+            if t == "no lldp run":
+                enabled = False
+            elif re.match(r"^lldp\s+timer\s+", t):
+                v = self._extract_match(t, r"^lldp\s+timer\s+(\d+)")
+                if v:
+                    timer = int(v)
+            elif re.match(r"^lldp\s+holdtime\s+", t):
+                v = self._extract_match(t, r"^lldp\s+holdtime\s+(\d+)")
+                if v:
+                    holdtime = int(v)
+            elif re.match(r"^lldp\s+reinit\s+", t):
+                v = self._extract_match(t, r"^lldp\s+reinit\s+(\d+)")
+                if v:
+                    reinit = int(v)
+            elif re.match(r"^lldp\s+tlv-select\s+", t):
+                tlv = self._extract_match(t, r"^lldp\s+tlv-select\s+(\S+)")
+                if tlv:
+                    tlv_select.append(tlv)
+
+        return LLDPConfig(
+            object_id="lldp",
+            raw_lines=raw_lines,
+            source_os=self.os_type,
+            line_numbers=line_numbers,
+            enabled=enabled,
+            timer=timer,
+            holdtime=holdtime,
+            reinit=reinit,
+            tlv_select=tlv_select,
+        )
+
+    # -----------------------------------------------------------------------
+    # CDP
+    # -----------------------------------------------------------------------
+
+    def parse_cdp(self) -> CDPConfig | None:
+        """Parse CDP global configuration.
+
+        Handles::
+
+            cdp run
+            no cdp run
+            cdp timer 60
+            cdp holdtime 180
+            cdp advertise-v2
+            no cdp advertise-v2
+        """
+        parse = self._get_parse_obj()
+        cdp_objs = parse.find_objects(r"^(?:no\s+)?cdp\s+")
+        if not cdp_objs:
+            return None
+
+        enabled = True
+        timer = holdtime = None
+        advertise_v2 = True
+        raw_lines: list[str] = []
+        line_numbers: list[int] = []
+
+        for obj in cdp_objs:
+            raw_lines.append(obj.text)
+            line_numbers.append(obj.linenum)
+            t = obj.text.strip()
+            if t == "no cdp run":
+                enabled = False
+            elif re.match(r"^cdp\s+timer\s+", t):
+                v = self._extract_match(t, r"^cdp\s+timer\s+(\d+)")
+                if v:
+                    timer = int(v)
+            elif re.match(r"^cdp\s+holdtime\s+", t):
+                v = self._extract_match(t, r"^cdp\s+holdtime\s+(\d+)")
+                if v:
+                    holdtime = int(v)
+            elif "no cdp advertise-v2" in t:
+                advertise_v2 = False
+
+        return CDPConfig(
+            object_id="cdp",
+            raw_lines=raw_lines,
+            source_os=self.os_type,
+            line_numbers=line_numbers,
+            enabled=enabled,
+            timer=timer,
+            holdtime=holdtime,
+            advertise_v2=advertise_v2,
+        )
+
+    # -----------------------------------------------------------------------
+    # Spanning Tree
+    # -----------------------------------------------------------------------
+
+    def parse_spanning_tree(self) -> STPConfig | None:
+        """Parse Spanning Tree Protocol global configuration.
+
+        Handles::
+
+            spanning-tree mode rapid-pvst
+            spanning-tree vlan 1 priority 4096
+            spanning-tree vlan 10,20 priority 8192
+            spanning-tree portfast default
+            spanning-tree portfast bpduguard default
+            spanning-tree portfast bpdufilter default
+            spanning-tree loopguard default
+        """
+        parse = self._get_parse_obj()
+        stp_objs = parse.find_objects(r"^spanning-tree\s+")
+        if not stp_objs:
+            return None
+
+        mode: str | None = None
+        vlan_configs: list[STPVlanConfig] = []
+        portfast_default = False
+        bpduguard_default = False
+        bpdufilter_default = False
+        loopguard_default = False
+        raw_lines: list[str] = []
+        line_numbers: list[int] = []
+
+        for obj in stp_objs:
+            raw_lines.append(obj.text)
+            line_numbers.append(obj.linenum)
+            t = obj.text.strip()
+
+            if re.match(r"^spanning-tree\s+mode\s+", t):
+                mode = self._extract_match(t, r"^spanning-tree\s+mode\s+(\S+)")
+            elif re.match(r"^spanning-tree\s+vlan\s+", t):
+                m = re.match(r"^spanning-tree\s+vlan\s+(\S+)\s+(\S+)\s+(\S+)", t)
+                if m:
+                    vlan_id, param, value = m.group(1), m.group(2), m.group(3)
+                    # Find existing vlan entry or create new one
+                    existing = next((v for v in vlan_configs if v.vlan_id == vlan_id), None)
+                    if existing is None:
+                        existing = STPVlanConfig(vlan_id=vlan_id)
+                        vlan_configs.append(existing)
+                    if param == "priority":
+                        existing.priority = int(value)
+                    elif param == "hello-time":
+                        existing.hello_time = int(value)
+                    elif param == "forward-time":
+                        existing.forward_time = int(value)
+                    elif param == "max-age":
+                        existing.max_age = int(value)
+            elif "portfast bpduguard default" in t:
+                bpduguard_default = True
+            elif "portfast bpdufilter default" in t:
+                bpdufilter_default = True
+            elif "portfast default" in t:
+                portfast_default = True
+            elif "loopguard default" in t:
+                loopguard_default = True
+
+        return STPConfig(
+            object_id="spanning_tree",
+            raw_lines=raw_lines,
+            source_os=self.os_type,
+            line_numbers=line_numbers,
+            mode=mode,
+            vlan_configs=vlan_configs,
+            portfast_default=portfast_default,
+            bpduguard_default=bpduguard_default,
+            bpdufilter_default=bpdufilter_default,
+            loopguard_default=loopguard_default,
+        )
+
+    def parse_vlans(self) -> list[VLANEntry]:
+        """Parse VLAN database entries.
+
+        Handles the IOS/IOS-XE block-level VLAN syntax::
+
+            vlan 10
+             name MGMT
+            vlan 20
+             name SERVERS
+            vlan 30
+             state suspend
+
+        Each ``vlan N`` block is parsed into a VLANEntry.  The compact
+        comma-separated form (``vlan 10,20,30``) is also supported — in that
+        case all VLAN IDs in the range share the same state (no name).
+        """
+        parse = self._get_parse_obj()
+        vlan_objs = parse.find_objects(r"^vlan\s+\d")
+        entries: list[VLANEntry] = []
+
+        for obj in vlan_objs:
+            m = re.match(r"^vlan\s+([\d,\-]+)", obj.text.strip())
+            if not m:
+                continue
+            vlan_str = m.group(1)
+
+            # Expand comma-separated / range notation
+            vlan_ids: list[int] = []
+            for part in vlan_str.split(","):
+                part = part.strip()
+                if "-" in part:
+                    try:
+                        start, end = part.split("-", 1)
+                        vlan_ids.extend(range(int(start), int(end) + 1))
+                    except ValueError:
+                        pass
+                else:
+                    try:
+                        vlan_ids.append(int(part))
+                    except ValueError:
+                        pass
+
+            # For single-VLAN blocks, read children for name / state
+            if len(vlan_ids) == 1:
+                vid = vlan_ids[0]
+                name: str | None = None
+                state = "active"
+
+                for child in obj.children:
+                    child_text = child.text.strip()
+                    nm = re.match(r"^name\s+(\S+)", child_text)
+                    if nm:
+                        name = nm.group(1)
+                    sm = re.match(r"^state\s+(active|suspend)", child_text)
+                    if sm:
+                        state = sm.group(1)
+
+                entries.append(VLANEntry(vlan_id=vid, name=name, state=state))
+            else:
+                # Compact form — no per-VLAN children
+                for vid in vlan_ids:
+                    entries.append(VLANEntry(vlan_id=vid))
+
+        # Deduplicate by vlan_id (last definition wins, matching IOS semantics)
+        seen: dict[int, VLANEntry] = {}
+        for entry in entries:
+            seen[entry.vlan_id] = entry
+        return list(seen.values())

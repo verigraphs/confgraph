@@ -562,3 +562,223 @@ class NXOSParser(IOSParser):
                 )
 
         return routes
+
+    # -----------------------------------------------------------------------
+    # NTP — NX-OS uses "use-vrf VRF" after the IP and "source-interface"
+    # -----------------------------------------------------------------------
+
+    def parse_ntp(self):
+        """Parse NTP from NX-OS config.
+
+        NX-OS differs from IOS in two ways:
+
+        - VRF is ``use-vrf VRF`` *after* the server IP, not ``vrf VRF`` before it.
+        - Source interface is ``ntp source-interface INTF`` (hyphenated).
+
+        Example::
+
+            ntp server 10.0.0.1 prefer use-vrf management
+            ntp server 10.0.0.2 use-vrf default
+            ntp source-interface mgmt0
+            ntp authenticate
+            ntp authentication-key 1 md5 password 3 <hash>
+            ntp trusted-key 1
+        """
+        from ipaddress import IPv4Address, IPv6Address
+        from confgraph.models.ntp import NTPConfig, NTPServer, NTPAuthKey
+
+        parse = self._get_parse_obj()
+        ntp_objs = parse.find_objects(r"^ntp\s+")
+        if not ntp_objs:
+            return None
+
+        servers = []
+        peers = []
+        auth_keys = []
+        trusted_keys = []
+        source_interface = None
+        authenticate = False
+        master = False
+        master_stratum = None
+        raw_lines = []
+        line_numbers = []
+
+        for obj in ntp_objs:
+            raw_lines.append(obj.text)
+            line_numbers.append(obj.linenum)
+            t = obj.text.strip()
+
+            if re.match(r"^ntp\s+server\s+", t):
+                m = re.match(r"^ntp\s+server\s+(\S+)(.*)", t)
+                if m:
+                    addr_str, rest = m.group(1), m.group(2)
+                    prefer = "prefer" in rest
+                    vrf_m = re.search(r"\buse-vrf\s+(\S+)", rest)
+                    vrf = vrf_m.group(1) if vrf_m else None
+                    key_m = re.search(r"\bkey\s+(\d+)", rest)
+                    ver_m = re.search(r"\bversion\s+(\d+)", rest)
+                    try:
+                        addr = IPv4Address(addr_str)
+                    except Exception:
+                        try:
+                            addr = IPv6Address(addr_str)
+                        except Exception:
+                            addr = addr_str
+                    servers.append(NTPServer(
+                        address=addr, prefer=prefer,
+                        key_id=int(key_m.group(1)) if key_m else None,
+                        version=int(ver_m.group(1)) if ver_m else None,
+                        vrf=vrf,
+                    ))
+            elif re.match(r"^ntp\s+peer\s+", t):
+                m = re.match(r"^ntp\s+peer\s+(\S+)(.*)", t)
+                if m:
+                    addr_str, rest = m.group(1), m.group(2)
+                    prefer = "prefer" in rest
+                    vrf_m = re.search(r"\buse-vrf\s+(\S+)", rest)
+                    vrf = vrf_m.group(1) if vrf_m else None
+                    key_m = re.search(r"\bkey\s+(\d+)", rest)
+                    try:
+                        addr = IPv4Address(addr_str)
+                    except Exception:
+                        try:
+                            addr = IPv6Address(addr_str)
+                        except Exception:
+                            addr = addr_str
+                    peers.append(NTPServer(
+                        address=addr, prefer=prefer,
+                        key_id=int(key_m.group(1)) if key_m else None,
+                        vrf=vrf,
+                    ))
+            elif re.match(r"^ntp\s+authentication-key\s+", t):
+                # NX-OS: "ntp authentication-key 1 md5 password 3 <hash>"
+                #     or "ntp authentication-key 1 md5 <plaintext>"
+                m = re.match(
+                    r"^ntp\s+authentication-key\s+(\d+)\s+(\S+)\s+(?:password\s+\S+\s+)?(\S+)", t
+                )
+                if m:
+                    auth_keys.append(NTPAuthKey(
+                        key_id=int(m.group(1)),
+                        algorithm=m.group(2),
+                        key_string=m.group(3),
+                    ))
+            elif re.match(r"^ntp\s+trusted-key\s+", t):
+                m = re.match(r"^ntp\s+trusted-key\s+(\d+)", t)
+                if m:
+                    trusted_keys.append(int(m.group(1)))
+            elif re.match(r"^ntp\s+source-interface\s+", t):
+                source_interface = self._extract_match(t, r"^ntp\s+source-interface\s+(\S+)")
+            elif re.match(r"^ntp\s+source\s+", t):
+                source_interface = self._extract_match(t, r"^ntp\s+source\s+(\S+)")
+            elif re.match(r"^ntp\s+authenticate\b", t):
+                authenticate = True
+            elif re.match(r"^ntp\s+master", t):
+                master = True
+                sm = re.match(r"^ntp\s+master\s+(\d+)", t)
+                if sm:
+                    master_stratum = int(sm.group(1))
+
+        return NTPConfig(
+            object_id="ntp",
+            raw_lines=raw_lines,
+            source_os=self.os_type,
+            line_numbers=line_numbers,
+            master=master,
+            master_stratum=master_stratum,
+            servers=servers,
+            peers=peers,
+            source_interface=source_interface,
+            authenticate=authenticate,
+            authentication_keys=auth_keys,
+            trusted_keys=trusted_keys,
+            update_calendar=False,
+            logging=False,
+        )
+
+    # -----------------------------------------------------------------------
+    # Syslog — NX-OS uses "logging server" (not "logging host")
+    # -----------------------------------------------------------------------
+
+    def parse_syslog(self):
+        """Parse syslog from NX-OS config.
+
+        NX-OS uses ``logging server`` (not ``logging host`` or bare IP)::
+
+            logging server 10.0.0.1 5 use-vrf management
+            logging server 10.0.0.2 use-vrf default port 1514
+            logging source-interface mgmt0
+            logging console 6
+            logging level bgp 5
+        """
+        from ipaddress import IPv4Address, IPv6Address
+        from confgraph.models.logging_config import SyslogConfig, LoggingHost
+
+        parse = self._get_parse_obj()
+        log_objs = parse.find_objects(r"^logging\s+")
+        if not log_objs:
+            return None
+
+        hosts = []
+        buffered_size = buffered_level = None
+        console_level = monitor_level = None
+        source_interface = None
+        enabled = True
+        raw_lines = []
+        line_numbers = []
+
+        for obj in log_objs:
+            raw_lines.append(obj.text)
+            line_numbers.append(obj.linenum)
+            t = obj.text.strip()
+
+            if re.match(r"^logging\s+server\s+", t):
+                # NX-OS: logging server ADDR [SEVERITY] [use-vrf VRF] [port PORT]
+                m = re.match(r"^logging\s+server\s+(\S+)(.*)", t)
+                if m:
+                    addr_str, rest = m.group(1), m.group(2)
+                    vrf_m = re.search(r"\buse-vrf\s+(\S+)", rest)
+                    vrf = vrf_m.group(1) if vrf_m else None
+                    port_m = re.search(r"\bport\s+(\d+)", rest)
+                    port = int(port_m.group(1)) if port_m else None
+                    # Optional severity integer immediately after the address
+                    level_m = re.match(r"^\s+(\d+)\b", rest)
+                    level = str(level_m.group(1)) if level_m else None
+                    try:
+                        addr = IPv4Address(addr_str)
+                    except Exception:
+                        try:
+                            addr = IPv6Address(addr_str)
+                        except Exception:
+                            addr = addr_str
+                    hosts.append(LoggingHost(address=addr, port=port, vrf=vrf, level=level))
+            elif re.match(r"^logging\s+source-interface\s+", t):
+                source_interface = self._extract_match(t, r"^logging\s+source-interface\s+(\S+)")
+            elif re.match(r"^logging\s+buffered\s+", t):
+                m = re.match(r"^logging\s+buffered\s+(\d+)(?:\s+(\S+))?", t)
+                if m:
+                    buffered_size = int(m.group(1))
+                    buffered_level = m.group(2)
+                else:
+                    m2 = re.match(r"^logging\s+buffered\s+(\S+)", t)
+                    if m2:
+                        buffered_level = m2.group(1)
+            elif re.match(r"^logging\s+console\s+", t):
+                console_level = self._extract_match(t, r"^logging\s+console\s+(\S+)")
+            elif re.match(r"^logging\s+monitor\s+", t):
+                monitor_level = self._extract_match(t, r"^logging\s+monitor\s+(\S+)")
+            elif "no logging" in t or "logging off" in t:
+                enabled = False
+
+        return SyslogConfig(
+            object_id="syslog",
+            raw_lines=raw_lines,
+            source_os=self.os_type,
+            line_numbers=line_numbers,
+            enabled=enabled,
+            hosts=hosts,
+            buffered_size=buffered_size,
+            buffered_level=buffered_level,
+            console_level=console_level,
+            monitor_level=monitor_level,
+            source_interface=source_interface,
+        )

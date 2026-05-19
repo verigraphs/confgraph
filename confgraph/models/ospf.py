@@ -77,6 +77,10 @@ class OSPFArea(BaseModel):
     nssa_default_information_originate: bool = Field(
         default=False, description="Originate default route in NSSA"
     )
+    nssa_default_information_originate_always: bool = Field(
+        default=False,
+        description="Always originate default route in NSSA (even if 0.0.0.0/0 not in ABR RIB)",
+    )
     nssa_translate: str | None = Field(
         default=None, description="NSSA translation option ('always', 'candidate')"
     )

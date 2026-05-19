@@ -213,6 +213,10 @@ class InterfaceConfig(BaseConfigObject):
         default_factory=dict,
         description="OSPF message-digest keys (key-id -> key-string)",
     )
+    ospf_mtu_ignore: bool = Field(
+        default=False,
+        description="Suppress OSPF MTU mismatch check on this interface (ip ospf mtu-ignore)",
+    )
 
     # Helper addresses
     helper_addresses: list[IPv4Address] = Field(
@@ -253,6 +257,12 @@ class InterfaceConfig(BaseConfigObject):
     pim_dr_priority: int | None = Field(default=None, description="PIM DR priority")
     pim_query_interval: int | None = Field(default=None, description="PIM query interval (seconds)")
     pim_bfd: bool = Field(default=False, description="BFD enabled for PIM on this interface")
+
+    # BFD per-interface
+    bfd_interval: int | None = Field(default=None, description="BFD min transmit interval (ms)")
+    bfd_min_rx: int | None = Field(default=None, description="BFD min receive interval (ms)")
+    bfd_multiplier: int | None = Field(default=None, description="BFD detection multiplier")
+    bfd_template: str | None = Field(default=None, description="BFD template name applied to this interface")
 
     # IGMP per-interface
     igmp_version: int | None = Field(default=None, description="IGMP version (1, 2, 3)")

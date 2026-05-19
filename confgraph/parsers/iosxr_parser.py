@@ -580,6 +580,8 @@ class IOSXRParser(IOSParser):
                     "area_type": OSPFAreaType.NORMAL,
                     "stub_no_summary": False,
                     "nssa_no_summary": False,
+                    "nssa_default_information_originate": False,
+                    "nssa_default_information_originate_always": False,
                     "authentication": None,
                     "ranges": [],
                     "interfaces": [],
@@ -593,6 +595,10 @@ class IOSXRParser(IOSParser):
                     area_dict[area_id]["nssa_no_summary"] = True
                 else:
                     area_dict[area_id]["area_type"] = OSPFAreaType.NSSA
+                if "default-information-originate" in text:
+                    area_dict[area_id]["nssa_default_information_originate"] = True
+                    if "always" in text:
+                        area_dict[area_id]["nssa_default_information_originate_always"] = True
 
             for prop_child in area_child.re_search_children(r"^\s+stub"):
                 text = prop_child.text.strip()
@@ -1368,3 +1374,246 @@ class IOSXRParser(IOSParser):
             isis_cfg.interfaces = isis_interfaces
 
         return isis_instances
+
+    # -----------------------------------------------------------------------
+    # NTP — hierarchical "ntp" block (IOS-XR style)
+    # -----------------------------------------------------------------------
+
+    def parse_ntp(self):
+        """Parse NTP from IOS-XR hierarchical ``ntp`` block.
+
+        IOS-XR nests NTP sub-commands under a top-level ``ntp`` block::
+
+            ntp
+             server 10.0.0.1 prefer
+             server vrf MGMT 10.0.0.2
+             source Loopback0
+             authenticate
+             authentication-key 1 md5 CiscoKey
+             trusted-key 1
+             update-calendar
+
+        Falls back to IOS flat-style (``ntp server …``) for configs that
+        use that syntax instead.
+        """
+        from ipaddress import IPv4Address, IPv6Address
+        from confgraph.models.ntp import NTPConfig, NTPServer, NTPAuthKey
+
+        parse = self._get_parse_obj()
+        ntp_blocks = parse.find_objects(r"^ntp\s*$")
+        if not ntp_blocks:
+            return super().parse_ntp()
+
+        servers = []
+        peers = []
+        auth_keys = []
+        trusted_keys = []
+        source_interface = None
+        authenticate = False
+        master = False
+        master_stratum = None
+        update_calendar = False
+        ag_query_only = ag_serve_only = ag_serve = ag_peer = None
+        raw_lines = []
+        line_numbers = []
+
+        for block in ntp_blocks:
+            raw_lines.append(block.text)
+            line_numbers.append(block.linenum)
+            for child in block.children:
+                raw_lines.append(child.text)
+                line_numbers.append(child.linenum)
+                ct = child.text.strip()
+
+                if re.match(r"^server\s+", ct):
+                    m = re.match(r"^server(?:\s+vrf\s+(\S+))?\s+(\S+)(.*)", ct)
+                    if m:
+                        vrf, addr_str, rest = m.group(1), m.group(2), m.group(3)
+                        prefer = "prefer" in rest
+                        key_m = re.search(r"\bkey\s+(\d+)", rest)
+                        ver_m = re.search(r"\bversion\s+(\d+)", rest)
+                        src_m = re.search(r"\bsource\s+(\S+)", rest)
+                        try:
+                            addr = IPv4Address(addr_str)
+                        except Exception:
+                            try:
+                                addr = IPv6Address(addr_str)
+                            except Exception:
+                                addr = addr_str
+                        servers.append(NTPServer(
+                            address=addr, prefer=prefer,
+                            key_id=int(key_m.group(1)) if key_m else None,
+                            version=int(ver_m.group(1)) if ver_m else None,
+                            vrf=vrf,
+                            source=src_m.group(1) if src_m else None,
+                        ))
+                elif re.match(r"^peer\s+", ct):
+                    m = re.match(r"^peer(?:\s+vrf\s+(\S+))?\s+(\S+)(.*)", ct)
+                    if m:
+                        vrf, addr_str, rest = m.group(1), m.group(2), m.group(3)
+                        prefer = "prefer" in rest
+                        key_m = re.search(r"\bkey\s+(\d+)", rest)
+                        try:
+                            addr = IPv4Address(addr_str)
+                        except Exception:
+                            try:
+                                addr = IPv6Address(addr_str)
+                            except Exception:
+                                addr = addr_str
+                        peers.append(NTPServer(
+                            address=addr, prefer=prefer,
+                            key_id=int(key_m.group(1)) if key_m else None,
+                            vrf=vrf,
+                        ))
+                elif re.match(r"^authentication-key\s+", ct):
+                    m = re.match(r"^authentication-key\s+(\d+)\s+(\S+)\s+(\S+)", ct)
+                    if m:
+                        auth_keys.append(NTPAuthKey(
+                            key_id=int(m.group(1)),
+                            algorithm=m.group(2),
+                            key_string=m.group(3),
+                        ))
+                elif re.match(r"^trusted-key\s+", ct):
+                    m = re.match(r"^trusted-key\s+(\d+)", ct)
+                    if m:
+                        trusted_keys.append(int(m.group(1)))
+                elif re.match(r"^source\s+", ct):
+                    source_interface = ct.split(None, 1)[1].strip()
+                elif ct == "authenticate":
+                    authenticate = True
+                elif re.match(r"^master", ct):
+                    master = True
+                    sm = re.match(r"^master\s+(\d+)", ct)
+                    if sm:
+                        master_stratum = int(sm.group(1))
+                elif ct == "update-calendar":
+                    update_calendar = True
+                elif re.match(r"^access-group\s+", ct):
+                    m = re.match(
+                        r"^access-group\s+(query-only|serve-only|serve|peer)\s+(\S+)", ct
+                    )
+                    if m:
+                        ag_type = m.group(1).replace("-", "_")
+                        acl = m.group(2)
+                        if ag_type == "query_only":
+                            ag_query_only = acl
+                        elif ag_type == "serve_only":
+                            ag_serve_only = acl
+                        elif ag_type == "serve":
+                            ag_serve = acl
+                        elif ag_type == "peer":
+                            ag_peer = acl
+
+        if not raw_lines:
+            return None
+
+        return NTPConfig(
+            object_id="ntp",
+            raw_lines=raw_lines,
+            source_os=self.os_type,
+            line_numbers=line_numbers,
+            master=master,
+            master_stratum=master_stratum,
+            servers=servers,
+            peers=peers,
+            source_interface=source_interface,
+            authenticate=authenticate,
+            authentication_keys=auth_keys,
+            trusted_keys=trusted_keys,
+            access_group_query_only=ag_query_only,
+            access_group_serve_only=ag_serve_only,
+            access_group_serve=ag_serve,
+            access_group_peer=ag_peer,
+            update_calendar=update_calendar,
+            logging=False,
+        )
+
+    # -----------------------------------------------------------------------
+    # BFD — no bfd-template in IOS-XR; capture slow-timers only
+    # -----------------------------------------------------------------------
+
+    def parse_bfd(self):
+        """Parse BFD global configuration from IOS-XR.
+
+        IOS-XR does not support ``bfd-template``.  BFD timers are per-interface
+        or per-neighbor.  The only global knob modelled here is ``slow-timers``,
+        which can appear either inside a hierarchical ``bfd`` block or as a flat
+        command::
+
+            bfd
+             slow-timers 2000
+             echo disable
+             multipath include location 0/0/CPU0
+
+        or (older XR style)::
+
+            bfd slow-timers 2000
+        """
+        from confgraph.models.bfd import BFDConfig
+
+        parse = self._get_parse_obj()
+        slow_timers = None
+        raw_lines = []
+        line_numbers = []
+
+        # Hierarchical "bfd" block
+        for block in parse.find_objects(r"^bfd\s*$"):
+            raw_lines.append(block.text)
+            line_numbers.append(block.linenum)
+            for child in block.children:
+                raw_lines.append(child.text)
+                line_numbers.append(child.linenum)
+                ct = child.text.strip()
+                m = re.match(r"^slow-timers\s+(\d+)", ct)
+                if m:
+                    slow_timers = int(m.group(1))
+
+        # Flat "bfd slow-timers N"
+        for obj in parse.find_objects(r"^bfd\s+slow-timers\s+"):
+            raw_lines.append(obj.text)
+            line_numbers.append(obj.linenum)
+            v = self._extract_match(obj.text, r"^bfd\s+slow-timers\s+(\d+)")
+            if v and slow_timers is None:
+                slow_timers = int(v)
+
+        if not raw_lines:
+            return None
+
+        return BFDConfig(
+            object_id="bfd",
+            raw_lines=raw_lines,
+            source_os=self.os_type,
+            line_numbers=line_numbers,
+            slow_timers=slow_timers,
+        )
+
+    def _parse_iface_bfd(self, intf_obj) -> tuple:
+        """Parse per-interface BFD for IOS-XR.
+
+        IOS-XR uses separate sub-commands rather than a single line::
+
+            interface GigabitEthernet0/0/0/0
+             bfd fast-detect
+             bfd minimum-interval 300
+             bfd multiplier 3
+
+        ``bfd minimum-interval`` sets the same timer for both tx and rx.
+        """
+        bfd_interval = bfd_min_rx = bfd_multiplier = bfd_template = None
+
+        mi_ch = intf_obj.re_search_children(r"^\s+bfd\s+minimum-interval\s+")
+        if mi_ch:
+            m = re.match(r"^\s+bfd\s+minimum-interval\s+(\d+)", mi_ch[0].text)
+            if m:
+                val = int(m.group(1))
+                bfd_interval = val
+                bfd_min_rx = val  # XR uses a single interval for both tx and rx
+
+        mul_ch = intf_obj.re_search_children(r"^\s+bfd\s+multiplier\s+")
+        if mul_ch:
+            m = re.match(r"^\s+bfd\s+multiplier\s+(\d+)", mul_ch[0].text)
+            if m:
+                bfd_multiplier = int(m.group(1))
+
+        # XR does not support "bfd template" per-interface; bfd_template stays None
+        return bfd_interval, bfd_min_rx, bfd_multiplier, bfd_template

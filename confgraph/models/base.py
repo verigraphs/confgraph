@@ -63,6 +63,14 @@ class BaseConfigObject(BaseModel):
         default_factory=list,
         description="Line numbers in the original configuration file",
     )
+    no_commands: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Scoped deletion tombstones set by the parser when 'no' commands appear "
+            "within this object's config block (e.g. 'neighbor:10.1.1.1' on BGPConfig, "
+            "'seq:30' on ACLConfig, 'description' on InterfaceConfig)."
+        ),
+    )
 
     class Config:
         """Pydantic model configuration."""

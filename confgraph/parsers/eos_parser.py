@@ -937,3 +937,42 @@ class EOSParser(IOSParser):
             )
 
         return isis_instances
+
+    # -----------------------------------------------------------------------
+    # BFD — "bfd slow-timer N" (singular, unlike IOS "bfd slow-timers")
+    # -----------------------------------------------------------------------
+
+    def parse_bfd(self):
+        """Parse BFD global configuration from EOS.
+
+        EOS uses ``bfd slow-timer N`` (singular — no trailing ``s``) as the
+        only global BFD knob.  BFD timers are otherwise per-interface.
+        IOS-style ``bfd-template`` does not exist in EOS::
+
+            bfd slow-timer 2000
+        """
+        from confgraph.models.bfd import BFDConfig
+
+        parse = self._get_parse_obj()
+        slow_timers = None
+        raw_lines = []
+        line_numbers = []
+
+        # EOS uses "bfd slow-timer N" (singular), not "bfd slow-timers N"
+        for obj in parse.find_objects(r"^bfd\s+slow-timer\b"):
+            raw_lines.append(obj.text)
+            line_numbers.append(obj.linenum)
+            v = self._extract_match(obj.text, r"^bfd\s+slow-timer\s+(\d+)")
+            if v:
+                slow_timers = int(v)
+
+        if not raw_lines:
+            return None
+
+        return BFDConfig(
+            object_id="bfd",
+            raw_lines=raw_lines,
+            source_os=self.os_type,
+            line_numbers=line_numbers,
+            slow_timers=slow_timers,
+        )
