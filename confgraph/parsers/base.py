@@ -615,3 +615,133 @@ class BaseParser(ABC):
         """
         shutdown_children = obj.re_search_children(r"^\s+shutdown")
         return len(shutdown_children) > 0
+
+
+# ---------------------------------------------------------------------------
+# Shared BGP peer-group attribute parser
+# ---------------------------------------------------------------------------
+
+def apply_peer_group_command(pg_data: dict, command: str) -> None:
+    """Apply a single BGP peer-group attribute line to *pg_data* in-place.
+
+    *command* is the attribute text after the peer-group name — e.g.
+    ``"route-map RM-IN in"`` or ``"next-hop-self"``.  All three OS parsers
+    (IOS, IOS-XR, NX-OS) extract this text in the same form and call this
+    function; adding a new peer-group attribute requires exactly one change
+    here rather than one change per parser.
+
+    *pg_data* must already have all BGPPeerGroup fields initialised to their
+    defaults (None / False) before the first call.
+    """
+    import re as _re
+
+    if command.startswith("remote-as "):
+        val = command.replace("remote-as ", "").strip()
+        try:
+            pg_data["remote_as"] = int(val)
+        except ValueError:
+            pg_data["remote_as"] = val
+
+    elif command.startswith("description "):
+        pg_data["description"] = command.replace("description ", "").strip()
+
+    elif command.startswith("update-source "):
+        pg_data["update_source"] = command.replace("update-source ", "").strip()
+
+    elif command == "next-hop-self":
+        pg_data["next_hop_self"] = True
+
+    elif command == "route-reflector-client":
+        pg_data["route_reflector_client"] = True
+
+    elif command.startswith("send-community"):
+        if "both" in command:
+            pg_data["send_community"] = "both"
+        elif "extended" in command:
+            pg_data["send_community"] = "extended"
+        else:
+            pg_data["send_community"] = True
+
+    elif command.startswith("route-map ") and " in" in command:
+        m = _re.search(r"route-map\s+(\S+)\s+in", command)
+        if m:
+            pg_data["route_map_in"] = m.group(1)
+
+    elif command.startswith("route-map ") and " out" in command:
+        m = _re.search(r"route-map\s+(\S+)\s+out", command)
+        if m:
+            pg_data["route_map_out"] = m.group(1)
+
+    elif command.startswith("prefix-list ") and " in" in command:
+        m = _re.search(r"prefix-list\s+(\S+)\s+in", command)
+        if m:
+            pg_data["prefix_list_in"] = m.group(1)
+
+    elif command.startswith("prefix-list ") and " out" in command:
+        m = _re.search(r"prefix-list\s+(\S+)\s+out", command)
+        if m:
+            pg_data["prefix_list_out"] = m.group(1)
+
+    elif command.startswith("filter-list ") and " in" in command:
+        m = _re.search(r"filter-list\s+(\S+)\s+in", command)
+        if m:
+            pg_data["filter_list_in"] = m.group(1)
+
+    elif command.startswith("filter-list ") and " out" in command:
+        m = _re.search(r"filter-list\s+(\S+)\s+out", command)
+        if m:
+            pg_data["filter_list_out"] = m.group(1)
+
+    elif command.startswith("ebgp-multihop "):
+        parts = command.replace("ebgp-multihop ", "").strip().split()
+        if parts:
+            try:
+                pg_data["ebgp_multihop"] = int(parts[0])
+            except ValueError:
+                pass
+
+    elif command.startswith("password "):
+        pg_data["password"] = command.replace("password ", "").strip()
+
+    elif command == "fall-over bfd":
+        pg_data["fall_over_bfd"] = True
+
+    elif command == "disable-connected-check":
+        pg_data["disable_connected_check"] = True
+
+    elif command.startswith("maximum-prefix "):
+        parts = command.replace("maximum-prefix ", "").strip().split()
+        if parts:
+            try:
+                pg_data["maximum_prefix"] = int(parts[0])
+            except ValueError:
+                pass
+
+
+def _default_pg_data(name: str) -> dict:
+    """Return a pg_data dict with all BGPPeerGroup fields at their defaults.
+
+    Every parser must start from this dict before calling
+    ``apply_peer_group_command`` so that BGPPeerGroup(**pg_data) always
+    receives the full field set.
+    """
+    return {
+        "name": name,
+        "remote_as": None,
+        "description": None,
+        "update_source": None,
+        "next_hop_self": False,
+        "route_reflector_client": False,
+        "send_community": False,
+        "route_map_in": None,
+        "route_map_out": None,
+        "prefix_list_in": None,
+        "prefix_list_out": None,
+        "filter_list_in": None,
+        "filter_list_out": None,
+        "ebgp_multihop": None,
+        "password": None,
+        "fall_over_bfd": False,
+        "disable_connected_check": False,
+        "maximum_prefix": None,
+    }

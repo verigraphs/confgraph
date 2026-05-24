@@ -129,6 +129,10 @@ class InterfaceConfig(BaseConfigObject):
         default=None,
         description="Configured bandwidth in Kbps (for OSPF cost calculation)",
     )
+    delay: int | None = Field(
+        default=None,
+        description="Configured delay in tens of microseconds (for EIGRP metric calculation)",
+    )
 
     # Layer 2 attributes
     switchport_mode: str | None = Field(
@@ -156,6 +160,16 @@ class InterfaceConfig(BaseConfigObject):
     channel_group_mode: str | None = Field(
         default=None,
         description="Channel-group mode ('active', 'passive', 'on', 'desirable', 'auto')",
+    )
+    min_links: int | None = Field(
+        default=None,
+        description="Minimum number of active member links required to keep port-channel up (port-channel min-links N)",
+    )
+
+    # STP per-interface
+    stp_root_guard: bool = Field(
+        default=False,
+        description="STP root guard enabled on this interface (spanning-tree guard root)",
     )
 
     # FHRP (First Hop Redundancy Protocols)
@@ -236,6 +250,70 @@ class InterfaceConfig(BaseConfigObject):
     tunnel_mode: str | None = Field(
         default=None,
         description="Tunnel mode (e.g., 'gre ip', 'ipsec ipv4')",
+    )
+    tunnel_protection_profile: str | None = Field(
+        default=None,
+        description="IPsec profile name applied via 'tunnel protection ipsec profile <name>'",
+    )
+    tunnel_key: int | None = Field(
+        default=None,
+        description="GRE tunnel key",
+    )
+    nhrp_network_id: int | None = Field(
+        default=None,
+        description="NHRP network-id (DMVPN domain identifier)",
+    )
+    nhrp_authentication: str | None = Field(
+        default=None,
+        description="NHRP authentication key",
+    )
+    nhrp_nhs: list[IPv4Address] = Field(
+        default_factory=list,
+        description="NHRP NHS (hub) IP addresses configured on this spoke",
+    )
+    nhrp_map: list[str] = Field(
+        default_factory=list,
+        description="Static NHRP map entries in 'proto-addr nbma-addr' format",
+    )
+
+    # Port-Security
+    port_security_enabled: bool = Field(
+        default=False,
+        description="Switchport port-security globally enabled on this interface",
+    )
+    port_security_max_mac: int | None = Field(
+        default=None,
+        description="Maximum allowed MAC addresses (switchport port-security maximum N)",
+    )
+    port_security_violation: str | None = Field(
+        default=None,
+        description="Violation mode: 'shutdown', 'restrict', or 'protect'",
+    )
+    port_security_sticky: bool = Field(
+        default=False,
+        description="Sticky MAC learning enabled (switchport port-security mac-address sticky)",
+    )
+
+    # 802.1X
+    dot1x_port_control: str | None = Field(
+        default=None,
+        description="802.1X port-control mode: 'auto', 'force-authorized', 'force-unauthorized'",
+    )
+    dot1x_host_mode: str | None = Field(
+        default=None,
+        description="802.1X host mode: 'single-host', 'multi-host', 'multi-auth', 'multi-domain'",
+    )
+    dot1x_mab: bool = Field(
+        default=False,
+        description="MAC Authentication Bypass (MAB) enabled on this interface",
+    )
+    dot1x_guest_vlan: int | None = Field(
+        default=None,
+        description="Guest VLAN assigned when no 802.1X supplicant responds",
+    )
+    dot1x_auth_fail_vlan: int | None = Field(
+        default=None,
+        description="Auth-fail VLAN assigned when 802.1X authentication fails",
     )
 
     # CDP/LLDP

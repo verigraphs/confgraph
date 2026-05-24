@@ -3,7 +3,7 @@
 import re
 from ipaddress import IPv4Address, IPv4Interface, IPv4Network, IPv6Address, IPv6Interface, IPv6Network
 
-from confgraph.parsers.base import BaseParser
+from confgraph.parsers.base import BaseParser, apply_peer_group_command, _default_pg_data
 from confgraph.models.base import OSType
 from confgraph.models.vrf import VRFConfig
 from confgraph.models.interface import (
@@ -301,6 +301,14 @@ class IOSParser(BaseParser):
                     self._extract_match(bw_children[0].text, r"^\s+bandwidth\s+(\d+)")
                 )
 
+            # Delay (for EIGRP composite metric)
+            delay = None
+            delay_children = intf_obj.re_search_children(r"^\s+delay\s+(\d+)")
+            if delay_children:
+                delay = int(
+                    self._extract_match(delay_children[0].text, r"^\s+delay\s+(\d+)")
+                )
+
             # Switchport attributes
             switchport_mode = None
             access_vlan = None
@@ -344,6 +352,97 @@ class IOSParser(BaseParser):
                     )
                 )
 
+            # Port-Security
+            port_security_enabled = bool(
+                intf_obj.re_search_children(r"^\s+switchport\s+port-security\s*$")
+            )
+            port_security_max_mac = None
+            psmax_ch = intf_obj.re_search_children(
+                r"^\s+switchport\s+port-security\s+maximum\s+(\d+)"
+            )
+            if psmax_ch:
+                val = self._extract_match(
+                    psmax_ch[0].text, r"^\s+switchport\s+port-security\s+maximum\s+(\d+)"
+                )
+                if val:
+                    port_security_max_mac = int(val)
+
+            port_security_violation = None
+            psv_ch = intf_obj.re_search_children(
+                r"^\s+switchport\s+port-security\s+violation\s+(\S+)"
+            )
+            if psv_ch:
+                port_security_violation = self._extract_match(
+                    psv_ch[0].text,
+                    r"^\s+switchport\s+port-security\s+violation\s+(\S+)",
+                )
+
+            port_security_sticky = bool(
+                intf_obj.re_search_children(
+                    r"^\s+switchport\s+port-security\s+mac-address\s+sticky"
+                )
+            )
+
+            # 802.1X
+            dot1x_port_control = None
+            # Modern IOS syntax: authentication port-control <mode>
+            auth_pc_ch = intf_obj.re_search_children(
+                r"^\s+authentication\s+port-control\s+(\S+)"
+            )
+            if auth_pc_ch:
+                dot1x_port_control = self._extract_match(
+                    auth_pc_ch[0].text, r"^\s+authentication\s+port-control\s+(\S+)"
+                )
+            else:
+                # Legacy syntax: dot1x port-control <mode>
+                d1x_pc_ch = intf_obj.re_search_children(
+                    r"^\s+dot1x\s+port-control\s+(\S+)"
+                )
+                if d1x_pc_ch:
+                    dot1x_port_control = self._extract_match(
+                        d1x_pc_ch[0].text, r"^\s+dot1x\s+port-control\s+(\S+)"
+                    )
+
+            dot1x_host_mode = None
+            hm_ch = intf_obj.re_search_children(
+                r"^\s+authentication\s+host-mode\s+(\S+)"
+            )
+            if hm_ch:
+                dot1x_host_mode = self._extract_match(
+                    hm_ch[0].text, r"^\s+authentication\s+host-mode\s+(\S+)"
+                )
+
+            dot1x_mab = bool(intf_obj.re_search_children(r"^\s+mab\s*$"))
+
+            dot1x_guest_vlan = None
+            gv_ch = intf_obj.re_search_children(
+                r"^\s+authentication\s+event\s+no-response\s+action\s+authorize\s+vlan\s+(\d+)"
+            )
+            if gv_ch:
+                val = self._extract_match(
+                    gv_ch[0].text,
+                    r"^\s+authentication\s+event\s+no-response\s+action\s+authorize\s+vlan\s+(\d+)",
+                )
+                if val:
+                    dot1x_guest_vlan = int(val)
+
+            dot1x_auth_fail_vlan = None
+            afv_ch = intf_obj.re_search_children(
+                r"^\s+authentication\s+event\s+fail\s+action\s+authorize\s+vlan\s+(\d+)"
+            )
+            if afv_ch:
+                val = self._extract_match(
+                    afv_ch[0].text,
+                    r"^\s+authentication\s+event\s+fail\s+action\s+authorize\s+vlan\s+(\d+)",
+                )
+                if val:
+                    dot1x_auth_fail_vlan = int(val)
+
+            # STP per-interface
+            stp_root_guard = bool(
+                intf_obj.re_search_children(r"^\s+spanning-tree\s+guard\s+root")
+            )
+
             # Port-channel
             channel_group = None
             channel_group_mode = None
@@ -358,6 +457,17 @@ class IOSParser(BaseParser):
                 if match:
                     channel_group = int(match.group(1))
                     channel_group_mode = match.group(2)
+
+            min_links = None
+            ml_children = intf_obj.re_search_children(
+                r"^\s+port-channel\s+min-links\s+(\d+)"
+            )
+            if ml_children:
+                ml_match = re.search(
+                    r"port-channel\s+min-links\s+(\d+)", ml_children[0].text
+                )
+                if ml_match:
+                    min_links = int(ml_match.group(1))
 
             # OSPF attributes
             ospf_process_id = None
@@ -468,6 +578,12 @@ class IOSParser(BaseParser):
             tunnel_source = None
             tunnel_destination = None
             tunnel_mode = None
+            tunnel_protection_profile = None
+            tunnel_key = None
+            nhrp_network_id = None
+            nhrp_authentication = None
+            nhrp_nhs: list = []
+            nhrp_map: list = []
 
             if intf_type == InterfaceType.TUNNEL:
                 tunnel_src_children = intf_obj.re_search_children(
@@ -497,6 +613,70 @@ class IOSParser(BaseParser):
                     tunnel_mode = self._extract_match(
                         tunnel_mode_children[0].text, r"^\s+tunnel\s+mode\s+(.+)"
                     )
+
+                # tunnel protection ipsec profile <name>
+                tp_children = intf_obj.re_search_children(
+                    r"^\s+tunnel\s+protection\s+ipsec\s+profile\s+(\S+)"
+                )
+                if tp_children:
+                    tunnel_protection_profile = self._extract_match(
+                        tp_children[0].text,
+                        r"^\s+tunnel\s+protection\s+ipsec\s+profile\s+(\S+)",
+                    )
+
+                # tunnel key <num>
+                tk_children = intf_obj.re_search_children(r"^\s+tunnel\s+key\s+(\d+)")
+                if tk_children:
+                    key_str = self._extract_match(
+                        tk_children[0].text, r"^\s+tunnel\s+key\s+(\d+)"
+                    )
+                    if key_str:
+                        tunnel_key = int(key_str)
+
+                # ip nhrp network-id <id>
+                nid_children = intf_obj.re_search_children(
+                    r"^\s+ip\s+nhrp\s+network-id\s+(\d+)"
+                )
+                if nid_children:
+                    nid_str = self._extract_match(
+                        nid_children[0].text, r"^\s+ip\s+nhrp\s+network-id\s+(\d+)"
+                    )
+                    if nid_str:
+                        nhrp_network_id = int(nid_str)
+
+                # ip nhrp authentication <key>
+                na_children = intf_obj.re_search_children(
+                    r"^\s+ip\s+nhrp\s+authentication\s+(\S+)"
+                )
+                if na_children:
+                    nhrp_authentication = self._extract_match(
+                        na_children[0].text, r"^\s+ip\s+nhrp\s+authentication\s+(\S+)"
+                    )
+
+                # ip nhrp nhs <ip> (one per line, multiple allowed)
+                nhs_children = intf_obj.re_search_children(
+                    r"^\s+ip\s+nhrp\s+nhs\s+(\d+\.\d+\.\d+\.\d+)"
+                )
+                for nhs_child in nhs_children:
+                    ip_str = self._extract_match(
+                        nhs_child.text, r"^\s+ip\s+nhrp\s+nhs\s+(\d+\.\d+\.\d+\.\d+)"
+                    )
+                    try:
+                        nhrp_nhs.append(IPv4Address(ip_str))
+                    except ValueError:
+                        pass
+
+                # ip nhrp map <proto-addr> <nbma-addr>
+                nmap_children = intf_obj.re_search_children(
+                    r"^\s+ip\s+nhrp\s+map\s+(\d+\.\d+\.\d+\.\d+)\s+(\d+\.\d+\.\d+\.\d+)"
+                )
+                for nmap_child in nmap_children:
+                    m = re.search(
+                        r"^\s+ip\s+nhrp\s+map\s+(\d+\.\d+\.\d+\.\d+)\s+(\d+\.\d+\.\d+\.\d+)",
+                        nmap_child.text,
+                    )
+                    if m:
+                        nhrp_map.append(f"{m.group(1)} {m.group(2)}")
 
             # HSRP groups
             hsrp_groups = self._parse_hsrp_groups(intf_obj)
@@ -541,6 +721,10 @@ class IOSParser(BaseParser):
 
             # BFD per-interface (platform-specific hook)
             bfd_interval, bfd_min_rx, bfd_multiplier, bfd_template = self._parse_iface_bfd(intf_obj)
+            if intf_obj.re_search_children(r"^\s+no\s+bfd\s+interval"):
+                iface_no_commands.append(f"field:interface:{intf_name}:bfd_interval")
+                iface_no_commands.append(f"field:interface:{intf_name}:bfd_min_rx")
+                iface_no_commands.append(f"field:interface:{intf_name}:bfd_multiplier")
 
             # IGMP per-interface
             igmp_version = None
@@ -631,12 +815,24 @@ class IOSParser(BaseParser):
                     speed=speed,
                     duplex=duplex,
                     bandwidth=bandwidth,
+                    delay=delay,
                     switchport_mode=switchport_mode,
                     access_vlan=access_vlan,
                     trunk_allowed_vlans=trunk_allowed_vlans,
                     trunk_native_vlan=trunk_native_vlan,
                     channel_group=channel_group,
                     channel_group_mode=channel_group_mode,
+                    min_links=min_links,
+                    port_security_enabled=port_security_enabled,
+                    port_security_max_mac=port_security_max_mac,
+                    port_security_violation=port_security_violation,
+                    port_security_sticky=port_security_sticky,
+                    dot1x_port_control=dot1x_port_control,
+                    dot1x_host_mode=dot1x_host_mode,
+                    dot1x_mab=dot1x_mab,
+                    dot1x_guest_vlan=dot1x_guest_vlan,
+                    dot1x_auth_fail_vlan=dot1x_auth_fail_vlan,
+                    stp_root_guard=stp_root_guard,
                     hsrp_groups=hsrp_groups,
                     vrrp_groups=vrrp_groups,
                     ospf_process_id=ospf_process_id,
@@ -655,6 +851,12 @@ class IOSParser(BaseParser):
                     tunnel_source=tunnel_source,
                     tunnel_destination=tunnel_destination,
                     tunnel_mode=tunnel_mode,
+                    tunnel_protection_profile=tunnel_protection_profile,
+                    tunnel_key=tunnel_key,
+                    nhrp_network_id=nhrp_network_id,
+                    nhrp_authentication=nhrp_authentication,
+                    nhrp_nhs=nhrp_nhs,
+                    nhrp_map=nhrp_map,
                     pim_mode=pim_mode,
                     pim_dr_priority=pim_dr_priority,
                     pim_query_interval=pim_query_interval,
@@ -712,6 +914,22 @@ class IOSParser(BaseParser):
                 except ValueError:
                     pass
 
+            # Cluster ID (route reflector)
+            cluster_id = None
+            cid_children = bgp_obj.re_search_children(r"^\s+bgp\s+cluster-id\s+(\S+)")
+            if cid_children:
+                cid_str = self._extract_match(
+                    cid_children[0].text, r"^\s+bgp\s+cluster-id\s+(\S+)"
+                )
+                if cid_str:
+                    try:
+                        cluster_id = int(cid_str)
+                    except ValueError:
+                        try:
+                            cluster_id = IPv4Address(cid_str)
+                        except ValueError:
+                            pass
+
             # Log neighbor changes
             log_neighbor_changes = len(
                 bgp_obj.re_search_children(r"^\s+bgp\s+log-neighbor-changes")
@@ -746,6 +964,7 @@ class IOSParser(BaseParser):
                     line_numbers=line_numbers,
                     asn=asn,
                     router_id=router_id,
+                    cluster_id=cluster_id,
                     vrf=None,
                     log_neighbor_changes=log_neighbor_changes,
                     bestpath_options=bestpath_options,
@@ -778,6 +997,10 @@ class IOSParser(BaseParser):
                 continue
 
             process_id = int(process_id_str)
+            # Capture VRF from "router ospf <pid> vrf <name>" (IOS VRF-Lite style)
+            ospf_vrf = self._extract_match(
+                ospf_obj.text, r"^router\s+ospf\s+\d+\s+vrf\s+(\S+)"
+            )  # None when no VRF qualifier
             raw_lines, line_numbers = self._get_raw_lines_and_line_numbers(ospf_obj)
 
             # Router ID
@@ -901,7 +1124,7 @@ class IOSParser(BaseParser):
                     source_os=self.os_type,
                     line_numbers=line_numbers,
                     process_id=process_id,
-                    vrf=None,
+                    vrf=ospf_vrf,
                     router_id=router_id,
                     log_adjacency_changes=log_adjacency_changes,
                     log_adjacency_changes_detail=log_adjacency_changes_detail,
@@ -1497,7 +1720,10 @@ class IOSParser(BaseParser):
                     "prefix_list_in": None,
                     "prefix_list_out": None,
                     "maximum_prefix": None,
+                    "next_hop_self": False,
                     "route_reflector_client": False,
+                    "fall_over_bfd": False,
+                    "shutdown": False,
                 }
 
             # Parse commands
@@ -1534,8 +1760,14 @@ class IOSParser(BaseParser):
                 parts = command.replace("maximum-prefix ", "").split()
                 if parts:
                     neighbor_dict[peer_ip_str]["maximum_prefix"] = int(parts[0])
+            elif command == "next-hop-self":
+                neighbor_dict[peer_ip_str]["next_hop_self"] = True
             elif command == "route-reflector-client":
                 neighbor_dict[peer_ip_str]["route_reflector_client"] = True
+            elif command == "fall-over bfd":
+                neighbor_dict[peer_ip_str]["fall_over_bfd"] = True
+            elif command == "shutdown":
+                neighbor_dict[peer_ip_str]["shutdown"] = True
 
         # Create BGPNeighbor objects
         for peer_ip_str, neighbor_data in neighbor_dict.items():
@@ -1547,12 +1779,19 @@ class IOSParser(BaseParser):
                 except ValueError:
                     continue
 
-            # Skip if no remote-as and no peer-group (invalid neighbor)
-            if neighbor_data["remote_as"] is None and neighbor_data["peer_group"] is None:
+            # Skip if no remote-as and no peer-group (invalid neighbor).
+            # Exception: allow shutdown-only stubs — a proposal may contain only
+            # "neighbor X shutdown" to administratively shut an existing session
+            # without restating remote-as. The merger will apply shutdown=True to
+            # the matching base neighbor via _merge_neighbor_fields.
+            if (
+                neighbor_data["remote_as"] is None
+                and neighbor_data["peer_group"] is None
+                and not neighbor_data.get("shutdown", False)
+            ):
                 continue
 
-            # If no remote-as but has peer-group, it inherits from peer-group
-            # We'll set a placeholder value
+            # If no remote-as but has peer-group (or shutdown stub), it inherits
             remote_as = neighbor_data["remote_as"] if neighbor_data["remote_as"] is not None else "inherited"
 
             neighbors.append(
@@ -1569,7 +1808,10 @@ class IOSParser(BaseParser):
                     prefix_list_in=neighbor_data["prefix_list_in"],
                     prefix_list_out=neighbor_data["prefix_list_out"],
                     maximum_prefix=neighbor_data["maximum_prefix"],
+                    next_hop_self=neighbor_data.get("next_hop_self", False),
                     route_reflector_client=neighbor_data["route_reflector_client"],
+                    fall_over_bfd=neighbor_data.get("fall_over_bfd", False),
+                    shutdown=neighbor_data.get("shutdown", False),
                 )
             )
 
@@ -1585,44 +1827,12 @@ class IOSParser(BaseParser):
             if not pg_name:
                 continue
 
-            # Find all configurations for this peer-group
-            pg_config_children = bgp_obj.re_search_children(rf"^\s+neighbor\s+{re.escape(pg_name)}\s+")
+            pg_data = _default_pg_data(pg_name)
 
-            pg_data = {
-                "name": pg_name,
-                "remote_as": None,
-                "description": None,
-                "update_source": None,
-                "route_reflector_client": False,
-                "send_community": False,
-            }
-
-            for pg_config_child in pg_config_children:
+            for pg_config_child in bgp_obj.re_search_children(rf"^\s+neighbor\s+{re.escape(pg_name)}\s+"):
                 match = re.search(rf"^\s+neighbor\s+{re.escape(pg_name)}\s+(.+)", pg_config_child.text)
-                if not match:
-                    continue
-
-                command = match.group(1)
-
-                if command.startswith("remote-as "):
-                    as_str = command.replace("remote-as ", "").strip()
-                    try:
-                        pg_data["remote_as"] = int(as_str)
-                    except ValueError:
-                        pg_data["remote_as"] = as_str
-                elif command.startswith("description "):
-                    pg_data["description"] = command.replace("description ", "").strip()
-                elif command.startswith("update-source "):
-                    pg_data["update_source"] = command.replace("update-source ", "").strip()
-                elif command == "route-reflector-client":
-                    pg_data["route_reflector_client"] = True
-                elif command.startswith("send-community"):
-                    if "both" in command:
-                        pg_data["send_community"] = "both"
-                    elif "extended" in command:
-                        pg_data["send_community"] = "extended"
-                    else:
-                        pg_data["send_community"] = True
+                if match:
+                    apply_peer_group_command(pg_data, match.group(1))
 
             peer_groups.append(BGPPeerGroup(**pg_data))
 
@@ -1925,6 +2135,7 @@ class IOSParser(BaseParser):
                 if peer_str not in af_nb_data:
                     af_nb_data[peer_str] = {
                         "activate": False,
+                        "next_hop_self": False,
                         "route_map_in": None,
                         "route_map_out": None,
                         "prefix_list_in": None,
@@ -1936,6 +2147,8 @@ class IOSParser(BaseParser):
 
                 if cmd == "activate":
                     af_nb_data[peer_str]["activate"] = True
+                elif cmd == "next-hop-self":
+                    af_nb_data[peer_str]["next_hop_self"] = True
                 elif cmd.startswith("route-map ") and cmd.endswith(" in"):
                     af_nb_data[peer_str]["route_map_in"] = cmd[len("route-map "):-3].strip()
                 elif cmd.startswith("route-map ") and cmd.endswith(" out"):
@@ -1953,27 +2166,56 @@ class IOSParser(BaseParser):
                     if rm_m:
                         af_nb_data[peer_str]["default_originate_route_map"] = rm_m.group(1)
 
-            # Attach BGPNeighborAF to matching neighbors
+            # Attach BGPNeighborAF to matching neighbors.
+            # If the neighbor appears in the AF block but NOT at the global level
+            # (common in delta proposals that only add a route-map to an existing
+            # neighbor), create a thin stub so the merger can merge the AF policy
+            # into the base config's existing neighbor entry.
             for peer_str, data in af_nb_data.items():
-                nb = nb_index.get(peer_str)
-                if nb is None:
-                    continue
                 # Only attach if there is at least one policy field set
-                if any(v for v in data.values() if v):
-                    nb.address_families.append(
-                        BGPNeighborAF(
-                            afi=afi,
-                            safi=safi,
-                            activate=data["activate"],
-                            route_map_in=data["route_map_in"],
-                            route_map_out=data["route_map_out"],
-                            prefix_list_in=data["prefix_list_in"],
-                            prefix_list_out=data["prefix_list_out"],
-                            filter_list_in=data["filter_list_in"],
-                            filter_list_out=data["filter_list_out"],
-                            default_originate_route_map=data["default_originate_route_map"],
-                        )
+                if not any(v for v in data.values() if v):
+                    continue
+                af_entry = BGPNeighborAF(
+                    afi=afi,
+                    safi=safi,
+                    activate=data["activate"],
+                    next_hop_self=data.get("next_hop_self", False),
+                    route_map_in=data["route_map_in"],
+                    route_map_out=data["route_map_out"],
+                    prefix_list_in=data["prefix_list_in"],
+                    prefix_list_out=data["prefix_list_out"],
+                    filter_list_in=data["filter_list_in"],
+                    filter_list_out=data["filter_list_out"],
+                    default_originate_route_map=data["default_originate_route_map"],
+                )
+                nb = nb_index.get(peer_str)
+                if nb is not None:
+                    # Propagate next_hop_self from AF block to the neighbor object
+                    # so the simulator can read it from nbr_src.next_hop_self directly.
+                    if data.get("next_hop_self"):
+                        nb.next_hop_self = True
+                    nb.address_families.append(af_entry)
+                else:
+                    # AF-only neighbor (no global declaration in this proposal).
+                    # Create a thin stub with remote_as="inherited" so the merger
+                    # can match it by peer IP to the baseline's existing neighbor
+                    # and apply the AF policy without clobbering remote_as.
+                    try:
+                        from ipaddress import IPv4Address, IPv6Address
+                        peer_ip = IPv4Address(peer_str)
+                    except ValueError:
+                        try:
+                            peer_ip = IPv6Address(peer_str)
+                        except ValueError:
+                            continue
+                    stub = BGPNeighbor(
+                        peer_ip=peer_ip,
+                        remote_as="inherited",
+                        next_hop_self=data.get("next_hop_self", False),
+                        address_families=[af_entry],
                     )
+                    neighbors.append(stub)
+                    nb_index[peer_str] = stub
 
     def _parse_bgp_networks(self, bgp_obj, vrf: str | None) -> list[BGPNetwork]:
         """Parse BGP network statements at global level (not in address-family)."""
@@ -2218,6 +2460,8 @@ class IOSParser(BaseParser):
         return static_routes
 
     def parse_deletion_commands(self) -> list[str]:
+        # Handles:
+        #   - ``no vlan <id>``                              → ``vlan:<id>``
         """Parse top-level 'no' deletion commands into tombstone strings.
 
         Handles:
@@ -2251,6 +2495,23 @@ class IOSParser(BaseParser):
                 tombstones.append(f"static:{vrf}:{dest}")
             except ValueError:
                 pass
+        # --- vlan database deletions ---
+        for obj in parse.find_objects(r"^no\s+vlan\s+"):
+            m = re.search(r"^no\s+vlan\s+([\d,\-]+)", obj.text)
+            if m:
+                vlan_str = m.group(1)
+                for part in vlan_str.split(","):
+                    part = part.strip()
+                    if "-" in part:
+                        try:
+                            start, end = part.split("-", 1)
+                            for vid in range(int(start), int(end) + 1):
+                                tombstones.append(f"vlan:{vid}")
+                        except ValueError:
+                            pass
+                    else:
+                        tombstones.append(f"vlan:{part}")
+
 
         # --- process-level deletions ---
         for obj in parse.find_objects(r"^no\s+router\s+ospf\s+"):
@@ -2270,10 +2531,6 @@ class IOSParser(BaseParser):
 
         for obj in parse.find_objects(r"^no\s+router\s+eigrp\s+"):
             m = re.search(r"^no\s+router\s+eigrp\s+(\S+)", obj.text)
-            if m:
-                tombstones.append(f"process:eigrp:{m.group(1)}")
-
-        # --- ACL: whole-ACL deletion ---
         for obj in parse.find_objects(r"^no\s+ip\s+access-list\s+"):
             m = re.search(
                 r"^no\s+ip\s+access-list\s+(?:standard|extended)\s+(\S+)", obj.text
@@ -2306,6 +2563,10 @@ class IOSParser(BaseParser):
             tombstones.append("singleton:syslog")
         if parse.find_objects(r"^no\s+ip\s+multicast-routing"):
             tombstones.append("singleton:multicast")
+        if parse.find_objects(r"^no\s+aaa\s+new-model"):
+            tombstones.append("singleton:aaa")
+        if parse.find_objects(r"^no\s+bfd-template\s+") or parse.find_objects(r"^no\s+bfd\s+"):
+            tombstones.append("singleton:bfd")
 
         # --- ACE-level deletions: "no <seq>" inside ip access-list blocks ---
         for acl_obj in parse.find_objects(
@@ -2322,6 +2583,34 @@ class IOSParser(BaseParser):
                 m2 = re.match(r"^no\s+(\d+)$", child_text)
                 if m2:
                     tombstones.append(f"acl-seq:{acl_name}:{m2.group(1)}")
+
+        # --- Registry-driven nested block deletions ---
+        # Each NestedDeletionRule maps a (parent_block, nested_no_command) pair
+        # to a ``field:<template>`` tombstone consumed by _apply_deletions() →
+        # _del_field() in the merger.  Adding a new nested deletion requires
+        # exactly one new entry in tombstones.NESTED_DELETION_RULES plus one
+        # accessor in merger._FIELD_PATH_ACCESSORS — nothing else changes.
+        from confgraph.tombstones import NESTED_DELETION_RULES
+        for rule in NESTED_DELETION_RULES:
+            for block_obj in parse.find_objects(rule.parent_pattern):
+                pm = re.search(rule.parent_pattern, block_obj.text)
+                if not pm:
+                    continue
+                parent_ctx = {
+                    name: (pm.group(i + 1) or "")
+                    for i, name in enumerate(rule.parent_groups)
+                }
+                for child in block_obj.all_children:
+                    text = child.text.strip()
+                    cm = re.match(rule.child_pattern, text)
+                    if not cm:
+                        continue
+                    child_ctx = {
+                        name: (cm.group(i + 1) or "")
+                        for i, name in enumerate(rule.child_groups)
+                    }
+                    ctx = {**parent_ctx, **child_ctx}
+                    tombstones.append("field:" + rule.template.format(**ctx))
 
         return tombstones
 

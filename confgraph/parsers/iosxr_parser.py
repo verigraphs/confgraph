@@ -33,7 +33,7 @@ from confgraph.models.community_list import (
     ASPathListEntry,
 )
 from confgraph.models.isis import ISISConfig, ISISInterface, ISISRedistribute
-from confgraph.parsers.base import _BASE_KNOWN_PATTERNS
+from confgraph.parsers.base import _BASE_KNOWN_PATTERNS, apply_peer_group_command, _default_pg_data
 from confgraph.parsers.ios_parser import IOSParser
 
 
@@ -245,6 +245,168 @@ class IOSXRParser(IOSParser):
         return interfaces
 
     # -----------------------------------------------------------------------
+    # BGP — shared neighbor block parsers (single source of truth)
+    # -----------------------------------------------------------------------
+
+    def _parse_iosxr_neighbor_block(self, nb_child) -> dict:
+        """Parse all attributes from a single IOS-XR ``neighbor X { ... }`` block.
+
+        This is the single source of truth for neighbor attribute parsing in
+        IOS-XR.  Both the global neighbor path (``_parse_bgp_neighbors``) and
+        the VRF neighbor path (``_parse_bgp_vrf_instances``) delegate here so
+        that adding a new field requires exactly one code change.
+
+        IOS-XR block structure::
+
+            neighbor 10.1.1.1
+             remote-as 65001
+             description ISP1
+             update-source Loopback0
+             ebgp-multihop 2
+             password encrypted <hash>
+             fall-over bfd
+             local-as 65099 no-prepend replace-as
+             address-family ipv4 unicast
+              route-policy ISP-IN in
+              route-policy ISP-OUT out
+              prefix-set ALLOWED-IN in
+              next-hop-self
+              send-community-ebgp
+              route-reflector-client
+
+        Returns a flat dict keyed by BGPNeighbor field names.  The caller is
+        responsible for checking ``remote_as``/``peer_group`` presence and
+        constructing the ``BGPNeighbor`` object.
+        """
+        nd: dict = {
+            "remote_as": None,
+            "peer_group": None,
+            "description": None,
+            "update_source": None,
+            "ebgp_multihop": None,
+            "password": None,
+            "shutdown": False,
+            "fall_over_bfd": False,
+            "local_as": None,
+            "local_as_no_prepend": False,
+            "local_as_replace_as": False,
+            "next_hop_self": False,
+            "send_community": False,
+            "route_reflector_client": False,
+            "route_map_in": None,
+            "route_map_out": None,
+            "prefix_list_in": None,
+            "prefix_list_out": None,
+        }
+
+        for child in nb_child.all_children:
+            text = child.text.strip()
+
+            # Neighbor-level attributes
+            if text.startswith("remote-as "):
+                val = text.split(None, 1)[1].strip()
+                try:
+                    nd["remote_as"] = int(val)
+                except ValueError:
+                    nd["remote_as"] = val
+            elif text.startswith("description "):
+                nd["description"] = text.split(None, 1)[1].strip()
+            elif text.startswith("update-source "):
+                nd["update_source"] = text.split(None, 1)[1].strip()
+            elif text.startswith("ebgp-multihop "):
+                parts = text.split()
+                if len(parts) > 1 and parts[1].isdigit():
+                    nd["ebgp_multihop"] = int(parts[1])
+            elif text.startswith("use neighbor-group "):
+                nd["peer_group"] = text.split(None, 2)[2].strip()
+            elif text.startswith("password "):
+                # IOS-XR: "password encrypted <hash>" or "password clear <text>"
+                parts = text.split(None, 2)
+                if len(parts) == 3:
+                    nd["password"] = parts[2]
+                elif len(parts) == 2:
+                    nd["password"] = parts[1]
+            elif text == "shutdown":
+                nd["shutdown"] = True
+            elif text == "fall-over bfd":
+                nd["fall_over_bfd"] = True
+            elif text.startswith("local-as "):
+                parts = text.split()
+                if len(parts) >= 2 and parts[1].isdigit():
+                    nd["local_as"] = int(parts[1])
+                    nd["local_as_no_prepend"] = "no-prepend" in parts
+                    nd["local_as_replace_as"] = "replace-as" in parts
+
+            # AF-level attributes (found via all_children recursion)
+            elif text.startswith("route-policy ") and text.endswith(" in"):
+                nd["route_map_in"] = text[len("route-policy "):-3].strip()
+            elif text.startswith("route-policy ") and text.endswith(" out"):
+                nd["route_map_out"] = text[len("route-policy "):-4].strip()
+            elif text.startswith("prefix-set ") and text.endswith(" in"):
+                nd["prefix_list_in"] = text[len("prefix-set "):-3].strip()
+            elif text.startswith("prefix-set ") and text.endswith(" out"):
+                nd["prefix_list_out"] = text[len("prefix-set "):-4].strip()
+            elif text == "next-hop-self":
+                nd["next_hop_self"] = True
+            elif text == "route-reflector-client":
+                nd["route_reflector_client"] = True
+            elif text.startswith("send-community"):
+                if "both" in text:
+                    nd["send_community"] = "both"
+                elif "extended" in text:
+                    nd["send_community"] = "extended"
+                else:
+                    nd["send_community"] = True
+
+        return nd
+
+    def _parse_iosxr_neighbor_af_block(self, af_child) -> dict:
+        """Parse a single ``address-family ipv4|ipv6 unicast`` block under a neighbor.
+
+        Used by ``_apply_bgp_af_neighbor_policies`` to build ``BGPNeighborAF``
+        objects.  Returns an af_data dict keyed by ``BGPNeighborAF`` field names.
+        """
+        af_data: dict = {
+            "activate": True,
+            "route_map_in": None,
+            "route_map_out": None,
+            "prefix_list_in": None,
+            "prefix_list_out": None,
+            "filter_list_in": None,
+            "filter_list_out": None,
+            "next_hop_self": False,
+            "send_community": False,
+            "route_reflector_client": False,
+            "default_originate_route_map": None,
+        }
+
+        for policy_child in af_child.all_children:
+            cmd = policy_child.text.strip()
+            if cmd.startswith("route-policy ") and cmd.endswith(" in"):
+                af_data["route_map_in"] = cmd[len("route-policy "):-3].strip()
+            elif cmd.startswith("route-policy ") and cmd.endswith(" out"):
+                af_data["route_map_out"] = cmd[len("route-policy "):-4].strip()
+            elif cmd.startswith("prefix-set ") and cmd.endswith(" in"):
+                af_data["prefix_list_in"] = cmd[len("prefix-set "):-3].strip()
+            elif cmd.startswith("prefix-set ") and cmd.endswith(" out"):
+                af_data["prefix_list_out"] = cmd[len("prefix-set "):-4].strip()
+            elif cmd == "next-hop-self":
+                af_data["next_hop_self"] = True
+            elif cmd == "route-reflector-client":
+                af_data["route_reflector_client"] = True
+            elif cmd.startswith("send-community"):
+                if "both" in cmd:
+                    af_data["send_community"] = "both"
+                elif "extended" in cmd:
+                    af_data["send_community"] = "extended"
+                else:
+                    af_data["send_community"] = True
+            elif cmd.startswith("default-originate route-policy "):
+                af_data["default_originate_route_map"] = cmd.split(None, 2)[2].strip()
+
+        return af_data
+
+    # -----------------------------------------------------------------------
     # BGP — "neighbor-group NAME" / "use neighbor-group NAME"
     # -----------------------------------------------------------------------
 
@@ -258,36 +420,10 @@ class IOSXRParser(IOSParser):
             if not pg_name:
                 continue
 
-            pg_data: dict = {
-                "name": pg_name,
-                "remote_as": None,
-                "description": None,
-                "update_source": None,
-                "route_reflector_client": False,
-                "send_community": False,
-            }
+            pg_data = _default_pg_data(pg_name)
 
             for child in ng_child.all_children:
-                text = child.text.strip()
-                if text.startswith("remote-as "):
-                    val = text.replace("remote-as ", "").strip()
-                    try:
-                        pg_data["remote_as"] = int(val)
-                    except ValueError:
-                        pg_data["remote_as"] = val
-                elif text.startswith("description "):
-                    pg_data["description"] = text.replace("description ", "").strip()
-                elif text.startswith("update-source "):
-                    pg_data["update_source"] = text.replace("update-source ", "").strip()
-                elif text == "route-reflector-client":
-                    pg_data["route_reflector_client"] = True
-                elif text.startswith("send-community"):
-                    if "both" in text:
-                        pg_data["send_community"] = "both"
-                    elif "extended" in text:
-                        pg_data["send_community"] = "extended"
-                    else:
-                        pg_data["send_community"] = True
+                apply_peer_group_command(pg_data, child.text.strip())
 
             peer_groups.append(BGPPeerGroup(**pg_data))
 
@@ -328,40 +464,37 @@ class IOSXRParser(IOSParser):
                     except ValueError:
                         continue
 
-                nd: dict = {
-                    "remote_as": None,
-                    "description": None,
-                    "update_source": None,
-                    "route_map_in": None,
-                    "route_map_out": None,
-                }
-                for child in nb_child.all_children:
-                    text = child.text.strip()
-                    if text.startswith("remote-as "):
-                        val = text.split(None, 1)[1].strip()
-                        try:
-                            nd["remote_as"] = int(val)
-                        except ValueError:
-                            nd["remote_as"] = val
-                    elif text.startswith("description "):
-                        nd["description"] = text.split(None, 1)[1].strip()
-                    elif text.startswith("update-source "):
-                        nd["update_source"] = text.split(None, 1)[1].strip()
-                    # AF-level route-policy (inside address-family block)
-                    elif text.startswith("route-policy ") and text.endswith(" in"):
-                        nd["route_map_in"] = text[len("route-policy "):-3].strip()
-                    elif text.startswith("route-policy ") and text.endswith(" out"):
-                        nd["route_map_out"] = text[len("route-policy "):-4].strip()
+                nd = self._parse_iosxr_neighbor_block(nb_child)
 
-                if nd["remote_as"] is None:
-                    continue
+                has_policy = (
+                    nd["route_map_in"] or nd["route_map_out"] or nd["next_hop_self"]
+                    or nd["prefix_list_in"] or nd["prefix_list_out"]
+                )
+                if nd["remote_as"] is None and nd["peer_group"] is None:
+                    if not has_policy:
+                        continue
+                    nd["remote_as"] = "inherited"
+
                 vrf_neighbors.append(BGPNeighbor(
                     peer_ip=peer_ip,
-                    remote_as=nd["remote_as"],
+                    remote_as=nd["remote_as"] if nd["remote_as"] is not None else "inherited",
+                    peer_group=nd["peer_group"],
                     description=nd["description"],
                     update_source=nd["update_source"],
+                    ebgp_multihop=nd["ebgp_multihop"],
+                    password=nd["password"],
+                    shutdown=nd["shutdown"],
+                    fall_over_bfd=nd["fall_over_bfd"],
+                    local_as=nd["local_as"],
+                    local_as_no_prepend=nd["local_as_no_prepend"],
+                    local_as_replace_as=nd["local_as_replace_as"],
+                    next_hop_self=nd["next_hop_self"],
+                    send_community=nd["send_community"],
+                    route_reflector_client=nd["route_reflector_client"],
                     route_map_in=nd["route_map_in"],
                     route_map_out=nd["route_map_out"],
+                    prefix_list_in=nd["prefix_list_in"],
+                    prefix_list_out=nd["prefix_list_out"],
                 ))
 
             # Redistribution
@@ -400,6 +533,7 @@ class IOSXRParser(IOSParser):
                     peer_groups=[],
                     address_families=[],
                     redistribute=redistribute,
+                    no_commands=[],
                 )
             )
 
@@ -712,44 +846,83 @@ class IOSXRParser(IOSParser):
 
             raw_lines, line_numbers = self._get_raw_lines_and_line_numbers(rp_obj)
 
-            # Extract match/set clauses as best-effort from the policy body
+            # Extract match/set clauses as best-effort from the policy body.
+            # Handles IOS-XR if/then/else by emitting two RouteMapSequences:
+            #   seq 10: match + if-branch sets
+            #   seq 20: no match (catch-all) + else-branch sets
             match_clauses: list[RouteMapMatch] = []
-            set_clauses: list[RouteMapSet] = []
+            if_set_clauses: list[RouteMapSet] = []
+            else_set_clauses: list[RouteMapSet] = []
+            in_else = False
+
+            def _parse_set(text: str, target: list[RouteMapSet]) -> None:
+                if text.startswith("set local-preference "):
+                    val = self._extract_match(text, r"set local-preference (\S+)")
+                    if val:
+                        target.append(RouteMapSet(set_type="local-preference", values=[val]))
+                elif text.startswith("set med ") or text.startswith("set metric "):
+                    val = self._extract_match(text, r"set (?:med|metric) (\S+)")
+                    if val:
+                        target.append(RouteMapSet(set_type="metric", values=[val]))
+                elif text.startswith("set community "):
+                    val = self._extract_match(text, r"set community (\S+)")
+                    if val:
+                        target.append(RouteMapSet(set_type="community", values=[val]))
+                elif text.startswith("prepend as-path "):
+                    vals = text.replace("prepend as-path ", "").split()
+                    target.append(RouteMapSet(set_type="as-path prepend", values=vals))
+                elif text.startswith("set origin "):
+                    val = self._extract_match(text, r"set origin (\S+)")
+                    if val:
+                        target.append(RouteMapSet(set_type="origin", values=[val]))
 
             for child in rp_obj.all_children:
                 text = child.text.strip()
-                if text.startswith("if destination in "):
+                if text == "else":
+                    in_else = True
+                elif text in ("endif", "end-policy"):
+                    in_else = False
+                elif text.startswith("if destination in "):
                     dest = self._extract_match(text, r"if destination in (\S+)")
                     if dest:
                         match_clauses.append(
                             RouteMapMatch(match_type="ip address prefix-list", values=[dest])
                         )
-                elif text.startswith("set local-preference "):
-                    val = self._extract_match(text, r"set local-preference (\S+)")
-                    if val:
-                        set_clauses.append(RouteMapSet(set_type="local-preference", values=[val]))
-                elif text.startswith("set med ") or text.startswith("set metric "):
-                    val = self._extract_match(text, r"set (?:med|metric) (\S+)")
-                    if val:
-                        set_clauses.append(RouteMapSet(set_type="metric", values=[val]))
-                elif text.startswith("set community "):
-                    val = self._extract_match(text, r"set community (\S+)")
-                    if val:
-                        set_clauses.append(RouteMapSet(set_type="community", values=[val]))
-                elif text.startswith("prepend as-path "):
-                    vals = text.replace("prepend as-path ", "").split()
-                    set_clauses.append(RouteMapSet(set_type="as-path prepend", values=vals))
-                elif text.startswith("set origin "):
-                    val = self._extract_match(text, r"set origin (\S+)")
-                    if val:
-                        set_clauses.append(RouteMapSet(set_type="origin", values=[val]))
+                elif text.startswith("if community matches-any "):
+                    comm_set = self._extract_match(text, r"if community matches-any (\S+)")
+                    if comm_set:
+                        match_clauses.append(
+                            RouteMapMatch(match_type="community", values=[comm_set])
+                        )
+                elif text.startswith("set ") or text.startswith("prepend as-path "):
+                    target = else_set_clauses if in_else else if_set_clauses
+                    _parse_set(text, target)
 
-            sequence = RouteMapSequence(
-                sequence=10,
-                action="permit",
-                match_clauses=match_clauses,
-                set_clauses=set_clauses,
-            )
+            sequences: list[RouteMapSequence] = []
+            if match_clauses:
+                # Sequence 10: the if-branch (match + its set clauses)
+                sequences.append(RouteMapSequence(
+                    sequence=10,
+                    action="permit",
+                    match_clauses=match_clauses,
+                    set_clauses=if_set_clauses,
+                ))
+                # Sequence 20: the else-branch (catch-all, no match clause)
+                if else_set_clauses:
+                    sequences.append(RouteMapSequence(
+                        sequence=20,
+                        action="permit",
+                        match_clauses=[],
+                        set_clauses=else_set_clauses,
+                    ))
+            else:
+                # No if/then — simple policy with no match clause
+                sequences.append(RouteMapSequence(
+                    sequence=10,
+                    action="permit",
+                    match_clauses=[],
+                    set_clauses=if_set_clauses,
+                ))
 
             route_maps.append(
                 RouteMapConfig(
@@ -758,7 +931,7 @@ class IOSXRParser(IOSParser):
                     source_os=self.os_type,
                     line_numbers=line_numbers,
                     name=rp_name,
-                    sequences=[sequence],
+                    sequences=sequences,
                 )
             )
 
@@ -1105,6 +1278,9 @@ class IOSXRParser(IOSParser):
              description ISP1-PEER
              address-family ipv4 unicast
               route-policy ISP1-IN in
+
+        Delegates all attribute parsing to ``_parse_iosxr_neighbor_block`` so
+        that this path and the VRF path stay in sync automatically.
         """
         neighbors = []
         neighbor_blocks = bgp_obj.re_search_children(r"^\s+neighbor\s+(\S+)\s*$")
@@ -1122,50 +1298,37 @@ class IOSXRParser(IOSParser):
                 except ValueError:
                     continue
 
-            nd: dict = {
-                "remote_as": None,
-                "peer_group": None,
-                "description": None,
-                "update_source": None,
-                "ebgp_multihop": None,
-                "password": None,
-                "route_map_in": None,
-                "route_map_out": None,
-            }
+            nd = self._parse_iosxr_neighbor_block(nb_child)
 
-            for child in nb_child.all_children:
-                text = child.text.strip()
-                if text.startswith("remote-as "):
-                    val = text.split(None, 1)[1].strip()
-                    try:
-                        nd["remote_as"] = int(val)
-                    except ValueError:
-                        nd["remote_as"] = val
-                elif text.startswith("description "):
-                    nd["description"] = text.split(None, 1)[1].strip()
-                elif text.startswith("update-source "):
-                    nd["update_source"] = text.split(None, 1)[1].strip()
-                elif text.startswith("ebgp-multihop "):
-                    parts = text.split()
-                    if len(parts) > 1 and parts[1].isdigit():
-                        nd["ebgp_multihop"] = int(parts[1])
-                elif text.startswith("use neighbor-group "):
-                    nd["peer_group"] = text.split(None, 2)[2].strip()
-
+            has_policy = (
+                nd["route_map_in"] or nd["route_map_out"] or nd["next_hop_self"]
+                or nd["prefix_list_in"] or nd["prefix_list_out"]
+            )
             if nd["remote_as"] is None and nd["peer_group"] is None:
-                continue
+                if not has_policy:
+                    continue
+                nd["remote_as"] = "inherited"
 
-            remote_as = nd["remote_as"] if nd["remote_as"] is not None else "inherited"
             neighbors.append(BGPNeighbor(
                 peer_ip=peer_ip,
-                remote_as=remote_as,
+                remote_as=nd["remote_as"] if nd["remote_as"] is not None else "inherited",
                 peer_group=nd["peer_group"],
                 description=nd["description"],
                 update_source=nd["update_source"],
                 ebgp_multihop=nd["ebgp_multihop"],
                 password=nd["password"],
+                shutdown=nd["shutdown"],
+                fall_over_bfd=nd["fall_over_bfd"],
+                local_as=nd["local_as"],
+                local_as_no_prepend=nd["local_as_no_prepend"],
+                local_as_replace_as=nd["local_as_replace_as"],
+                next_hop_self=nd["next_hop_self"],
+                send_community=nd["send_community"],
+                route_reflector_client=nd["route_reflector_client"],
                 route_map_in=nd["route_map_in"],
                 route_map_out=nd["route_map_out"],
+                prefix_list_in=nd["prefix_list_in"],
+                prefix_list_out=nd["prefix_list_out"],
             ))
 
         return neighbors
@@ -1183,6 +1346,9 @@ class IOSXRParser(IOSParser):
              address-family ipv4 unicast
               route-policy ISP-IN in
               route-policy ISP-OUT out
+
+        Delegates AF-block parsing to ``_parse_iosxr_neighbor_af_block`` so
+        that this method only handles iteration and object construction.
         """
         nb_index = {str(nb.peer_ip): nb for nb in neighbors}
 
@@ -1201,27 +1367,7 @@ class IOSXRParser(IOSParser):
                 if not m:
                     continue
                 afi, safi = m.group(1), "unicast"
-                af_data: dict = {
-                    "activate": True,
-                    "route_map_in": None,
-                    "route_map_out": None,
-                    "prefix_list_in": None,
-                    "prefix_list_out": None,
-                    "filter_list_in": None,
-                    "filter_list_out": None,
-                    "default_originate_route_map": None,
-                }
-                for policy_child in af_child.all_children:
-                    cmd = policy_child.text.strip()
-                    if cmd.startswith("route-policy ") and cmd.endswith(" in"):
-                        af_data["route_map_in"] = cmd[len("route-policy "):-3].strip()
-                    elif cmd.startswith("route-policy ") and cmd.endswith(" out"):
-                        af_data["route_map_out"] = cmd[len("route-policy "):-4].strip()
-                    elif cmd.startswith("prefix-set ") and cmd.endswith(" in"):
-                        af_data["prefix_list_in"] = cmd[len("prefix-set "):-3].strip()
-                    elif cmd.startswith("prefix-set ") and cmd.endswith(" out"):
-                        af_data["prefix_list_out"] = cmd[len("prefix-set "):-4].strip()
-
+                af_data = self._parse_iosxr_neighbor_af_block(af_child)
                 if any(v for v in af_data.values() if v and v is not True):
                     nb.address_families.append(BGPNeighborAF(afi=afi, safi=safi, **af_data))
 

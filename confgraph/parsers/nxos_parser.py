@@ -14,7 +14,7 @@ from confgraph.models.bgp import (
 )
 from confgraph.models.ospf import OSPFConfig
 from confgraph.models.static_route import StaticRoute
-from confgraph.parsers.base import _BASE_KNOWN_PATTERNS
+from confgraph.parsers.base import _BASE_KNOWN_PATTERNS, apply_peer_group_command, _default_pg_data
 from confgraph.parsers.ios_parser import IOSParser
 
 
@@ -224,55 +224,9 @@ class NXOSParser(IOSParser):
         seen: set[str] = set()
 
         def _build_pg(pg_name: str, children_iter) -> BGPPeerGroup:
-            pg_data: dict = {
-                "name": pg_name,
-                "remote_as": None,
-                "description": None,
-                "update_source": None,
-                "route_reflector_client": False,
-                "send_community": False,
-                "route_map_in": None,
-                "route_map_out": None,
-                "prefix_list_in": None,
-                "prefix_list_out": None,
-            }
+            pg_data = _default_pg_data(pg_name)
             for child in children_iter:
-                text = child.text.strip()
-                if text.startswith("remote-as "):
-                    val = text.replace("remote-as ", "").strip()
-                    try:
-                        pg_data["remote_as"] = int(val)
-                    except ValueError:
-                        pg_data["remote_as"] = val
-                elif text.startswith("description "):
-                    pg_data["description"] = text.replace("description ", "").strip()
-                elif text.startswith("update-source "):
-                    pg_data["update_source"] = text.replace("update-source ", "").strip()
-                elif text == "route-reflector-client":
-                    pg_data["route_reflector_client"] = True
-                elif text.startswith("send-community"):
-                    if "both" in text:
-                        pg_data["send_community"] = "both"
-                    elif "extended" in text:
-                        pg_data["send_community"] = "extended"
-                    else:
-                        pg_data["send_community"] = True
-                elif text.startswith("route-map ") and " in" in text:
-                    m = re.search(r"route-map\s+(\S+)\s+in", text)
-                    if m:
-                        pg_data["route_map_in"] = m.group(1)
-                elif text.startswith("route-map ") and " out" in text:
-                    m = re.search(r"route-map\s+(\S+)\s+out", text)
-                    if m:
-                        pg_data["route_map_out"] = m.group(1)
-                elif text.startswith("prefix-list ") and " in" in text:
-                    m = re.search(r"prefix-list\s+(\S+)\s+in", text)
-                    if m:
-                        pg_data["prefix_list_in"] = m.group(1)
-                elif text.startswith("prefix-list ") and " out" in text:
-                    m = re.search(r"prefix-list\s+(\S+)\s+out", text)
-                    if m:
-                        pg_data["prefix_list_out"] = m.group(1)
+                apply_peer_group_command(pg_data, child.text.strip())
             return BGPPeerGroup(**pg_data)
 
         # NX-OS native: template peer NAME blocks
