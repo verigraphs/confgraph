@@ -2531,6 +2531,9 @@ class IOSParser(BaseParser):
 
         for obj in parse.find_objects(r"^no\s+router\s+eigrp\s+"):
             m = re.search(r"^no\s+router\s+eigrp\s+(\S+)", obj.text)
+            if m:
+                tombstones.append(f"process:eigrp:{m.group(1)}")
+
         for obj in parse.find_objects(r"^no\s+ip\s+access-list\s+"):
             m = re.search(
                 r"^no\s+ip\s+access-list\s+(?:standard|extended)\s+(\S+)", obj.text
