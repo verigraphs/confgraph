@@ -3,6 +3,7 @@
 __pycache__/
 *.pyc
 .DS_Store
+*.html
 .claude/
 temp/
 Self_Sustain_Parser_sys_design_v3.md
