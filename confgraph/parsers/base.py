@@ -68,6 +68,7 @@ from confgraph.models.lldp import LLDPConfig
 from confgraph.models.cdp import CDPConfig
 from confgraph.models.stp import STPConfig
 from confgraph.models.vlan import VLANEntry
+from confgraph.models.netflow import NetFlowConfig
 
 
 # Top-level config line patterns that are "claimed" by a parse_* method.
@@ -420,6 +421,10 @@ class BaseParser(ABC):
         """Parse Spanning Tree Protocol global configuration."""
         return None
 
+    def parse_netflow(self) -> NetFlowConfig | None:
+        """Parse NetFlow export configuration."""
+        return None
+
     def parse_vlans(self) -> list[VLANEntry]:
         """Parse VLAN database entries."""
         return []
@@ -498,6 +503,7 @@ class BaseParser(ABC):
         ("cdp",                "parse_cdp"),
         ("spanning_tree",      "parse_spanning_tree"),
         ("vlans",              "parse_vlans"),
+        ("netflow",            "parse_netflow"),
         ("no_commands",        "parse_deletion_commands"),
     ]
 

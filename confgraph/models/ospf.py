@@ -100,6 +100,14 @@ class OSPFArea(BaseModel):
     virtual_links: list[str] = Field(
         default_factory=list, description="Virtual link configurations"
     )
+    filter_list_in: str | None = Field(
+        default=None,
+        description="Prefix-list name filtering Type-3 LSAs flooded into this area (inbound to area)",
+    )
+    filter_list_out: str | None = Field(
+        default=None,
+        description="Prefix-list name filtering Type-3 LSAs sent out of this area (outbound from area)",
+    )
 
     class Config:
         """Pydantic model configuration."""

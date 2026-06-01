@@ -719,6 +719,8 @@ class IOSXRParser(IOSParser):
                     "authentication": None,
                     "ranges": [],
                     "interfaces": [],
+                    "filter_list_in": None,
+                    "filter_list_out": None,
                 }
 
             # Area type
@@ -761,6 +763,18 @@ class IOSXRParser(IOSParser):
                         )
                     except ValueError:
                         pass
+
+            # Type-3 LSA filter-list (IOS-XR: 'filter-list prefix NAME in|out')
+            for fl_child in area_child.re_search_children(r"^\s+filter-list\s+prefix\s+"):
+                fl_match = re.search(
+                    r"filter-list\s+prefix\s+(\S+)\s+(in|out)", fl_child.text
+                )
+                if fl_match:
+                    pl_name, direction = fl_match.group(1), fl_match.group(2)
+                    if direction == "in":
+                        area_dict[area_id]["filter_list_in"] = pl_name
+                    else:
+                        area_dict[area_id]["filter_list_out"] = pl_name
 
             # Interfaces nested under area
             for intf_child in area_child.re_search_children(r"^\s+interface\s+(\S+)"):

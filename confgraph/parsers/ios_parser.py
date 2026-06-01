@@ -79,6 +79,7 @@ from confgraph.models.lldp import LLDPConfig
 from confgraph.models.cdp import CDPConfig
 from confgraph.models.stp import STPConfig, STPVlanConfig
 from confgraph.models.vlan import VLANEntry
+from confgraph.models.netflow import NetFlowConfig, NetFlowDestination
 
 
 class IOSParser(BaseParser):
@@ -791,6 +792,27 @@ class IOSParser(BaseParser):
             elif nat_out_ch:
                 nat_direction = "outside"
 
+            # uRPF — 'ip verify unicast source reachable-via rx|any'
+            ip_verify_unicast = None
+            urpf_ch = intf_obj.re_search_children(
+                r"^\s+ip\s+verify\s+unicast\s+source\s+reachable-via\s+(rx|any)"
+            )
+            if urpf_ch:
+                m = re.search(
+                    r"^\s+ip\s+verify\s+unicast\s+source\s+reachable-via\s+(rx|any)",
+                    urpf_ch[0].text,
+                )
+                if m:
+                    ip_verify_unicast = m.group(1)
+
+            # PBR — 'ip policy route-map <name>'
+            ip_policy_route_map = None
+            pbr_ch = intf_obj.re_search_children(r"^\s+ip\s+policy\s+route-map\s+(\S+)")
+            if pbr_ch:
+                ip_policy_route_map = self._extract_match(
+                    pbr_ch[0].text, r"^\s+ip\s+policy\s+route-map\s+(\S+)"
+                )
+
             # Crypto map
             crypto_map_name = None
             cm_ch = intf_obj.re_search_children(r"^\s+crypto\s+map\s+(\S+)")
@@ -876,6 +898,8 @@ class IOSParser(BaseParser):
                     service_policy_input=service_policy_input,
                     service_policy_output=service_policy_output,
                     nat_direction=nat_direction,
+                    ip_verify_unicast=ip_verify_unicast,
+                    ip_policy_route_map=ip_policy_route_map,
                     crypto_map=crypto_map_name,
                     no_commands=iface_no_commands,
                 )
@@ -930,6 +954,45 @@ class IOSParser(BaseParser):
                         except ValueError:
                             pass
 
+            # RPKI cache server: 'bgp rpki server tcp <ip> port <port>'
+            rpki_server = None
+            rpki_children = bgp_obj.re_search_children(
+                r"^\s+bgp\s+rpki\s+server\s+tcp\s+(\S+)\s+port\s+(\d+)"
+            )
+            if rpki_children:
+                m = re.search(
+                    r"^\s+bgp\s+rpki\s+server\s+tcp\s+(\S+)\s+port\s+(\d+)",
+                    rpki_children[0].text,
+                )
+                if m:
+                    rpki_server = f"{m.group(1)}:{m.group(2)}"
+
+            # Confederation identifier and peers
+            confederation_id = None
+            confed_id_children = bgp_obj.re_search_children(
+                r"^\s+bgp\s+confederation\s+identifier\s+(\d+)"
+            )
+            if confed_id_children:
+                cid_val = self._extract_match(
+                    confed_id_children[0].text,
+                    r"^\s+bgp\s+confederation\s+identifier\s+(\d+)",
+                )
+                if cid_val:
+                    try:
+                        confederation_id = int(cid_val)
+                    except ValueError:
+                        pass
+
+            confederation_peers: list[int] = []
+            for cp_child in bgp_obj.re_search_children(
+                r"^\s+bgp\s+confederation\s+peers\s+"
+            ):
+                for tok in cp_child.text.split()[3:]:
+                    try:
+                        confederation_peers.append(int(tok))
+                    except ValueError:
+                        pass
+
             # Log neighbor changes
             log_neighbor_changes = len(
                 bgp_obj.re_search_children(r"^\s+bgp\s+log-neighbor-changes")
@@ -965,6 +1028,9 @@ class IOSParser(BaseParser):
                     asn=asn,
                     router_id=router_id,
                     cluster_id=cluster_id,
+                    confederation_id=confederation_id,
+                    confederation_peers=confederation_peers,
+                    rpki_server=rpki_server,
                     vrf=None,
                     log_neighbor_changes=log_neighbor_changes,
                     bestpath_options=bestpath_options,
@@ -1864,6 +1930,8 @@ class IOSParser(BaseParser):
                     "nssa_default_information_originate_always": False,
                     "authentication": None,
                     "ranges": [],
+                    "filter_list_in": None,
+                    "filter_list_out": None,
                 }
 
             if "nssa" in command:
@@ -1887,6 +1955,14 @@ class IOSParser(BaseParser):
                     area_dict[area_id]["authentication"] = "message-digest"
                 else:
                     area_dict[area_id]["authentication"] = "simple"
+            elif "filter-list" in command:
+                fl_match = re.search(r"filter-list\s+prefix\s+(\S+)\s+(in|out)", command)
+                if fl_match:
+                    pl_name, direction = fl_match.group(1), fl_match.group(2)
+                    if direction == "in":
+                        area_dict[area_id]["filter_list_in"] = pl_name
+                    else:
+                        area_dict[area_id]["filter_list_out"] = pl_name
             elif "range" in command:
                 range_match = re.search(r"range\s+(\S+)\s+(\S+)", command)
                 if range_match:
@@ -1961,16 +2037,21 @@ class IOSParser(BaseParser):
         """Parse BGP address-families (global, non-VRF)."""
         address_families = []
 
-        # Find address-family blocks (not VRF-specific)
-        af_children = bgp_obj.re_search_children(r"^\s+address-family\s+(ipv4|ipv6)\s*$")
+        # Find address-family blocks (not VRF-specific).
+        # Matches both the shorthand 'address-family ipv4' and the explicit-SAFI
+        # form 'address-family ipv4 unicast' / 'address-family ipv4 multicast'.
+        # VRF-specific AF blocks ('address-family ipv4 vrf NAME') are excluded
+        # because they use the 'vrf' keyword, which this pattern does not match.
+        _AF_RE = r"^\s+address-family\s+(ipv4|ipv6)(?:\s+(unicast|multicast))?\s*$"
+        af_children = bgp_obj.re_search_children(_AF_RE)
 
         for af_child in af_children:
-            match = re.search(r"^\s+address-family\s+(ipv4|ipv6)\s*$", af_child.text)
+            match = re.search(_AF_RE, af_child.text)
             if not match:
                 continue
 
             afi = match.group(1)
-            safi = "unicast"  # Default SAFI
+            safi = match.group(2) or "unicast"
 
             # Parse networks within this AF
             networks = []
@@ -2080,6 +2161,20 @@ class IOSParser(BaseParser):
                 if v:
                     maximum_paths_ibgp = int(v)
 
+            # RPKI prefix validation mode.
+            # 'bgp bestpath prefix-validate allow-invalid' → permissive (True).
+            # 'no bgp bestpath prefix-validate allow-invalid' → strict (False).
+            # Absent from this AF block → None (merger: do not override baseline).
+            prefix_validate_allow_invalid: bool | None = None
+            if af_child.re_search_children(
+                r"^\s+no\s+bgp\s+bestpath\s+prefix-validate\s+allow-invalid"
+            ):
+                prefix_validate_allow_invalid = False
+            elif af_child.re_search_children(
+                r"^\s+bgp\s+bestpath\s+prefix-validate\s+allow-invalid"
+            ):
+                prefix_validate_allow_invalid = True
+
             address_families.append(
                 BGPAddressFamily(
                     afi=afi,
@@ -2090,6 +2185,7 @@ class IOSParser(BaseParser):
                     aggregate_addresses=aggregates,
                     maximum_paths=maximum_paths,
                     maximum_paths_ibgp=maximum_paths_ibgp,
+                    prefix_validate_allow_invalid=prefix_validate_allow_invalid,
                 )
             )
 
@@ -2112,29 +2208,28 @@ class IOSParser(BaseParser):
         # Build a lookup: peer_ip_str → BGPNeighbor
         nb_index = {str(nb.peer_ip): nb for nb in neighbors}
 
-        # Find all non-VRF AF blocks inside this router bgp
-        af_children = bgp_obj.re_search_children(r"^\s+address-family\s+(ipv4|ipv6)\s*$")
+        # Find all non-VRF AF blocks inside this router bgp.
+        # Matches 'address-family ipv4', 'address-family ipv4 unicast',
+        # and 'address-family ipv4 multicast'.  VRF AF blocks are excluded.
+        _AF_RE = r"^\s+address-family\s+(ipv4|ipv6)(?:\s+(unicast|multicast))?\s*$"
+        af_children = bgp_obj.re_search_children(_AF_RE)
 
         for af_child in af_children:
-            m = re.search(r"^\s+address-family\s+(ipv4|ipv6)\s*$", af_child.text)
+            m = re.search(_AF_RE, af_child.text)
             if not m:
                 continue
             afi = m.group(1)
-            safi = "unicast"
+            safi = m.group(2) or "unicast"
 
             # Collect per-neighbor settings from this AF block
             af_nb_data: dict[str, dict] = {}
-            nb_lines = af_child.re_search_children(r"^\s+neighbor\s+(\S+)\s+")
-            for child in nb_lines:
-                nm = re.search(r"^\s+neighbor\s+(\S+)\s+(.+)", child.text)
-                if not nm:
-                    continue
-                peer_str = nm.group(1)
-                cmd = nm.group(2).strip()
 
-                if peer_str not in af_nb_data:
-                    af_nb_data[peer_str] = {
-                        "activate": False,
+            def _ensure_af_nb_entry(peer: str) -> None:
+                if peer not in af_nb_data:
+                    af_nb_data[peer] = {
+                        # Default True — consistent with BGPNeighborAF model default.
+                        # Only 'no neighbor X activate' overrides this to False.
+                        "activate": True,
                         "next_hop_self": False,
                         "route_map_in": None,
                         "route_map_out": None,
@@ -2143,7 +2238,30 @@ class IOSParser(BaseParser):
                         "filter_list_in": None,
                         "filter_list_out": None,
                         "default_originate_route_map": None,
+                        "maximum_prefix": None,
+                        "maximum_prefix_warning_only": False,
+                        "advertise_map": None,
+                        "exist_map": None,
                     }
+
+            # 'no neighbor X activate' — explicit AF deactivation
+            nb_no_lines = af_child.re_search_children(r"^\s+no\s+neighbor\s+(\S+)\s+activate")
+            for child in nb_no_lines:
+                no_m = re.search(r"^\s+no\s+neighbor\s+(\S+)\s+activate", child.text)
+                if no_m:
+                    peer_str = no_m.group(1)
+                    _ensure_af_nb_entry(peer_str)
+                    af_nb_data[peer_str]["activate"] = False
+
+            nb_lines = af_child.re_search_children(r"^\s+neighbor\s+(\S+)\s+")
+            for child in nb_lines:
+                nm = re.search(r"^\s+neighbor\s+(\S+)\s+(.+)", child.text)
+                if not nm:
+                    continue
+                peer_str = nm.group(1)
+                cmd = nm.group(2).strip()
+
+                _ensure_af_nb_entry(peer_str)
 
                 if cmd == "activate":
                     af_nb_data[peer_str]["activate"] = True
@@ -2165,6 +2283,21 @@ class IOSParser(BaseParser):
                     rm_m = re.search(r"route-map\s+(\S+)", cmd)
                     if rm_m:
                         af_nb_data[peer_str]["default_originate_route_map"] = rm_m.group(1)
+                elif cmd.startswith("maximum-prefix "):
+                    parts = cmd.replace("maximum-prefix ", "").split()
+                    if parts:
+                        try:
+                            af_nb_data[peer_str]["maximum_prefix"] = int(parts[0])
+                        except ValueError:
+                            pass
+                        if "warning-only" in parts:
+                            af_nb_data[peer_str]["maximum_prefix_warning_only"] = True
+                elif cmd.startswith("advertise-map "):
+                    # advertise-map ADVERTISE-MAP exist-map EXIST-MAP
+                    am_m = re.match(r"advertise-map\s+(\S+)\s+exist-map\s+(\S+)", cmd)
+                    if am_m:
+                        af_nb_data[peer_str]["advertise_map"] = am_m.group(1)
+                        af_nb_data[peer_str]["exist_map"] = am_m.group(2)
 
             # Attach BGPNeighborAF to matching neighbors.
             # If the neighbor appears in the AF block but NOT at the global level
@@ -2172,8 +2305,11 @@ class IOSParser(BaseParser):
             # neighbor), create a thin stub so the merger can merge the AF policy
             # into the base config's existing neighbor entry.
             for peer_str, data in af_nb_data.items():
-                # Only attach if there is at least one policy field set
-                if not any(v for v in data.values() if v):
+                # Only attach if there is at least one non-default field.
+                # activate=False (explicit deactivation) counts as meaningful
+                # even though it is falsy.
+                has_content = any(v for v in data.values() if v) or not data.get("activate", True)
+                if not has_content:
                     continue
                 af_entry = BGPNeighborAF(
                     afi=afi,
@@ -2187,6 +2323,10 @@ class IOSParser(BaseParser):
                     filter_list_in=data["filter_list_in"],
                     filter_list_out=data["filter_list_out"],
                     default_originate_route_map=data["default_originate_route_map"],
+                    maximum_prefix=data["maximum_prefix"],
+                    maximum_prefix_warning_only=data["maximum_prefix_warning_only"],
+                    advertise_map=data.get("advertise_map"),
+                    exist_map=data.get("exist_map"),
                 )
                 nb = nb_index.get(peer_str)
                 if nb is not None:
@@ -5031,9 +5171,10 @@ class IOSParser(BaseParser):
         parse = self._get_parse_obj()
         domain_objs = parse.find_objects(r"^ip\s+domain")
         ns_objs = parse.find_objects(r"^ip\s+name-server")
+        no_ns_objs = parse.find_objects(r"^no\s+ip\s+name-server")
         lookup_disabled = bool(parse.find_objects(r"^no\s+ip\s+domain.lookup"))
 
-        if not domain_objs and not ns_objs and not lookup_disabled:
+        if not domain_objs and not ns_objs and not no_ns_objs and not lookup_disabled:
             return None
 
         domain_name: str | None = None
@@ -5437,3 +5578,61 @@ class IOSParser(BaseParser):
         for entry in entries:
             seen[entry.vlan_id] = entry
         return list(seen.values())
+
+    def parse_netflow(self) -> NetFlowConfig | None:
+        """Parse NetFlow export configuration.
+
+        Handles::
+
+            ip flow-export destination 10.0.0.100 9996
+            ip flow-export source GigabitEthernet0/1
+            ip flow-export version 9
+        """
+        parse = self._get_parse_obj()
+        flow_objs = parse.find_objects(r"^ip\s+flow-export\s+")
+        if not flow_objs:
+            return None
+
+        source_interface: str | None = None
+        destinations: list[NetFlowDestination] = []
+        version: int | None = None
+        raw_lines: list[str] = []
+        line_numbers: list[int] = []
+
+        for obj in flow_objs:
+            raw_lines.append(obj.text)
+            line_numbers.append(obj.linenum)
+            t = obj.text.strip()
+
+            m_dst = re.match(r"^ip\s+flow-export\s+destination\s+(\S+)\s+(\d+)", t)
+            if m_dst:
+                try:
+                    destinations.append(NetFlowDestination(
+                        address=IPv4Address(m_dst.group(1)),
+                        port=int(m_dst.group(2)),
+                    ))
+                except ValueError:
+                    pass
+                continue
+
+            m_src = re.match(r"^ip\s+flow-export\s+source\s+(\S+)", t)
+            if m_src:
+                source_interface = m_src.group(1)
+                continue
+
+            m_ver = re.match(r"^ip\s+flow-export\s+version\s+(\d+)", t)
+            if m_ver:
+                try:
+                    version = int(m_ver.group(1))
+                except ValueError:
+                    pass
+
+        return NetFlowConfig(
+            object_id="netflow",
+            raw_lines=raw_lines,
+            source_os=self.os_type,
+            line_numbers=line_numbers,
+            source_interface=source_interface,
+            destinations=destinations,
+            version=version,
+        )

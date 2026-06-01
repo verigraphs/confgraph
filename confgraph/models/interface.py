@@ -357,6 +357,18 @@ class InterfaceConfig(BaseConfigObject):
     # NAT
     nat_direction: str | None = Field(default=None, description="NAT direction (inside or outside)")
 
+    # uRPF (unicast Reverse Path Forwarding)
+    ip_verify_unicast: str | None = Field(
+        default=None,
+        description="uRPF mode: 'rx' (strict — source must be reachable via same interface), 'any' (loose), or None",
+    )
+
+    # PBR (Policy-Based Routing)
+    ip_policy_route_map: str | None = Field(
+        default=None,
+        description="Route-map applied for PBR on this interface ('ip policy route-map <name>')",
+    )
+
     # Crypto
     crypto_map: str | None = Field(default=None, description="Crypto map applied to this interface")
 

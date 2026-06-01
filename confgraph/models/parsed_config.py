@@ -35,6 +35,7 @@ from confgraph.models.lldp import LLDPConfig
 from confgraph.models.cdp import CDPConfig
 from confgraph.models.stp import STPConfig
 from confgraph.models.vlan import VLANEntry
+from confgraph.models.netflow import NetFlowConfig
 
 
 class ParsedConfig(BaseModel):
@@ -192,6 +193,10 @@ class ParsedConfig(BaseModel):
     vlans: list[VLANEntry] = Field(
         default_factory=list,
         description="VLAN database entries",
+    )
+    netflow: NetFlowConfig | None = Field(
+        default=None,
+        description="NetFlow export configuration",
     )
     no_commands: list[str] = Field(
         default_factory=list,

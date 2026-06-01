@@ -123,6 +123,10 @@ class BGPNeighborAF(BaseModel):
     maximum_prefix_threshold: int | None = Field(
         default=None, description="Threshold percentage for warning"
     )
+    maximum_prefix_warning_only: bool = Field(
+        default=False,
+        description="maximum-prefix warning-only — log but do not tear down session",
+    )
     default_originate: bool = Field(
         default=False, description="Originate default route to this neighbor"
     )
@@ -135,6 +139,21 @@ class BGPNeighborAF(BaseModel):
     )
     soft_reconfiguration_inbound: bool = Field(
         default=False, description="Enable soft reconfiguration for inbound updates"
+    )
+    advertise_map: str | None = Field(
+        default=None,
+        description=(
+            "Route-map naming the prefixes to conditionally advertise "
+            "(used with exist_map for conditional advertisement)"
+        ),
+    )
+    exist_map: str | None = Field(
+        default=None,
+        description=(
+            "Route-map whose condition must match a prefix in the local RIB "
+            "for advertise_map prefixes to be sent; if the condition is FALSE "
+            "all matching prefixes are suppressed"
+        ),
     )
 
 
@@ -308,6 +327,14 @@ class BGPAddressFamily(BaseModel):
     synchronization: bool = Field(
         default=False, description="Enable BGP synchronization"
     )
+    prefix_validate_allow_invalid: bool | None = Field(
+        default=None,
+        description=(
+            "RPKI prefix validation mode: True = allow-invalid (permissive); "
+            "False = strict enforcement (invalid ROA routes dropped); "
+            "None = not mentioned in this config block (merger: no override)."
+        ),
+    )
 
 
 class BGPConfig(BaseConfigObject):
@@ -382,4 +409,11 @@ class BGPConfig(BaseConfigObject):
     )
     default_metric: int | None = Field(
         default=None, description="Default MED metric"
+    )
+    rpki_server: str | None = Field(
+        default=None,
+        description=(
+            "RPKI cache server address — format '<ip>:<port>' "
+            "(e.g. '10.100.0.100:3323'). None = not configured."
+        ),
     )
