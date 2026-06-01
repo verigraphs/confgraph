@@ -24,175 +24,26 @@ try:
 except ImportError:
     pass
 
+import warnings
+
+from confgraph.loader import OS_ALIASES as _OS_ALIAS, detect_os as _detect_os, load_and_parse
 from confgraph.models.base import OSType
 from confgraph.parsers.base import ParseError
 
 
 # ---------------------------------------------------------------------------
-# Inventory lookup (CONFGRAPH_INVENTORY env var → CSV file)
+# Backward-compat shims (kept for any code still importing from confgraph.cli)
 # ---------------------------------------------------------------------------
-
-_DEVICE_COLS  = {"device_name", "device", "devicename", "hostname", "host_name"}
-_OS_COLS      = {"os_type", "ostype", "os-type"}
-_OS_ALIAS     = {"iosxr": "ios_xr", "ios_xr": "ios_xr", "ios": "ios",
-                 "nxos": "nxos", "nx-os": "nxos", "eos": "eos",
-                 "junos": "junos", "panos": "panos", "pan-os": "panos"}
-
-
-def _load_inventory() -> dict[str, str]:
-    """Return hostname→os_type mapping from the CSV pointed to by CONFGRAPH_INVENTORY.
-
-    Returns an empty dict if the env var is unset or the file cannot be read.
-    """
-    import csv, os
-    path = os.environ.get("CONFGRAPH_INVENTORY", "").strip()
-    if not path:
-        return {}
-    try:
-        with open(path, newline="", encoding="utf-8") as fh:
-            reader = csv.DictReader(fh)
-            if reader.fieldnames is None:
-                return {}
-
-            # Find the actual column names (case-insensitive)
-            device_col = next(
-                (f for f in reader.fieldnames if f.strip().lower() in _DEVICE_COLS), None
-            )
-            os_col = next(
-                (f for f in reader.fieldnames if f.strip().lower() in _OS_COLS), None
-            )
-            if not device_col or not os_col:
-                click.echo(
-                    f"Warning: Inventory CSV '{path}' missing required columns "
-                    f"(need a device name column and an os_type column).",
-                    err=True,
-                )
-                return {}
-
-            inventory: dict[str, str] = {}
-            for row in reader:
-                host = row.get(device_col, "").strip()
-                os_raw = row.get(os_col, "").strip().lower()
-                os_val = _OS_ALIAS.get(os_raw)
-                if host and os_val:
-                    inventory[host] = os_val
-            return inventory
-    except OSError as exc:
-        click.echo(f"Warning: Could not read inventory file '{path}': {exc}", err=True)
-        return {}
-
-
-def _hostname_from_config(text: str, path_stem: str) -> str:
-    """Extract hostname from config text, falling back to filename stem."""
-    import re
-    m = re.search(r"^hostname\s+(\S+)", text, re.MULTILINE)
-    return m.group(1) if m else path_stem
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _detect_os(text: str) -> OSType:
-    """Heuristically detect OS type from config text."""
-    # PAN-OS signals (XML with PAN-OS-specific tags)
-    for sig in ("<config version=", "<devices>", "<vsys>", "<rulebase>",
-                "panos", "PAN-OS", "<virtual-router>"):
-        if sig in text:
-            return OSType.PANOS
-
-    # EOS signals
-    for sig in ("Arista", "EOS-", "vEOS", "daemon Accounting",
-                "ip virtual-router", "transceiver qsfp"):
-        if sig in text:
-            return OSType.EOS
-
-    # NX-OS signals
-    for sig in ("vrf context ", "feature ", " vdc ", "Nexus"):
-        if sig in text:
-            return OSType.NXOS
-
-    # JunOS signals — brace-style and set-style
-    for sig in ("system {", "interfaces {", "protocols {",
-                "routing-options {", "set system host-name"):
-        if sig in text:
-            return OSType.JUNOS
-    # set-style JunOS: require at least 2 characteristic set prefixes
-    set_junos_sigs = ("set routing-instances ", "set policy-options ",
-                      "set protocols bgp ", "set protocols ospf ",
-                      "set interfaces ", "set routing-options ")
-    if sum(1 for s in set_junos_sigs if s in text) >= 2:
-        return OSType.JUNOS
-
-    # IOS-XR signals
-    for sig in ("RP/0/", "route-policy\n", "prefix-set\n",
-                "ipv4 address ", "neighbor-group "):
-        if sig in text:
-            return OSType.IOS_XR
-
-    # IOS / IOS-XE signals
-    for sig in ("Cisco IOS", "IOS-XE", "IOS XE"):
-        if sig in text:
-            return OSType.IOS
-
-    click.echo(
-        "Warning: OS type could not be auto-detected — defaulting to IOS. "
-        "Use --os to specify explicitly.",
-        err=True,
-    )
-    return OSType.IOS
-
 
 def _load_and_parse(config_path: Path, os_type: str | None):
-    """Read config file, detect OS, parse, return (parsed, detected_os)."""
-    text = config_path.read_text(encoding="utf-8", errors="replace")
-
-    if os_type:
-        # CLI uses "iosxr" but the enum value is "ios_xr"
-        detected = OSType(_OS_ALIAS.get(os_type.lower(), os_type))
-    else:
-        # 1. Inventory lookup (CONFGRAPH_INVENTORY env var)
-        inventory = _load_inventory()
-        if inventory:
-            hostname = _hostname_from_config(text, config_path.stem)
-            os_from_inv = inventory.get(hostname)
-            if os_from_inv:
-                detected = OSType(os_from_inv)
-                click.echo(
-                    f"  OS resolved from inventory: {detected.value} (hostname: {hostname})",
-                    err=True,
-                )
-            else:
-                click.echo(
-                    f"  Warning: Hostname '{hostname}' not found in inventory — "
-                    "falling back to auto-detection.",
-                    err=True,
-                )
-                detected = _detect_os(text)
-        else:
-            # 2. Heuristic fallback
-            detected = _detect_os(text)
-
-    if detected == OSType.PANOS:
-        from confgraph.parsers.panos_parser import PANOSParser
-        parsed = PANOSParser(text).parse()
-    elif detected == OSType.EOS:
-        from confgraph.parsers.eos_parser import EOSParser
-        parsed = EOSParser(text).parse()
-    elif detected == OSType.NXOS:
-        from confgraph.parsers.nxos_parser import NXOSParser
-        parsed = NXOSParser(text).parse()
-    elif detected == OSType.IOS_XR:
-        from confgraph.parsers.iosxr_parser import IOSXRParser
-        parsed = IOSXRParser(text).parse()
-    elif detected == OSType.JUNOS:
-        from confgraph.parsers.junos_parser import JunOSParser
-        parsed = JunOSParser(text).parse()
-    else:
-        from confgraph.parsers.ios_parser import IOSParser
-        parsed = IOSParser(text).parse()
-
-    return parsed, detected
+    """Deprecated: use confgraph.loader.load_and_parse instead."""
+    warnings.warn(
+        "confgraph.cli._load_and_parse is deprecated and will be removed in a "
+        "future release. Use 'from confgraph.loader import load_and_parse' instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return load_and_parse(config_path, os_type, log_fn=click.echo)
 
 
 # ---------------------------------------------------------------------------
