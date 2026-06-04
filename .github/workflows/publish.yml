@@ -25,4 +25,5 @@ jobs:
         run: |
           uv publish \
             --publish-url https://maven.pkg.github.com/verigraphs/confgraph \
+            --username ${{ github.actor }} \
             --token ${{ secrets.GITHUB_TOKEN }}
