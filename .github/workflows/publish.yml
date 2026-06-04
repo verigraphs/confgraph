@@ -24,6 +24,6 @@ jobs:
       - name: Publish to GitHub Packages
         run: |
           uv publish \
-            --publish-url https://maven.pkg.github.com/verigraphs/confgraph \
+            --publish-url https://pypi.pkg.github.com/verigraphs/ \
             --username ${{ github.actor }} \
             --token ${{ secrets.GITHUB_TOKEN }}
