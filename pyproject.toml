@@ -1,3 +1,7 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
 [project]
 name = "confgraph"
 version = "0.2.0"
@@ -37,8 +41,5 @@ confgraph = "confgraph.cli:main"
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
 
-[tool.setuptools.packages.find]
-include = ["confgraph*"]
-
-[tool.setuptools.package-data]
-confgraph = ["graph/assets/*.js"]
+[tool.hatch.build.targets.wheel]
+packages = ["confgraph"]

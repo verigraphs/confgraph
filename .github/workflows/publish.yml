@@ -1,0 +1,28 @@
+name: Publish to GitHub Packages
+
+on:
+  push:
+    tags: ["v*.*.*"]
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.11"
+
+      - name: Build wheel
+        run: uv build --wheel
+
+      - name: Publish to GitHub Packages
+        run: |
+          uv publish \
+            --publish-url https://maven.pkg.github.com/verigraphs/confgraph \
+            --token ${{ secrets.GITHUB_TOKEN }}
