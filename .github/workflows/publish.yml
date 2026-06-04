@@ -25,5 +25,4 @@ jobs:
         run: |
           uv publish \
             --publish-url https://pypi.pkg.github.com/verigraphs/ \
-            --username ${{ github.actor }} \
             --token ${{ secrets.GITHUB_TOKEN }}
