@@ -82,7 +82,7 @@ class EOSParser(IOSParser):
 
         EOS format: ``vrf VRFNAME`` (no "forwarding" keyword).
         """
-        vrf_children = intf_obj.re_search_children(r"^\s+vrf\s+(\S+)")
+        vrf_children = intf_obj.find_child_objects(r"^\s+vrf\s+(\S+)")
         if vrf_children:
             return self._extract_match(
                 vrf_children[0].text, r"^\s+vrf\s+(\S+)"
@@ -108,7 +108,7 @@ class EOSParser(IOSParser):
 
             # Extract RD
             rd = None
-            rd_children = vrf_obj.re_search_children(r"^\s+rd\s+(\S+)")
+            rd_children = vrf_obj.find_child_objects(r"^\s+rd\s+(\S+)")
             if rd_children:
                 rd = self._extract_match(rd_children[0].text, r"^\s+rd\s+(\S+)")
 
@@ -726,7 +726,7 @@ class EOSParser(IOSParser):
 
         # EOS: maximum-paths N  (global, eBGP)
         global_mp: int | None = None
-        mp_ch = bgp_obj.re_search_children(r"^\s+maximum-paths\s+(?!ibgp)(\d+)")
+        mp_ch = bgp_obj.find_child_objects(r"^\s+maximum-paths\s+(?!ibgp)(\d+)")
         if mp_ch:
             v = self._extract_match(mp_ch[0].text, r"^\s+maximum-paths\s+(\d+)")
             if v:
@@ -734,7 +734,7 @@ class EOSParser(IOSParser):
 
         # EOS: maximum-paths ibgp N  (global)
         global_mp_ibgp: int | None = None
-        mp_ibgp_ch = bgp_obj.re_search_children(r"^\s+maximum-paths\s+ibgp\s+(\d+)")
+        mp_ibgp_ch = bgp_obj.find_child_objects(r"^\s+maximum-paths\s+ibgp\s+(\d+)")
         if mp_ibgp_ch:
             v = self._extract_match(mp_ibgp_ch[0].text, r"^\s+maximum-paths\s+ibgp\s+(\d+)")
             if v:
@@ -787,7 +787,7 @@ class EOSParser(IOSParser):
 
             # NET addresses
             net = []
-            net_children = isis_obj.re_search_children(r"^\s+net\s+(\S+)")
+            net_children = isis_obj.find_child_objects(r"^\s+net\s+(\S+)")
             for net_child in net_children:
                 net_addr = self._extract_match(net_child.text, r"^\s+net\s+(\S+)")
                 if net_addr:
@@ -795,27 +795,27 @@ class EOSParser(IOSParser):
 
             # IS type
             is_type = None
-            is_type_children = isis_obj.re_search_children(r"^\s+is-type\s+(\S+)")
+            is_type_children = isis_obj.find_child_objects(r"^\s+is-type\s+(\S+)")
             if is_type_children:
                 is_type = self._extract_match(is_type_children[0].text, r"^\s+is-type\s+(\S+)")
 
             # Metric style (EOS default is wide)
             metric_style = None
-            metric_children = isis_obj.re_search_children(r"^\s+metric-style\s+(\S+)")
+            metric_children = isis_obj.find_child_objects(r"^\s+metric-style\s+(\S+)")
             if metric_children:
                 metric_style = self._extract_match(metric_children[0].text, r"^\s+metric-style\s+(\S+)")
 
             # Log adjacency changes
-            log_adjacency_changes = len(isis_obj.re_search_children(r"^\s+log-adjacency-changes")) > 0
+            log_adjacency_changes = len(isis_obj.find_child_objects(r"^\s+log-adjacency-changes")) > 0
 
             # Passive interface default
             passive_interface_default = len(
-                isis_obj.re_search_children(r"^\s+passive-interface\s+default")
+                isis_obj.find_child_objects(r"^\s+passive-interface\s+default")
             ) > 0
 
             # Passive interfaces
             passive_interfaces = []
-            passive_intf_children = isis_obj.re_search_children(r"^\s+passive-interface\s+(\S+)")
+            passive_intf_children = isis_obj.find_child_objects(r"^\s+passive-interface\s+(\S+)")
             for passive_child in passive_intf_children:
                 if "default" not in passive_child.text:
                     intf_name = self._extract_match(passive_child.text, r"^\s+passive-interface\s+(\S+)")
@@ -824,7 +824,7 @@ class EOSParser(IOSParser):
 
             # Non-passive interfaces
             non_passive_interfaces = []
-            non_passive_children = isis_obj.re_search_children(r"^\s+no\s+passive-interface\s+(\S+)")
+            non_passive_children = isis_obj.find_child_objects(r"^\s+no\s+passive-interface\s+(\S+)")
             for non_passive_child in non_passive_children:
                 intf_name = self._extract_match(non_passive_child.text, r"^\s+no\s+passive-interface\s+(\S+)")
                 if intf_name:
@@ -833,7 +833,7 @@ class EOSParser(IOSParser):
             # Parse redistribution (EOS uses address-family context)
             redistribute = []
             # Look for redistribute statements (can be at top level or in address-family)
-            redist_children = isis_obj.re_search_children(r"^\s+redistribute\s+(\S+)")
+            redist_children = isis_obj.find_child_objects(r"^\s+redistribute\s+(\S+)")
             for redist_child in redist_children:
                 match = re.search(r"^\s+redistribute\s+(\S+)(.+)?", redist_child.text)
                 if match:
@@ -889,27 +889,27 @@ class EOSParser(IOSParser):
             # Authentication (EOS supports various auth modes)
             authentication_mode = None
             authentication_key = None
-            auth_children = isis_obj.re_search_children(r"^\s+authentication\s+mode\s+(\S+)")
+            auth_children = isis_obj.find_child_objects(r"^\s+authentication\s+mode\s+(\S+)")
             if auth_children:
                 authentication_mode = self._extract_match(auth_children[0].text, r"^\s+authentication\s+mode\s+(\S+)")
 
-            auth_key_children = isis_obj.re_search_children(r"^\s+authentication\s+key\s+(\S+)")
+            auth_key_children = isis_obj.find_child_objects(r"^\s+authentication\s+key\s+(\S+)")
             if auth_key_children:
                 authentication_key = self._extract_match(auth_key_children[0].text, r"^\s+authentication\s+key\s+(\S+)")
 
             # Timers
             max_lsp_lifetime = None
-            lsp_lifetime_children = isis_obj.re_search_children(r"^\s+max-lsp-lifetime\s+(\d+)")
+            lsp_lifetime_children = isis_obj.find_child_objects(r"^\s+max-lsp-lifetime\s+(\d+)")
             if lsp_lifetime_children:
                 max_lsp_lifetime = int(self._extract_match(lsp_lifetime_children[0].text, r"^\s+max-lsp-lifetime\s+(\d+)"))
 
             lsp_refresh_interval = None
-            lsp_refresh_children = isis_obj.re_search_children(r"^\s+lsp-refresh-interval\s+(\d+)")
+            lsp_refresh_children = isis_obj.find_child_objects(r"^\s+lsp-refresh-interval\s+(\d+)")
             if lsp_refresh_children:
                 lsp_refresh_interval = int(self._extract_match(lsp_refresh_children[0].text, r"^\s+lsp-refresh-interval\s+(\d+)"))
 
             spf_interval = None
-            spf_children = isis_obj.re_search_children(r"^\s+spf-interval\s+(\d+)")
+            spf_children = isis_obj.find_child_objects(r"^\s+spf-interval\s+(\d+)")
             if spf_children:
                 spf_interval = int(self._extract_match(spf_children[0].text, r"^\s+spf-interval\s+(\d+)"))
 

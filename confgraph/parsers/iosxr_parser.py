@@ -176,7 +176,7 @@ class IOSXRParser(IOSParser):
 
     def _extract_interface_vrf(self, intf_obj) -> str | None:
         """Extract VRF from interface. IOS-XR uses ``vrf NAME`` (no keyword)."""
-        vrf_ch = intf_obj.re_search_children(r"^\s+vrf\s+(\S+)")
+        vrf_ch = intf_obj.find_child_objects(r"^\s+vrf\s+(\S+)")
         if vrf_ch:
             return self._extract_match(vrf_ch[0].text, r"^\s+vrf\s+(\S+)")
         return None
@@ -202,7 +202,7 @@ class IOSXRParser(IOSParser):
                 continue
 
             # IOS-XR: ipv4 address X.X.X.X MASK
-            ipv4_children = intf_obj.re_search_children(
+            ipv4_children = intf_obj.find_child_objects(
                 r"^\s+ipv4\s+address\s+(\d+\.\d+\.\d+\.\d+)\s+(\d+\.\d+\.\d+\.\d+)"
             )
             if ipv4_children:
@@ -219,7 +219,7 @@ class IOSXRParser(IOSParser):
                         pass
 
             # IOS-XR: ipv4 access-group <name> ingress|egress
-            for ag_ch in intf_obj.re_search_children(
+            for ag_ch in intf_obj.find_child_objects(
                 r"^\s+ipv4\s+access-group\s+\S+\s+(ingress|egress)"
             ):
                 m = re.match(r"^\s+ipv4\s+access-group\s+(\S+)\s+(ingress|egress)", ag_ch.text)
@@ -230,7 +230,7 @@ class IOSXRParser(IOSParser):
                         intf_cfg.acl_out = m.group(1)
 
             # IOS-XR: ipv6 address
-            ipv6_children = intf_obj.re_search_children(r"^\s+ipv6\s+address\s+(\S+)")
+            ipv6_children = intf_obj.find_child_objects(r"^\s+ipv6\s+address\s+(\S+)")
             ipv6_addresses = []
             for ipv6_child in ipv6_children:
                 m = re.search(r"^\s+ipv6\s+address\s+(\S+)", ipv6_child.text)
@@ -414,7 +414,7 @@ class IOSXRParser(IOSParser):
         """Parse BGP peer-groups. IOS-XR uses ``neighbor-group NAME`` blocks."""
         peer_groups = []
 
-        ng_children = bgp_obj.re_search_children(r"^\s+neighbor-group\s+(\S+)")
+        ng_children = bgp_obj.find_child_objects(r"^\s+neighbor-group\s+(\S+)")
         for ng_child in ng_children:
             pg_name = self._extract_match(ng_child.text, r"^\s+neighbor-group\s+(\S+)")
             if not pg_name:
@@ -435,7 +435,7 @@ class IOSXRParser(IOSParser):
         IOS-XR uses ``vrf VRFNAME`` blocks directly under ``router bgp``.
         """
         vrf_instances = []
-        vrf_children = bgp_obj.re_search_children(r"^\s+vrf\s+(\S+)")
+        vrf_children = bgp_obj.find_child_objects(r"^\s+vrf\s+(\S+)")
 
         for vrf_child in vrf_children:
             vrf_name = self._extract_match(vrf_child.text, r"^\s+vrf\s+(\S+)")
@@ -446,13 +446,13 @@ class IOSXRParser(IOSParser):
 
             # RD is inside the VRF block
             rd = None
-            rd_ch = vrf_child.re_search_children(r"^\s+rd\s+(\S+)")
+            rd_ch = vrf_child.find_child_objects(r"^\s+rd\s+(\S+)")
             if rd_ch:
                 rd = self._extract_match(rd_ch[0].text, r"^\s+rd\s+(\S+)")
 
             # VRF neighbors — IOS-XR uses block syntax per neighbor
             vrf_neighbors: list[BGPNeighbor] = []
-            for nb_child in vrf_child.re_search_children(r"^\s+neighbor\s+(\S+)\s*$"):
+            for nb_child in vrf_child.find_child_objects(r"^\s+neighbor\s+(\S+)\s*$"):
                 peer_str = self._extract_match(nb_child.text, r"^\s+neighbor\s+(\S+)\s*$")
                 if not peer_str:
                     continue
@@ -553,7 +553,7 @@ class IOSXRParser(IOSParser):
         """
         address_families: list[BGPAddressFamily] = []
 
-        af_children = bgp_obj.re_search_children(
+        af_children = bgp_obj.find_child_objects(
             r"^\s+address-family\s+(ipv4|ipv6)\s+unicast"
         )
         for af_child in af_children:
@@ -565,7 +565,7 @@ class IOSXRParser(IOSParser):
 
             # IOS-XR: maximum-paths ebgp N
             maximum_paths: int | None = None
-            mp_ch = af_child.re_search_children(r"^\s+maximum-paths\s+ebgp\s+(\d+)")
+            mp_ch = af_child.find_child_objects(r"^\s+maximum-paths\s+ebgp\s+(\d+)")
             if mp_ch:
                 v = self._extract_match(mp_ch[0].text, r"^\s+maximum-paths\s+ebgp\s+(\d+)")
                 if v:
@@ -573,7 +573,7 @@ class IOSXRParser(IOSParser):
 
             # IOS-XR: maximum-paths ibgp N
             maximum_paths_ibgp: int | None = None
-            mp_ibgp_ch = af_child.re_search_children(r"^\s+maximum-paths\s+ibgp\s+(\d+)")
+            mp_ibgp_ch = af_child.find_child_objects(r"^\s+maximum-paths\s+ibgp\s+(\d+)")
             if mp_ibgp_ch:
                 v = self._extract_match(mp_ibgp_ch[0].text, r"^\s+maximum-paths\s+ibgp\s+(\d+)")
                 if v:
@@ -613,7 +613,7 @@ class IOSXRParser(IOSParser):
 
             # Router ID
             router_id = None
-            rid_ch = ospf_obj.re_search_children(r"^\s+router-id\s+(\S+)")
+            rid_ch = ospf_obj.find_child_objects(r"^\s+router-id\s+(\S+)")
             if rid_ch:
                 rid_str = self._extract_match(rid_ch[0].text, r"^\s+router-id\s+(\S+)")
                 try:
@@ -622,12 +622,12 @@ class IOSXRParser(IOSParser):
                     pass
 
             # Log adjacency changes
-            log_adj = bool(ospf_obj.re_search_children(r"^\s+log\s+adjacency\s+changes"))
-            log_adj_detail = bool(ospf_obj.re_search_children(r"^\s+log\s+adjacency\s+changes\s+detail"))
+            log_adj = bool(ospf_obj.find_child_objects(r"^\s+log\s+adjacency\s+changes"))
+            log_adj_detail = bool(ospf_obj.find_child_objects(r"^\s+log\s+adjacency\s+changes\s+detail"))
 
             # Auto-cost
             auto_cost_ref_bw = None
-            ac_ch = ospf_obj.re_search_children(r"^\s+auto-cost\s+reference-bandwidth\s+(\d+)")
+            ac_ch = ospf_obj.find_child_objects(r"^\s+auto-cost\s+reference-bandwidth\s+(\d+)")
             if ac_ch:
                 v = self._extract_match(ac_ch[0].text, r"^\s+auto-cost\s+reference-bandwidth\s+(\d+)")
                 if v:
@@ -651,7 +651,7 @@ class IOSXRParser(IOSParser):
             di_metric_type: int | None = None
             di_route_map: str | None = None
 
-            di_ch = ospf_obj.re_search_children(r"^\s+default-information\s+originate")
+            di_ch = ospf_obj.find_child_objects(r"^\s+default-information\s+originate")
             if di_ch:
                 di_originate = True
                 di_text = di_ch[0].text
@@ -702,7 +702,7 @@ class IOSXRParser(IOSParser):
         area_dict: dict[str, dict] = {}
         passive_interfaces: list[str] = []
 
-        area_children = ospf_obj.re_search_children(r"^\s+area\s+(\S+)")
+        area_children = ospf_obj.find_child_objects(r"^\s+area\s+(\S+)")
         for area_child in area_children:
             area_id = self._extract_match(area_child.text, r"^\s+area\s+(\S+)")
             if not area_id:
@@ -724,7 +724,7 @@ class IOSXRParser(IOSParser):
                 }
 
             # Area type
-            for prop_child in area_child.re_search_children(r"^\s+nssa"):
+            for prop_child in area_child.find_child_objects(r"^\s+nssa"):
                 text = prop_child.text.strip()
                 if "no-summary" in text or "no-redistribution no-summary" in text:
                     area_dict[area_id]["area_type"] = OSPFAreaType.TOTALLY_NSSA
@@ -736,7 +736,7 @@ class IOSXRParser(IOSParser):
                     if "always" in text:
                         area_dict[area_id]["nssa_default_information_originate_always"] = True
 
-            for prop_child in area_child.re_search_children(r"^\s+stub"):
+            for prop_child in area_child.find_child_objects(r"^\s+stub"):
                 text = prop_child.text.strip()
                 if "no-summary" in text:
                     area_dict[area_id]["area_type"] = OSPFAreaType.TOTALLY_STUB
@@ -745,7 +745,7 @@ class IOSXRParser(IOSParser):
                     area_dict[area_id]["area_type"] = OSPFAreaType.STUB
 
             # Authentication
-            auth_ch = area_child.re_search_children(r"^\s+authentication\s+")
+            auth_ch = area_child.find_child_objects(r"^\s+authentication\s+")
             if auth_ch:
                 if "message-digest" in auth_ch[0].text:
                     area_dict[area_id]["authentication"] = "message-digest"
@@ -753,7 +753,7 @@ class IOSXRParser(IOSParser):
                     area_dict[area_id]["authentication"] = "simple"
 
             # Ranges (IOS-XR: range X.X.X.X/N)
-            for range_child in area_child.re_search_children(r"^\s+range\s+(\S+)"):
+            for range_child in area_child.find_child_objects(r"^\s+range\s+(\S+)"):
                 range_str = self._extract_match(range_child.text, r"^\s+range\s+(\S+)")
                 if range_str:
                     try:
@@ -765,7 +765,7 @@ class IOSXRParser(IOSParser):
                         pass
 
             # Type-3 LSA filter-list (IOS-XR: 'filter-list prefix NAME in|out')
-            for fl_child in area_child.re_search_children(r"^\s+filter-list\s+prefix\s+"):
+            for fl_child in area_child.find_child_objects(r"^\s+filter-list\s+prefix\s+"):
                 fl_match = re.search(
                     r"filter-list\s+prefix\s+(\S+)\s+(in|out)", fl_child.text
                 )
@@ -777,12 +777,12 @@ class IOSXRParser(IOSParser):
                         area_dict[area_id]["filter_list_out"] = pl_name
 
             # Interfaces nested under area
-            for intf_child in area_child.re_search_children(r"^\s+interface\s+(\S+)"):
+            for intf_child in area_child.find_child_objects(r"^\s+interface\s+(\S+)"):
                 intf_name = self._extract_match(intf_child.text, r"^\s+interface\s+(\S+)")
                 if intf_name and intf_name not in area_dict[area_id]["interfaces"]:
                     area_dict[area_id]["interfaces"].append(intf_name)
                 # IOS-XR marks passive with "passive enable" inside the interface block
-                if intf_name and intf_child.re_search_children(r"^\s+passive\s+enable"):
+                if intf_name and intf_child.find_child_objects(r"^\s+passive\s+enable"):
                     if intf_name not in passive_interfaces:
                         passive_interfaces.append(intf_name)
 
@@ -794,7 +794,7 @@ class IOSXRParser(IOSParser):
     def _parse_ospf_redistribute_iosxr(self, ospf_obj) -> list[OSPFRedistribute]:
         """Parse OSPF redistribution for IOS-XR (uses route-policy instead of route-map)."""
         redistribute: list[OSPFRedistribute] = []
-        redist_ch = ospf_obj.re_search_children(r"^\s+redistribute\s+(\S+)")
+        redist_ch = ospf_obj.find_child_objects(r"^\s+redistribute\s+(\S+)")
 
         for redist_child in redist_ch:
             match = re.search(r"^\s+redistribute\s+(\S+)(.+)?", redist_child.text)
@@ -1265,15 +1265,15 @@ class IOSXRParser(IOSParser):
                     ))
 
             # Global routes
-            for af_child in static_obj.re_search_children(r"^\s+address-family\s+ipv4\s+unicast"):
+            for af_child in static_obj.find_child_objects(r"^\s+address-family\s+ipv4\s+unicast"):
                 _extract_routes(af_child, vrf=None)
 
             # VRF routes
-            for vrf_child in static_obj.re_search_children(r"^\s+vrf\s+(\S+)"):
+            for vrf_child in static_obj.find_child_objects(r"^\s+vrf\s+(\S+)"):
                 vrf_name = self._extract_match(vrf_child.text, r"^\s+vrf\s+(\S+)")
                 if not vrf_name:
                     continue
-                for af_child in vrf_child.re_search_children(r"^\s+address-family\s+ipv4\s+unicast"):
+                for af_child in vrf_child.find_child_objects(r"^\s+address-family\s+ipv4\s+unicast"):
                     _extract_routes(af_child, vrf=vrf_name)
 
         return static_routes
@@ -1297,7 +1297,7 @@ class IOSXRParser(IOSParser):
         that this path and the VRF path stay in sync automatically.
         """
         neighbors = []
-        neighbor_blocks = bgp_obj.re_search_children(r"^\s+neighbor\s+(\S+)\s*$")
+        neighbor_blocks = bgp_obj.find_child_objects(r"^\s+neighbor\s+(\S+)\s*$")
 
         for nb_child in neighbor_blocks:
             peer_str = self._extract_match(nb_child.text, r"^\s+neighbor\s+(\S+)\s*$")
@@ -1366,14 +1366,14 @@ class IOSXRParser(IOSParser):
         """
         nb_index = {str(nb.peer_ip): nb for nb in neighbors}
 
-        neighbor_blocks = bgp_obj.re_search_children(r"^\s+neighbor\s+(\S+)\s*$")
+        neighbor_blocks = bgp_obj.find_child_objects(r"^\s+neighbor\s+(\S+)\s*$")
         for nb_child in neighbor_blocks:
             peer_str = self._extract_match(nb_child.text, r"^\s+neighbor\s+(\S+)\s*$")
             if not peer_str or peer_str not in nb_index:
                 continue
 
             nb = nb_index[peer_str]
-            af_children = nb_child.re_search_children(
+            af_children = nb_child.find_child_objects(
                 r"^\s+address-family\s+(ipv4|ipv6)\s+unicast"
             )
             for af_child in af_children:
@@ -1419,7 +1419,7 @@ class IOSXRParser(IOSParser):
         pim_autorp = False
 
         for pim_obj in pim_objs:
-            for af_child in pim_obj.re_search_children(r"^\s+address-family\s+ipv4"):
+            for af_child in pim_obj.find_child_objects(r"^\s+address-family\s+ipv4"):
                 for child in af_child.all_children:
                     text = child.text.strip()
                     rp_m = re.match(r"^rp-address\s+(\S+)(.*)", text)
@@ -1485,14 +1485,14 @@ class IOSXRParser(IOSParser):
 
             isis_interfaces: list[ISISInterface] = []
 
-            for intf_child in isis_obj.re_search_children(r"^\s+interface\s+(\S+)"):
+            for intf_child in isis_obj.find_child_objects(r"^\s+interface\s+(\S+)"):
                 intf_name = self._extract_match(intf_child.text, r"^\s+interface\s+(\S+)")
                 if not intf_name:
                     continue
 
                 # Global metric: metric N  (no level qualifier)
                 isis_metric: int | None = None
-                m_ch = intf_child.re_search_children(r"^\s+metric\s+(\d+)\s*$")
+                m_ch = intf_child.find_child_objects(r"^\s+metric\s+(\d+)\s*$")
                 if m_ch:
                     v = self._extract_match(m_ch[0].text, r"^\s+metric\s+(\d+)")
                     if v:
@@ -1500,14 +1500,14 @@ class IOSXRParser(IOSParser):
 
                 # Level-specific metrics
                 isis_metric_l1: int | None = None
-                m1_ch = intf_child.re_search_children(r"^\s+metric\s+(\d+)\s+level-1")
+                m1_ch = intf_child.find_child_objects(r"^\s+metric\s+(\d+)\s+level-1")
                 if m1_ch:
                     v = self._extract_match(m1_ch[0].text, r"^\s+metric\s+(\d+)")
                     if v:
                         isis_metric_l1 = int(v)
 
                 isis_metric_l2: int | None = None
-                m2_ch = intf_child.re_search_children(r"^\s+metric\s+(\d+)\s+level-2")
+                m2_ch = intf_child.find_child_objects(r"^\s+metric\s+(\d+)\s+level-2")
                 if m2_ch:
                     v = self._extract_match(m2_ch[0].text, r"^\s+metric\s+(\d+)")
                     if v:
@@ -1515,12 +1515,12 @@ class IOSXRParser(IOSParser):
 
                 # Circuit type
                 circuit_type: str | None = None
-                ct_ch = intf_child.re_search_children(r"^\s+circuit-type\s+(\S+)")
+                ct_ch = intf_child.find_child_objects(r"^\s+circuit-type\s+(\S+)")
                 if ct_ch:
                     circuit_type = self._extract_match(ct_ch[0].text, r"^\s+circuit-type\s+(\S+)")
 
                 # Passive — IOS-XR uses "passive" keyword directly
-                isis_passive = bool(intf_child.re_search_children(r"^\s+passive"))
+                isis_passive = bool(intf_child.find_child_objects(r"^\s+passive"))
 
                 isis_interfaces.append(ISISInterface(
                     name=intf_name,
@@ -1761,7 +1761,7 @@ class IOSXRParser(IOSParser):
         """
         bfd_interval = bfd_min_rx = bfd_multiplier = bfd_template = None
 
-        mi_ch = intf_obj.re_search_children(r"^\s+bfd\s+minimum-interval\s+")
+        mi_ch = intf_obj.find_child_objects(r"^\s+bfd\s+minimum-interval\s+")
         if mi_ch:
             m = re.match(r"^\s+bfd\s+minimum-interval\s+(\d+)", mi_ch[0].text)
             if m:
@@ -1769,7 +1769,7 @@ class IOSXRParser(IOSParser):
                 bfd_interval = val
                 bfd_min_rx = val  # XR uses a single interval for both tx and rx
 
-        mul_ch = intf_obj.re_search_children(r"^\s+bfd\s+multiplier\s+")
+        mul_ch = intf_obj.find_child_objects(r"^\s+bfd\s+multiplier\s+")
         if mul_ch:
             m = re.match(r"^\s+bfd\s+multiplier\s+(\d+)", mul_ch[0].text)
             if m:

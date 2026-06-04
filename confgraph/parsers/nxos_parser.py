@@ -95,7 +95,7 @@ class NXOSParser(IOSParser):
             entry = vrf_map[vrf_name]
 
             # RD
-            rd_ch = vrf_obj.re_search_children(r"^\s+rd\s+(\S+)")
+            rd_ch = vrf_obj.find_child_objects(r"^\s+rd\s+(\S+)")
             if rd_ch and entry["rd"] is None:
                 entry["rd"] = self._extract_match(rd_ch[0].text, r"^\s+rd\s+(\S+)")
 
@@ -147,11 +147,11 @@ class NXOSParser(IOSParser):
         NX-OS uses ``vrf member NAME`` (NX-OS native) or bare ``vrf NAME``
         (seen in some NX-OS configs and older-style templates).
         """
-        vrf_ch = intf_obj.re_search_children(r"^\s+vrf\s+member\s+(\S+)")
+        vrf_ch = intf_obj.find_child_objects(r"^\s+vrf\s+member\s+(\S+)")
         if vrf_ch:
             return self._extract_match(vrf_ch[0].text, r"^\s+vrf\s+member\s+(\S+)")
         # Fallback: bare "vrf NAME" (without member keyword)
-        vrf_bare = intf_obj.re_search_children(r"^\s+vrf\s+(?!member\s)(\S+)")
+        vrf_bare = intf_obj.find_child_objects(r"^\s+vrf\s+(?!member\s)(\S+)")
         if vrf_bare:
             return self._extract_match(vrf_bare[0].text, r"^\s+vrf\s+(?!member\s)(\S+)")
         return None
@@ -179,7 +179,7 @@ class NXOSParser(IOSParser):
                 continue
 
             # NX-OS: ip address X.X.X.X/24
-            cidr_children = intf_obj.re_search_children(
+            cidr_children = intf_obj.find_child_objects(
                 r"^\s+ip\s+address\s+(\d+\.\d+\.\d+\.\d+/\d+)"
             )
             if cidr_children:
@@ -195,7 +195,7 @@ class NXOSParser(IOSParser):
 
             # NX-OS OSPF: "ip router ospf PROC area AREA" (slightly different
             # from IOS "ip ospf PROC area AREA")
-            ospf_router_children = intf_obj.re_search_children(
+            ospf_router_children = intf_obj.find_child_objects(
                 r"^\s+ip\s+router\s+ospf\s+(\d+)\s+area\s+(\S+)"
             )
             if ospf_router_children:
@@ -230,7 +230,7 @@ class NXOSParser(IOSParser):
             return BGPPeerGroup(**pg_data)
 
         # NX-OS native: template peer NAME blocks
-        for tmpl_child in bgp_obj.re_search_children(r"^\s+template\s+peer\s+(\S+)"):
+        for tmpl_child in bgp_obj.find_child_objects(r"^\s+template\s+peer\s+(\S+)"):
             pg_name = self._extract_match(tmpl_child.text, r"^\s+template\s+peer\s+(\S+)")
             if not pg_name or pg_name in seen:
                 continue
@@ -238,13 +238,13 @@ class NXOSParser(IOSParser):
             peer_groups.append(_build_pg(pg_name, tmpl_child.all_children))
 
         # IOS-style: neighbor NAME peer-group (declaration line)
-        for pg_decl in bgp_obj.re_search_children(r"^\s+neighbor\s+(\S+)\s+peer-group\s*$"):
+        for pg_decl in bgp_obj.find_child_objects(r"^\s+neighbor\s+(\S+)\s+peer-group\s*$"):
             pg_name = self._extract_match(pg_decl.text, r"^\s+neighbor\s+(\S+)\s+peer-group\s*$")
             if not pg_name or pg_name in seen:
                 continue
             seen.add(pg_name)
             # Gather all config lines for this peer-group name
-            pg_config = bgp_obj.re_search_children(
+            pg_config = bgp_obj.find_child_objects(
                 rf"^\s+neighbor\s+{re.escape(pg_name)}\s+(.+)"
             )
 
@@ -270,7 +270,7 @@ class NXOSParser(IOSParser):
         from ipaddress import IPv4Address, IPv6Address
 
         vrf_instances = []
-        vrf_children = bgp_obj.re_search_children(r"^\s+vrf\s+(\S+)")
+        vrf_children = bgp_obj.find_child_objects(r"^\s+vrf\s+(\S+)")
 
         for vrf_child in vrf_children:
             vrf_name = self._extract_match(vrf_child.text, r"^\s+vrf\s+(\S+)")

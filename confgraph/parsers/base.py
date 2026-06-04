@@ -619,7 +619,7 @@ class BaseParser(ABC):
         Returns:
             True if shutdown, False otherwise
         """
-        shutdown_children = obj.re_search_children(r"^\s+shutdown")
+        shutdown_children = obj.find_child_objects(r"^\s+shutdown")
         return len(shutdown_children) > 0
 
 
