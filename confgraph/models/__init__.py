@@ -7,6 +7,7 @@ from confgraph.models.interface import (
     InterfaceType,
     HSRPGroup,
     VRRPGroup,
+    GLBPGroup,
 )
 from confgraph.models.bgp import (
     BGPConfig,
@@ -49,6 +50,7 @@ __all__ = [
     "InterfaceType",
     "HSRPGroup",
     "VRRPGroup",
+    "GLBPGroup",
     "BGPConfig",
     "BGPNeighbor",
     "BGPPeerGroup",

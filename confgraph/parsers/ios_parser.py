@@ -11,6 +11,7 @@ from confgraph.models.interface import (
     InterfaceType,
     HSRPGroup,
     VRRPGroup,
+    GLBPGroup,
 )
 from confgraph.models.bgp import (
     BGPConfig,
@@ -685,6 +686,9 @@ class IOSParser(BaseParser):
             # VRRP groups
             vrrp_groups = self._parse_vrrp_groups(intf_obj)
 
+            # GLBP groups
+            glbp_groups = self._parse_glbp_groups(intf_obj)
+
             # Helper addresses
             helper_addresses = []
             helper_children = intf_obj.find_child_objects(
@@ -857,6 +861,7 @@ class IOSParser(BaseParser):
                     stp_root_guard=stp_root_guard,
                     hsrp_groups=hsrp_groups,
                     vrrp_groups=vrrp_groups,
+                    glbp_groups=glbp_groups,
                     ospf_process_id=ospf_process_id,
                     ospf_area=ospf_area,
                     ospf_cost=ospf_cost,
@@ -1628,6 +1633,56 @@ class IOSParser(BaseParser):
             vrrp_groups.append(VRRPGroup(**group_data))
 
         return vrrp_groups
+
+    def _parse_glbp_groups(self, intf_obj) -> list[GLBPGroup]:
+        """Parse GLBP groups from interface configuration."""
+        glbp_groups = []
+
+        glbp_children = intf_obj.find_child_objects(r"^\s+glbp\s+(\d+)")
+
+        glbp_dict: dict[int, dict] = {}
+
+        for glbp_child in glbp_children:
+            match = re.search(r"^\s+glbp\s+(\d+)\s+(.+)", glbp_child.text)
+            if not match:
+                continue
+
+            group_num = int(match.group(1))
+            command = match.group(2)
+
+            if group_num not in glbp_dict:
+                glbp_dict[group_num] = {
+                    "group_number": group_num,
+                    "priority": None,
+                    "preempt": False,
+                    "virtual_ip": None,
+                    "weighting": None,
+                    "authentication": None,
+                    "track_objects": [],
+                }
+
+            if command.startswith("ip "):
+                ip_str = command.replace("ip ", "").strip()
+                try:
+                    glbp_dict[group_num]["virtual_ip"] = IPv4Address(ip_str)
+                except ValueError:
+                    pass
+            elif command.startswith("priority "):
+                priority_str = command.replace("priority ", "").strip()
+                glbp_dict[group_num]["priority"] = int(priority_str)
+            elif command == "preempt":
+                glbp_dict[group_num]["preempt"] = True
+            elif command.startswith("weighting "):
+                weight_str = command.replace("weighting ", "").strip().split()[0]
+                glbp_dict[group_num]["weighting"] = int(weight_str)
+            elif command.startswith("authentication "):
+                auth_str = command.replace("authentication ", "").strip()
+                glbp_dict[group_num]["authentication"] = auth_str
+
+        for group_data in glbp_dict.values():
+            glbp_groups.append(GLBPGroup(**group_data))
+
+        return glbp_groups
 
     def _parse_bgp_bestpath_options(self, bgp_obj) -> BGPBestpathOptions:
         """Parse BGP best-path options."""

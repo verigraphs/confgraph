@@ -95,6 +95,10 @@ class DependencyResolver:
         self._class_maps = {cm.name: cm for cm in config.class_maps}
         self._policy_maps = {pm.name: pm for pm in config.policy_maps}
         self._ip_sla_ops = {op.sla_id: op for op in config.ip_sla_operations}
+        self._ospf_instances = {
+            f"{o.process_id}" + (f" vrf {o.vrf}" if o.vrf else ""): o
+            for o in config.ospf_instances
+        }
 
         # Track which named objects have been referenced (for orphan detection)
         self._referenced: dict[str, set[str]] = {
@@ -307,6 +311,11 @@ class DependencyResolver:
                 links.append(self._link("interface", iface.name, "acl_in", "acl", iface.acl_in))
             if iface.acl_out:
                 links.append(self._link("interface", iface.name, "acl_out", "acl", iface.acl_out))
+            if iface.ospf_process_id is not None:
+                ospf_node_id = f"{iface.ospf_process_id}" + (f" vrf {iface.vrf}" if iface.vrf else "")
+                links.append(self._link(
+                    "interface", iface.name, "ospf_process", "ospf_instance", ospf_node_id,
+                ))
         return links
 
     # ------------------------------------------------------------------
@@ -423,6 +432,7 @@ class DependencyResolver:
             "acl":            self._acls,
             "vrf":            self._vrfs,
             "interface":      self._interfaces,
+            "ospf_instance":  self._ospf_instances,
             "class_map":      self._class_maps,
             "policy_map":     self._policy_maps,
         }.get(ref_type, {})

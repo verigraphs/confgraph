@@ -58,6 +58,26 @@ class VRRPGroup(BaseModel):
     )
 
 
+class GLBPGroup(BaseModel):
+    """GLBP (Gateway Load Balancing Protocol) group configuration."""
+
+    group_number: int = Field(..., description="GLBP group number")
+    priority: int | None = Field(default=None, description="GLBP priority (1-255)")
+    preempt: bool = Field(default=False, description="Preempt enabled")
+    virtual_ip: IPv4Address | None = Field(
+        default=None, description="Virtual IP address"
+    )
+    weighting: int | None = Field(
+        default=None, description="GLBP weighting value"
+    )
+    authentication: str | None = Field(
+        default=None, description="Authentication string"
+    )
+    track_objects: list[int] = Field(
+        default_factory=list, description="Tracked object numbers"
+    )
+
+
 class InterfaceConfig(BaseConfigObject):
     """Interface configuration for all interface types.
 
@@ -180,6 +200,10 @@ class InterfaceConfig(BaseConfigObject):
     vrrp_groups: list[VRRPGroup] = Field(
         default_factory=list,
         description="VRRP groups configured on this interface",
+    )
+    glbp_groups: list[GLBPGroup] = Field(
+        default_factory=list,
+        description="GLBP groups configured on this interface",
     )
 
     # OSPF (embedded per-interface config)
