@@ -393,6 +393,18 @@ class BaseParser(ABC):
         """Parse IP multicast configuration."""
         return None
 
+    def parse_mpls(self) -> "MPLSConfig | None":
+        """Parse MPLS/LDP configuration."""
+        return None
+
+    def parse_vxlan(self) -> "VXLANConfig | None":
+        """Parse VXLAN/VTEP configuration."""
+        return None
+
+    def parse_vpc(self) -> "VPCConfig | None":
+        """Parse VPC/MLAG configuration."""
+        return None
+
     def parse_zones(self) -> list[PANOSZoneConfig]:
         """Parse PAN-OS security zone configurations."""
         return []
@@ -419,6 +431,14 @@ class BaseParser(ABC):
 
     def parse_spanning_tree(self) -> STPConfig | None:
         """Parse Spanning Tree Protocol global configuration."""
+        return None
+
+    def parse_lacp_system_priority(self) -> int | None:
+        """Parse global LACP system-priority."""
+        return None
+
+    def parse_vtp(self):
+        """Parse VTP configuration."""
         return None
 
     def parse_netflow(self) -> NetFlowConfig | None:
@@ -495,6 +515,9 @@ class BaseParser(ABC):
         ("eem_applets",        "parse_eem"),
         ("object_tracks",      "parse_object_tracks"),
         ("multicast",          "parse_multicast"),
+        ("mpls",               "parse_mpls"),
+        ("vxlan",              "parse_vxlan"),
+        ("vpc",                "parse_vpc"),
         ("zones",              "parse_zones"),
         ("aaa",                "parse_aaa"),
         ("dns",                "parse_dns"),
@@ -502,6 +525,8 @@ class BaseParser(ABC):
         ("lldp",               "parse_lldp"),
         ("cdp",                "parse_cdp"),
         ("spanning_tree",      "parse_spanning_tree"),
+        ("lacp_system_priority", "parse_lacp_system_priority"),
+        ("vtp",                "parse_vtp"),
         ("vlans",              "parse_vlans"),
         ("netflow",            "parse_netflow"),
         ("no_commands",        "parse_deletion_commands"),
@@ -723,6 +748,25 @@ def apply_peer_group_command(pg_data: dict, command: str) -> None:
             except ValueError:
                 pass
 
+    elif command.startswith("timers "):
+        import re as _re2
+        tm = _re2.match(r"timers\s+(\d+)\s+(\d+)", command)
+        if tm:
+            from confgraph.models.bgp import BGPTimers
+            pg_data["timers"] = BGPTimers(
+                keepalive=int(tm.group(1)), holdtime=int(tm.group(2)),
+            )
+
+    elif command.startswith("local-as "):
+        la_parts = command.replace("local-as ", "").strip().split()
+        if la_parts:
+            try:
+                pg_data["local_as"] = int(la_parts[0])
+            except ValueError:
+                pass
+            pg_data["local_as_no_prepend"] = "no-prepend" in la_parts
+            pg_data["local_as_replace_as"] = "replace-as" in la_parts
+
 
 def _default_pg_data(name: str) -> dict:
     """Return a pg_data dict with all BGPPeerGroup fields at their defaults.
@@ -750,4 +794,8 @@ def _default_pg_data(name: str) -> dict:
         "fall_over_bfd": False,
         "disable_connected_check": False,
         "maximum_prefix": None,
+        "timers": None,
+        "local_as": None,
+        "local_as_no_prepend": False,
+        "local_as_replace_as": False,
     }

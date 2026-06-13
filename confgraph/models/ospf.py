@@ -59,6 +59,34 @@ class OSPFRedistribute(BaseModel):
     tag: int | None = Field(default=None, description="Tag value")
 
 
+class OSPFVirtualLink(BaseModel):
+    """OSPF virtual-link configuration.
+
+    A virtual link extends area 0 across a non-backbone transit area,
+    connecting two ABRs that share the transit area.  Configured under
+    ``area <transit-area> virtual-link <neighbor-router-id>``.
+    """
+
+    neighbor_router_id: IPv4Address = Field(
+        ..., description="Router-ID of the remote ABR endpoint"
+    )
+    hello_interval: int | None = Field(
+        default=None, description="Hello interval (seconds)"
+    )
+    dead_interval: int | None = Field(
+        default=None, description="Dead interval (seconds)"
+    )
+    retransmit_interval: int | None = Field(
+        default=None, description="Retransmit interval (seconds)"
+    )
+    authentication: str | None = Field(
+        default=None, description="Authentication type (message-digest, null)"
+    )
+    authentication_key: str | None = Field(
+        default=None, description="Authentication key"
+    )
+
+
 class OSPFArea(BaseModel):
     """OSPF area configuration."""
 
@@ -97,7 +125,7 @@ class OSPFArea(BaseModel):
         default_factory=list,
         description="Interface names in this area (references InterfaceConfig)",
     )
-    virtual_links: list[str] = Field(
+    virtual_links: list[OSPFVirtualLink] = Field(
         default_factory=list, description="Virtual link configurations"
     )
     filter_list_in: str | None = Field(

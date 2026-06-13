@@ -138,6 +138,14 @@ class ISISConfig(BaseConfigObject):
         default=None,
         description="SPF calculation interval (seconds)",
     )
+    default_information_originate: bool = Field(
+        default=False,
+        description="Originate default route into IS-IS",
+    )
+    default_information_originate_route_map: str | None = Field(
+        default=None,
+        description="Route-map for default-originate (references RouteMapConfig)",
+    )
     interfaces: list[ISISInterface] = Field(
         default_factory=list,
         description="Per-interface IS-IS configuration (metric, circuit-type, passive)",

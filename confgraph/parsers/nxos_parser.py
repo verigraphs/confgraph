@@ -193,6 +193,13 @@ class NXOSParser(IOSParser):
                     except ValueError:
                         pass
 
+            # VPC per-interface: "vpc <id>" or "vpc peer-link"
+            vpc_ch = intf_obj.find_child_objects(r"^\s+vpc\s+(\d+)\s*$")
+            if vpc_ch:
+                vpc_m = re.match(r"^\s+vpc\s+(\d+)", vpc_ch[0].text)
+                if vpc_m:
+                    intf_cfg.vpc_id = int(vpc_m.group(1))
+
             # NX-OS OSPF: "ip router ospf PROC area AREA" (slightly different
             # from IOS "ip ospf PROC area AREA")
             ospf_router_children = intf_obj.find_child_objects(
@@ -735,4 +742,156 @@ class NXOSParser(IOSParser):
             console_level=console_level,
             monitor_level=monitor_level,
             source_interface=source_interface,
+        )
+
+    # -------------------------------------------------------------------
+    # VXLAN
+    # -------------------------------------------------------------------
+
+    def parse_vxlan(self) -> "VXLANConfig | None":
+        """Parse VXLAN configuration from ``interface nve1``.
+
+        Handles::
+
+            interface nve1
+              no shutdown
+              host-reachability protocol bgp
+              source-interface loopback1
+              member vni 10010
+                suppress-arp
+                mcast-group 239.1.1.1
+              member vni 50001 associate-vrf
+        """
+        from confgraph.models.vxlan import VXLANConfig, VXLANVniMapping
+
+        parse = self._get_parse_obj()
+        nve_objs = parse.find_objects(r"^interface\s+nve\d+")
+        if not nve_objs:
+            return None
+
+        nve_intf = nve_objs[0]
+        source_interface = None
+        vni_mappings: list[VXLANVniMapping] = []
+
+        for child in nve_intf.children:
+            t = child.text.strip()
+
+            m = re.match(r"source-interface\s+(\S+)", t, re.IGNORECASE)
+            if m:
+                source_interface = m.group(1)
+                continue
+
+            m = re.match(r"member\s+vni\s+(\d+)(?:\s+associate-vrf)?", t)
+            if m:
+                vni = int(m.group(1))
+                is_l3 = "associate-vrf" in t
+                vni_mappings.append(VXLANVniMapping(
+                    vni=vni,
+                    vrf="(L3)" if is_l3 else None,
+                    vlan=None,
+                ))
+                continue
+
+        return VXLANConfig(
+            object_id="vxlan",
+            raw_lines=[nve_intf.text] + [c.text for c in nve_intf.children],
+            source_os=self.os_type,
+            line_numbers=[],
+            source_interface=source_interface,
+            vni_mappings=vni_mappings,
+        )
+
+    # -------------------------------------------------------------------
+    # VPC
+    # -------------------------------------------------------------------
+
+    def parse_vpc(self) -> "VPCConfig | None":
+        """Parse VPC domain configuration.
+
+        Handles::
+
+            vpc domain 100
+              role priority 1000
+              system-priority 2000
+              peer-keepalive destination 10.0.0.2 source 10.0.0.1 vrf management
+              peer-gateway
+              delay restore 150
+              auto-recovery
+        """
+        from confgraph.models.vpc import VPCConfig
+
+        parse = self._get_parse_obj()
+        vpc_objs = parse.find_objects(r"^vpc\s+domain\s+\d+")
+        if not vpc_objs:
+            return None
+
+        vpc_obj = vpc_objs[0]
+        m = re.match(r"^vpc\s+domain\s+(\d+)", vpc_obj.text)
+        domain_id = int(m.group(1))
+
+        role_priority = None
+        system_priority = None
+        peer_ka_dst = None
+        peer_ka_src = None
+        peer_ka_vrf = None
+        peer_link = None
+        delay_restore = None
+        auto_recovery = False
+
+        for child in vpc_obj.children:
+            t = child.text.strip()
+
+            m = re.match(r"role\s+priority\s+(\d+)", t)
+            if m:
+                role_priority = int(m.group(1))
+                continue
+
+            m = re.match(r"system-priority\s+(\d+)", t)
+            if m:
+                system_priority = int(m.group(1))
+                continue
+
+            m = re.match(r"peer-keepalive\s+destination\s+(\S+)", t)
+            if m:
+                peer_ka_dst = IPv4Address(m.group(1))
+                src_m = re.search(r"source\s+(\S+)", t)
+                if src_m:
+                    peer_ka_src = IPv4Address(src_m.group(1))
+                vrf_m = re.search(r"vrf\s+(\S+)", t)
+                if vrf_m:
+                    peer_ka_vrf = vrf_m.group(1)
+                continue
+
+            m = re.match(r"delay\s+restore\s+(\d+)", t)
+            if m:
+                delay_restore = int(m.group(1))
+                continue
+
+            if re.match(r"auto-recovery\b", t):
+                auto_recovery = True
+                continue
+
+        # Find peer-link from interfaces (interface port-channel X → vpc peer-link)
+        for intf_obj in parse.find_objects(r"^interface\s+"):
+            for ch in intf_obj.children:
+                if re.match(r"\s+vpc\s+peer-link\b", ch.text):
+                    intf_name = re.match(r"^interface\s+(\S+)", intf_obj.text)
+                    if intf_name:
+                        peer_link = intf_name.group(1)
+                    break
+
+        return VPCConfig(
+            object_id="vpc",
+            raw_lines=[vpc_obj.text] + [c.text for c in vpc_obj.children],
+            source_os=self.os_type,
+            line_numbers=[],
+            domain_id=domain_id,
+            role_priority=role_priority,
+            system_priority=system_priority,
+            peer_keepalive_destination=peer_ka_dst,
+            peer_keepalive_source=peer_ka_src,
+            peer_keepalive_vrf=peer_ka_vrf,
+            peer_link=peer_link,
+            delay_restore=delay_restore,
+            auto_recovery=auto_recovery,
         )

@@ -297,6 +297,7 @@ class IOSXRParser(IOSParser):
             "route_map_out": None,
             "prefix_list_in": None,
             "prefix_list_out": None,
+            "timers": None,
         }
 
         for child in nb_child.all_children:
@@ -336,6 +337,13 @@ class IOSXRParser(IOSParser):
                     nd["local_as"] = int(parts[1])
                     nd["local_as_no_prepend"] = "no-prepend" in parts
                     nd["local_as_replace_as"] = "replace-as" in parts
+            elif text.startswith("timers "):
+                tm = re.match(r"timers\s+(\d+)\s+(\d+)", text)
+                if tm:
+                    from confgraph.models.bgp import BGPTimers
+                    nd["timers"] = BGPTimers(
+                        keepalive=int(tm.group(1)), holdtime=int(tm.group(2)),
+                    )
 
             # AF-level attributes (found via all_children recursion)
             elif text.startswith("route-policy ") and text.endswith(" in"):
@@ -495,6 +503,7 @@ class IOSXRParser(IOSParser):
                     route_map_out=nd["route_map_out"],
                     prefix_list_in=nd["prefix_list_in"],
                     prefix_list_out=nd["prefix_list_out"],
+                    timers=nd["timers"],
                 ))
 
             # Redistribution
@@ -644,6 +653,16 @@ class IOSXRParser(IOSParser):
             # Redistribution
             redistribute = self._parse_ospf_redistribute_iosxr(ospf_obj)
 
+            # Max-metric router-lsa
+            max_metric_router_lsa = False
+            max_metric_router_lsa_on_startup: int | None = None
+            mm_ch = ospf_obj.find_child_objects(r"^\s+max-metric\s+router-lsa")
+            if mm_ch:
+                max_metric_router_lsa = True
+                m = re.search(r"on-startup\s+(\d+)", mm_ch[0].text)
+                if m:
+                    max_metric_router_lsa_on_startup = int(m.group(1))
+
             # Default-information originate
             di_originate = False
             di_always = False
@@ -683,6 +702,8 @@ class IOSXRParser(IOSParser):
                     non_passive_interfaces=non_passive_interfaces,
                     areas=areas,
                     redistribute=redistribute,
+                    max_metric_router_lsa=max_metric_router_lsa,
+                    max_metric_router_lsa_on_startup=max_metric_router_lsa_on_startup,
                     default_information_originate=di_originate,
                     default_information_originate_always=di_always,
                     default_information_originate_metric=di_metric,
@@ -718,6 +739,7 @@ class IOSXRParser(IOSParser):
                     "nssa_default_information_originate_always": False,
                     "authentication": None,
                     "ranges": [],
+                    "virtual_links": [],
                     "interfaces": [],
                     "filter_list_in": None,
                     "filter_list_out": None,
@@ -775,6 +797,19 @@ class IOSXRParser(IOSParser):
                         area_dict[area_id]["filter_list_in"] = pl_name
                     else:
                         area_dict[area_id]["filter_list_out"] = pl_name
+
+            # Virtual-links (IOS-XR: virtual-link <neighbor-rid>)
+            for vl_child in area_child.find_child_objects(r"^\s+virtual-link\s+(\S+)"):
+                vl_rid_str = self._extract_match(vl_child.text, r"^\s+virtual-link\s+(\S+)")
+                if vl_rid_str:
+                    try:
+                        from confgraph.models.ospf import OSPFVirtualLink
+                        neighbor_rid = IPv4Address(vl_rid_str)
+                        area_dict[area_id]["virtual_links"].append(
+                            OSPFVirtualLink(neighbor_router_id=neighbor_rid)
+                        )
+                    except ValueError:
+                        pass
 
             # Interfaces nested under area
             for intf_child in area_child.find_child_objects(r"^\s+interface\s+(\S+)"):
@@ -1343,6 +1378,7 @@ class IOSXRParser(IOSParser):
                 route_map_out=nd["route_map_out"],
                 prefix_list_in=nd["prefix_list_in"],
                 prefix_list_out=nd["prefix_list_out"],
+                timers=nd["timers"],
             ))
 
         return neighbors

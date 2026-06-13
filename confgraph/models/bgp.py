@@ -79,6 +79,9 @@ class BGPAggregate(BaseModel):
     suppress_map: str | None = Field(
         default=None, description="Suppress-map to apply (references RouteMapConfig)"
     )
+    route_map: str | None = Field(
+        default=None, description="Route-map applied to aggregate (references RouteMapConfig)"
+    )
 
 
 class BGPNeighborAF(BaseModel):
@@ -89,9 +92,9 @@ class BGPNeighborAF(BaseModel):
         ..., description="Sub-address family identifier (e.g., 'unicast', 'multicast')"
     )
     activate: bool = Field(default=True, description="Activate this address family")
-    send_community: bool | str = Field(
-        default=False,
-        description="Send community attribute (True/False/'extended'/'both')",
+    send_community: bool | str | None = Field(
+        default=None,
+        description="Send community attribute (True/False/'extended'/'both'/None=not configured)",
     )
     next_hop_self: bool = Field(
         default=False, description="Set next-hop to self for EBGP peers"
@@ -178,9 +181,9 @@ class BGPNeighbor(BaseModel):
     next_hop_self: bool = Field(
         default=False, description="Set next-hop to self (global, not AF-specific)"
     )
-    send_community: bool | str = Field(
-        default=False,
-        description="Send community attribute (True/False/'extended'/'both')",
+    send_community: bool | str | None = Field(
+        default=None,
+        description="Send community attribute (True/False/'extended'/'both'/None=not configured)",
     )
     route_reflector_client: bool = Field(
         default=False, description="Configure as route-reflector client"
@@ -252,8 +255,8 @@ class BGPPeerGroup(BaseModel):
         default=None, description="EBGP multihop TTL value"
     )
     next_hop_self: bool = Field(default=False, description="Set next-hop to self")
-    send_community: bool | str = Field(
-        default=False, description="Send community attribute"
+    send_community: bool | str | None = Field(
+        default=None, description="Send community attribute (None=not configured)"
     )
     route_reflector_client: bool = Field(
         default=False, description="Configure as route-reflector client"
@@ -286,6 +289,15 @@ class BGPPeerGroup(BaseModel):
     )
     disable_connected_check: bool = Field(
         default=False, description="Disable connected check for EBGP"
+    )
+    local_as: int | None = Field(
+        default=None, description="Local AS number for this peer-group"
+    )
+    local_as_no_prepend: bool = Field(
+        default=False, description="Do not prepend local-as to updates from peer"
+    )
+    local_as_replace_as: bool = Field(
+        default=False, description="Replace real AS with local-as in updates to peer"
     )
     address_families: list[BGPNeighborAF] = Field(
         default_factory=list,

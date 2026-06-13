@@ -153,6 +153,22 @@ class InterfaceConfig(BaseConfigObject):
         default=None,
         description="Configured delay in tens of microseconds (for EIGRP metric calculation)",
     )
+    eigrp_authentication_mode: str | None = Field(
+        default=None,
+        description="EIGRP authentication mode (md5, hmac-sha-256)",
+    )
+    eigrp_authentication_key_chain: str | None = Field(
+        default=None,
+        description="EIGRP authentication key-chain name",
+    )
+    eigrp_hello_interval: int | None = Field(
+        default=None,
+        description="EIGRP hello interval in seconds (ip hello-interval eigrp <AS> <sec>); default 5",
+    )
+    eigrp_hold_time: int | None = Field(
+        default=None,
+        description="EIGRP hold time in seconds (ip hold-time eigrp <AS> <sec>); default 15",
+    )
 
     # Layer 2 attributes
     switchport_mode: str | None = Field(
@@ -186,7 +202,43 @@ class InterfaceConfig(BaseConfigObject):
         description="Minimum number of active member links required to keep port-channel up (port-channel min-links N)",
     )
 
+    # LACP per-interface
+    lacp_port_priority: int | None = Field(
+        default=None,
+        description="LACP port priority (lacp port-priority N). Default 32768.",
+    )
+    lacp_rate: str | None = Field(
+        default=None,
+        description="LACP rate: 'fast' (1 s) or 'normal' (30 s). None=default (normal).",
+    )
+
+    # VPC per-interface
+    vpc_id: int | None = Field(
+        default=None,
+        description="VPC ID assigned to this port-channel (NX-OS: vpc <id>)",
+    )
+
     # STP per-interface
+    stp_portfast: bool | None = Field(
+        default=None,
+        description="STP portfast enabled on this interface (spanning-tree portfast). None=inherit global default.",
+    )
+    stp_bpduguard: bool | None = Field(
+        default=None,
+        description="STP BPDU guard on this interface (spanning-tree bpduguard enable/disable). None=inherit global default.",
+    )
+    stp_bpdufilter: bool | None = Field(
+        default=None,
+        description="STP BPDU filter on this interface (spanning-tree bpdufilter enable/disable). None=inherit global default.",
+    )
+    stp_cost: int | None = Field(
+        default=None,
+        description="STP path cost override (spanning-tree cost X). None=auto.",
+    )
+    stp_port_priority: int | None = Field(
+        default=None,
+        description="STP port priority (spanning-tree port-priority X). None=default (128).",
+    )
     stp_root_guard: bool = Field(
         default=False,
         description="STP root guard enabled on this interface (spanning-tree guard root)",
@@ -353,6 +405,9 @@ class InterfaceConfig(BaseConfigObject):
         default=True,
         description="LLDP receive enabled",
     )
+
+    # MPLS per-interface
+    mpls_ip: bool = Field(default=False, description="MPLS IP forwarding enabled on this interface (mpls ip)")
 
     # PIM per-interface
     pim_mode: str | None = Field(default=None, description="PIM mode (sparse-mode, dense-mode, sparse-dense-mode)")

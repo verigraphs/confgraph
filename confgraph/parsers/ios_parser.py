@@ -32,6 +32,7 @@ from confgraph.models.ospf import (
     OSPFRange,
     OSPFRedistribute,
     OSPFMDKey,
+    OSPFVirtualLink,
 )
 from confgraph.models.route_map import (
     RouteMapConfig,
@@ -337,11 +338,36 @@ class IOSParser(BaseParser):
                 r"^\s+switchport\s+trunk\s+allowed\s+vlan\s+(.+)"
             )
             if trunk_allowed_children:
-                vlan_str = self._extract_match(
-                    trunk_allowed_children[0].text,
-                    r"^\s+switchport\s+trunk\s+allowed\s+vlan\s+(.+)",
-                )
-                trunk_allowed_vlans = self._parse_vlan_list(vlan_str)
+                # Process all lines as ordered set operations:
+                #   'vlan <list>'     → set/replace
+                #   'add <list>'      → union
+                #   'remove <list>'   → difference
+                #   'except <list>'   → all-except (1-4094 minus list)
+                #   'none'            → empty set
+                #   'all'             → all (1-4094)
+                _ALL_VLANS = set(range(1, 4095))
+                vlan_set: set[int] = set()
+                for child in trunk_allowed_children:
+                    vlan_str = self._extract_match(
+                        child.text,
+                        r"^\s+switchport\s+trunk\s+allowed\s+vlan\s+(.+)",
+                    )
+                    if not vlan_str:
+                        continue
+                    vlan_str = vlan_str.strip()
+                    if vlan_str == "none":
+                        vlan_set = set()
+                    elif vlan_str == "all":
+                        vlan_set = set(_ALL_VLANS)
+                    elif vlan_str.startswith("add "):
+                        vlan_set |= set(self._parse_vlan_list(vlan_str[4:]))
+                    elif vlan_str.startswith("remove "):
+                        vlan_set -= set(self._parse_vlan_list(vlan_str[7:]))
+                    elif vlan_str.startswith("except "):
+                        vlan_set = _ALL_VLANS - set(self._parse_vlan_list(vlan_str[7:]))
+                    else:
+                        vlan_set = set(self._parse_vlan_list(vlan_str))
+                trunk_allowed_vlans = sorted(vlan_set)
 
             trunk_native_children = intf_obj.find_child_objects(
                 r"^\s+switchport\s+trunk\s+native\s+vlan\s+(\d+)"
@@ -441,6 +467,36 @@ class IOSParser(BaseParser):
                     dot1x_auth_fail_vlan = int(val)
 
             # STP per-interface
+            stp_portfast: bool | None = None
+            if intf_obj.find_child_objects(r"^\s+spanning-tree\s+portfast\b"):
+                stp_portfast = True
+            elif intf_obj.find_child_objects(r"^\s+no\s+spanning-tree\s+portfast\b"):
+                stp_portfast = False
+
+            stp_bpduguard: bool | None = None
+            bg_ch = intf_obj.find_child_objects(r"^\s+spanning-tree\s+bpduguard\s+")
+            if bg_ch:
+                stp_bpduguard = "enable" in bg_ch[0].text
+
+            stp_bpdufilter: bool | None = None
+            bf_ch = intf_obj.find_child_objects(r"^\s+spanning-tree\s+bpdufilter\s+")
+            if bf_ch:
+                stp_bpdufilter = "enable" in bf_ch[0].text
+
+            stp_cost: int | None = None
+            cost_ch = intf_obj.find_child_objects(r"^\s+spanning-tree\s+cost\s+(\d+)")
+            if cost_ch:
+                val = self._extract_match(cost_ch[0].text, r"spanning-tree\s+cost\s+(\d+)")
+                if val:
+                    stp_cost = int(val)
+
+            stp_port_priority: int | None = None
+            pp_ch = intf_obj.find_child_objects(r"^\s+spanning-tree\s+port-priority\s+(\d+)")
+            if pp_ch:
+                val = self._extract_match(pp_ch[0].text, r"spanning-tree\s+port-priority\s+(\d+)")
+                if val:
+                    stp_port_priority = int(val)
+
             stp_root_guard = bool(
                 intf_obj.find_child_objects(r"^\s+spanning-tree\s+guard\s+root")
             )
@@ -470,6 +526,29 @@ class IOSParser(BaseParser):
                 )
                 if ml_match:
                     min_links = int(ml_match.group(1))
+
+            # LACP per-interface
+            lacp_port_priority = None
+            lacp_pp_children = intf_obj.find_child_objects(
+                r"^\s+lacp\s+port-priority\s+(\d+)"
+            )
+            if lacp_pp_children:
+                lacp_pp_match = re.search(
+                    r"lacp\s+port-priority\s+(\d+)", lacp_pp_children[0].text
+                )
+                if lacp_pp_match:
+                    lacp_port_priority = int(lacp_pp_match.group(1))
+
+            lacp_rate = None
+            lacp_rate_children = intf_obj.find_child_objects(
+                r"^\s+lacp\s+rate\s+(fast|normal)"
+            )
+            if lacp_rate_children:
+                lacp_rate_match = re.search(
+                    r"lacp\s+rate\s+(fast|normal)", lacp_rate_children[0].text
+                )
+                if lacp_rate_match:
+                    lacp_rate = lacp_rate_match.group(1)
 
             # OSPF attributes
             ospf_process_id = None
@@ -703,6 +782,9 @@ class IOSParser(BaseParser):
                 except ValueError:
                     pass
 
+            # MPLS per-interface
+            mpls_ip = bool(intf_obj.find_child_objects(r"^\s+mpls\s+ip\b"))
+
             # PIM per-interface
             pim_mode = None
             pim_ch = intf_obj.find_child_objects(r"^\s+ip\s+pim\s+")
@@ -723,6 +805,46 @@ class IOSParser(BaseParser):
                 if v:
                     pim_query_interval = int(v)
             pim_bfd = bool(intf_obj.find_child_objects(r"^\s+ip\s+pim\s+bfd"))
+
+            # EIGRP per-interface authentication
+            eigrp_auth_mode = None
+            eam_ch = intf_obj.find_child_objects(r"^\s+ip\s+authentication\s+mode\s+eigrp\s+")
+            if eam_ch:
+                eam = re.match(
+                    r"^\s+ip\s+authentication\s+mode\s+eigrp\s+\d+\s+(\S+)",
+                    eam_ch[0].text,
+                )
+                if eam:
+                    eigrp_auth_mode = eam.group(1)
+            eigrp_auth_key_chain = None
+            eakc_ch = intf_obj.find_child_objects(r"^\s+ip\s+authentication\s+key-chain\s+eigrp\s+")
+            if eakc_ch:
+                eakc = re.match(
+                    r"^\s+ip\s+authentication\s+key-chain\s+eigrp\s+\d+\s+(\S+)",
+                    eakc_ch[0].text,
+                )
+                if eakc:
+                    eigrp_auth_key_chain = eakc.group(1)
+
+            # EIGRP per-interface timers
+            eigrp_hello_interval = None
+            ehi_ch = intf_obj.find_child_objects(r"^\s+ip\s+hello-interval\s+eigrp\s+")
+            if ehi_ch:
+                ehi = re.match(
+                    r"^\s+ip\s+hello-interval\s+eigrp\s+\d+\s+(\d+)",
+                    ehi_ch[0].text,
+                )
+                if ehi:
+                    eigrp_hello_interval = int(ehi.group(1))
+            eigrp_hold_time = None
+            eht_ch = intf_obj.find_child_objects(r"^\s+ip\s+hold-time\s+eigrp\s+")
+            if eht_ch:
+                eht = re.match(
+                    r"^\s+ip\s+hold-time\s+eigrp\s+\d+\s+(\d+)",
+                    eht_ch[0].text,
+                )
+                if eht:
+                    eigrp_hold_time = int(eht.group(1))
 
             # BFD per-interface (platform-specific hook)
             bfd_interval, bfd_min_rx, bfd_multiplier, bfd_template = self._parse_iface_bfd(intf_obj)
@@ -842,6 +964,10 @@ class IOSParser(BaseParser):
                     duplex=duplex,
                     bandwidth=bandwidth,
                     delay=delay,
+                    eigrp_authentication_mode=eigrp_auth_mode,
+                    eigrp_authentication_key_chain=eigrp_auth_key_chain,
+                    eigrp_hello_interval=eigrp_hello_interval,
+                    eigrp_hold_time=eigrp_hold_time,
                     switchport_mode=switchport_mode,
                     access_vlan=access_vlan,
                     trunk_allowed_vlans=trunk_allowed_vlans,
@@ -849,6 +975,8 @@ class IOSParser(BaseParser):
                     channel_group=channel_group,
                     channel_group_mode=channel_group_mode,
                     min_links=min_links,
+                    lacp_port_priority=lacp_port_priority,
+                    lacp_rate=lacp_rate,
                     port_security_enabled=port_security_enabled,
                     port_security_max_mac=port_security_max_mac,
                     port_security_violation=port_security_violation,
@@ -858,6 +986,11 @@ class IOSParser(BaseParser):
                     dot1x_mab=dot1x_mab,
                     dot1x_guest_vlan=dot1x_guest_vlan,
                     dot1x_auth_fail_vlan=dot1x_auth_fail_vlan,
+                    stp_portfast=stp_portfast,
+                    stp_bpduguard=stp_bpduguard,
+                    stp_bpdufilter=stp_bpdufilter,
+                    stp_cost=stp_cost,
+                    stp_port_priority=stp_port_priority,
                     stp_root_guard=stp_root_guard,
                     hsrp_groups=hsrp_groups,
                     vrrp_groups=vrrp_groups,
@@ -884,6 +1017,7 @@ class IOSParser(BaseParser):
                     nhrp_authentication=nhrp_authentication,
                     nhrp_nhs=nhrp_nhs,
                     nhrp_map=nhrp_map,
+                    mpls_ip=mpls_ip,
                     pim_mode=pim_mode,
                     pim_dr_priority=pim_dr_priority,
                     pim_query_interval=pim_query_interval,
@@ -1003,6 +1137,19 @@ class IOSParser(BaseParser):
                 bgp_obj.find_child_objects(r"^\s+bgp\s+log-neighbor-changes")
             ) > 0
 
+            # Default local-preference (bgp default local-preference N)
+            default_local_preference = 100
+            dlp_children = bgp_obj.find_child_objects(
+                r"^\s+bgp\s+default\s+local-preference\s+(\d+)"
+            )
+            if dlp_children:
+                dlp_m = re.match(
+                    r"^\s+bgp\s+default\s+local-preference\s+(\d+)",
+                    dlp_children[0].text,
+                )
+                if dlp_m:
+                    default_local_preference = int(dlp_m.group(1))
+
             # Best-path options
             bestpath_options = self._parse_bgp_bestpath_options(bgp_obj)
 
@@ -1045,6 +1192,7 @@ class IOSParser(BaseParser):
                     networks=networks,
                     redistribute=redistribute,
                     no_commands=bgp_no_commands,
+                    default_local_preference=default_local_preference,
                 )
             )
 
@@ -1165,6 +1313,16 @@ class IOSParser(BaseParser):
             redistribute = self._parse_ospf_redistribute(ospf_obj)
 
             # Default-information originate
+            # Max-metric router-lsa
+            max_metric_router_lsa = False
+            max_metric_router_lsa_on_startup: int | None = None
+            mm_children = ospf_obj.find_child_objects(r"^\s+max-metric\s+router-lsa")
+            if mm_children:
+                max_metric_router_lsa = True
+                m = re.search(r"on-startup\s+(\d+)", mm_children[0].text)
+                if m:
+                    max_metric_router_lsa_on_startup = int(m.group(1))
+
             default_info_originate = False
             default_info_always = False
             default_info_metric: int | None = None
@@ -1206,6 +1364,8 @@ class IOSParser(BaseParser):
                     network_statements=network_statements,
                     areas=areas,
                     redistribute=redistribute,
+                    max_metric_router_lsa=max_metric_router_lsa,
+                    max_metric_router_lsa_on_startup=max_metric_router_lsa_on_startup,
                     default_information_originate=default_info_originate,
                     default_information_originate_always=default_info_always,
                     default_information_originate_metric=default_info_metric,
@@ -1840,11 +2000,19 @@ class IOSParser(BaseParser):
                     "route_map_out": None,
                     "prefix_list_in": None,
                     "prefix_list_out": None,
+                    "filter_list_in": None,
+                    "filter_list_out": None,
                     "maximum_prefix": None,
                     "next_hop_self": False,
                     "route_reflector_client": False,
+                    "send_community": None,
                     "fall_over_bfd": False,
                     "shutdown": False,
+                    "disable_connected_check": False,
+                    "timers": None,
+                    "local_as": None,
+                    "local_as_no_prepend": False,
+                    "local_as_replace_as": False,
                 }
 
             # Parse commands
@@ -1889,6 +2057,38 @@ class IOSParser(BaseParser):
                 neighbor_dict[peer_ip_str]["fall_over_bfd"] = True
             elif command == "shutdown":
                 neighbor_dict[peer_ip_str]["shutdown"] = True
+            elif command == "disable-connected-check":
+                neighbor_dict[peer_ip_str]["disable_connected_check"] = True
+            elif command.startswith("timers "):
+                tm = re.match(r"timers\s+(\d+)\s+(\d+)", command)
+                if tm:
+                    neighbor_dict[peer_ip_str]["timers"] = BGPTimers(
+                        keepalive=int(tm.group(1)), holdtime=int(tm.group(2)),
+                    )
+            elif command.startswith("local-as "):
+                la_parts = command.replace("local-as ", "").strip().split()
+                if la_parts:
+                    try:
+                        neighbor_dict[peer_ip_str]["local_as"] = int(la_parts[0])
+                    except ValueError:
+                        pass
+                    neighbor_dict[peer_ip_str]["local_as_no_prepend"] = "no-prepend" in la_parts
+                    neighbor_dict[peer_ip_str]["local_as_replace_as"] = "replace-as" in la_parts
+            elif command.startswith("send-community"):
+                if "both" in command:
+                    neighbor_dict[peer_ip_str]["send_community"] = "both"
+                elif "extended" in command:
+                    neighbor_dict[peer_ip_str]["send_community"] = "extended"
+                else:
+                    neighbor_dict[peer_ip_str]["send_community"] = True
+            elif command.startswith("filter-list ") and " in" in command:
+                m = re.search(r"filter-list\s+(\S+)\s+in", command)
+                if m:
+                    neighbor_dict[peer_ip_str]["filter_list_in"] = m.group(1)
+            elif command.startswith("filter-list ") and " out" in command:
+                m = re.search(r"filter-list\s+(\S+)\s+out", command)
+                if m:
+                    neighbor_dict[peer_ip_str]["filter_list_out"] = m.group(1)
 
         # Create BGPNeighbor objects
         for peer_ip_str, neighbor_data in neighbor_dict.items():
@@ -1928,11 +2128,19 @@ class IOSParser(BaseParser):
                     route_map_out=neighbor_data["route_map_out"],
                     prefix_list_in=neighbor_data["prefix_list_in"],
                     prefix_list_out=neighbor_data["prefix_list_out"],
+                    filter_list_in=neighbor_data["filter_list_in"],
+                    filter_list_out=neighbor_data["filter_list_out"],
                     maximum_prefix=neighbor_data["maximum_prefix"],
                     next_hop_self=neighbor_data.get("next_hop_self", False),
                     route_reflector_client=neighbor_data["route_reflector_client"],
+                    send_community=neighbor_data["send_community"],
                     fall_over_bfd=neighbor_data.get("fall_over_bfd", False),
+                    disable_connected_check=neighbor_data.get("disable_connected_check", False),
                     shutdown=neighbor_data.get("shutdown", False),
+                    timers=neighbor_data["timers"],
+                    local_as=neighbor_data["local_as"],
+                    local_as_no_prepend=neighbor_data["local_as_no_prepend"],
+                    local_as_replace_as=neighbor_data["local_as_replace_as"],
                 )
             )
 
@@ -1985,6 +2193,7 @@ class IOSParser(BaseParser):
                     "nssa_default_information_originate_always": False,
                     "authentication": None,
                     "ranges": [],
+                    "virtual_links": [],
                     "filter_list_in": None,
                     "filter_list_out": None,
                 }
@@ -2005,6 +2214,39 @@ class IOSParser(BaseParser):
                     area_dict[area_id]["stub_no_summary"] = True
                 else:
                     area_dict[area_id]["area_type"] = OSPFAreaType.STUB
+            elif command.startswith("virtual-link "):
+                vl_match = re.search(r"virtual-link\s+(\S+)", command)
+                if vl_match:
+                    try:
+                        neighbor_rid = IPv4Address(vl_match.group(1))
+                        hello = None
+                        dead = None
+                        auth = None
+                        auth_key = None
+                        h_m = re.search(r"hello-interval\s+(\d+)", command)
+                        if h_m:
+                            hello = int(h_m.group(1))
+                        d_m = re.search(r"dead-interval\s+(\d+)", command)
+                        if d_m:
+                            dead = int(d_m.group(1))
+                        if "authentication message-digest" in command:
+                            auth = "message-digest"
+                        elif "authentication" in command:
+                            auth = "simple"
+                        ak_m = re.search(r"authentication-key\s+(\S+)", command)
+                        if ak_m:
+                            auth_key = ak_m.group(1)
+                        area_dict[area_id]["virtual_links"].append(
+                            OSPFVirtualLink(
+                                neighbor_router_id=neighbor_rid,
+                                hello_interval=hello,
+                                dead_interval=dead,
+                                authentication=auth,
+                                authentication_key=auth_key,
+                            )
+                        )
+                    except ValueError:
+                        pass
             elif "authentication" in command:
                 if "message-digest" in command:
                     area_dict[area_id]["authentication"] = "message-digest"
@@ -2191,11 +2433,32 @@ class IOSParser(BaseParser):
                         summary_only = "summary-only" in remaining
                         as_set = "as-set" in remaining
 
+                        route_map = None
+                        attribute_map = None
+                        advertise_map = None
+                        suppress_map = None
+                        rm = re.search(r"\broute-map\s+(\S+)", remaining)
+                        if rm:
+                            route_map = rm.group(1)
+                        am = re.search(r"\battribute-map\s+(\S+)", remaining)
+                        if am:
+                            attribute_map = am.group(1)
+                        adm = re.search(r"\badvertise-map\s+(\S+)", remaining)
+                        if adm:
+                            advertise_map = adm.group(1)
+                        sm = re.search(r"\bsuppress-map\s+(\S+)", remaining)
+                        if sm:
+                            suppress_map = sm.group(1)
+
                         aggregates.append(
                             BGPAggregate(
                                 prefix=prefix,
                                 summary_only=summary_only,
                                 as_set=as_set,
+                                route_map=route_map,
+                                attribute_map=attribute_map,
+                                advertise_map=advertise_map,
+                                suppress_map=suppress_map,
                             )
                         )
                     except ValueError:
@@ -3243,6 +3506,18 @@ class IOSParser(BaseParser):
                         )
                     )
 
+            # Default-information originate
+            default_info_originate = False
+            default_info_route_map: str | None = None
+            di_children = isis_obj.find_child_objects(
+                r"^\s+default-information\s+originate"
+            )
+            if di_children:
+                default_info_originate = True
+                m = re.search(r"\broute-map\s+(\S+)", di_children[0].text)
+                if m:
+                    default_info_route_map = m.group(1)
+
             # Authentication
             authentication_mode = None
             authentication_key = None
@@ -3349,6 +3624,8 @@ class IOSParser(BaseParser):
                     passive_interfaces=passive_interfaces,
                     non_passive_interfaces=non_passive_interfaces,
                     redistribute=redistribute,
+                    default_information_originate=default_info_originate,
+                    default_information_originate_route_map=default_info_route_map,
                     authentication_mode=authentication_mode,
                     authentication_key=authentication_key,
                     max_lsp_lifetime=max_lsp_lifetime,
@@ -3491,6 +3768,17 @@ class IOSParser(BaseParser):
                         reliability=int(dmm.group(3)), load=int(dmm.group(4)), mtu=int(dmm.group(5))
                     )
 
+            # K-values: metric weights tos K1 K2 K3 K4 K5
+            k_values = None
+            kv_objs = eigrp_obj.find_child_objects(r"^\s+metric\s+weights\s+")
+            if kv_objs:
+                kvm = re.match(
+                    r"^\s+metric\s+weights\s+\d+\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)",
+                    kv_objs[0].text,
+                )
+                if kvm:
+                    k_values = [int(kvm.group(i)) for i in range(1, 6)]
+
             log_neighbor = bool(eigrp_obj.find_child_objects(r"^\s+eigrp\s+log-neighbor-changes"))
             stub = None
             sc = eigrp_obj.find_child_objects(r"^\s+eigrp\s+stub")
@@ -3498,6 +3786,22 @@ class IOSParser(BaseParser):
                 sm = re.match(r"^\s+eigrp\s+stub\s*(.*)", sc[0].text)
                 if sm:
                     stub = sm.group(1).strip() or "stub"
+
+            # summary-address
+            summary_addresses = []
+            for sac in eigrp_obj.find_child_objects(r"^\s+summary-address\s+"):
+                sam = re.match(r"^\s+summary-address\s+(\S+)\s+(\S+)(?:\s+(\d+))?", sac.text)
+                if sam:
+                    try:
+                        from ipaddress import IPv4Network
+                        net_addr = sam.group(1)
+                        mask = sam.group(2)
+                        pfx = IPv4Network(f"{net_addr}/{mask}", strict=False)
+                        ad = int(sam.group(3)) if sam.group(3) else None
+                        from confgraph.models.eigrp import EIGRPSummaryAddress
+                        summary_addresses.append(EIGRPSummaryAddress(prefix=pfx, admin_distance=ad))
+                    except Exception:
+                        pass
 
             vrf = None
             vc2 = eigrp_obj.find_child_objects(r"^\s+address-family\s+ipv4\s+vrf\s+(\S+)")
@@ -3523,8 +3827,10 @@ class IOSParser(BaseParser):
                 distance_external=distance_external,
                 default_metric=default_metric,
                 log_neighbor_changes=log_neighbor,
+                k_values=k_values,
                 vrf=vrf,
                 stub=stub,
+                summary_addresses=summary_addresses,
             ))
 
         return eigrp_instances
@@ -5031,6 +5337,86 @@ class IOSParser(BaseParser):
         )
 
     # -----------------------------------------------------------------------
+    # MPLS / LDP
+    # -----------------------------------------------------------------------
+
+    def parse_mpls(self) -> "MPLSConfig | None":
+        """Parse global MPLS and LDP configuration.
+
+        Handles::
+
+            mpls ldp router-id Loopback0 force
+            mpls label range 100 199
+            mpls ldp graceful-restart
+            mpls ldp session protection
+            mpls ldp password required for <acl>
+
+        Per-interface ``mpls ip`` is parsed in parse_interfaces().
+        """
+        from confgraph.models.mpls import MPLSConfig
+
+        parse = self._get_parse_obj()
+
+        ldp_objs = parse.find_objects(r"^mpls\s+")
+        if not ldp_objs:
+            return None
+
+        ldp_router_id = None
+        ldp_router_id_force = False
+        label_range_min = None
+        label_range_max = None
+        ldp_graceful_restart = False
+        ldp_session_protection = False
+        ldp_password = None
+
+        for obj in ldp_objs:
+            t = obj.text.strip()
+
+            m = re.match(r"^mpls\s+ldp\s+router-id\s+(\S+)(\s+force)?", t)
+            if m:
+                ldp_router_id = m.group(1)
+                ldp_router_id_force = m.group(2) is not None
+                continue
+
+            m = re.match(r"^mpls\s+label\s+range\s+(\d+)\s+(\d+)", t)
+            if m:
+                label_range_min = int(m.group(1))
+                label_range_max = int(m.group(2))
+                continue
+
+            if re.match(r"^mpls\s+ldp\s+graceful-restart\b", t):
+                ldp_graceful_restart = True
+                continue
+
+            if re.match(r"^mpls\s+ldp\s+session\s+protection\b", t):
+                ldp_session_protection = True
+                continue
+
+            m = re.match(r"^mpls\s+ldp\s+password\s+", t)
+            if m:
+                ldp_password = t  # store raw line for config-only assessment
+                continue
+
+        # Determine if LDP is effectively enabled (any interface has mpls ip,
+        # or ldp router-id is set).
+        ldp_enabled = ldp_router_id is not None
+
+        return MPLSConfig(
+            object_id="mpls",
+            raw_lines=[o.text for o in ldp_objs],
+            source_os=self.os_type,
+            line_numbers=[],
+            ldp_router_id=ldp_router_id,
+            ldp_router_id_force=ldp_router_id_force,
+            label_range_min=label_range_min,
+            label_range_max=label_range_max,
+            ldp_enabled=ldp_enabled,
+            ldp_graceful_restart=ldp_graceful_restart,
+            ldp_session_protection=ldp_session_protection,
+            ldp_password=ldp_password,
+        )
+
+    # -----------------------------------------------------------------------
     # AAA
     # -----------------------------------------------------------------------
 
@@ -5563,6 +5949,63 @@ class IOSParser(BaseParser):
             bpduguard_default=bpduguard_default,
             bpdufilter_default=bpdufilter_default,
             loopguard_default=loopguard_default,
+        )
+
+    def parse_lacp_system_priority(self) -> int | None:
+        """Parse global ``lacp system-priority <N>``."""
+        parse = self._get_parse_obj()
+        objs = parse.find_objects(r"^lacp\s+system-priority\s+\d+")
+        if objs:
+            m = re.search(r"lacp\s+system-priority\s+(\d+)", objs[0].text)
+            if m:
+                return int(m.group(1))
+        return None
+
+    def parse_vtp(self):
+        """Parse VTP configuration.
+
+        Handles::
+
+            vtp domain EXAMPLE
+            vtp mode transparent
+            vtp version 2
+        """
+        from confgraph.models.vlan import VTPConfig
+
+        parse = self._get_parse_obj()
+        vtp_objs = parse.find_objects(r"^vtp\s+")
+        if not vtp_objs:
+            return None
+
+        domain: str | None = None
+        mode: str | None = None
+        version: int | None = None
+        raw_lines: list[str] = []
+        line_numbers: list[int] = []
+
+        for obj in vtp_objs:
+            raw_lines.append(obj.text)
+            line_numbers.append(obj.linenum)
+            t = obj.text.strip()
+
+            dm = re.match(r"^vtp\s+domain\s+(\S+)", t)
+            if dm:
+                domain = dm.group(1)
+            mm = re.match(r"^vtp\s+mode\s+(\S+)", t)
+            if mm:
+                mode = mm.group(1).lower()
+            vm = re.match(r"^vtp\s+version\s+(\d+)", t)
+            if vm:
+                version = int(vm.group(1))
+
+        return VTPConfig(
+            object_id="vtp",
+            raw_lines=raw_lines,
+            source_os=self.os_type,
+            line_numbers=line_numbers,
+            domain=domain,
+            mode=mode,
+            version=version,
         )
 
     def parse_vlans(self) -> list[VLANEntry]:

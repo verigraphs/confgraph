@@ -976,3 +976,83 @@ class EOSParser(IOSParser):
             line_numbers=line_numbers,
             slow_timers=slow_timers,
         )
+
+    # -------------------------------------------------------------------
+    # VXLAN
+    # -------------------------------------------------------------------
+
+    def parse_vxlan(self) -> "VXLANConfig | None":
+        """Parse VXLAN configuration from ``interface Vxlan1``.
+
+        Handles::
+
+            interface Vxlan1
+               vxlan source-interface Loopback1
+               vxlan udp-port 4789
+               vxlan vlan 10 vni 10010
+               vxlan vlan 20 vni 10020
+               vxlan vrf TENANT-A vni 50001
+               vxlan learn-restrict any
+               vxlan flood vtep 10.0.0.2 10.0.0.3
+        """
+        from confgraph.models.vxlan import VXLANConfig, VXLANVniMapping
+
+        parse = self._get_parse_obj()
+        vxlan_objs = parse.find_objects(r"^interface\s+Vxlan1\b")
+        if not vxlan_objs:
+            return None
+
+        vxlan_intf = vxlan_objs[0]
+        source_interface = None
+        udp_port = 4789
+        vni_mappings: list[VXLANVniMapping] = []
+        flood_vteps: list[str] = []
+        learn_restrict = False
+
+        for child in vxlan_intf.children:
+            t = child.text.strip()
+
+            m = re.match(r"vxlan\s+source-interface\s+(\S+)", t)
+            if m:
+                source_interface = m.group(1)
+                continue
+
+            m = re.match(r"vxlan\s+udp-port\s+(\d+)", t)
+            if m:
+                udp_port = int(m.group(1))
+                continue
+
+            m = re.match(r"vxlan\s+vlan\s+(\d+)\s+vni\s+(\d+)", t)
+            if m:
+                vni_mappings.append(VXLANVniMapping(
+                    vni=int(m.group(2)), vlan=int(m.group(1)),
+                ))
+                continue
+
+            m = re.match(r"vxlan\s+vrf\s+(\S+)\s+vni\s+(\d+)", t)
+            if m:
+                vni_mappings.append(VXLANVniMapping(
+                    vni=int(m.group(2)), vrf=m.group(1),
+                ))
+                continue
+
+            if re.match(r"vxlan\s+learn-restrict\s+", t):
+                learn_restrict = True
+                continue
+
+            m = re.match(r"vxlan\s+flood\s+vtep\s+(.*)", t)
+            if m:
+                flood_vteps.extend(m.group(1).split())
+                continue
+
+        return VXLANConfig(
+            object_id="vxlan",
+            raw_lines=[vxlan_intf.text] + [c.text for c in vxlan_intf.children],
+            source_os=self.os_type,
+            line_numbers=[],
+            source_interface=source_interface,
+            udp_port=udp_port,
+            vni_mappings=vni_mappings,
+            flood_vtep_list=flood_vteps,
+            learn_restrict=learn_restrict,
+        )

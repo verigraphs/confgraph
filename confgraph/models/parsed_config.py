@@ -27,6 +27,9 @@ from confgraph.models.ipsla import IPSLAOperation
 from confgraph.models.eem import EEMApplet
 from confgraph.models.object_tracking import ObjectTrack
 from confgraph.models.multicast import MulticastConfig
+from confgraph.models.mpls import MPLSConfig
+from confgraph.models.vxlan import VXLANConfig
+from confgraph.models.vpc import VPCConfig
 from confgraph.models.panos_zone import PANOSZoneConfig
 from confgraph.models.aaa import AAAConfig
 from confgraph.models.dns import DNSConfig
@@ -34,7 +37,7 @@ from confgraph.models.dhcp import DHCPConfig
 from confgraph.models.lldp import LLDPConfig
 from confgraph.models.cdp import CDPConfig
 from confgraph.models.stp import STPConfig
-from confgraph.models.vlan import VLANEntry
+from confgraph.models.vlan import VLANEntry, VTPConfig
 from confgraph.models.netflow import NetFlowConfig
 
 
@@ -162,6 +165,18 @@ class ParsedConfig(BaseModel):
         default=None,
         description="IP multicast configuration",
     )
+    mpls: "MPLSConfig | None" = Field(
+        default=None,
+        description="MPLS/LDP configuration",
+    )
+    vxlan: "VXLANConfig | None" = Field(
+        default=None,
+        description="VXLAN/VTEP configuration",
+    )
+    vpc: "VPCConfig | None" = Field(
+        default=None,
+        description="VPC/MLAG configuration",
+    )
     zones: list[PANOSZoneConfig] = Field(
         default_factory=list,
         description="PAN-OS security zone configurations",
@@ -189,6 +204,14 @@ class ParsedConfig(BaseModel):
     spanning_tree: STPConfig | None = Field(
         default=None,
         description="Spanning Tree Protocol global configuration",
+    )
+    lacp_system_priority: int | None = Field(
+        default=None,
+        description="LACP system priority (global: lacp system-priority N). Default 32768.",
+    )
+    vtp: VTPConfig | None = Field(
+        default=None,
+        description="VLAN Trunking Protocol configuration",
     )
     vlans: list[VLANEntry] = Field(
         default_factory=list,
