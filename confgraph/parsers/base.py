@@ -124,6 +124,8 @@ _BASE_KNOWN_PATTERNS: list[str] = [
     r"^radius-server",
     r"^radius\s+server",
     r"^aaa\s+group\s+server",
+    r"^ip\s+tacacs\s+source-interface",
+    r"^ip\s+radius\s+source-interface",
     # DNS
     r"^ip\s+domain",
     r"^ip\s+name-server",

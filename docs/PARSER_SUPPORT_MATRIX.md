@@ -2,28 +2,27 @@
 
 ## Overview
 
-This document provides a comprehensive overview of parser support across all network operating systems (OS types) in the confgraph project. It serves as a central reference for understanding which protocols, features, and OS versions are currently supported.
+Comprehensive overview of parser support across all network operating systems in confgraph. Each parser inherits from either `BaseParser` (abstract base) or `IOSParser` (reference implementation). EOS, IOS-XR, and NX-OS extend IOSParser and inherit methods where syntax is compatible.
 
-**Last Updated:** February 21, 2026
+**Last Updated:** June 14, 2026
 
 ---
 
 ## OS Type Support Summary
 
-| OS Type | Parser Status | Supported Versions | Sample Config | Documentation | Test Coverage |
-|---------|---------------|-------------------|---------------|---------------|---------------|
-| **Cisco IOS** | ✅ **Complete** | IOS 15.0+ | ✅ `samples/ios.txt` | ✅ [IOS_PARSER_SUPPORT.md](IOS_PARSER_SUPPORT.md) | ✅ High |
-| **Cisco IOS-XE** | ✅ **Complete** | IOS-XE 3.x, 16.x, 17.x | ✅ `samples/ios_xe.txt` | ✅ [IOS_PARSER_SUPPORT.md](IOS_PARSER_SUPPORT.md) | ✅ High |
-| **Arista EOS** | ✅ **Complete** | EOS 4.20+, 4.30+, 4.35+ | ✅ `samples/eos.txt` | ✅ [EOS_PARSER_SUPPORT.md](EOS_PARSER_SUPPORT.md) | ✅ High |
-| **Cisco IOS-XR** | ✅ **Complete** | IOS-XR 6.x, 7.x | ✅ `samples/iosxr_test.cfg` | ✅ [IOSXR_PARSER_SUPPORT.md](IOSXR_PARSER_SUPPORT.md) | ⚠️ Medium |
-| **Cisco NX-OS** | ✅ **Complete** | NX-OS 9.x | ✅ `samples/nxos.txt` | ⚠️ See matrix | ⚠️ Medium |
-| **Juniper JunOS** | ✅ **Complete** | JunOS 20.x, 21.x, 22.x | ✅ `samples/junos_test.cfg` | ✅ [JUNOS_PARSER_SUPPORT.md](JUNOS_PARSER_SUPPORT.md) | ⚠️ Medium |
-| **Palo Alto PAN-OS** | ✅ **Complete** | PAN-OS 9.x, 10.x | ✅ `samples/panos_sample.xml` | ✅ [PANOS_PARSER_SUPPORT.md](PANOS_PARSER_SUPPORT.md) | ⚠️ Medium |
+| OS Type | Parser Class | Inherits From | Override Count | Status |
+|---------|-------------|---------------|----------------|--------|
+| **Cisco IOS / IOS-XE** | `IOSParser` | `BaseParser` | 39 methods | ✅ Reference implementation |
+| **Arista EOS** | `EOSParser` | `IOSParser` | 11 overrides + 28 inherited | ✅ Complete |
+| **Cisco IOS-XR** | `IOSXRParser` | `IOSParser` | 14 overrides + 25 inherited | ✅ Complete |
+| **Cisco NX-OS** | `NXOSParser` | `IOSParser` | 10 overrides + 31 inherited | ✅ Complete |
+| **Juniper JunOS** | `JunOSParser` | `BaseParser` | 13 methods | ✅ Core protocols |
+| **Palo Alto PAN-OS** | `PANOSParser` | `BaseParser` | 9 methods | ✅ Security-focused |
 
-**Legend:**
-- ✅ Complete/Available
-- ⚠️ Partial/In Progress
-- ❌ Not Available/Not Implemented
+**Legend for protocol tables below:**
+- ✅ = Native override for this platform's syntax
+- ✅ (inherited) = Uses IOSParser implementation (works for platforms with compatible flat syntax)
+- ❌ = Not implemented (returns empty)
 
 ---
 
@@ -31,511 +30,310 @@ This document provides a comprehensive overview of parser support across all net
 
 ### Core Routing Protocols
 
-| Protocol | IOS/IOS-XE | EOS | IOS-XR | NX-OS | Notes |
-|----------|------------|-----|--------|-------|-------|
-| **BGP** | ✅ Full | ✅ Full (inherited) | ❌ | ❌ | Address-family model |
-| **OSPF** | ✅ Full | ✅ Full (inherited) | ❌ | ❌ | All area types supported |
-| **IS-IS** | ✅ Full | ✅ Full | ❌ | ❌ | Level-1, Level-2, redistribution |
-| **EIGRP** | ❌ | ❌ | ❌ | ❌ | Not yet implemented |
-| **RIP** | ❌ | ❌ | ❌ | ❌ | Low priority |
+| Protocol | IOS/IOS-XE | EOS | IOS-XR | NX-OS | JunOS | PAN-OS |
+|----------|------------|-----|--------|-------|-------|--------|
+| **BGP** | ✅ | ✅ (inherited) | ✅ (inherited) | ✅ | ✅ | ✅ |
+| **OSPF** | ✅ | ✅ (inherited) | ✅ | ✅ | ✅ | ✅ |
+| **IS-IS** | ✅ | ✅ | ✅ | ✅ (inherited) | ❌ | ❌ |
+| **EIGRP** | ✅ | ✅ (inherited) | ✅ (inherited) | ✅ (inherited) | ❌ | ❌ |
+| **RIP** | ✅ | ✅ (inherited) | ✅ (inherited) | ✅ (inherited) | ❌ | ❌ |
+| **Static Routes** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+
+Notes:
+- NX-OS BGP override handles `template peer` / `inherit peer` syntax
+- IOS-XR OSPF override handles hierarchical `router ospf` → `area` → `interface` nesting
+- EOS IS-IS override handles address-family based configuration
+- IOS-XR IS-IS override handles per-interface config nested under `router isis`
 
 ### Infrastructure
 
-| Protocol | IOS/IOS-XE | EOS | IOS-XR | NX-OS | Notes |
-|----------|------------|-----|--------|-------|-------|
-| **VRF** | ✅ Full | ✅ Full | ❌ | ❌ | EOS uses "vrf instance" syntax (now handled) |
-| **Interfaces** | ✅ Full | ✅ Full (inherited) | ❌ | ❌ | All types supported |
-| **Static Routes** | ✅ Full | ✅ Full | ❌ | ❌ | EOS supports egress-vrf |
-| **Route-Maps** | ✅ Full | ✅ Full (inherited) | ❌ | ❌ | All match/set clauses |
-| **Prefix-Lists** | ✅ Full | ✅ Full | ❌ | ❌ | EOS uses CIDR notation (now handled) |
+| Protocol | IOS/IOS-XE | EOS | IOS-XR | NX-OS | JunOS | PAN-OS |
+|----------|------------|-----|--------|-------|-------|--------|
+| **VRF** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **Interfaces** | ✅ | ✅ (inherited) | ✅ | ✅ | ✅ | ✅ |
+| **Route-Maps** | ✅ | ✅ (inherited) | ✅ | ✅ (inherited) | ✅ | ❌ |
+| **Prefix-Lists** | ✅ | ✅ | ✅ | ✅ (inherited) | ✅ | ❌ |
+
+Notes:
+- EOS VRF uses `vrf instance` syntax; IOS-XR uses `vrf NAME`; NX-OS uses `vrf context`
+- IOS-XR route-maps override handles `route-policy` → `RouteMapConfig`
+- IOS-XR prefix-lists override handles `prefix-set` syntax
 
 ### Access Control & Filtering
 
-| Protocol | IOS/IOS-XE | EOS | IOS-XR | NX-OS | Notes |
-|----------|------------|-----|--------|-------|-------|
-| **ACLs** | ✅ Full | ✅ Full | ❌ | ❌ | Standard & Extended |
-| **Community Lists** | ✅ Full | ✅ Full | ❌ | ❌ | Standard & Expanded/Regexp |
-| **AS-Path Lists** | ✅ Full | ✅ Full | ❌ | ❌ | Regex support |
+| Protocol | IOS/IOS-XE | EOS | IOS-XR | NX-OS | JunOS | PAN-OS |
+|----------|------------|-----|--------|-------|-------|--------|
+| **ACLs** | ✅ | ✅ | ✅ | ✅ (inherited) | ✅ | ✅ |
+| **Community Lists** | ✅ | ✅ | ✅ | ✅ (inherited) | ✅ | ❌ |
+| **AS-Path Lists** | ✅ | ✅ | ✅ | ✅ (inherited) | ✅ | ❌ |
 
-### High Availability
+Notes:
+- IOS-XR community-lists override handles `community-set` / `extcommunity-set` syntax
+- IOS-XR AS-path lists override handles `as-path-set` syntax
+- EOS ACL override handles optional `standard` keyword and CIDR notation
 
-| Protocol | IOS/IOS-XE | EOS | IOS-XR | NX-OS | Notes |
-|----------|------------|-----|--------|-------|-------|
-| **HSRP** | ✅ Full | ⚠️ Limited | ❌ | ❌ | Interface-level parsing |
-| **VRRP** | ✅ Full | ✅ Full (inherited) | ❌ | ❌ | Interface-level parsing |
-| **GLBP** | ❌ | ❌ | ❌ | ❌ | Not yet implemented |
+### Data Center / Overlay
 
-### Discovery & Monitoring
+| Protocol | IOS/IOS-XE | EOS | IOS-XR | NX-OS | JunOS | PAN-OS |
+|----------|------------|-----|--------|-------|-------|--------|
+| **VXLAN/EVPN** | ❌ | ✅ | ❌ | ✅ | ❌ | ❌ |
+| **VPC / MLAG** | ❌ | ✅ (MLAG) | ❌ | ✅ (VPC) | ❌ | ❌ |
+| **VLANs** | ✅ | ✅ (inherited) | ✅ (inherited) | ✅ (inherited) | ❌ | ❌ |
+| **VTP** | ✅ | ✅ (inherited) | ✅ (inherited) | ✅ (inherited) | ❌ | ❌ |
+| **STP** | ✅ | ✅ (inherited) | ✅ (inherited) | ✅ (inherited) | ❌ | ❌ |
 
-| Protocol | IOS/IOS-XE | EOS | IOS-XR | NX-OS | Notes |
-|----------|------------|-----|--------|-------|-------|
-| **LLDP** | ❌ | ❌ | ❌ | ❌ | Planned |
-| **CDP** | ❌ | ❌ | ❌ | ❌ | Planned |
-| **SNMP** | ❌ | ❌ | ❌ | ❌ | Future consideration |
+Notes:
+- EOS VXLAN parsed from `interface Vxlan1` block (source-interface, VNI mappings, flood VTEPs)
+- NX-OS VXLAN parsed from `interface nve1` block
+- EOS MLAG (`mlag configuration`) maps to `VPCConfig` (domain-id is string, not int)
+- NX-OS VPC parsed from `vpc domain` block + `vpc peer-link` on interfaces
+
+### MPLS / Label Switching
+
+| Protocol | IOS/IOS-XE | EOS | IOS-XR | NX-OS | JunOS | PAN-OS |
+|----------|------------|-----|--------|-------|-------|--------|
+| **MPLS/LDP** | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ |
+
+Notes:
+- IOS uses flat syntax (`mpls ldp router-id Loopback0 force`)
+- EOS override handles hierarchical `mpls ldp` block with `router-id interface Loopback0`
+- IOS-XR override handles hierarchical `mpls ldp` block with `router-id <IP>`
+- NX-OS override handles `mpls ldp configuration` block
+- Per-interface `mpls ip` parsed on IOS/EOS/NX-OS interface blocks; IOS-XR lists interfaces under `mpls ldp` block instead
 
 ### Multicast
 
-| Protocol | IOS/IOS-XE | EOS | IOS-XR | NX-OS | Notes |
-|----------|------------|-----|--------|-------|-------|
-| **PIM** | ❌ | ❌ | ❌ | ❌ | Planned (high priority) |
-| **IGMP** | ❌ | ❌ | ❌ | ❌ | Planned (high priority) |
-| **MSDP** | ❌ | ❌ | ❌ | ❌ | Future consideration |
+| Protocol | IOS/IOS-XE | EOS | IOS-XR | NX-OS | JunOS | PAN-OS |
+|----------|------------|-----|--------|-------|-------|--------|
+| **PIM** | ✅ | ✅ (inherited) | ✅ | ✅ (inherited) | ❌ | ❌ |
 
----
+Notes:
+- IOS parses `ip pim rp-address`, `ip pim ssm`, `ip multicast-routing`, per-interface `ip pim sparse-mode`, MSDP peers
+- IOS-XR multicast override handles hierarchical `router pim` and `router msdp` blocks
+- EOS/NX-OS inherit IOS flat-syntax multicast parsing via `_BASE_KNOWN_PATTERNS`
 
-## Feature Support Matrix
+### Management & Monitoring
 
-### IOS / IOS-XE Parser
+| Protocol | IOS/IOS-XE | EOS | IOS-XR | NX-OS | JunOS | PAN-OS |
+|----------|------------|-----|--------|-------|-------|--------|
+| **NTP** | ✅ | ✅ (inherited) | ✅ | ✅ | ✅ | ❌ |
+| **SNMP** | ✅ | ✅ (inherited) | ✅ (inherited) | ✅ (inherited) | ✅ | ❌ |
+| **Syslog** | ✅ | ✅ (inherited) | ✅ (inherited) | ✅ | ✅ | ❌ |
+| **BFD** | ✅ | ✅ | ✅ | ✅ (inherited) | ❌ | ❌ |
+| **NetFlow** | ✅ | ✅ (inherited) | ✅ (inherited) | ✅ (inherited) | ❌ | ❌ |
+| **LLDP** | ✅ | ✅ (inherited) | ✅ (inherited) | ✅ (inherited) | ❌ | ❌ |
+| **CDP** | ✅ | ✅ (inherited) | ✅ (inherited) | ✅ (inherited) | ❌ | ❌ |
 
-**Parser Class:** `confgraph.parsers.ios_parser.IOSParser`
-**Documentation:** [IOS_PARSER_SUPPORT.md](IOS_PARSER_SUPPORT.md)
+Notes:
+- IOS-XR NTP override handles hierarchical `ntp` block
+- NX-OS NTP override handles flat `ntp server` with `use-vrf` keyword
+- NX-OS syslog override handles `logging server` with VRF and facility
+- EOS BFD override handles EOS-specific `bfd` block syntax
 
-#### Supported Versions
-- **Cisco IOS:** 15.0+, 15M&T series, 15S series
-- **Cisco IOS-XE:** 3.x, 16.x (Denali, Everest, Fuji, Gibraltar), 17.x (Amsterdam, Bengaluru, Cupertino)
+### Security & AAA
 
-#### Protocol Coverage
+| Protocol | IOS/IOS-XE | EOS | IOS-XR | NX-OS | JunOS | PAN-OS |
+|----------|------------|-----|--------|-------|-------|--------|
+| **AAA** | ✅ | ✅ (inherited) | ✅ (inherited) | ✅ (inherited) | ❌ | ❌ |
+| **NAT** | ✅ | ✅ (inherited) | ✅ (inherited) | ✅ (inherited) | ❌ | ✅ |
+| **Crypto/IPsec** | ✅ | ✅ (inherited) | ✅ (inherited) | ✅ (inherited) | ❌ | ✅ |
+| **Security Zones** | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ |
 
-| Protocol | Status | Attributes Captured | Missing Features |
-|----------|--------|---------------------|------------------|
-| **VRF** | ✅ Complete | RD, RT import/export, route-maps | IPv6 VRF |
-| **Interfaces** | ✅ Complete | All 7 types, IP addressing, OSPF, HSRP, VRRP, Tunnel | QoS policies |
-| **BGP** | ✅ Complete | Neighbors, peer-groups, AF, VRF instances, route-maps | Additional AFs (L2VPN, etc.) |
-| **OSPF** | ✅ Complete | Process, areas, redistribution, authentication | OSPFv3 |
-| **IS-IS** | ✅ Complete | NET, levels, redistribution, authentication, timers | Multi-topology |
-| **Route-Maps** | ✅ Complete | Match/set clauses, sequences, continue | Some advanced match types |
-| **Prefix-Lists** | ✅ Complete | IPv4 with ge/le | IPv6 prefix-lists |
-| **Static Routes** | ✅ Complete | Dest, next-hop, distance, tag, name, track, VRF | DHCPv4/v6 next-hop |
-| **ACLs** | ✅ Complete | Standard/Extended, named, sequences | Reflexive ACLs, IPv6 |
-| **Community Lists** | ✅ Complete | Standard/Expanded, all community types | Large communities |
-| **AS-Path Lists** | ✅ Complete | Named/numbered, regex | N/A |
+Notes:
+- AAA parses authentication/authorization/accounting method-lists, TACACS+/RADIUS servers
+- PAN-OS zones parsed from XML `vsys` → `zone` elements
 
-#### Test Results
-- **Sample Config:** `samples/ios.txt` (202 lines), `samples/ios_xe.txt` (264 lines)
-- **Test Scripts:** `test_ios_parser.py`, `test_ios_parser_detailed.py`
-- **Objects Parsed:**
-  - 11 interfaces
-  - 2 VRFs
-  - 1 BGP instance (3 neighbors, 1 peer-group)
-  - 1 OSPF process
-  - 9 route-maps
-  - 4 prefix-lists
-  - 4 static routes
-  - 2 ACLs
-  - 2 community lists
-  - 1 AS-path list
+### Services
 
----
+| Protocol | IOS/IOS-XE | EOS | IOS-XR | NX-OS | JunOS | PAN-OS |
+|----------|------------|-----|--------|-------|-------|--------|
+| **DNS** | ✅ | ✅ (inherited) | ✅ (inherited) | ✅ (inherited) | ❌ | ❌ |
+| **DHCP** | ✅ | ✅ (inherited) | ✅ (inherited) | ✅ (inherited) | ❌ | ❌ |
 
-### Arista EOS Parser
+### High Availability (Interface-Level)
 
-**Parser Class:** `confgraph.parsers.eos_parser.EOSParser`
-**Documentation:** [EOS_PARSER_SUPPORT.md](EOS_PARSER_SUPPORT.md)
-**Inheritance:** Extends `IOSParser` (90% code reuse)
+| Protocol | IOS/IOS-XE | EOS | IOS-XR | NX-OS | JunOS | PAN-OS |
+|----------|------------|-----|--------|-------|-------|--------|
+| **HSRP** | ✅ | ✅ (inherited) | ✅ (inherited) | ✅ (inherited) | ❌ | ❌ |
+| **VRRP** | ✅ | ✅ (inherited) | ✅ (inherited) | ✅ (inherited) | ❌ | ❌ |
+| **LACP** | ✅ | ✅ (inherited) | ✅ (inherited) | ✅ (inherited) | ❌ | ❌ |
 
-#### Supported Versions
-- **Arista EOS:** 4.20+, 4.30+ (validated), 4.35+ (validated)
+Notes:
+- HSRP/VRRP parsed as part of interface config (InterfaceConfig fields)
+- LACP system-priority parsed globally; per-interface channel-group and min-links on InterfaceConfig
 
-#### Protocol Coverage
+### Operational / Automation
 
-| Protocol | Status | Attributes Captured | Missing Features |
-|----------|--------|---------------------|------------------|
-| **VRF** | ✅ Complete | Instance name, RD, EVPN route-targets, route-maps | N/A |
-| **Interfaces** | ✅ Complete | CIDR notation, all types | Same as IOS |
-| **BGP** | ✅ Complete | Inherited from IOS | Same as IOS |
-| **OSPF** | ✅ Complete | Inherited from IOS, BFD support | Same as IOS |
-| **IS-IS** | ✅ Complete | Modern syntax, address-families | Segment Routing not parsed |
-| **Route-Maps** | ✅ Complete | Inherited from IOS | Same as IOS |
-| **Prefix-Lists** | ✅ Complete | CIDR notation, seq numbers, ge/le | N/A |
-| **Static Routes** | ✅ Complete | CIDR, egress-vrf for inter-VRF routing | N/A |
-| **ACLs** | ✅ Complete | Optional "standard" keyword, CIDR notation, seq numbers | Numbered ACLs, IPv6 |
-| **Community Lists** | ✅ Complete | Regexp keyword instead of standard/expanded | Same as IOS |
-| **AS-Path Lists** | ✅ Complete | Identical to IOS | Same as IOS |
+| Protocol | IOS/IOS-XE | EOS | IOS-XR | NX-OS | JunOS | PAN-OS |
+|----------|------------|-----|--------|-------|-------|--------|
+| **IP SLA** | ✅ | ✅ (inherited) | ✅ (inherited) | ✅ (inherited) | ❌ | ❌ |
+| **EEM** | ✅ | ✅ (inherited) | ✅ (inherited) | ✅ (inherited) | ❌ | ❌ |
+| **Object Tracking** | ✅ | ✅ (inherited) | ✅ (inherited) | ✅ (inherited) | ❌ | ❌ |
+| **Banners** | ✅ | ✅ (inherited) | ✅ (inherited) | ✅ (inherited) | ❌ | ❌ |
+| **Line Config** | ✅ | ✅ (inherited) | ✅ (inherited) | ✅ (inherited) | ❌ | ❌ |
 
-#### EOS-Specific Features
-- **CIDR Notation:** Native support for `/prefix` in routes, interfaces, ACLs
-- **Egress-VRF:** Inter-VRF static routing support
-- **ACL Auto-Detection:** Determines standard vs extended from entries
-- **Modern IS-IS:** Address-family based configuration
+### QoS
 
-#### Fixed Issues
-1. **VRF Parsing:** ✅ Now handles `vrf instance` with EVPN route-targets
-2. **Prefix-Lists:** ✅ Now handles hierarchical syntax with CIDR notation
-
-#### Known Gaps
-1. **VXLAN/EVPN:** Not parsed (high priority for DC deployments)
-2. **MLAG:** Not parsed
-3. **Numbered ACLs:** Traditional numbered ACLs not supported
-4. **IPv6:** Limited IPv6 parsing coverage
-
-#### Test Results
-- **Sample Config:** `samples/eos.txt` (369 lines, EOS 4.30.1F)
-- **Test Script:** `test_eos_parser.py`
-- **Objects Parsed:**
-  - 14 interfaces
-  - 0 VRFs ⚠️ (needs fix)
-  - 1 BGP instance (7 neighbors)
-  - 1 OSPF process
-  - 13 route-maps
-  - 0 prefix-lists ⚠️ (needs fix)
-  - 5 static routes (including egress-vrf)
-  - 3 ACLs (1 standard, 2 extended)
-  - 3 community lists
-  - 2 AS-path lists
-
----
-
-### IOS-XR Parser
-
-**Parser Class:** Not implemented
-**Documentation:** None
-**Status:** ❌ Not Started
-
-#### Expected Differences from IOS
-- Hierarchical configuration syntax
-- Route-policies instead of route-maps
-- Different interface naming (Bundle-Ether, TenGigE, etc.)
-- Commit-based configuration model
-
-#### Sample Configuration Available
-- **File:** `samples/ios_xr.txt` (243 lines)
-- **Content:** VRF, interfaces, BGP, OSPF, route-policies
-
-#### Priority
-- **Business Value:** High (service provider focus)
-- **Implementation Complexity:** High (significant syntax differences)
-- **Estimated Effort:** 3-4 weeks
-
----
-
-### NX-OS Parser
-
-**Parser Class:** Not implemented
-**Documentation:** None
-**Status:** ❌ Not Started
-
-#### Expected Differences from IOS
-- Feature enable commands (`feature bgp`, `feature ospf`)
-- Different VRF syntax
-- Template peer syntax for BGP
-- Different OSPF configuration style
-
-#### Sample Configuration Available
-- **File:** `samples/nxos.txt` (213 lines)
-- **Content:** VRF, interfaces, BGP, OSPF, route-maps
-
-#### Priority
-- **Business Value:** High (data center focus)
-- **Implementation Complexity:** Medium (some IOS similarity)
-- **Estimated Effort:** 2-3 weeks
-
----
-
-## Version Support Details
-
-### Cisco IOS Versions
-
-| Version Series | Status | Notes |
-|---------------|--------|-------|
-| IOS 15.0(x) | ✅ Supported | Baseline version |
-| IOS 15.1(x) | ✅ Supported | Enhanced features |
-| IOS 15.2(x) | ✅ Supported | Security updates |
-| IOS 15.3(x) | ✅ Supported | Current stable |
-| IOS 15.4(x)+ | ✅ Supported | Latest features |
-| IOS 15M&T | ✅ Supported | Mainline & Technology |
-| IOS 15S | ✅ Supported | Service provider |
-
-### Cisco IOS-XE Versions
-
-| Version Series | Code Name | Status | Notes |
-|---------------|-----------|--------|-------|
-| IOS-XE 3.x | N/A | ✅ Supported | Early XE versions |
-| IOS-XE 16.3 | Denali | ✅ Supported | |
-| IOS-XE 16.6 | Everest | ✅ Supported | |
-| IOS-XE 16.9 | Fuji | ✅ Supported | |
-| IOS-XE 16.12 | Gibraltar | ✅ Supported | |
-| IOS-XE 17.3 | Amsterdam | ✅ Supported | |
-| IOS-XE 17.6 | Bengaluru | ✅ Supported | |
-| IOS-XE 17.9+ | Cupertino+ | ✅ Supported | Current |
-
-### Arista EOS Versions
-
-| Version Series | Status | Validation | Notes |
-|---------------|--------|------------|-------|
-| EOS 4.20.x | ⚠️ Expected | Not tested | Basic compatibility |
-| EOS 4.25.x | ⚠️ Expected | Not tested | Should work |
-| EOS 4.30.x | ✅ Validated | Sample config | Baseline version |
-| EOS 4.33.x | ✅ Validated | Documentation | Confirmed features |
-| EOS 4.34.x | ✅ Validated | Documentation | Additional features |
-| EOS 4.35.x | ✅ Validated | Documentation | Current reference |
+| Protocol | IOS/IOS-XE | EOS | IOS-XR | NX-OS | JunOS | PAN-OS |
+|----------|------------|-----|--------|-------|-------|--------|
+| **Class-Maps** | ✅ | ✅ (inherited) | ✅ (inherited) | ✅ (inherited) | ❌ | ❌ |
+| **Policy-Maps** | ✅ | ✅ (inherited) | ✅ (inherited) | ✅ (inherited) | ❌ | ❌ |
 
 ---
 
 ## Data Model Coverage
 
-### Pydantic Models
+All models live in `confgraph/models/` and use Pydantic.
 
-| Model | Location | OS Support | Completeness |
-|-------|----------|------------|--------------|
-| `BaseConfigObject` | `models/base.py` | All | ✅ Complete |
-| `OSType` | `models/base.py` | All | ✅ Complete |
-| `VRFConfig` | `models/vrf.py` | IOS, EOS | ✅ Complete |
-| `InterfaceConfig` | `models/interface.py` | IOS, EOS | ✅ Complete |
-| `BGPConfig` | `models/bgp.py` | IOS, EOS | ✅ Complete |
-| `OSPFConfig` | `models/ospf.py` | IOS, EOS | ✅ Complete |
-| `RouteMapConfig` | `models/route_map.py` | IOS, EOS | ✅ Complete |
-| `PrefixListConfig` | `models/prefix_list.py` | IOS, EOS | ✅ Complete |
-| `StaticRoute` | `models/static_route.py` | IOS, EOS | ✅ Complete |
-| `ACLConfig` | `models/acl.py` | IOS, EOS | ✅ Complete |
-| `CommunityListConfig` | `models/community_list.py` | IOS, EOS | ✅ Complete |
-| `ASPathListConfig` | `models/community_list.py` | IOS, EOS | ✅ Complete |
-| `ISISConfig` | `models/isis.py` | IOS, EOS | ✅ Complete |
-| `ParsedConfig` | `models/parsed_config.py` | All | ✅ Complete |
-
-### Vendor-Specific Models Needed
-
-| Vendor | Missing Models | Priority |
-|--------|----------------|----------|
-| **IOS-XR** | Route-Policy, RPL, Commit Config | High |
-| **NX-OS** | Feature Config, VPC, FabricPath | High |
-| **EOS** | VXLAN, MLAG, Management API | Medium |
-
----
-
-## Test Coverage Summary
-
-### Test Files
-
-| Test File | Purpose | OS Type | Status |
-|-----------|---------|---------|--------|
-| `test_ios_parser.py` | Basic IOS parsing | IOS | ✅ Passing |
-| `test_ios_parser_detailed.py` | Detailed BGP validation | IOS | ✅ Passing |
-| `test_new_protocols.py` | New protocol support | IOS | ✅ Passing |
-| `test_eos_parser.py` | EOS parsing | EOS | ✅ Passing |
-
-### Coverage Metrics
-
-| OS Type | Protocol Coverage | Test Coverage | Real Device Validation |
-|---------|------------------|---------------|----------------------|
-| **IOS/IOS-XE** | 11 protocols | High (90%+) | ⚠️ Sample configs only |
-| **EOS** | 11 protocols | Medium (70%) | ⚠️ Sample configs only |
-| **IOS-XR** | 0 protocols | None | ❌ Not tested |
-| **NX-OS** | 0 protocols | None | ❌ Not tested |
+| Model | File | Used By |
+|-------|------|---------|
+| `BaseConfigObject` | `base.py` | All parsers |
+| `OSType` | `base.py` | All parsers |
+| `ParsedConfig` | `parsed_config.py` | All parsers (39 data fields) |
+| `VRFConfig` | `vrf.py` | IOS, EOS, IOS-XR, NX-OS, JunOS, PAN-OS |
+| `InterfaceConfig` | `interface.py` | All parsers |
+| `BGPConfig` | `bgp.py` | IOS, EOS, IOS-XR, NX-OS, JunOS, PAN-OS |
+| `OSPFConfig` | `ospf.py` | IOS, EOS, IOS-XR, NX-OS, JunOS, PAN-OS |
+| `ISISConfig` | `isis.py` | IOS, EOS, IOS-XR, NX-OS |
+| `RouteMapConfig` | `route_map.py` | IOS, EOS, IOS-XR, NX-OS, JunOS |
+| `PrefixListConfig` | `prefix_list.py` | IOS, EOS, IOS-XR, NX-OS, JunOS |
+| `StaticRoute` | `static_route.py` | IOS, EOS, IOS-XR, NX-OS, JunOS, PAN-OS |
+| `ACLConfig` | `acl.py` | IOS, EOS, IOS-XR, NX-OS, JunOS, PAN-OS |
+| `CommunityListConfig` | `community_list.py` | IOS, EOS, IOS-XR, NX-OS, JunOS |
+| `ASPathListConfig` | `community_list.py` | IOS, EOS, IOS-XR, NX-OS, JunOS |
+| `MulticastConfig` | `multicast.py` | IOS, EOS, IOS-XR, NX-OS |
+| `MPLSConfig` | `mpls.py` | IOS, EOS, IOS-XR, NX-OS |
+| `VXLANConfig` | `vxlan.py` | EOS, NX-OS |
+| `VPCConfig` | `vpc.py` | EOS (MLAG), NX-OS (VPC) |
+| `AAAConfig` | `aaa.py` | IOS, EOS, IOS-XR, NX-OS |
+| `NTPConfig` | `ntp.py` | IOS, EOS, IOS-XR, NX-OS, JunOS |
+| `SNMPConfig` | `snmp.py` | IOS, EOS, IOS-XR, NX-OS, JunOS |
+| `SyslogConfig` | `syslog.py` | IOS, EOS, IOS-XR, NX-OS, JunOS |
+| `BFDConfig` | `bfd.py` | IOS, EOS, IOS-XR, NX-OS |
+| `DNSConfig` | `dns.py` | IOS, EOS, IOS-XR, NX-OS |
+| `DHCPConfig` | `dhcp.py` | IOS, EOS, IOS-XR, NX-OS |
+| `LLDPConfig` | `lldp.py` | IOS, EOS, IOS-XR, NX-OS |
+| `CDPConfig` | `cdp.py` | IOS, EOS, IOS-XR, NX-OS |
+| `STPConfig` | `stp.py` | IOS, EOS, IOS-XR, NX-OS |
+| `VTPConfig` | `vlan.py` | IOS, EOS, IOS-XR, NX-OS |
+| `VLANEntry` | `vlan.py` | IOS, EOS, IOS-XR, NX-OS |
+| `NetFlowConfig` | `netflow.py` | IOS, EOS, IOS-XR, NX-OS |
+| `NATConfig` | `nat.py` | IOS, EOS, IOS-XR, NX-OS, PAN-OS |
+| `CryptoConfig` | `crypto.py` | IOS, EOS, IOS-XR, NX-OS, PAN-OS |
+| `PANOSZoneConfig` | `panos_zone.py` | PAN-OS |
+| `IPSLAOperation` | `ip_sla.py` | IOS, EOS, IOS-XR, NX-OS |
+| `EEMApplet` | `eem.py` | IOS, EOS, IOS-XR, NX-OS |
+| `ObjectTrack` | `object_tracking.py` | IOS, EOS, IOS-XR, NX-OS |
 
 ---
 
-## Documentation Sources
+## Simulation Coverage (confgraph-entrp)
 
-### Cisco IOS/IOS-XE
-- **Primary:** Cisco IOS Configuration Guides (15.x, 16.x, 17.x)
-- **Reference:** Cisco IOS Command Reference
-- **URL:** https://www.cisco.com/c/en/us/support/ios-nx-os-software/
+The simulation engine in `confgraph-entrp` provides service-level impact assessment for configuration changes. Not all parsed protocols have simulation support.
 
-### Arista EOS
-- **Primary:** Arista EOS User Manual (4.30.x, 4.35.x)
-- **Reference:** Arista EOS Command Reference
-- **URL:** https://www.arista.com/en/support/product-documentation
-
-### Cisco IOS-XR
-- **Available:** Sample configurations only
-- **Documentation:** Not yet reviewed
-- **URL:** https://www.cisco.com/c/en/us/support/routers/
-
-### Cisco NX-OS
-- **Available:** Sample configurations only
-- **Documentation:** Not yet reviewed
-- **URL:** https://www.cisco.com/c/en/us/support/switches/
-
----
-
-## Roadmap & Priorities
-
-### Immediate Priorities (Q1 2026)
-
-1. ~~**Fix EOS VRF Parsing**~~ - ✅ Completed - Override `parse_vrfs()` to handle `vrf instance`
-2. ~~**Fix EOS Prefix-List Parsing**~~ - ✅ Completed - Handle CIDR notation correctly
-3. **Validate Against Real Devices** - Test IOS and EOS parsers with production configs
-4. **Add LLDP/CDP Parsing** - Critical for topology discovery
-
-### Short-Term (Q2 2026)
-
-1. **Implement IOS-XR Parser** - High business value (SP focus)
-2. **Implement NX-OS Parser** - High business value (DC focus)
-3. **Add Multicast Support** - PIM, IGMP for IOS/EOS
-4. **Enhanced Test Coverage** - Increase to 95%+ code coverage
-
-### Medium-Term (Q3-Q4 2026)
-
-1. **VXLAN/EVPN Support** - For EOS and NX-OS data center deployments
-2. **IPv6 Protocol Support** - Full IPv6 parsing across all protocols
-3. **QoS Policy Parsing** - Class-maps, policy-maps, service-policies
-4. **AAA Configuration** - Authentication and authorization parsing
-
-### Long-Term (2027+)
-
-1. **Additional Vendors** - Juniper JunOS (if business need arises)
-2. **SD-WAN Support** - Viptela, Meraki configurations
-3. **Automation Integration** - Ansible, Terraform, Netbox integration
-4. **Dependency Graph Engine** - Build and visualize config dependencies
-5. **Blast Radius Analysis** - Impact analysis for configuration changes
+| Protocol | Simulation | Assessment Type |
+|----------|-----------|-----------------|
+| **BGP** | ✅ | Neighbor changes, AF changes, route-map impact |
+| **OSPF** | ✅ | Area changes, adjacency loss, redistribution |
+| **IS-IS** | ✅ | Adjacency loss, metric changes |
+| **PIM/Multicast** | ✅ | RP reachability (IGP-based), PIM interface removal |
+| **MPLS/LDP** | ✅ | Router-ID state, LDP peer reachability |
+| **VXLAN** | ✅ | VTEP source-interface state, VTEP reachability |
+| **VPC/MLAG** | ✅ | Peer-link state, keepalive reachability (VRF-aware) |
+| **VTP** | ✅ | Cross-device VLAN propagation (server→client) |
+| **LACP** | ✅ | Port-channel min-links → forced down cascade |
+| **STP** | ✅ | Blocked port computation |
+| **L2/VLAN** | ✅ | SVI state derivation from VLAN database |
+| **NTP** | ✅ | Server changes, source-interface changes |
+| **SNMP** | ✅ | Community/server changes |
+| **Syslog** | ✅ | Server changes |
+| **AAA** | ✅ | Method-list changes, TACACS/RADIUS server removal |
+| **DNS** | ✅ | Server changes |
+| **DHCP** | ✅ | Pool/relay changes |
+| **BFD** | ✅ | Timer changes |
+| **Interfaces** | ✅ | Shutdown detection, IP changes, causal chain |
 
 ---
 
-## Self-Sustaining Validation System
+## Test Coverage
 
-### Proposed Architecture
+| Test File | Purpose | Status |
+|-----------|---------|--------|
+| `test_ios_parser.py` | IOS core parsing | ✅ Passing |
+| `test_ios_parser_detailed.py` | IOS BGP detailed validation | ✅ Passing |
+| `test_new_protocols.py` | IOS extended protocol support | ✅ Passing |
+| `test_eos_parser.py` | EOS parsing | ✅ Passing |
+| `test_bgp_parser_e2e.py` | BGP end-to-end across platforms | ✅ Passing |
+| `test_iface_bfd_parser.py` | Interface BFD parsing | ✅ Passing |
+| `test_service_parsers.py` | NTP/SNMP/Syslog/BFD on IOS-XR, EOS, NX-OS | ✅ Passing |
+| `test_interface_normalize.py` | Interface name normalization | ✅ Passing |
+| `test_parser_mpls_vpc_gaps.py` | MPLS (IOS-XR, EOS, NX-OS) + EOS MLAG | ✅ Passing |
 
-The self-sustaining system mentioned in project requirements would:
-
-1. **Monitor Vendor Documentation**
-   - Scrape/monitor Cisco, Arista release notes
-   - Detect new configuration syntax or attributes
-   - Track OS version releases
-
-2. **Validate Parsers**
-   - Compare parser capabilities vs. documentation
-   - Identify missing attributes or protocols
-   - Generate gap analysis reports
-
-3. **Auto-Update Recommendations**
-   - Suggest data model updates
-   - Propose parser changes
-   - Create test cases for new features
-
-4. **Continuous Validation**
-   - Test against new OS versions
-   - Validate backward compatibility
-   - Generate compliance reports
-
-### Implementation Status
-**Status:** ❌ Not Started
-**Priority:** High (aligns with project vision)
-**Estimated Effort:** 6-8 weeks
+**Total: 196 tests passing** (confgraph repo)
 
 ---
 
-## Maintenance Schedule
+## Architecture
 
-### Regular Updates
+### Parser Inheritance
 
-| Activity | Frequency | Last Completed | Next Due |
-|----------|-----------|----------------|----------|
-| Review IOS release notes | Quarterly | Feb 2026 | May 2026 |
-| Review IOS-XE release notes | Quarterly | Feb 2026 | May 2026 |
-| Review EOS release notes | Quarterly | Feb 2026 | May 2026 |
-| Update parser support docs | As needed | Feb 21, 2026 | N/A |
-| Validate against new OS versions | On release | Feb 2026 | TBD |
-| Review test coverage | Monthly | Feb 2026 | Mar 2026 |
-
-### Trigger-Based Updates
-
-- **New Major OS Release** - Review within 2 weeks
-- **Syntax Changes** - Update parser within 1 week
-- **Security Updates** - Immediate review if config-related
-- **Feature Requests** - Triage and prioritize
-
----
-
-## Contributing
-
-### Adding Support for New Protocols
-
-1. **Research:** Review vendor documentation
-2. **Data Model:** Create/update Pydantic model in `confgraph/models/`
-3. **Parser:** Implement parsing method in appropriate parser class
-4. **Tests:** Add test cases and sample configurations
-5. **Documentation:** Update this matrix and protocol-specific docs
-
-### Adding Support for New OS Types
-
-1. **Sample Config:** Create comprehensive sample in `samples/`
-2. **Parser Class:** Create new parser in `confgraph/parsers/`
-3. **Tests:** Create test script `test_<os>_parser.py`
-4. **Documentation:** Create `docs/<OS>_PARSER_SUPPORT.md`
-5. **Update Matrix:** Add row to this document
-
----
-
-## Quick Reference
+```
+BaseParser (ABC) ─── 40 parse_* methods defined
+├── IOSParser ─────── 39 implemented (reference parser)
+│   ├── EOSParser ─── 11 overrides (VRF, prefix-lists, ACLs, IS-IS, BFD, VXLAN, MPLS, MLAG, ...)
+│   ├── IOSXRParser ─ 14 overrides (VRF, interfaces, OSPF, route-maps, prefix-lists, ACLs, IS-IS, multicast, MPLS, NTP, BFD, ...)
+│   └── NXOSParser ── 10 overrides (VRF, interfaces, BGP, OSPF, static-routes, NTP, syslog, VXLAN, VPC, MPLS)
+├── JunOSParser ───── 13 methods (core routing + management)
+└── PANOSParser ───── 9 methods (routing + security/NAT/zones)
+```
 
 ### File Locations
 
 ```
 confgraph/
-├── models/              # Pydantic data models
-│   ├── base.py         # OSType enum, BaseConfigObject
-│   ├── vrf.py          # VRF configuration
-│   ├── interface.py    # Interface configuration
-│   ├── bgp.py          # BGP configuration
-│   ├── ospf.py         # OSPF configuration
-│   ├── isis.py         # IS-IS configuration
-│   ├── route_map.py    # Route-map configuration
-│   ├── prefix_list.py  # Prefix-list configuration
-│   ├── static_route.py # Static route configuration
-│   ├── acl.py          # ACL configuration
-│   └── community_list.py # BGP community/AS-path lists
-├── parsers/            # Parser implementations
-│   ├── base.py         # Abstract base parser
-│   ├── ios_parser.py   # IOS/IOS-XE parser
-│   └── eos_parser.py   # Arista EOS parser
-└── ...
-
-docs/
-├── IOS_PARSER_SUPPORT.md       # IOS/IOS-XE documentation
-├── EOS_PARSER_SUPPORT.md       # Arista EOS documentation
-└── PARSER_SUPPORT_MATRIX.md    # This file
-
-samples/
-├── ios.txt           # Cisco IOS sample
-├── ios_xe.txt        # Cisco IOS-XE sample
-├── eos.txt           # Arista EOS sample
-├── ios_xr.txt        # Cisco IOS-XR sample (no parser yet)
-└── nxos.txt          # Cisco NX-OS sample (no parser yet)
-
-tests/
-├── test_ios_parser.py              # IOS parser tests
-├── test_ios_parser_detailed.py    # IOS BGP detailed tests
-├── test_new_protocols.py           # IOS new protocols tests
-└── test_eos_parser.py              # EOS parser tests
+├── models/                    # Pydantic data models (37 model classes)
+│   ├── base.py               # OSType enum, BaseConfigObject
+│   ├── parsed_config.py      # ParsedConfig (39 data fields)
+│   ├── bgp.py                # BGP (config, neighbor, peer-group, AF)
+│   ├── ospf.py               # OSPF (config, area, redistribute)
+│   ├── isis.py               # IS-IS (config, interface, redistribute)
+│   ├── interface.py          # InterfaceConfig (all interface types)
+│   ├── vrf.py                # VRF
+│   ├── route_map.py          # Route-map / route-policy
+│   ├── prefix_list.py        # Prefix-list / prefix-set
+│   ├── static_route.py       # Static routes
+│   ├── acl.py                # ACLs
+│   ├── community_list.py     # Community + AS-path lists
+│   ├── multicast.py          # PIM/MSDP/multicast
+│   ├── mpls.py               # MPLS/LDP
+│   ├── vxlan.py              # VXLAN/EVPN
+│   ├── vpc.py                # VPC/MLAG
+│   ├── vlan.py               # VTP + VLAN entries
+│   ├── aaa.py                # AAA
+│   ├── ntp.py                # NTP
+│   ├── snmp.py               # SNMP
+│   ├── syslog.py             # Syslog
+│   ├── bfd.py                # BFD
+│   ├── dns.py                # DNS
+│   ├── dhcp.py               # DHCP
+│   ├── lldp.py               # LLDP
+│   ├── cdp.py                # CDP
+│   ├── stp.py                # Spanning-tree
+│   ├── netflow.py            # NetFlow
+│   ├── nat.py                # NAT
+│   ├── crypto.py             # Crypto/IPsec
+│   ├── panos_zone.py         # PAN-OS security zones
+│   ├── ip_sla.py             # IP SLA
+│   ├── eem.py                # EEM applets
+│   └── object_tracking.py    # Object tracking
+├── parsers/                   # Parser implementations
+│   ├── base.py               # Abstract BaseParser (40 methods)
+│   ├── ios_parser.py         # IOS/IOS-XE (reference, ~5500 lines)
+│   ├── eos_parser.py         # Arista EOS
+│   ├── iosxr_parser.py       # Cisco IOS-XR
+│   ├── nxos_parser.py        # Cisco NX-OS
+│   ├── junos_parser.py       # Juniper JunOS
+│   └── panos_parser.py       # Palo Alto PAN-OS
+└── utils/
+    └── interface.py           # Interface name normalization
 ```
-
-### Usage Examples
-
-```python
-# Parse IOS configuration
-from confgraph.parsers.ios_parser import IOSParser
-from confgraph.models.base import OSType
-
-with open("samples/ios.txt") as f:
-    config_text = f.read()
-
-parser = IOSParser(config_text, OSType.IOS)
-parsed = parser.parse()
-
-print(f"Interfaces: {len(parsed.interfaces)}")
-print(f"BGP Instances: {len(parsed.bgp_instances)}")
-print(f"VRFs: {len(parsed.vrfs)}")
-
-# Parse EOS configuration
-from confgraph.parsers.eos_parser import EOSParser
-
-parser = EOSParser(config_text)  # Auto-sets OSType.EOS
-parsed = parser.parse()
-
-print(f"Static Routes: {len(parsed.static_routes)}")
-print(f"ACLs: {len(parsed.acls)}")
-```
-
----
-
-## Contact & Support
-
-### Project Information
-- **Project:** confgraph - Vendor-agnostic config analysis engine
-- **Repository:** (Add repository URL)
-- **Issue Tracker:** (Add issue tracker URL)
-
-### Documentation Updates
-- **Last Updated:** February 21, 2026
-- **Document Version:** 1.0
-- **Next Review:** May 2026

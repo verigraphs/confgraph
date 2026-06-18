@@ -12,7 +12,7 @@ class VPCConfig(BaseConfigObject):
     Per-interface ``vpc <id>`` membership is on InterfaceConfig.vpc_id.
     """
 
-    domain_id: int = Field(..., description="VPC domain ID")
+    domain_id: int | str = Field(..., description="VPC/MLAG domain ID")
     role_priority: int | None = Field(
         default=None,
         description="VPC role priority (lower = primary)",

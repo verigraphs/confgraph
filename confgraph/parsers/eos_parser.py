@@ -54,6 +54,8 @@ class EOSParser(IOSParser):
         r"^no\s+aaa",
         r"^aaa",
         r"^transceiver",
+        r"^mpls",
+        r"^mlag configuration",
     ]
 
     # Extend base best_guess keywords with EOS-specific ones
@@ -1055,4 +1057,151 @@ class EOSParser(IOSParser):
             vni_mappings=vni_mappings,
             flood_vtep_list=flood_vteps,
             learn_restrict=learn_restrict,
+        )
+
+    # -------------------------------------------------------------------
+    # MPLS / LDP — hierarchical "mpls ldp" block (EOS style)
+    # -------------------------------------------------------------------
+
+    def parse_mpls(self) -> "MPLSConfig | None":
+        """Parse MPLS/LDP from EOS hierarchical ``mpls ldp`` block.
+
+        EOS nests LDP sub-commands under ``mpls ldp``::
+
+            mpls ldp
+               router-id interface Loopback0
+               no shutdown
+               transport-address interface Loopback0
+
+        Note: EOS uses ``router-id interface <name>`` (with the "interface"
+        keyword) unlike IOS-XR which uses a raw IP.
+        """
+        from confgraph.models.mpls import MPLSConfig
+
+        parse = self._get_parse_obj()
+
+        ldp_objs = parse.find_objects(r"^mpls\s+ldp\s*$")
+        if not ldp_objs:
+            return None
+
+        ldp_obj = ldp_objs[0]
+
+        ldp_router_id = None
+        ldp_router_id_force = False
+        ldp_graceful_restart = False
+        ldp_session_protection = False
+        ldp_password = None
+
+        for child in ldp_obj.children:
+            t = child.text.strip()
+
+            # EOS: "router-id interface Loopback0"
+            m = re.match(r"router-id\s+interface\s+(\S+)", t)
+            if m:
+                ldp_router_id = m.group(1)
+                continue
+
+            # EOS also supports "router-id <IP>" without "interface"
+            m = re.match(r"router-id\s+(\S+)", t)
+            if m:
+                ldp_router_id = m.group(1)
+                continue
+
+            if re.match(r"graceful-restart\b", t):
+                ldp_graceful_restart = True
+                continue
+
+            if re.match(r"session\s+protection\b", t):
+                ldp_session_protection = True
+                continue
+
+            m = re.match(r"password\s+", t)
+            if m:
+                ldp_password = t
+                continue
+
+        ldp_enabled = ldp_router_id is not None
+
+        raw = [ldp_obj.text] + [c.text for c in ldp_obj.children]
+        return MPLSConfig(
+            object_id="mpls",
+            raw_lines=raw,
+            source_os=self.os_type,
+            line_numbers=[],
+            ldp_router_id=ldp_router_id,
+            ldp_router_id_force=ldp_router_id_force,
+            ldp_enabled=ldp_enabled,
+            ldp_graceful_restart=ldp_graceful_restart,
+            ldp_session_protection=ldp_session_protection,
+            ldp_password=ldp_password,
+        )
+
+    # -------------------------------------------------------------------
+    # MLAG → VPCConfig
+    # -------------------------------------------------------------------
+
+    def parse_vpc(self) -> "VPCConfig | None":
+        """Parse EOS MLAG configuration into VPCConfig.
+
+        Handles::
+
+            mlag configuration
+               domain-id MLAG_DOMAIN
+               local-interface Vlan4094
+               peer-address 10.0.0.2
+               peer-link Port-Channel1
+               reload-delay mlag 300
+        """
+        from ipaddress import IPv4Address
+        from confgraph.models.vpc import VPCConfig
+
+        parse = self._get_parse_obj()
+        mlag_objs = parse.find_objects(r"^mlag\s+configuration")
+        if not mlag_objs:
+            return None
+
+        mlag_obj = mlag_objs[0]
+
+        domain_id: str | None = None
+        peer_link: str | None = None
+        peer_address: IPv4Address | None = None
+        reload_delay: int | None = None
+
+        for child in mlag_obj.children:
+            t = child.text.strip()
+
+            m = re.match(r"domain-id\s+(\S+)", t)
+            if m:
+                domain_id = m.group(1)
+                continue
+
+            m = re.match(r"peer-link\s+(\S+)", t)
+            if m:
+                peer_link = m.group(1)
+                continue
+
+            m = re.match(r"peer-address\s+(\S+)", t)
+            if m:
+                peer_address = IPv4Address(m.group(1))
+                continue
+
+            m = re.match(r"reload-delay\s+mlag\s+(\d+)", t)
+            if m:
+                reload_delay = int(m.group(1))
+                continue
+
+        if domain_id is None:
+            return None
+
+        return VPCConfig(
+            object_id="vpc",
+            raw_lines=[mlag_obj.text] + [c.text for c in mlag_obj.children],
+            source_os=self.os_type,
+            line_numbers=[],
+            domain_id=domain_id,
+            peer_link=peer_link,
+            peer_keepalive_destination=peer_address,
+            peer_keepalive_source=None,
+            peer_keepalive_vrf=None,
+            delay_restore=reload_delay,
         )

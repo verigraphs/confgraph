@@ -4,6 +4,7 @@ import re
 from ipaddress import IPv4Address, IPv4Interface, IPv4Network, IPv6Address, IPv6Interface, IPv6Network
 
 from confgraph.parsers.base import BaseParser, apply_peer_group_command, _default_pg_data
+from confgraph.utils.interface import normalize_interface_name
 from confgraph.models.base import OSType
 from confgraph.models.vrf import VRFConfig
 from confgraph.models.interface import (
@@ -3015,19 +3016,158 @@ class IOSParser(BaseParser):
             if m:
                 tombstones.append(f"prefix-list:{m.group(1)}:seq:{m.group(2)}")
 
-        # --- singleton protocol removals ---
-        if parse.find_objects(r"^no\s+snmp-server"):
-            tombstones.append("singleton:snmp")
-        if parse.find_objects(r"^no\s+ntp\s+"):
-            tombstones.append("singleton:ntp")
-        if parse.find_objects(r"^no\s+logging\s+"):
-            tombstones.append("singleton:syslog")
+        # --- singleton protocol removals (whole-section) ---
         if parse.find_objects(r"^no\s+ip\s+multicast-routing"):
             tombstones.append("singleton:multicast")
         if parse.find_objects(r"^no\s+aaa\s+new-model"):
             tombstones.append("singleton:aaa")
-        if parse.find_objects(r"^no\s+bfd-template\s+") or parse.find_objects(r"^no\s+bfd\s+"):
-            tombstones.append("singleton:bfd")
+
+        # --- Multicast entry-level tombstones ---
+        for obj in parse.find_objects(r"^no\s+ip\s+pim\s+rp-address\s+"):
+            m = re.match(r"^no\s+ip\s+pim\s+rp-address\s+(\S+)", obj.text.strip())
+            if m:
+                tombstones.append(f"field:multicast:rp:{m.group(1)}")
+        for obj in parse.find_objects(r"^no\s+ip\s+msdp\s+peer\s+"):
+            m = re.match(r"^no\s+ip\s+msdp\s+peer\s+(\S+)", obj.text.strip())
+            if m:
+                tombstones.append(f"field:multicast:msdp:{m.group(1)}")
+
+        # --- BFD entry-level tombstones ---
+        for obj in parse.find_objects(r"^no\s+bfd-template\s+"):
+            m = re.match(r"^no\s+bfd-template\s+(?:single-hop|multi-hop)\s+(\S+)", obj.text.strip())
+            if m:
+                tombstones.append(f"field:bfd:template:{m.group(1)}")
+            else:
+                tombstones.append("singleton:bfd")
+        # Bare "no bfd" or "no bfd slow-timers" etc — but NOT "no bfd-template" (handled above)
+        for obj in parse.find_objects(r"^no\s+bfd\s+"):
+            if not re.match(r"^no\s+bfd-template\b", obj.text.strip()):
+                tombstones.append("singleton:bfd")
+        # --- Syslog entry-level tombstones ---
+        for obj in parse.find_objects(r"^no\s+logging\s+"):
+            t = obj.text.strip()
+            m = re.match(r"^no\s+logging\s+host\s+(\S+)", t)
+            if m:
+                tombstones.append(f"field:syslog:host:{m.group(1)}")
+                continue
+            # Unrecognized "no logging ..." → whole-section removal
+            tombstones.append("singleton:syslog")
+
+        # --- DNS entry-level tombstones ---
+        for obj in parse.find_objects(r"^no\s+ip\s+name-server\s+"):
+            m = re.match(r"^no\s+ip\s+name-server\s+(\S+)", obj.text.strip())
+            if m:
+                tombstones.append(f"field:dns:name_server:{m.group(1)}")
+        for obj in parse.find_objects(r"^no\s+ip\s+domain.list\s+"):
+            m = re.match(r"^no\s+ip\s+domain.list\s+(\S+)", obj.text.strip())
+            if m:
+                tombstones.append(f"field:dns:domain:{m.group(1)}")
+        if parse.find_objects(r"^no\s+ip\s+domain.lookup\s*$"):
+            tombstones.append("singleton:dns")
+
+        # --- NetFlow entry-level tombstones ---
+        for obj in parse.find_objects(r"^no\s+ip\s+flow-export\s+destination\s+"):
+            m = re.match(r"^no\s+ip\s+flow-export\s+destination\s+(\S+)\s+(\d+)", obj.text.strip())
+            if m:
+                tombstones.append(f"field:netflow:destination:{m.group(1)}:{m.group(2)}")
+        if parse.find_objects(r"^no\s+ip\s+flow-export\s*$"):
+            tombstones.append("singleton:netflow")
+
+        # --- DHCP entry-level tombstones ---
+        for obj in parse.find_objects(r"^no\s+ip\s+dhcp\s+pool\s+"):
+            m = re.match(r"^no\s+ip\s+dhcp\s+pool\s+(\S+)", obj.text.strip())
+            if m:
+                tombstones.append(f"field:dhcp:pool:{m.group(1)}")
+        for obj in parse.find_objects(r"^no\s+ip\s+dhcp\s+excluded-address\s+"):
+            m = re.match(r"^no\s+ip\s+dhcp\s+excluded-address\s+(\S+)", obj.text.strip())
+            if m:
+                tombstones.append(f"field:dhcp:excluded:{m.group(1)}")
+
+        # --- NTP entry-level tombstones ---
+        for obj in parse.find_objects(r"^no\s+ntp\s+"):
+            t = obj.text.strip()
+            m = re.match(r"^no\s+ntp\s+server\s+(\S+)", t)
+            if m:
+                tombstones.append(f"field:ntp:server:{m.group(1)}")
+                continue
+            m = re.match(r"^no\s+ntp\s+peer\s+(\S+)", t)
+            if m:
+                tombstones.append(f"field:ntp:peer:{m.group(1)}")
+                continue
+            m = re.match(r"^no\s+ntp\s+authentication-key\s+(\d+)", t)
+            if m:
+                tombstones.append(f"field:ntp:auth_key:{m.group(1)}")
+                continue
+            # Unrecognized "no ntp ..." → whole-section removal
+            tombstones.append("singleton:ntp")
+
+        # --- SNMP entry-level tombstones ---
+        # Bare "no snmp-server" (no sub-command) → whole-section removal
+        if parse.find_objects(r"^no\s+snmp-server\s*$"):
+            tombstones.append("singleton:snmp")
+        for obj in parse.find_objects(r"^no\s+snmp-server\s+"):
+            t = obj.text.strip()
+            m = re.match(r"^no\s+snmp-server\s+community\s+(\S+)", t)
+            if m:
+                tombstones.append(f"field:snmp:community:{m.group(1)}")
+                continue
+            m = re.match(r"^no\s+snmp-server\s+host\s+(\S+)", t)
+            if m:
+                tombstones.append(f"field:snmp:host:{m.group(1)}")
+                continue
+            m = re.match(r"^no\s+snmp-server\s+view\s+(\S+)", t)
+            if m:
+                tombstones.append(f"field:snmp:view:{m.group(1)}")
+                continue
+            m = re.match(r"^no\s+snmp-server\s+group\s+(\S+)", t)
+            if m:
+                tombstones.append(f"field:snmp:group:{m.group(1)}")
+                continue
+            m = re.match(r"^no\s+snmp-server\s+user\s+(\S+)", t)
+            if m:
+                tombstones.append(f"field:snmp:user:{m.group(1)}")
+                continue
+            # Unrecognized "no snmp-server ..." → whole-section removal
+            tombstones.append("singleton:snmp")
+
+        # --- AAA entry-level tombstones ---
+        for obj in parse.find_objects(r"^no\s+aaa\s+authentication\s+"):
+            m = re.match(r"^no\s+aaa\s+authentication\s+(\S+)\s+(\S+)", obj.text.strip())
+            if m:
+                tombstones.append(f"field:aaa:authentication:{m.group(1)}:{m.group(2)}")
+        for obj in parse.find_objects(r"^no\s+aaa\s+authorization\s+"):
+            m = re.match(r"^no\s+aaa\s+authorization\s+(\S+)\s+(\S+)", obj.text.strip())
+            if m:
+                tombstones.append(f"field:aaa:authorization:{m.group(1)}:{m.group(2)}")
+        for obj in parse.find_objects(r"^no\s+aaa\s+accounting\s+"):
+            m = re.match(r"^no\s+aaa\s+accounting\s+(\S+)\s+(\S+)", obj.text.strip())
+            if m:
+                tombstones.append(f"field:aaa:accounting:{m.group(1)}:{m.group(2)}")
+        for obj in parse.find_objects(r"^no\s+tacacs\s+server\s+"):
+            m = re.match(r"^no\s+tacacs\s+server\s+(\S+)", obj.text.strip())
+            if m:
+                tombstones.append(f"field:aaa:tacacs_named:{m.group(1)}")
+        for obj in parse.find_objects(r"^no\s+tacacs-server\s+host\s+"):
+            m = re.match(r"^no\s+tacacs-server\s+host\s+(\S+)", obj.text.strip())
+            if m:
+                tombstones.append(f"field:aaa:tacacs:{m.group(1)}")
+        for obj in parse.find_objects(r"^no\s+radius\s+server\s+"):
+            m = re.match(r"^no\s+radius\s+server\s+(\S+)", obj.text.strip())
+            if m:
+                tombstones.append(f"field:aaa:radius_named:{m.group(1)}")
+        for obj in parse.find_objects(r"^no\s+radius-server\s+host\s+"):
+            m = re.match(r"^no\s+radius-server\s+host\s+(\S+)", obj.text.strip())
+            if m:
+                tombstones.append(f"field:aaa:radius:{m.group(1)}")
+
+        # --- interface deletions ---
+        # ``no interface Loopback0`` → ``interface:Loopback0``
+        # Deleting a parent also implicitly removes its sub-interfaces
+        # (e.g. ``no interface GigabitEthernet0/0`` removes ``GigabitEthernet0/0.10``).
+        for obj in parse.find_objects(r"^no\s+interface\s+"):
+            m = re.search(r"^no\s+interface\s+(\S+)", obj.text)
+            if m:
+                tombstones.append(f"interface:{normalize_interface_name(m.group(1))}")
 
         # --- ACE-level deletions: "no <seq>" inside ip access-list blocks ---
         for acl_obj in parse.find_objects(
@@ -5447,7 +5587,12 @@ class IOSParser(BaseParser):
         radius_legacy = parse.find_objects(r"^radius-server\s+host\s+")
         group_objs = parse.find_objects(r"^aaa\s+group\s+server\s+")
 
-        if not aaa_objs and not tacacs_named and not tacacs_legacy and not radius_named and not radius_legacy:
+        tacacs_src_objs = parse.find_objects(r"^ip\s+tacacs\s+source-interface\s+")
+        radius_src_objs = parse.find_objects(r"^ip\s+radius\s+source-interface\s+")
+
+        if (not aaa_objs and not tacacs_named and not tacacs_legacy
+                and not radius_named and not radius_legacy
+                and not tacacs_src_objs and not radius_src_objs):
             return None
 
         new_model = False
@@ -5497,6 +5642,7 @@ class IOSParser(BaseParser):
         for obj in tacacs_named:
             raw_lines.append(obj.text)
             line_numbers.append(obj.linenum)
+            block_name = self._extract_match(obj.text.strip(), r"^tacacs\s+server\s+(\S+)")
             address = None
             port = None
             timeout_val = None
@@ -5519,7 +5665,7 @@ class IOSParser(BaseParser):
                 elif ct.startswith("vrf "):
                     vrf = ct.split(None, 1)[1]
             if address:
-                tacacs_servers.append(TacacsServer(address=address, port=port, timeout=timeout_val, key=key, vrf=vrf))
+                tacacs_servers.append(TacacsServer(name=block_name, address=address, port=port, timeout=timeout_val, key=key, vrf=vrf))
 
         # Legacy single-line TACACS ("tacacs-server host ADDR")
         for obj in tacacs_legacy:
@@ -5539,6 +5685,7 @@ class IOSParser(BaseParser):
         for obj in radius_named:
             raw_lines.append(obj.text)
             line_numbers.append(obj.linenum)
+            block_name = self._extract_match(obj.text.strip(), r"^radius\s+server\s+(\S+)")
             address = None
             auth_port = acct_port = timeout_val = None
             key = vrf = None
@@ -5558,7 +5705,7 @@ class IOSParser(BaseParser):
                     if v:
                         timeout_val = int(v)
             if address:
-                radius_servers.append(RadiusServer(address=address, auth_port=auth_port, acct_port=acct_port, timeout=timeout_val, key=key))
+                radius_servers.append(RadiusServer(name=block_name, address=address, auth_port=auth_port, acct_port=acct_port, timeout=timeout_val, key=key))
 
         # Legacy single-line RADIUS ("radius-server host ADDR")
         for obj in radius_legacy:
@@ -5578,6 +5725,23 @@ class IOSParser(BaseParser):
             raw_lines.append(obj.text)
             line_numbers.append(obj.linenum)
 
+        # Source-interface bindings (global config lines)
+        tacacs_src_iface: str | None = None
+        for obj in tacacs_src_objs:
+            raw_lines.append(obj.text)
+            line_numbers.append(obj.linenum)
+            m = re.match(r"ip\s+tacacs\s+source-interface\s+(\S+)", obj.text.strip())
+            if m:
+                tacacs_src_iface = m.group(1)
+
+        radius_src_iface: str | None = None
+        for obj in radius_src_objs:
+            raw_lines.append(obj.text)
+            line_numbers.append(obj.linenum)
+            m = re.match(r"ip\s+radius\s+source-interface\s+(\S+)", obj.text.strip())
+            if m:
+                radius_src_iface = m.group(1)
+
         local_auth = any("local" in al.methods for al in auth_lists)
 
         return AAAConfig(
@@ -5591,6 +5755,8 @@ class IOSParser(BaseParser):
             accounting_lists=acct_lists,
             tacacs_servers=tacacs_servers,
             radius_servers=radius_servers,
+            tacacs_source_interface=tacacs_src_iface,
+            radius_source_interface=radius_src_iface,
             local_auth_enabled=local_auth,
         )
 

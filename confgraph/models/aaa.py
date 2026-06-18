@@ -34,6 +34,7 @@ class AAAAcctList(BaseModel):
 class TacacsServer(BaseModel):
     """TACACS+ server definition."""
 
+    name: str | None = Field(default=None, description="Named server block name (IOS-XE 'tacacs server T1')")
     address: str = Field(..., description="Server IP or hostname")
     port: int | None = Field(default=None, description="TCP port (default 49)")
     timeout: int | None = Field(default=None, description="Timeout in seconds")
@@ -44,6 +45,7 @@ class TacacsServer(BaseModel):
 class RadiusServer(BaseModel):
     """RADIUS server definition."""
 
+    name: str | None = Field(default=None, description="Named server block name (IOS-XE 'radius server R1')")
     address: str = Field(..., description="Server IP or hostname")
     auth_port: int | None = Field(default=None, description="Auth port (default 1812/1645)")
     acct_port: int | None = Field(default=None, description="Accounting port (default 1813/1646)")
@@ -70,6 +72,14 @@ class AAAConfig(BaseConfigObject):
     )
     radius_servers: list[RadiusServer] = Field(
         default_factory=list, description="RADIUS server definitions"
+    )
+    tacacs_source_interface: str | None = Field(
+        default=None,
+        description="Source interface for TACACS+ packets (ip tacacs source-interface)",
+    )
+    radius_source_interface: str | None = Field(
+        default=None,
+        description="Source interface for RADIUS packets (ip radius source-interface)",
     )
     local_auth_enabled: bool = Field(
         default=False,

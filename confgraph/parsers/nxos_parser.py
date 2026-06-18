@@ -32,6 +32,7 @@ _NXOS_KNOWN_PATTERNS: list[str] = [
     r"^boot",
     r"^spanning-tree",
     r"^port-profile",
+    r"^mpls",
 ]
 
 
@@ -894,4 +895,108 @@ class NXOSParser(IOSParser):
             peer_link=peer_link,
             delay_restore=delay_restore,
             auto_recovery=auto_recovery,
+        )
+
+    # -----------------------------------------------------------------------
+    # MPLS / LDP — "mpls ldp configuration" block (NX-OS style)
+    # -----------------------------------------------------------------------
+
+    # -------------------------------------------------------------------
+    # Deletion commands (tombstones)
+    # -------------------------------------------------------------------
+
+    def parse_deletion_commands(self) -> list[str]:
+        """Parse NX-OS deletion commands into tombstone strings.
+
+        Inherits all IOS top-level tombstones (``no router ospf``,
+        ``no ip pim rp-address``, ``no vlan``, etc.) and adds NX-OS-specific
+        nested block deletions:
+
+          - ``no member vni <id>`` inside ``interface nve``  → ``field:vxlan:vni:<id>``
+          - ``no peer-keepalive`` inside ``vpc domain``      → ``field:vpc:peer_keepalive_*``
+        """
+        tombstones = super().parse_deletion_commands()
+        parse = self._get_parse_obj()
+
+        # --- VXLAN VNI removal (nested under interface nve) ---
+        for nve_obj in parse.find_objects(r"^interface\s+nve\d+"):
+            for child in nve_obj.children:
+                t = child.text.strip()
+                m = re.match(r"no\s+member\s+vni\s+(\d+)", t)
+                if m:
+                    tombstones.append(f"field:vxlan:vni:{m.group(1)}")
+
+        # --- vPC peer-keepalive removal (nested under vpc domain) ---
+        for vpc_obj in parse.find_objects(r"^vpc\s+domain\s+\d+"):
+            for child in vpc_obj.children:
+                t = child.text.strip()
+                if re.match(r"no\s+peer-keepalive\b", t):
+                    tombstones.append("field:vpc:peer_keepalive_destination")
+                    tombstones.append("field:vpc:peer_keepalive_source")
+                    tombstones.append("field:vpc:peer_keepalive_vrf")
+
+        return tombstones
+
+    def parse_mpls(self) -> "MPLSConfig | None":
+        """Parse MPLS/LDP from NX-OS hierarchical ``mpls ldp configuration`` block.
+
+        NX-OS nests LDP sub-commands under ``mpls ldp configuration``::
+
+            feature mpls ldp
+            mpls ldp configuration
+              router-id Loopback0
+              graceful-restart
+        """
+        from confgraph.models.mpls import MPLSConfig
+
+        parse = self._get_parse_obj()
+
+        ldp_objs = parse.find_objects(r"^mpls\s+ldp\s+configuration\s*$")
+        if not ldp_objs:
+            return None
+
+        ldp_obj = ldp_objs[0]
+
+        ldp_router_id = None
+        ldp_router_id_force = False
+        ldp_graceful_restart = False
+        ldp_session_protection = False
+        ldp_password = None
+
+        for child in ldp_obj.children:
+            t = child.text.strip()
+
+            m = re.match(r"router-id\s+(\S+)(\s+force)?", t)
+            if m:
+                ldp_router_id = m.group(1)
+                ldp_router_id_force = m.group(2) is not None
+                continue
+
+            if re.match(r"graceful-restart\b", t):
+                ldp_graceful_restart = True
+                continue
+
+            if re.match(r"session\s+protection\b", t):
+                ldp_session_protection = True
+                continue
+
+            m = re.match(r"password\s+", t)
+            if m:
+                ldp_password = t
+                continue
+
+        ldp_enabled = ldp_router_id is not None
+
+        raw = [ldp_obj.text] + [c.text for c in ldp_obj.children]
+        return MPLSConfig(
+            object_id="mpls",
+            raw_lines=raw,
+            source_os=self.os_type,
+            line_numbers=[],
+            ldp_router_id=ldp_router_id,
+            ldp_router_id_force=ldp_router_id_force,
+            ldp_enabled=ldp_enabled,
+            ldp_graceful_restart=ldp_graceful_restart,
+            ldp_session_protection=ldp_session_protection,
+            ldp_password=ldp_password,
         )

@@ -1572,6 +1572,87 @@ class IOSXRParser(IOSParser):
         return isis_instances
 
     # -----------------------------------------------------------------------
+    # MPLS / LDP — hierarchical "mpls ldp" block (IOS-XR style)
+    # -----------------------------------------------------------------------
+
+    def parse_mpls(self) -> "MPLSConfig | None":
+        """Parse MPLS/LDP from IOS-XR hierarchical ``mpls ldp`` block.
+
+        IOS-XR nests LDP sub-commands under a ``mpls ldp`` block::
+
+            mpls ldp
+             router-id 10.0.0.1
+             graceful-restart
+             session protection
+             address-family ipv4
+             !
+             interface GigabitEthernet0/0/0/0
+             !
+
+        Note: label range and per-interface ``mpls ip`` are not extracted
+        from the hierarchical block — IOS-XR lists interfaces as children
+        of ``mpls ldp`` rather than annotating ``interface`` blocks.
+        Per-interface ``mpls ip`` on IOS-XR is therefore not available
+        for ``_assess_mpls`` interface-state checks.  This is intentional:
+        interface MPLS enablement on XR is implied by presence under the
+        ``mpls ldp`` block and does not use a separate ``mpls ip`` knob.
+        """
+        from confgraph.models.mpls import MPLSConfig
+
+        parse = self._get_parse_obj()
+
+        ldp_objs = parse.find_objects(r"^mpls\s+ldp\s*$")
+        if not ldp_objs:
+            return None
+
+        ldp_obj = ldp_objs[0]
+
+        ldp_router_id = None
+        ldp_router_id_force = False
+        ldp_graceful_restart = False
+        ldp_session_protection = False
+        ldp_password = None
+
+        for child in ldp_obj.children:
+            t = child.text.strip()
+
+            # IOS-XR: "router-id 10.0.0.1 [force]"
+            m = re.match(r"router-id\s+(\S+)(\s+force)?", t)
+            if m:
+                ldp_router_id = m.group(1)
+                ldp_router_id_force = m.group(2) is not None
+                continue
+
+            if re.match(r"graceful-restart\b", t):
+                ldp_graceful_restart = True
+                continue
+
+            if re.match(r"session\s+protection\b", t):
+                ldp_session_protection = True
+                continue
+
+            m = re.match(r"password\s+", t)
+            if m:
+                ldp_password = t
+                continue
+
+        ldp_enabled = ldp_router_id is not None
+
+        raw = [ldp_obj.text] + [c.text for c in ldp_obj.children]
+        return MPLSConfig(
+            object_id="mpls",
+            raw_lines=raw,
+            source_os=self.os_type,
+            line_numbers=[],
+            ldp_router_id=ldp_router_id,
+            ldp_router_id_force=ldp_router_id_force,
+            ldp_enabled=ldp_enabled,
+            ldp_graceful_restart=ldp_graceful_restart,
+            ldp_session_protection=ldp_session_protection,
+            ldp_password=ldp_password,
+        )
+
+    # -----------------------------------------------------------------------
     # NTP — hierarchical "ntp" block (IOS-XR style)
     # -----------------------------------------------------------------------
 
