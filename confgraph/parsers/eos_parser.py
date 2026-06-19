@@ -1137,6 +1137,50 @@ class EOSParser(IOSParser):
         )
 
     # -------------------------------------------------------------------
+    # Deletion commands (tombstones)
+    # -------------------------------------------------------------------
+
+    def parse_deletion_commands(self) -> list[str]:
+        """Parse EOS deletion commands into tombstone strings.
+
+        Inherits all IOS top-level tombstones (``no router ospf``,
+        ``no ip pim rp-address``, ``no vlan``, etc.) and adds EOS-specific
+        nested block deletions:
+
+          - ``no vxlan vlan <id> vni <id>`` inside ``interface Vxlan1``
+            → ``field:vxlan:vni:<vni_id>``
+          - ``no vxlan vrf <name> vni <id>`` inside ``interface Vxlan1``
+            → ``field:vxlan:vni:<vni_id>``
+          - ``no peer-address`` inside ``mlag configuration``
+            → ``field:vpc:peer_keepalive_destination``
+        """
+        tombstones = super().parse_deletion_commands()
+        parse = self._get_parse_obj()
+
+        # --- VXLAN VNI removal (nested under interface Vxlan1) ---
+        for vxlan_obj in parse.find_objects(r"^interface\s+Vxlan1\b"):
+            for child in vxlan_obj.children:
+                t = child.text.strip()
+                # "no vxlan vlan <vlan_id> vni <vni_id>"
+                m = re.match(r"no\s+vxlan\s+vlan\s+\d+\s+vni\s+(\d+)", t)
+                if m:
+                    tombstones.append(f"field:vxlan:vni:{m.group(1)}")
+                    continue
+                # "no vxlan vrf <name> vni <vni_id>"
+                m = re.match(r"no\s+vxlan\s+vrf\s+\S+\s+vni\s+(\d+)", t)
+                if m:
+                    tombstones.append(f"field:vxlan:vni:{m.group(1)}")
+
+        # --- MLAG peer-address removal (nested under mlag configuration) ---
+        for mlag_obj in parse.find_objects(r"^mlag\s+configuration"):
+            for child in mlag_obj.children:
+                t = child.text.strip()
+                if re.match(r"no\s+peer-address\b", t):
+                    tombstones.append("field:vpc:peer_keepalive_destination")
+
+        return tombstones
+
+    # -------------------------------------------------------------------
     # MLAG → VPCConfig
     # -------------------------------------------------------------------
 
