@@ -3160,6 +3160,12 @@ class IOSParser(BaseParser):
             if m:
                 tombstones.append(f"field:aaa:radius:{m.group(1)}")
 
+        # --- LLDP entry-level tombstones ---
+        for obj in parse.find_objects(r"^no\s+lldp\s+tlv-select\s+"):
+            m = re.match(r"^no\s+lldp\s+tlv-select\s+(\S+)", obj.text.strip())
+            if m:
+                tombstones.append(f"field:lldp:tlv:{m.group(1)}")
+
         # --- interface deletions ---
         # ``no interface Loopback0`` → ``interface:Loopback0``
         # Deleting a parent also implicitly removes its sub-interfaces
