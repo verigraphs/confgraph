@@ -2331,6 +2331,96 @@ class IOSParser(BaseParser):
 
         return redistribute
 
+    # ------------------------------------------------------------------
+    # Shared BGP helpers — single source of truth for network/redistribute
+    # ------------------------------------------------------------------
+
+    def _parse_bgp_network_stmts(self, config_objs) -> list["BGPNetwork"]:
+        """Parse ``network`` statements from a list of config-line objects.
+
+        Handles all IOS forms::
+
+            network 10.50.1.0 mask 255.255.255.0
+            network 10.50.1.0 mask 255.255.255.0 route-map RM_NAME
+            network 10.50.1.0 mask 255.255.255.0 backdoor
+            network 192.168.1.0/24              (classless)
+            network 2001:db8::/32               (IPv6)
+        """
+        from confgraph.models.bgp import BGPNetwork
+
+        networks: list[BGPNetwork] = []
+        for obj in config_objs:
+            t = obj.text
+            net_match = re.search(
+                r"^\s+network\s+(\S+)(?:\s+mask\s+(\S+))?", t
+            )
+            if not net_match:
+                continue
+
+            prefix_str = net_match.group(1)
+            mask_str = net_match.group(2)
+
+            rm_match = re.search(r"\broute-map\s+(\S+)", t)
+            backdoor = bool(re.search(r"\bbackdoor\b", t))
+
+            try:
+                if mask_str:
+                    prefix = IPv4Network(f"{prefix_str}/{mask_str}", strict=False)
+                elif ":" in prefix_str:
+                    prefix = IPv6Network(prefix_str, strict=False)
+                else:
+                    prefix = IPv4Network(prefix_str, strict=False)
+
+                networks.append(BGPNetwork(
+                    prefix=prefix,
+                    route_map=rm_match.group(1) if rm_match else None,
+                    backdoor=backdoor,
+                ))
+            except ValueError:
+                pass
+
+        return networks
+
+    def _parse_bgp_redistribute_stmts(self, config_objs) -> list["BGPRedistribute"]:
+        """Parse ``redistribute`` statements from a list of config-line objects."""
+        from confgraph.models.bgp import BGPRedistribute
+
+        redistribute: list[BGPRedistribute] = []
+        for obj in config_objs:
+            match = re.search(r"^\s+redistribute\s+(\S+)(.+)?", obj.text)
+            if not match:
+                continue
+
+            protocol = match.group(1)
+            remaining = match.group(2).strip() if match.group(2) else ""
+
+            process_id = None
+            route_map = None
+            metric = None
+
+            pid_match = re.search(r"(\d+)", remaining)
+            if pid_match:
+                process_id = int(pid_match.group(1))
+
+            rm_match = re.search(r"route-map\s+(\S+)", remaining)
+            if rm_match:
+                route_map = rm_match.group(1)
+
+            metric_match = re.search(r"metric\s+(\d+)", remaining)
+            if metric_match:
+                metric = int(metric_match.group(1))
+
+            redistribute.append(
+                BGPRedistribute(
+                    protocol=protocol,
+                    process_id=process_id,
+                    route_map=route_map,
+                    metric=metric,
+                )
+            )
+
+        return redistribute
+
     def _parse_bgp_address_families(self, bgp_obj) -> list[BGPAddressFamily]:
         """Parse BGP address-families (global, non-VRF)."""
         address_families = []
@@ -2351,65 +2441,12 @@ class IOSParser(BaseParser):
             afi = match.group(1)
             safi = match.group(2) or "unicast"
 
-            # Parse networks within this AF
-            networks = []
-            network_children = af_child.find_child_objects(r"^\s+network\s+")
-            for net_child in network_children:
-                net_match = re.search(
-                    r"^\s+network\s+(\S+)(?:\s+mask\s+(\S+))?", net_child.text
-                )
-                if net_match:
-                    prefix_str = net_match.group(1)
-                    mask_str = net_match.group(2)
-
-                    try:
-                        if mask_str:
-                            # IOS style: network 10.0.0.0 mask 255.255.0.0
-                            prefix = IPv4Network(f"{prefix_str}/{mask_str}", strict=False)
-                        else:
-                            # Classless: network 192.168.1.0/24
-                            prefix = IPv4Network(prefix_str, strict=False) if afi == "ipv4" else IPv6Network(prefix_str, strict=False)
-
-                        networks.append(BGPNetwork(prefix=prefix))
-                    except ValueError:
-                        pass
-
-            # Parse redistribution
-            redistribute = []
-            redist_children = af_child.find_child_objects(r"^\s+redistribute\s+(\S+)")
-            for redist_child in redist_children:
-                match = re.search(r"^\s+redistribute\s+(\S+)(.+)?", redist_child.text)
-                if match:
-                    protocol = match.group(1)
-                    remaining = match.group(2).strip() if match.group(2) else ""
-
-                    process_id = None
-                    route_map = None
-                    metric = None
-
-                    # Extract process ID
-                    pid_match = re.search(r"(\d+)", remaining)
-                    if pid_match:
-                        process_id = int(pid_match.group(1))
-
-                    # Extract route-map
-                    rm_match = re.search(r"route-map\s+(\S+)", remaining)
-                    if rm_match:
-                        route_map = rm_match.group(1)
-
-                    # Extract metric
-                    metric_match = re.search(r"metric\s+(\d+)", remaining)
-                    if metric_match:
-                        metric = int(metric_match.group(1))
-
-                    redistribute.append(
-                        BGPRedistribute(
-                            protocol=protocol,
-                            process_id=process_id,
-                            route_map=route_map,
-                            metric=metric,
-                        )
-                    )
+            networks = self._parse_bgp_network_stmts(
+                af_child.find_child_objects(r"^\s+network\s+")
+            )
+            redistribute = self._parse_bgp_redistribute_stmts(
+                af_child.find_child_objects(r"^\s+redistribute\s+(\S+)")
+            )
 
             # Parse aggregates
             aggregates = []
@@ -2676,18 +2713,27 @@ class IOSParser(BaseParser):
                     neighbors.append(stub)
                     nb_index[peer_str] = stub
 
-    def _parse_bgp_networks(self, bgp_obj, vrf: str | None) -> list[BGPNetwork]:
-        """Parse BGP network statements at global level (not in address-family)."""
-        networks = []
-        # Global network statements (outside address-family blocks)
-        # These are rare in modern configs but supported
-        return networks
+    def _parse_bgp_networks(self, bgp_obj, vrf: str | None) -> list["BGPNetwork"]:
+        """Parse BGP network statements at global level (not in address-family).
 
-    def _parse_bgp_redistribute(self, bgp_obj, vrf: str | None) -> list[BGPRedistribute]:
-        """Parse BGP redistribute statements at global level."""
-        redistribute = []
-        # Global redistribute statements (outside address-family blocks)
-        return redistribute
+        Classic IOS configs place ``network`` directly under ``router bgp``
+        without an explicit ``address-family`` block.  These are implicit
+        IPv4 unicast.  Using ``bgp_obj.children`` (direct children only)
+        ensures we never pick up networks nested inside AF blocks.
+        """
+        network_objs = [
+            c for c in bgp_obj.children
+            if re.match(r"^\s+network\s+", c.text)
+        ]
+        return self._parse_bgp_network_stmts(network_objs)
+
+    def _parse_bgp_redistribute(self, bgp_obj, vrf: str | None) -> list["BGPRedistribute"]:
+        """Parse BGP redistribute statements at global level (not in address-family)."""
+        redist_objs = [
+            c for c in bgp_obj.children
+            if re.match(r"^\s+redistribute\s+", c.text)
+        ]
+        return self._parse_bgp_redistribute_stmts(redist_objs)
 
     def _parse_bgp_vrf_instances(self, bgp_obj, asn: int) -> list[BGPConfig]:
         """Parse VRF-specific BGP instances from address-family ipv4 vrf blocks."""
@@ -2771,35 +2817,13 @@ class IOSParser(BaseParser):
                     )
                 )
 
-            # Parse redistribution in VRF
-            redistribute = []
-            redist_children = vrf_af_child.find_child_objects(r"^\s+redistribute\s+(\S+)")
-            for redist_child in redist_children:
-                match = re.search(r"^\s+redistribute\s+(\S+)(.+)?", redist_child.text)
-                if match:
-                    protocol = match.group(1)
-                    remaining = match.group(2).strip() if match.group(2) else ""
-
-                    process_id = None
-                    route_map = None
-
-                    # Extract process ID
-                    pid_match = re.search(r"(\d+)", remaining)
-                    if pid_match:
-                        process_id = int(pid_match.group(1))
-
-                    # Extract route-map
-                    rm_match = re.search(r"route-map\s+(\S+)", remaining)
-                    if rm_match:
-                        route_map = rm_match.group(1)
-
-                    redistribute.append(
-                        BGPRedistribute(
-                            protocol=protocol,
-                            process_id=process_id,
-                            route_map=route_map,
-                        )
-                    )
+            # Parse VRF networks and redistribution via shared helpers
+            vrf_networks = self._parse_bgp_network_stmts(
+                vrf_af_child.find_child_objects(r"^\s+network\s+")
+            )
+            redistribute = self._parse_bgp_redistribute_stmts(
+                vrf_af_child.find_child_objects(r"^\s+redistribute\s+(\S+)")
+            )
 
             # 'no neighbor X ...' tombstones for VRF instance
             vrf_no_commands = self._parse_bgp_neighbor_tombstones(vrf_af_child)
@@ -2819,6 +2843,7 @@ class IOSParser(BaseParser):
                     neighbors=vrf_neighbors,
                     peer_groups=[],
                     address_families=[],
+                    networks=vrf_networks,
                     redistribute=redistribute,
                     no_commands=vrf_no_commands,
                 )
