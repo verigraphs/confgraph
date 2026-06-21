@@ -799,9 +799,7 @@ class JunOSParser(BaseParser):
             peer_groups.append(pg)
 
             # Parse neighbors within this group
-            nbr_block = grp_data.get("neighbor", {})
-            if not isinstance(nbr_block, dict):
-                continue
+            nbr_block = _as_named_block(grp_data.get("neighbor", {}))
 
             for nbr_ip_str, nbr_data in nbr_block.items():
                 if not isinstance(nbr_data, dict):
@@ -982,10 +980,8 @@ class JunOSParser(BaseParser):
             for area_id, area_data in area_block.items():
                 if not isinstance(area_data, dict):
                     continue
-                intf_block = area_data.get("interface", {})
-                intf_names: list[str] = []
-                if isinstance(intf_block, dict):
-                    intf_names = list(intf_block.keys())
+                intf_block = _as_named_block(area_data.get("interface", {}))
+                intf_names = list(intf_block.keys())
                 areas.append(OSPFArea(
                     area_id=str(area_id),
                     interfaces=intf_names,
@@ -1193,6 +1189,24 @@ def _str_val(v: Any) -> str | None:
             return None
         return str(keys[0]).strip('"') or None
     return str(v).strip('"')
+
+
+def _as_named_block(v: Any) -> dict:
+    """Normalise a hierarchy value to a dict keyed by name.
+
+    Handles three shapes:
+    - ``dict``  — already a named-block (return as-is)
+    - ``str``   — single bare leaf (``'ge-0/0/0.0'`` → ``{'ge-0/0/0.0': {}}``)
+    - ``list``  — multiple bare leaves → ``{name: {} for name in list}``
+    - anything else → empty dict
+    """
+    if isinstance(v, dict):
+        return v
+    if isinstance(v, str):
+        return {v: {}}
+    if isinstance(v, list):
+        return {str(item): {} for item in v}
+    return {}
 
 
 def _junos_interface_type(name: str) -> InterfaceType:

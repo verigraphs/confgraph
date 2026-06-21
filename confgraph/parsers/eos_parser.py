@@ -4,9 +4,9 @@ import re
 from ipaddress import IPv4Address, IPv4Interface, IPv4Network, IPv6Address, IPv6Interface, IPv6Network
 
 from confgraph.parsers.ios_parser import IOSParser
-from confgraph.parsers.base import _BASE_KNOWN_PATTERNS, _BASE_BEST_GUESS_KEYWORDS
+from confgraph.parsers.base import _BASE_KNOWN_PATTERNS, _BASE_BEST_GUESS_KEYWORDS, _default_pg_data, apply_peer_group_command
 from confgraph.models.base import OSType
-from confgraph.models.bgp import BGPAddressFamily
+from confgraph.models.bgp import BGPAddressFamily, BGPNeighbor, BGPPeerGroup
 from confgraph.models.vrf import VRFConfig
 from confgraph.models.prefix_list import PrefixListConfig, PrefixListEntry
 from confgraph.models.static_route import StaticRoute
@@ -90,6 +90,74 @@ class EOSParser(IOSParser):
                 vrf_children[0].text, r"^\s+vrf\s+(\S+)"
             )
         return None
+
+    def parse_interfaces(self) -> list:
+        """Parse interfaces — patches CIDR IPv4 and EOS OSPF area.
+
+        EOS uses ``ip address 10.0.0.1/30`` (CIDR) instead of IOS dotted-mask,
+        and ``ip ospf area 0.0.0.0`` (no process ID) for interface OSPF binding.
+        """
+        interfaces = super().parse_interfaces()
+
+        parse = self._get_parse_obj()
+        intf_objs = parse.find_objects(r"^interface\s+")
+
+        for intf_obj in intf_objs:
+            intf_name = self._extract_match(intf_obj.text, r"^interface\s+(\S+)")
+            if not intf_name:
+                continue
+
+            intf_cfg = next((i for i in interfaces if i.name == intf_name), None)
+            if intf_cfg is None:
+                continue
+
+            # EOS CIDR primary: "ip address X.X.X.X/Y"
+            cidr_children = intf_obj.find_child_objects(
+                r"^\s+ip\s+address\s+(\d+\.\d+\.\d+\.\d+/\d+)"
+            )
+            # Filter out secondary
+            cidr_primary = [
+                c for c in cidr_children if "secondary" not in c.text.lower()
+            ]
+            if cidr_primary:
+                m = re.search(
+                    r"^\s+ip\s+address\s+(\d+\.\d+\.\d+\.\d+/\d+)",
+                    cidr_primary[0].text,
+                )
+                if m:
+                    try:
+                        intf_cfg.ip_address = IPv4Interface(m.group(1))
+                    except ValueError:
+                        pass
+
+            # EOS CIDR secondary: "ip address X.X.X.X/Y secondary"
+            cidr_sec = [
+                c for c in cidr_children if "secondary" in c.text.lower()
+            ]
+            for sec in cidr_sec:
+                sm = re.search(
+                    r"^\s+ip\s+address\s+(\d+\.\d+\.\d+\.\d+/\d+)",
+                    sec.text,
+                )
+                if sm:
+                    try:
+                        intf_cfg.secondary_ips.append(IPv4Interface(sm.group(1)))
+                    except ValueError:
+                        pass
+
+            # EOS OSPF area: "ip ospf area <area>" (no process ID)
+            ospf_area_children = intf_obj.find_child_objects(
+                r"^\s+ip\s+ospf\s+area\s+(\S+)"
+            )
+            if ospf_area_children and intf_cfg.ospf_area is None:
+                am = re.search(
+                    r"^\s+ip\s+ospf\s+area\s+(\S+)",
+                    ospf_area_children[0].text,
+                )
+                if am:
+                    intf_cfg.ospf_area = am.group(1)
+
+        return interfaces
 
     def parse_vrfs(self) -> list[VRFConfig]:
         """Parse VRF configurations for EOS.
@@ -714,6 +782,190 @@ class EOSParser(IOSParser):
 
         return as_path_lists
 
+    # -------------------------------------------------------------------
+    # BGP — EOS "peer group" (two words) support
+    # -------------------------------------------------------------------
+
+    def _parse_bgp_peer_groups(self, bgp_obj) -> list[BGPPeerGroup]:
+        """Parse BGP peer-groups for EOS.
+
+        EOS uses ``neighbor NAME peer group`` (two words) instead of IOS
+        ``neighbor NAME peer-group`` (hyphen).
+        """
+        # IOS hyphenated form
+        peer_groups = super()._parse_bgp_peer_groups(bgp_obj)
+        seen = {pg.name for pg in peer_groups}
+
+        # EOS two-word form: "neighbor NAME peer group"
+        pg_children = bgp_obj.find_child_objects(
+            r"^\s+neighbor\s+(\S+)\s+peer\s+group\s*$"
+        )
+        for pg_child in pg_children:
+            pg_name = self._extract_match(
+                pg_child.text, r"^\s+neighbor\s+(\S+)\s+peer\s+group\s*$"
+            )
+            if not pg_name or pg_name in seen:
+                continue
+            seen.add(pg_name)
+
+            pg_data = _default_pg_data(pg_name)
+            for config_child in bgp_obj.find_child_objects(
+                rf"^\s+neighbor\s+{re.escape(pg_name)}\s+"
+            ):
+                m = re.search(
+                    rf"^\s+neighbor\s+{re.escape(pg_name)}\s+(.+)",
+                    config_child.text,
+                )
+                if m:
+                    cmd = m.group(1)
+                    # Skip the "peer group" definition line itself
+                    if cmd.strip() == "peer group":
+                        continue
+                    apply_peer_group_command(pg_data, cmd)
+
+            peer_groups.append(BGPPeerGroup(**pg_data))
+
+        return peer_groups
+
+    def _parse_bgp_neighbors(self, bgp_obj) -> list[BGPNeighbor]:
+        """Parse BGP neighbors for EOS.
+
+        Handles the two-word ``peer group NAME`` form in addition to IOS
+        ``peer-group NAME`` (hyphen).
+        """
+        # Let IOS handle what it can (hyphenated peer-group, inline remote-as)
+        neighbors = super()._parse_bgp_neighbors(bgp_obj)
+        existing_ips = {str(n.peer_ip) for n in neighbors}
+
+        # Build the set of EOS peer-group names (two-word form)
+        eos_pg_names = set()
+        for child in bgp_obj.find_child_objects(r"^\s+neighbor\s+(\S+)\s+peer\s+group\s*$"):
+            m = re.search(r"^\s+neighbor\s+(\S+)\s+peer\s+group\s*$", child.text)
+            if m:
+                eos_pg_names.add(m.group(1))
+
+        # Find neighbors that use "peer group NAME" (two words)
+        neighbor_children = bgp_obj.find_child_objects(r"^\s+neighbor\s+(\S+)\s+")
+        neighbor_dict: dict[str, dict] = {}
+
+        for child in neighbor_children:
+            m = re.search(r"^\s+neighbor\s+(\S+)\s+(.+)", child.text)
+            if not m:
+                continue
+
+            peer_ip_str = m.group(1)
+            command = m.group(2)
+
+            # Skip peer-group definition lines
+            if peer_ip_str in eos_pg_names:
+                continue
+
+            # Skip neighbors already captured by super()
+            if peer_ip_str in existing_ips:
+                # But still check if this line has "peer group" to patch
+                if command.startswith("peer group "):
+                    pg_name = command.replace("peer group ", "").strip()
+                    for n in neighbors:
+                        if str(n.peer_ip) == peer_ip_str and n.peer_group is None:
+                            n.peer_group = pg_name
+                continue
+
+            # New neighbor not captured by super()
+            if peer_ip_str not in neighbor_dict:
+                neighbor_dict[peer_ip_str] = {
+                    "peer_ip": peer_ip_str,
+                    "remote_as": None,
+                    "peer_group": None,
+                    "description": None,
+                    "update_source": None,
+                    "ebgp_multihop": None,
+                    "password": None,
+                    "route_map_in": None,
+                    "route_map_out": None,
+                    "prefix_list_in": None,
+                    "prefix_list_out": None,
+                    "filter_list_in": None,
+                    "filter_list_out": None,
+                    "maximum_prefix": None,
+                    "next_hop_self": False,
+                    "route_reflector_client": False,
+                    "send_community": None,
+                    "fall_over_bfd": False,
+                    "shutdown": False,
+                    "disable_connected_check": False,
+                    "timers": None,
+                    "local_as": None,
+                    "local_as_no_prepend": False,
+                    "local_as_replace_as": False,
+                }
+
+            if command.startswith("peer group "):
+                neighbor_dict[peer_ip_str]["peer_group"] = command.replace("peer group ", "").strip()
+            elif command.startswith("remote-as "):
+                as_str = command.replace("remote-as ", "").strip()
+                try:
+                    neighbor_dict[peer_ip_str]["remote_as"] = int(as_str)
+                except ValueError:
+                    neighbor_dict[peer_ip_str]["remote_as"] = as_str
+            elif command.startswith("description "):
+                neighbor_dict[peer_ip_str]["description"] = command.replace("description ", "").strip()
+            elif command.startswith("update-source "):
+                neighbor_dict[peer_ip_str]["update_source"] = command.replace("update-source ", "").strip()
+            elif command == "shutdown":
+                neighbor_dict[peer_ip_str]["shutdown"] = True
+
+        # Create BGPNeighbor objects for EOS-specific neighbors
+        from ipaddress import IPv6Address
+        for peer_ip_str, ndata in neighbor_dict.items():
+            try:
+                peer_ip = IPv4Address(peer_ip_str)
+            except ValueError:
+                try:
+                    peer_ip = IPv6Address(peer_ip_str)
+                except ValueError:
+                    continue
+
+            # Same guard as IOS: skip if no remote-as and no peer-group
+            if (
+                ndata["remote_as"] is None
+                and ndata["peer_group"] is None
+                and not ndata.get("shutdown", False)
+            ):
+                continue
+
+            remote_as = ndata["remote_as"] if ndata["remote_as"] is not None else "inherited"
+
+            neighbors.append(
+                BGPNeighbor(
+                    peer_ip=peer_ip,
+                    remote_as=remote_as,
+                    peer_group=ndata["peer_group"],
+                    description=ndata["description"],
+                    update_source=ndata["update_source"],
+                    ebgp_multihop=ndata["ebgp_multihop"],
+                    password=ndata["password"],
+                    route_map_in=ndata["route_map_in"],
+                    route_map_out=ndata["route_map_out"],
+                    prefix_list_in=ndata["prefix_list_in"],
+                    prefix_list_out=ndata["prefix_list_out"],
+                    filter_list_in=ndata["filter_list_in"],
+                    filter_list_out=ndata["filter_list_out"],
+                    maximum_prefix=ndata["maximum_prefix"],
+                    next_hop_self=ndata["next_hop_self"],
+                    route_reflector_client=ndata["route_reflector_client"],
+                    send_community=ndata["send_community"],
+                    fall_over_bfd=ndata["fall_over_bfd"],
+                    shutdown=ndata["shutdown"],
+                    disable_connected_check=ndata["disable_connected_check"],
+                    timers=ndata["timers"],
+                    local_as=ndata["local_as"],
+                    local_as_no_prepend=ndata["local_as_no_prepend"],
+                    local_as_replace_as=ndata["local_as_replace_as"],
+                )
+            )
+
+        return neighbors
+
     def _parse_bgp_address_families(self, bgp_obj) -> list[BGPAddressFamily]:
         """Parse BGP address-families for EOS.
 
@@ -1226,7 +1478,10 @@ class EOSParser(IOSParser):
 
             m = re.match(r"peer-address\s+(\S+)", t)
             if m:
-                peer_address = IPv4Address(m.group(1))
+                try:
+                    peer_address = IPv4Address(m.group(1))
+                except ValueError:
+                    pass
                 continue
 
             m = re.match(r"reload-delay\s+mlag\s+(\d+)", t)

@@ -245,8 +245,15 @@ def _parse_block(tokens: list[str], pos: int) -> tuple[dict[str, Any], int]:
                     result[keyword] = {}
                 container = result[keyword]
                 if not isinstance(container, dict):
-                    # Shouldn't normally happen; replace scalar with dict
+                    # Promote existing bare leaf(s) into the dict as
+                    # empty-bodied entries so they aren't lost.
+                    existing = container
                     container = {}
+                    if isinstance(existing, list):
+                        for v in existing:
+                            container[v] = {}
+                    else:
+                        container[existing] = {}
                     result[keyword] = container
                 if name in container:
                     # Merge duplicate named blocks
@@ -281,12 +288,19 @@ def _parse_block(tokens: list[str], pos: int) -> tuple[dict[str, Any], int]:
 # ---------------------------------------------------------------------------
 
 def _set_leaf(result: dict[str, Any], key: str, value: str) -> None:
-    """Insert *value* under *key*, converting to list on duplicates."""
+    """Insert *value* under *key*, converting to list on duplicates.
+
+    When *key* already holds a dict (from a named block), insert the bare
+    leaf as an empty-bodied entry so it isn't lost.
+    """
     if key not in result:
         result[key] = value
     else:
         existing = result[key]
-        if isinstance(existing, list):
+        if isinstance(existing, dict):
+            # Named block already present — add bare leaf as empty entry
+            existing[value] = {}
+        elif isinstance(existing, list):
             existing.append(value)
         else:
             result[key] = [existing, value]

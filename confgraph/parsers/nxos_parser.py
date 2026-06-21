@@ -390,6 +390,173 @@ class NXOSParser(IOSParser):
         return vrf_instances
 
     # -----------------------------------------------------------------------
+    # BGP — NX-OS nested neighbor blocks + inherit peer
+    # -----------------------------------------------------------------------
+
+    def _parse_bgp_neighbors(self, bgp_obj) -> list["BGPNeighbor"]:
+        """Parse BGP neighbors, adding NX-OS nested-block / ``inherit peer`` support.
+
+        NX-OS uses two neighbor forms:
+
+        1. **Inline** (IOS-compatible)::
+
+               neighbor 10.0.0.2 remote-as 65001
+
+        2. **Nested block** (NX-OS native)::
+
+               neighbor 10.0.0.2
+                 inherit peer LEAF
+                 description spine-link
+
+        ``super()`` handles form 1.  This override additionally scans for
+        bare ``neighbor <ip>`` lines (no trailing command) and parses their
+        child attributes, including ``inherit peer NAME`` → ``peer_group``.
+        """
+        from confgraph.models.bgp import BGPNeighbor, BGPTimers
+
+        # --- Form 1: inline neighbors via IOS parser ---
+        neighbors = super()._parse_bgp_neighbors(bgp_obj)
+        seen_ips = {str(n.peer_ip) for n in neighbors}
+
+        # --- Form 2: nested neighbor blocks ---
+        # Match bare "neighbor <ip>" lines (no command after the IP).
+        for nb_obj in bgp_obj.find_child_objects(r"^\s+neighbor\s+\S+\s*$"):
+            m = re.match(r"^\s+neighbor\s+(\S+)\s*$", nb_obj.text)
+            if not m:
+                continue
+            peer_ip_str = m.group(1)
+
+            # Skip if already captured by the inline pass
+            if peer_ip_str in seen_ips:
+                continue
+
+            # Validate as IP address
+            try:
+                peer_ip = IPv4Address(peer_ip_str)
+            except ValueError:
+                from ipaddress import IPv6Address
+                try:
+                    peer_ip = IPv6Address(peer_ip_str)
+                except ValueError:
+                    continue
+
+            # Parse child attributes
+            nd: dict = {
+                "remote_as": None, "peer_group": None, "description": None,
+                "update_source": None, "ebgp_multihop": None, "password": None,
+                "route_map_in": None, "route_map_out": None,
+                "prefix_list_in": None, "prefix_list_out": None,
+                "filter_list_in": None, "filter_list_out": None,
+                "maximum_prefix": None, "next_hop_self": False,
+                "route_reflector_client": False, "send_community": None,
+                "fall_over_bfd": False, "shutdown": False,
+                "disable_connected_check": False, "timers": None,
+                "local_as": None, "local_as_no_prepend": False,
+                "local_as_replace_as": False,
+            }
+
+            for child in nb_obj.all_children:
+                cmd = child.text.strip()
+
+                # inherit peer NAME → peer_group
+                im = re.match(r"inherit\s+peer\s+(\S+)", cmd)
+                if im:
+                    nd["peer_group"] = im.group(1)
+                    continue
+                if cmd.startswith("remote-as "):
+                    val = cmd.replace("remote-as ", "").strip()
+                    try:
+                        nd["remote_as"] = int(val)
+                    except ValueError:
+                        nd["remote_as"] = val
+                elif cmd.startswith("description "):
+                    nd["description"] = cmd.replace("description ", "").strip()
+                elif cmd.startswith("update-source "):
+                    nd["update_source"] = cmd.replace("update-source ", "").strip()
+                elif cmd.startswith("ebgp-multihop "):
+                    nd["ebgp_multihop"] = int(cmd.replace("ebgp-multihop ", "").strip())
+                elif cmd.startswith("password "):
+                    nd["password"] = cmd.replace("password ", "").strip()
+                elif cmd.startswith("route-map ") and " in" in cmd:
+                    nd["route_map_in"] = cmd.replace("route-map ", "").replace(" in", "").strip()
+                elif cmd.startswith("route-map ") and " out" in cmd:
+                    nd["route_map_out"] = cmd.replace("route-map ", "").replace(" out", "").strip()
+                elif cmd.startswith("prefix-list ") and " in" in cmd:
+                    nd["prefix_list_in"] = cmd.replace("prefix-list ", "").replace(" in", "").strip()
+                elif cmd.startswith("prefix-list ") and " out" in cmd:
+                    nd["prefix_list_out"] = cmd.replace("prefix-list ", "").replace(" out", "").strip()
+                elif cmd.startswith("maximum-prefix "):
+                    parts = cmd.replace("maximum-prefix ", "").split()
+                    if parts:
+                        nd["maximum_prefix"] = int(parts[0])
+                elif cmd == "next-hop-self":
+                    nd["next_hop_self"] = True
+                elif cmd == "route-reflector-client":
+                    nd["route_reflector_client"] = True
+                elif cmd == "fall-over bfd":
+                    nd["fall_over_bfd"] = True
+                elif cmd == "shutdown":
+                    nd["shutdown"] = True
+                elif cmd == "disable-connected-check":
+                    nd["disable_connected_check"] = True
+                elif cmd.startswith("timers "):
+                    tm = re.match(r"timers\s+(\d+)\s+(\d+)", cmd)
+                    if tm:
+                        nd["timers"] = BGPTimers(keepalive=int(tm.group(1)), holdtime=int(tm.group(2)))
+                elif cmd.startswith("local-as "):
+                    la_parts = cmd.replace("local-as ", "").strip().split()
+                    if la_parts:
+                        try:
+                            nd["local_as"] = int(la_parts[0])
+                        except ValueError:
+                            pass
+                        nd["local_as_no_prepend"] = "no-prepend" in la_parts
+                        nd["local_as_replace_as"] = "replace-as" in la_parts
+                elif cmd.startswith("send-community"):
+                    if "both" in cmd:
+                        nd["send_community"] = "both"
+                    elif "extended" in cmd:
+                        nd["send_community"] = "extended"
+                    else:
+                        nd["send_community"] = True
+
+            # Skip if no remote-as, no peer-group, and not a shutdown stub
+            if nd["remote_as"] is None and nd["peer_group"] is None and not nd["shutdown"]:
+                continue
+
+            remote_as = nd["remote_as"] if nd["remote_as"] is not None else "inherited"
+
+            seen_ips.add(peer_ip_str)
+            neighbors.append(BGPNeighbor(
+                peer_ip=peer_ip,
+                remote_as=remote_as,
+                peer_group=nd["peer_group"],
+                description=nd["description"],
+                update_source=nd["update_source"],
+                ebgp_multihop=nd["ebgp_multihop"],
+                password=nd["password"],
+                route_map_in=nd["route_map_in"],
+                route_map_out=nd["route_map_out"],
+                prefix_list_in=nd["prefix_list_in"],
+                prefix_list_out=nd["prefix_list_out"],
+                filter_list_in=nd["filter_list_in"],
+                filter_list_out=nd["filter_list_out"],
+                maximum_prefix=nd["maximum_prefix"],
+                next_hop_self=nd["next_hop_self"],
+                route_reflector_client=nd["route_reflector_client"],
+                send_community=nd["send_community"],
+                fall_over_bfd=nd["fall_over_bfd"],
+                disable_connected_check=nd["disable_connected_check"],
+                shutdown=nd["shutdown"],
+                timers=nd["timers"],
+                local_as=nd["local_as"],
+                local_as_no_prepend=nd["local_as_no_prepend"],
+                local_as_replace_as=nd["local_as_replace_as"],
+            ))
+
+        return neighbors
+
+    # -----------------------------------------------------------------------
     # BGP — peer-group attribute inheritance
     # -----------------------------------------------------------------------
 

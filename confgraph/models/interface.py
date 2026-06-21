@@ -23,6 +23,7 @@ class HSRPGroup(BaseModel):
     """HSRP (Hot Standby Router Protocol) group configuration."""
 
     group_number: int = Field(..., description="HSRP group number")
+    version: int | None = Field(default=None, description="HSRP version (1 or 2)")
     priority: int | None = Field(default=None, description="HSRP priority (0-255)")
     preempt: bool = Field(default=False, description="Preempt enabled")
     virtual_ip: IPv4Address | None = Field(
@@ -135,7 +136,11 @@ class InterfaceConfig(BaseConfigObject):
     # Physical attributes
     mtu: int | None = Field(
         default=None,
-        description="Maximum transmission unit (bytes)",
+        description="L2/system maximum transmission unit (bytes) — the 'mtu' command",
+    )
+    ip_mtu: int | None = Field(
+        default=None,
+        description="IP-layer MTU override ('ip mtu') — when set, OSPF uses this instead of mtu",
     )
     speed: str | None = Field(
         default=None,

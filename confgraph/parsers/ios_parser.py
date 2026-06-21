@@ -244,6 +244,8 @@ class IOSParser(BaseParser):
             ip_children = intf_obj.find_child_objects(
                 r"^\s+ip\s+address\s+(\d+\.\d+\.\d+\.\d+)\s+(\d+\.\d+\.\d+\.\d+)"
             )
+            # Filter out secondary IPs — primary is the first non-secondary match
+            ip_children = [c for c in ip_children if "secondary" not in c.text.lower()]
             if ip_children:
                 match = re.search(
                     r"^\s+ip\s+address\s+(\d+\.\d+\.\d+\.\d+)\s+(\d+\.\d+\.\d+\.\d+)",
@@ -279,11 +281,17 @@ class IOSParser(BaseParser):
                     except ValueError:
                         pass
 
-            # MTU
+            # MTU (L2/system)
             mtu = None
             mtu_children = intf_obj.find_child_objects(r"^\s+mtu\s+(\d+)")
             if mtu_children:
                 mtu = int(self._extract_match(mtu_children[0].text, r"^\s+mtu\s+(\d+)"))
+
+            # IP MTU (L3 override — OSPF uses this when present)
+            ip_mtu = None
+            ip_mtu_children = intf_obj.find_child_objects(r"^\s+ip\s+mtu\s+(\d+)")
+            if ip_mtu_children:
+                ip_mtu = int(self._extract_match(ip_mtu_children[0].text, r"^\s+ip\s+mtu\s+(\d+)"))
 
             # Speed
             speed = None
@@ -629,13 +637,25 @@ class IOSParser(BaseParser):
                     ospf_network_children[0].text, r"^\s+ip\s+ospf\s+network\s+(.+)"
                 )
 
-            # ip ospf authentication
+            # ip ospf authentication (with or without mode argument)
             ospf_auth_children = intf_obj.find_child_objects(
-                r"^\s+ip\s+ospf\s+authentication\s+(.+)"
+                r"^\s+ip\s+ospf\s+authentication\b"
             )
             if ospf_auth_children:
-                ospf_authentication = self._extract_match(
-                    ospf_auth_children[0].text, r"^\s+ip\s+ospf\s+authentication\s+(.+)"
+                auth_mode = self._extract_match(
+                    ospf_auth_children[0].text, r"^\s+ip\s+ospf\s+authentication\s+(\S+)"
+                )
+                # Bare "ip ospf authentication" (no argument) → simple-password mode
+                ospf_authentication = auth_mode if auth_mode else "simple"
+
+            # ip ospf authentication-key (simple-password key)
+            ospf_authkey_children = intf_obj.find_child_objects(
+                r"^\s+ip\s+ospf\s+authentication-key\s+(\S+)"
+            )
+            if ospf_authkey_children:
+                ospf_authentication_key = self._extract_match(
+                    ospf_authkey_children[0].text,
+                    r"^\s+ip\s+ospf\s+authentication-key\s+(\S+)",
                 )
 
             # ip ospf message-digest-key
@@ -961,6 +981,7 @@ class IOSParser(BaseParser):
                     ipv6_addresses=ipv6_addresses,
                     secondary_ips=secondary_ips,
                     mtu=mtu,
+                    ip_mtu=ip_mtu,
                     speed=speed,
                     duplex=duplex,
                     bandwidth=bandwidth,
@@ -1686,7 +1707,15 @@ class IOSParser(BaseParser):
         """Parse HSRP groups from interface configuration."""
         hsrp_groups = []
 
-        # Find all standby commands
+        # Capture interface-level "standby version <n>" (applies to all groups)
+        hsrp_version: int | None = None
+        version_children = intf_obj.find_child_objects(r"^\s+standby\s+version\s+(\d+)")
+        if version_children:
+            vm = re.search(r"standby\s+version\s+(\d+)", version_children[0].text)
+            if vm:
+                hsrp_version = int(vm.group(1))
+
+        # Find all standby commands with a group number
         standby_children = intf_obj.find_child_objects(r"^\s+standby\s+(\d+)")
 
         # Group by HSRP group number
@@ -1738,6 +1767,7 @@ class IOSParser(BaseParser):
 
         # Create HSRPGroup objects
         for group_data in hsrp_dict.values():
+            group_data["version"] = hsrp_version
             hsrp_groups.append(HSRPGroup(**group_data))
 
         return hsrp_groups
@@ -2031,7 +2061,10 @@ class IOSParser(BaseParser):
             elif command.startswith("update-source "):
                 neighbor_dict[peer_ip_str]["update_source"] = command.replace("update-source ", "").strip()
             elif command.startswith("ebgp-multihop "):
-                neighbor_dict[peer_ip_str]["ebgp_multihop"] = int(command.replace("ebgp-multihop ", "").strip())
+                try:
+                    neighbor_dict[peer_ip_str]["ebgp_multihop"] = int(command.replace("ebgp-multihop ", "").strip())
+                except ValueError:
+                    pass
             elif command.startswith("password "):
                 neighbor_dict[peer_ip_str]["password"] = command.replace("password ", "").strip()
             elif command.startswith("route-map ") and " in" in command:
@@ -2049,7 +2082,10 @@ class IOSParser(BaseParser):
             elif command.startswith("maximum-prefix "):
                 parts = command.replace("maximum-prefix ", "").split()
                 if parts:
-                    neighbor_dict[peer_ip_str]["maximum_prefix"] = int(parts[0])
+                    try:
+                        neighbor_dict[peer_ip_str]["maximum_prefix"] = int(parts[0])
+                    except ValueError:
+                        pass
             elif command == "next-hop-self":
                 neighbor_dict[peer_ip_str]["next_hop_self"] = True
             elif command == "route-reflector-client":
@@ -2890,6 +2926,15 @@ class IOSParser(BaseParser):
             except ValueError:
                 # It's an interface name
                 next_hop_interface = next_hop_str
+                # IOS allows "ip route DEST MASK <interface> <next-hop-ip>" —
+                # when both are present, the next-hop IP is the first token in remaining.
+                r_parts = remaining.split()
+                if r_parts:
+                    try:
+                        next_hop = IPv4Address(r_parts[0])
+                        remaining = " ".join(r_parts[1:])
+                    except ValueError:
+                        pass
 
             # Parse optional parameters
             distance = 1  # Default administrative distance
@@ -3062,21 +3107,14 @@ class IOSParser(BaseParser):
             m = re.match(r"^no\s+bfd-template\s+(?:single-hop|multi-hop)\s+(\S+)", obj.text.strip())
             if m:
                 tombstones.append(f"field:bfd:template:{m.group(1)}")
-            else:
-                tombstones.append("singleton:bfd")
-        # Bare "no bfd" or "no bfd slow-timers" etc — but NOT "no bfd-template" (handled above)
-        for obj in parse.find_objects(r"^no\s+bfd\s+"):
-            if not re.match(r"^no\s+bfd-template\b", obj.text.strip()):
-                tombstones.append("singleton:bfd")
+            # Untyped "no bfd-template <name>" or bare "no bfd ..." (slow-timers
+            # etc.) are attribute removals, not service removal — no tombstone.
         # --- Syslog entry-level tombstones ---
         for obj in parse.find_objects(r"^no\s+logging\s+"):
             t = obj.text.strip()
             m = re.match(r"^no\s+logging\s+host\s+(\S+)", t)
             if m:
                 tombstones.append(f"field:syslog:host:{m.group(1)}")
-                continue
-            # Unrecognized "no logging ..." → whole-section removal
-            tombstones.append("singleton:syslog")
 
         # --- DNS entry-level tombstones ---
         for obj in parse.find_objects(r"^no\s+ip\s+name-server\s+"):
@@ -3122,9 +3160,6 @@ class IOSParser(BaseParser):
             m = re.match(r"^no\s+ntp\s+authentication-key\s+(\d+)", t)
             if m:
                 tombstones.append(f"field:ntp:auth_key:{m.group(1)}")
-                continue
-            # Unrecognized "no ntp ..." → whole-section removal
-            tombstones.append("singleton:ntp")
 
         # --- SNMP entry-level tombstones ---
         # Bare "no snmp-server" (no sub-command) → whole-section removal
@@ -3151,9 +3186,6 @@ class IOSParser(BaseParser):
             m = re.match(r"^no\s+snmp-server\s+user\s+(\S+)", t)
             if m:
                 tombstones.append(f"field:snmp:user:{m.group(1)}")
-                continue
-            # Unrecognized "no snmp-server ..." → whole-section removal
-            tombstones.append("singleton:snmp")
 
         # --- AAA entry-level tombstones ---
         for obj in parse.find_objects(r"^no\s+aaa\s+authentication\s+"):
@@ -3252,17 +3284,19 @@ class IOSParser(BaseParser):
         parse = self._get_parse_obj()
 
         # Find all ACL definitions (named ACLs)
-        acl_objs = parse.find_objects(r"^ip\s+access-list\s+(standard|extended)\s+(\S+)")
+        # IOS: "ip access-list standard|extended NAME"
+        # NX-OS: "ip access-list NAME" (no keyword — treated as extended)
+        acl_objs = parse.find_objects(r"^ip\s+access-list\s+\S+")
 
         for acl_obj in acl_objs:
             match = re.search(
-                r"^ip\s+access-list\s+(standard|extended)\s+(\S+)",
+                r"^ip\s+access-list\s+(?:(standard|extended)\s+)?(\S+)",
                 acl_obj.text,
             )
             if not match:
                 continue
 
-            acl_type = match.group(1)
+            acl_type = match.group(1) or "extended"
             acl_name = match.group(2)
 
             raw_lines, line_numbers = self._get_raw_lines_and_line_numbers(acl_obj)
@@ -3637,10 +3671,12 @@ class IOSParser(BaseParser):
                     metric_type = None
                     level = None
 
-                    # Extract process ID
-                    pid_match = re.search(r"(\d+)", remaining)
-                    if pid_match:
-                        process_id = int(pid_match.group(1))
+                    # Extract process ID — only for protocols that carry one,
+                    # and only as the leading token (positional, not from keywords).
+                    if protocol in ("ospf", "eigrp", "bgp"):
+                        pid_match = re.match(r"(\d+)", remaining)
+                        if pid_match:
+                            process_id = int(pid_match.group(1))
 
                     # Extract route-map
                     rm_match = re.search(r"route-map\s+(\S+)", remaining)
@@ -3658,13 +3694,13 @@ class IOSParser(BaseParser):
                     elif "metric-type external" in remaining:
                         metric_type = "external"
 
-                    # Extract level
-                    if "level-1" in remaining:
+                    # Extract level — check level-1-2 before level-1/level-2
+                    if "level-1-2" in remaining:
+                        level = "level-1-2"
+                    elif "level-1" in remaining:
                         level = "level-1"
                     elif "level-2" in remaining:
                         level = "level-2"
-                    elif "level-1-2" in remaining:
-                        level = "level-1-2"
 
                     redistribute.append(
                         ISISRedistribute(
@@ -4259,7 +4295,8 @@ class IOSParser(BaseParser):
         for obj in snmp_objs:
             t = obj.text.strip()
             if re.match(r"^snmp-server\s+community\s+", t):
-                m = re.match(r"^snmp-server\s+community\s+(\S+)\s+(ro|rw)(\s+.*)?$", t)
+                # IOS/IOS-XR: snmp-server community STRING ro|rw [view V] [ACL]
+                m = re.match(r"^snmp-server\s+community\s+(\S+)\s+(ro|rw)(\s+.*)?$", t, re.IGNORECASE)
                 if m:
                     acl = None
                     view = None
@@ -4272,8 +4309,18 @@ class IOSParser(BaseParser):
                     if parts and not re.match(r"^(view|ipv6)$", parts[-1]):
                         acl = parts[-1]
                     communities.append(SNMPCommunity(
-                        community_string=m.group(1), access=m.group(2),
+                        community_string=m.group(1), access=m.group(2).lower(),
                         acl=acl, view=view,
+                    ))
+                    continue
+                # NX-OS: snmp-server community STRING group ROLE
+                m = re.match(r"^snmp-server\s+community\s+(\S+)\s+group\s+(\S+)", t)
+                if m:
+                    # Map NX-OS roles to ro/rw: network-operator → ro, network-admin → rw
+                    role = m.group(2)
+                    access = "rw" if "admin" in role else "ro"
+                    communities.append(SNMPCommunity(
+                        community_string=m.group(1), access=access,
                     ))
             elif re.match(r"^snmp-server\s+host\s+", t):
                 m = re.match(r"^snmp-server\s+host\s+(\S+)(?:\s+vrf\s+(\S+))?(?:\s+(traps|informs))?(?:\s+version\s+(1|2c|3\s+\S+))?\s+(\S+)", t)
@@ -5706,6 +5753,7 @@ class IOSParser(BaseParser):
             m = re.match(r"tacacs-server\s+host\s+(\S+)(?:\s+port\s+(\d+))?(?:\s+timeout\s+(\d+))?(?:\s+key\s+(\S+))?", t)
             if m:
                 tacacs_servers.append(TacacsServer(
+                    name=m.group(1),
                     address=m.group(1),
                     port=int(m.group(2)) if m.group(2) else None,
                     timeout=int(m.group(3)) if m.group(3) else None,
@@ -5746,6 +5794,7 @@ class IOSParser(BaseParser):
             m = re.match(r"radius-server\s+host\s+(\S+)(?:\s+auth-port\s+(\d+))?(?:\s+acct-port\s+(\d+))?(?:\s+key\s+(\S+))?", t)
             if m:
                 radius_servers.append(RadiusServer(
+                    name=m.group(1),
                     address=m.group(1),
                     auth_port=int(m.group(2)) if m.group(2) else None,
                     acct_port=int(m.group(3)) if m.group(3) else None,
@@ -5805,14 +5854,19 @@ class IOSParser(BaseParser):
             ip domain list corp.example.com
             ip name-server 8.8.8.8 8.8.4.4
             no ip domain lookup
+            domain name example.com             (IOS-XR, no "ip" prefix)
+            domain name-server 8.8.8.8          (IOS-XR)
         """
         parse = self._get_parse_obj()
-        domain_objs = parse.find_objects(r"^ip\s+domain")
+        # IOS: "ip domain …" / IOS-XR: "domain …" (no ip prefix)
+        domain_objs = parse.find_objects(r"^(?:ip\s+)?domain")
+        # IOS: "ip name-server" / IOS-XR: "domain name-server"
         ns_objs = parse.find_objects(r"^ip\s+name-server")
-        no_ns_objs = parse.find_objects(r"^no\s+ip\s+name-server")
-        lookup_disabled = bool(parse.find_objects(r"^no\s+ip\s+domain.lookup"))
+        xr_ns_objs = parse.find_objects(r"^domain\s+name-server")
+        no_ns_objs = parse.find_objects(r"^no\s+(?:ip\s+)?name-server")
+        lookup_disabled = bool(parse.find_objects(r"^no\s+(?:ip\s+)?domain.lookup"))
 
-        if not domain_objs and not ns_objs and not no_ns_objs and not lookup_disabled:
+        if not domain_objs and not ns_objs and not xr_ns_objs and not no_ns_objs and not lookup_disabled:
             return None
 
         domain_name: str | None = None
@@ -5825,23 +5879,35 @@ class IOSParser(BaseParser):
             raw_lines.append(obj.text)
             line_numbers.append(obj.linenum)
             t = obj.text.strip()
-            # "ip domain name DOMAIN" or "ip domain-name DOMAIN"
-            m = re.match(r"^ip\s+domain(?:-|\s+)name\s+(\S+)", t)
+            # "ip domain name DOMAIN" / "ip domain-name DOMAIN" / "domain name DOMAIN"
+            m = re.match(r"^(?:ip\s+)?domain(?:-|\s+)name\s+(\S+)", t)
             if m and domain_name is None:
                 domain_name = m.group(1)
                 continue
-            # "ip domain list DOMAIN"
-            m = re.match(r"^ip\s+domain\s+list\s+(\S+)", t)
+            # "ip domain list DOMAIN" / "domain list DOMAIN"
+            m = re.match(r"^(?:ip\s+)?domain\s+list\s+(\S+)", t)
             if m:
                 domain_list.append(m.group(1))
 
         for obj in ns_objs:
             raw_lines.append(obj.text)
             line_numbers.append(obj.linenum)
-            # "ip name-server A B C ..." — multiple IPs on one line
+            # "ip name-server [vrf NAME] A B C ..." — multiple IPs on one line
             t = obj.text.strip()
-            parts = re.split(r"\s+", t)[2:]
+            parts = re.split(r"\s+", t)[2:]  # skip "ip name-server"
+            # Strip optional "vrf <name>" prefix
+            if len(parts) >= 2 and parts[0].lower() == "vrf":
+                parts = parts[2:]
             name_servers.extend(parts)
+
+        # IOS-XR: "domain name-server <ip>" — one IP per line
+        for obj in xr_ns_objs:
+            raw_lines.append(obj.text)
+            line_numbers.append(obj.linenum)
+            t = obj.text.strip()
+            m = re.match(r"^domain\s+name-server\s+(\S+)", t)
+            if m:
+                name_servers.append(m.group(1))
 
         return DNSConfig(
             object_id="dns",
@@ -5971,7 +6037,7 @@ class IOSParser(BaseParser):
             lldp tlv-select system-description
         """
         parse = self._get_parse_obj()
-        lldp_objs = parse.find_objects(r"^(?:no\s+)?lldp\s+")
+        lldp_objs = parse.find_objects(r"^(?:no\s+)?lldp\b")
         if not lldp_objs:
             return None
 
@@ -5985,7 +6051,7 @@ class IOSParser(BaseParser):
             raw_lines.append(obj.text)
             line_numbers.append(obj.linenum)
             t = obj.text.strip()
-            if t == "no lldp run":
+            if t in ("no lldp run", "no lldp"):
                 enabled = False
             elif re.match(r"^lldp\s+timer\s+", t):
                 v = self._extract_match(t, r"^lldp\s+timer\s+(\d+)")
@@ -6033,7 +6099,7 @@ class IOSParser(BaseParser):
             no cdp advertise-v2
         """
         parse = self._get_parse_obj()
-        cdp_objs = parse.find_objects(r"^(?:no\s+)?cdp\s+")
+        cdp_objs = parse.find_objects(r"^(?:no\s+)?cdp\b")
         if not cdp_objs:
             return None
 
@@ -6047,7 +6113,7 @@ class IOSParser(BaseParser):
             raw_lines.append(obj.text)
             line_numbers.append(obj.linenum)
             t = obj.text.strip()
-            if t == "no cdp run":
+            if t in ("no cdp run", "no cdp"):
                 enabled = False
             elif re.match(r"^cdp\s+timer\s+", t):
                 v = self._extract_match(t, r"^cdp\s+timer\s+(\d+)")
