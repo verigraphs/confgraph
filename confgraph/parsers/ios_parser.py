@@ -966,6 +966,27 @@ class IOSParser(BaseParser):
             if cm_ch:
                 crypto_map_name = self._extract_match(cm_ch[0].text, r"^\s+crypto\s+map\s+(\S+)")
 
+            # IP unnumbered
+            unnumbered_source = None
+            unnum_ch = intf_obj.find_child_objects(r"^\s+ip\s+unnumbered\s+(\S+)")
+            if unnum_ch:
+                unnumbered_source = self._extract_match(
+                    unnum_ch[0].text, r"^\s+ip\s+unnumbered\s+(\S+)"
+                )
+
+            # Per-interface CDP
+            cdp_enabled = True
+            if intf_obj.find_child_objects(r"^\s+no\s+cdp\s+enable"):
+                cdp_enabled = False
+
+            # Per-interface LLDP
+            lldp_transmit = True
+            lldp_receive = True
+            if intf_obj.find_child_objects(r"^\s+no\s+lldp\s+transmit"):
+                lldp_transmit = False
+            if intf_obj.find_child_objects(r"^\s+no\s+lldp\s+receive"):
+                lldp_receive = False
+
             interfaces.append(
                 InterfaceConfig(
                     object_id=f"interface_{intf_name}",
@@ -1062,6 +1083,10 @@ class IOSParser(BaseParser):
                     ip_verify_unicast=ip_verify_unicast,
                     ip_policy_route_map=ip_policy_route_map,
                     crypto_map=crypto_map_name,
+                    unnumbered_source=unnumbered_source,
+                    cdp_enabled=cdp_enabled,
+                    lldp_transmit=lldp_transmit,
+                    lldp_receive=lldp_receive,
                     no_commands=iface_no_commands,
                 )
             )
@@ -1368,6 +1393,81 @@ class IOSParser(BaseParser):
                 if m:
                     default_info_route_map = m.group(1)
 
+            # OSPF distance: "distance ospf intra-area N inter-area N external N"
+            distance: int | None = None
+            distance_intra: int | None = None
+            distance_inter: int | None = None
+            distance_external: int | None = None
+            dist_ospf_ch = ospf_obj.find_child_objects(r"^\s+distance\s+ospf")
+            if dist_ospf_ch:
+                dt = dist_ospf_ch[0].text
+                m = re.search(r"intra-area\s+(\d+)", dt)
+                if m:
+                    distance_intra = int(m.group(1))
+                m = re.search(r"inter-area\s+(\d+)", dt)
+                if m:
+                    distance_inter = int(m.group(1))
+                m = re.search(r"external\s+(\d+)", dt)
+                if m:
+                    distance_external = int(m.group(1))
+            # Simple "distance N"
+            dist_simple_ch = ospf_obj.find_child_objects(r"^\s+distance\s+(\d+)\s*$")
+            if dist_simple_ch:
+                v = self._extract_match(dist_simple_ch[0].text, r"^\s+distance\s+(\d+)")
+                if v:
+                    distance = int(v)
+
+            # Default metric
+            default_metric: int | None = None
+            dm_ch = ospf_obj.find_child_objects(r"^\s+default-metric\s+(\d+)")
+            if dm_ch:
+                v = self._extract_match(dm_ch[0].text, r"^\s+default-metric\s+(\d+)")
+                if v:
+                    default_metric = int(v)
+
+            # Max-LSA
+            max_lsa: int | None = None
+            ml_ch = ospf_obj.find_child_objects(r"^\s+max-lsa\s+(\d+)")
+            if ml_ch:
+                v = self._extract_match(ml_ch[0].text, r"^\s+max-lsa\s+(\d+)")
+                if v:
+                    max_lsa = int(v)
+
+            # Timers throttle SPF: "timers throttle spf <initial> <min> <max>"
+            spf_initial: int | None = None
+            spf_min: int | None = None
+            spf_max: int | None = None
+            spf_ch = ospf_obj.find_child_objects(r"^\s+timers\s+throttle\s+spf\s+")
+            if spf_ch:
+                m = re.search(r"timers\s+throttle\s+spf\s+(\d+)\s+(\d+)\s+(\d+)", spf_ch[0].text)
+                if m:
+                    spf_initial = int(m.group(1))
+                    spf_min = int(m.group(2))
+                    spf_max = int(m.group(3))
+
+            # Timers throttle LSA: "timers throttle lsa all <msec>"
+            lsa_all: int | None = None
+            lsa_ch = ospf_obj.find_child_objects(r"^\s+timers\s+throttle\s+lsa\s+all\s+(\d+)")
+            if lsa_ch:
+                v = self._extract_match(lsa_ch[0].text, r"timers\s+throttle\s+lsa\s+all\s+(\d+)")
+                if v:
+                    lsa_all = int(v)
+
+            # Shutdown
+            ospf_shutdown = len(ospf_obj.find_child_objects(r"^\s+shutdown\s*$")) > 0
+
+            # Graceful restart
+            graceful_restart = len(ospf_obj.find_child_objects(r"^\s+graceful-restart\s*$")) > 0
+            graceful_restart_helper = len(
+                ospf_obj.find_child_objects(r"^\s+graceful-restart\s+helper")
+            ) > 0
+            # Also detect "nsf" (IOS synonym for graceful-restart)
+            if not graceful_restart:
+                graceful_restart = len(ospf_obj.find_child_objects(r"^\s+nsf\b")) > 0
+
+            # BFD all-interfaces
+            bfd_all = len(ospf_obj.find_child_objects(r"^\s+bfd\s+all-interfaces")) > 0
+
             ospf_instances.append(
                 OSPFConfig(
                     object_id=f"ospf_{process_id}",
@@ -1393,6 +1493,20 @@ class IOSParser(BaseParser):
                     default_information_originate_metric=default_info_metric,
                     default_information_originate_metric_type=default_info_metric_type,
                     default_information_originate_route_map=default_info_route_map,
+                    distance=distance,
+                    distance_intra_area=distance_intra,
+                    distance_inter_area=distance_inter,
+                    distance_external=distance_external,
+                    default_metric=default_metric,
+                    max_lsa=max_lsa,
+                    timers_throttle_spf_initial=spf_initial,
+                    timers_throttle_spf_min=spf_min,
+                    timers_throttle_spf_max=spf_max,
+                    timers_throttle_lsa_all=lsa_all,
+                    shutdown=ospf_shutdown,
+                    graceful_restart=graceful_restart,
+                    graceful_restart_helper=graceful_restart_helper,
+                    bfd_all_interfaces=bfd_all,
                 )
             )
 
@@ -3861,7 +3975,19 @@ class IOSParser(BaseParser):
             try:
                 as_number = int(as_number_str)
             except ValueError:
+                # Named-mode EIGRP: "router eigrp NAME" — the real AS is
+                # under "address-family ipv4 unicast autonomous-system N"
                 as_number = as_number_str
+                af_ch = eigrp_obj.find_child_objects(
+                    r"^\s+address-family\s+ipv4.*autonomous-system\s+(\d+)"
+                )
+                if af_ch:
+                    as_val = self._extract_match(
+                        af_ch[0].text,
+                        r"autonomous-system\s+(\d+)",
+                    )
+                    if as_val:
+                        as_number = int(as_val)
 
             raw_lines, line_numbers = self._get_raw_lines_and_line_numbers(eigrp_obj)
 
@@ -4304,6 +4430,8 @@ class IOSParser(BaseParser):
                     vm = re.search(r"\bview\s+(\S+)", rest)
                     if vm:
                         view = vm.group(1)
+                        # Remove "view NAME" so view name isn't also treated as ACL
+                        rest = re.sub(r"\bview\s+\S+", "", rest).strip()
                     # last token may be ACL
                     parts = rest.split()
                     if parts and not re.match(r"^(view|ipv6)$", parts[-1]):
@@ -4419,7 +4547,8 @@ class IOSParser(BaseParser):
         """Parse syslog/logging configuration."""
         parse = self._get_parse_obj()
         log_objs = parse.find_objects(r"^logging\s+")
-        if not log_objs:
+        no_log_objs = parse.find_objects(r"^no\s+logging\s+on\s*$")
+        if not log_objs and not no_log_objs:
             return None
 
         from ipaddress import IPv4Address, IPv6Address
@@ -4428,7 +4557,7 @@ class IOSParser(BaseParser):
         console_level = monitor_level = trap_level = None
         facility = source_interface = origin_id = None
         timestamps_log = timestamps_debug = None
-        enabled = True
+        enabled = not bool(no_log_objs)
 
         for obj in log_objs:
             t = obj.text.strip()
@@ -4482,7 +4611,7 @@ class IOSParser(BaseParser):
                 m = re.match(r"^logging\s+timestamps\s+debug\s+(.*)", t)
                 if m:
                     timestamps_debug = m.group(1).strip()
-            elif "no logging" in t or "logging off" in t:
+            elif t == "logging off":
                 enabled = False
 
         return SyslogConfig(
@@ -5709,7 +5838,7 @@ class IOSParser(BaseParser):
                 m = re.match(r"^aaa\s+accounting\s+(\S+)(?:\s+(\d+))?\s+(\S+)\s+(start-stop|stop-only|none)\s+(.*)", t)
                 if m:
                     service, priv, name, trigger, methods_str = m.group(1), m.group(2), m.group(3), m.group(4), m.group(5)
-                    methods = re.findall(r"\S+", methods_str.replace("group", ""))
+                    methods = methods_str.split()
                     acct_lists.append(AAAAcctList(
                         name=name, service=service,
                         privilege_level=int(priv) if priv else None,

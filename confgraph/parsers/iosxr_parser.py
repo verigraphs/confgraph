@@ -76,6 +76,7 @@ class IOSXRParser(IOSParser):
         super().__init__(config_text, os_type=OSType.IOS_XR)
         self.syntax = "iosxr"
         self.parse_obj = None  # Force re-creation with new syntax
+        self._bgp_vrf_rd: dict[str, str] = {}  # VRF name → RD from BGP block (X6)
 
     # -----------------------------------------------------------------------
     # VRFs — "vrf NAME" with nested import/export route-target blocks
@@ -300,10 +301,13 @@ class IOSXRParser(IOSParser):
             "timers": None,
         }
 
-        for child in nb_child.all_children:
+        # Use .children (direct children only) — not .all_children — so
+        # AF-level attributes (route-policy, next-hop-self, etc. inside
+        # address-family sub-blocks) don't flatten onto the neighbor.
+        # Per-AF policies are handled separately by _apply_bgp_af_neighbor_policies.
+        for child in nb_child.children:
             text = child.text.strip()
 
-            # Neighbor-level attributes
             if text.startswith("remote-as "):
                 val = text.split(None, 1)[1].strip()
                 try:
@@ -321,7 +325,6 @@ class IOSXRParser(IOSParser):
             elif text.startswith("use neighbor-group "):
                 nd["peer_group"] = text.split(None, 2)[2].strip()
             elif text.startswith("password "):
-                # IOS-XR: "password encrypted <hash>" or "password clear <text>"
                 parts = text.split(None, 2)
                 if len(parts) == 3:
                     nd["password"] = parts[2]
@@ -344,8 +347,8 @@ class IOSXRParser(IOSParser):
                     nd["timers"] = BGPTimers(
                         keepalive=int(tm.group(1)), holdtime=int(tm.group(2)),
                     )
-
-            # AF-level attributes (found via all_children recursion)
+            # Neighbor-level route-policy / next-hop-self / etc. (direct child,
+            # not nested under an address-family block)
             elif text.startswith("route-policy ") and text.endswith(" in"):
                 nd["route_map_in"] = text[len("route-policy "):-3].strip()
             elif text.startswith("route-policy ") and text.endswith(" out"):
@@ -452,11 +455,13 @@ class IOSXRParser(IOSParser):
 
             raw_lines, line_numbers = self._get_raw_lines_and_line_numbers(vrf_child)
 
-            # RD is inside the VRF block
+            # RD is inside the VRF block — store for X6 back-fill onto VRFConfig
             rd = None
             rd_ch = vrf_child.find_child_objects(r"^\s+rd\s+(\S+)")
             if rd_ch:
                 rd = self._extract_match(rd_ch[0].text, r"^\s+rd\s+(\S+)")
+                if rd and vrf_name:
+                    self._bgp_vrf_rd[vrf_name] = rd
 
             # VRF neighbors — IOS-XR uses block syntax per neighbor
             vrf_neighbors: list[BGPNeighbor] = []
@@ -685,6 +690,80 @@ class IOSXRParser(IOSParser):
                 if m:
                     di_route_map = m.group(1)
 
+            # ---- OSPF-advanced fields ----
+
+            # Distance
+            distance: int | None = None
+            distance_intra: int | None = None
+            distance_inter: int | None = None
+            distance_external: int | None = None
+            dist_ospf_ch = ospf_obj.find_child_objects(r"^\s+distance\s+ospf")
+            for dc in dist_ospf_ch:
+                m = re.search(r"intra-area\s+(\d+)", dc.text)
+                if m:
+                    distance_intra = int(m.group(1))
+                m = re.search(r"inter-area\s+(\d+)", dc.text)
+                if m:
+                    distance_inter = int(m.group(1))
+                m = re.search(r"external\s+(\d+)", dc.text)
+                if m:
+                    distance_external = int(m.group(1))
+            dist_simple_ch = ospf_obj.find_child_objects(r"^\s+distance\s+(\d+)\s*$")
+            if dist_simple_ch:
+                v = self._extract_match(dist_simple_ch[0].text, r"^\s+distance\s+(\d+)")
+                if v:
+                    distance = int(v)
+
+            # Default metric
+            default_metric: int | None = None
+            dm_ch = ospf_obj.find_child_objects(r"^\s+default-metric\s+(\d+)")
+            if dm_ch:
+                v = self._extract_match(dm_ch[0].text, r"^\s+default-metric\s+(\d+)")
+                if v:
+                    default_metric = int(v)
+
+            # Max LSA
+            max_lsa: int | None = None
+            ml_ch = ospf_obj.find_child_objects(r"^\s+max-lsa\s+(\d+)")
+            if ml_ch:
+                v = self._extract_match(ml_ch[0].text, r"^\s+max-lsa\s+(\d+)")
+                if v:
+                    max_lsa = int(v)
+
+            # Timers throttle spf
+            spf_initial: int | None = None
+            spf_min: int | None = None
+            spf_max: int | None = None
+            spf_ch = ospf_obj.find_child_objects(r"^\s+timers\s+throttle\s+spf\s+(\d+)\s+(\d+)\s+(\d+)")
+            if spf_ch:
+                m = re.match(r"^\s+timers\s+throttle\s+spf\s+(\d+)\s+(\d+)\s+(\d+)", spf_ch[0].text)
+                if m:
+                    spf_initial = int(m.group(1))
+                    spf_min = int(m.group(2))
+                    spf_max = int(m.group(3))
+
+            # Timers throttle lsa all
+            lsa_all: int | None = None
+            lsa_ch = ospf_obj.find_child_objects(r"^\s+timers\s+throttle\s+lsa\s+all\s+(\d+)")
+            if lsa_ch:
+                v = self._extract_match(lsa_ch[0].text, r"^\s+timers\s+throttle\s+lsa\s+all\s+(\d+)")
+                if v:
+                    lsa_all = int(v)
+
+            # Shutdown
+            ospf_shutdown = len(ospf_obj.find_child_objects(r"^\s+shutdown\s*$")) > 0
+
+            # Graceful restart (IOS-XR uses "graceful-restart" directly)
+            graceful_restart = len(ospf_obj.find_child_objects(r"^\s+graceful-restart\s*$")) > 0
+            graceful_restart_helper = len(
+                ospf_obj.find_child_objects(r"^\s+graceful-restart\s+helper")
+            ) > 0
+            if not graceful_restart:
+                graceful_restart = len(ospf_obj.find_child_objects(r"^\s+nsf\b")) > 0
+
+            # BFD all-interfaces
+            bfd_all = len(ospf_obj.find_child_objects(r"^\s+bfd\s+(?:fast-detect|all-interfaces)")) > 0
+
             ospf_instances.append(
                 OSPFConfig(
                     object_id=f"ospf_{process_id}",
@@ -709,6 +788,20 @@ class IOSXRParser(IOSParser):
                     default_information_originate_metric=di_metric,
                     default_information_originate_metric_type=di_metric_type,
                     default_information_originate_route_map=di_route_map,
+                    distance=distance,
+                    distance_intra_area=distance_intra,
+                    distance_inter_area=distance_inter,
+                    distance_external=distance_external,
+                    default_metric=default_metric,
+                    max_lsa=max_lsa,
+                    timers_throttle_spf_initial=spf_initial,
+                    timers_throttle_spf_min=spf_min,
+                    timers_throttle_spf_max=spf_max,
+                    timers_throttle_lsa_all=lsa_all,
+                    shutdown=ospf_shutdown,
+                    graceful_restart=graceful_restart,
+                    graceful_restart_helper=graceful_restart_helper,
+                    bfd_all_interfaces=bfd_all,
                 )
             )
 
@@ -1894,3 +1987,219 @@ class IOSXRParser(IOSParser):
 
         # XR does not support "bfd template" per-interface; bfd_template stays None
         return bfd_interval, bfd_min_rx, bfd_multiplier, bfd_template
+
+    # -------------------------------------------------------------------
+    # DHCP — IOS-XR hierarchical "dhcp ipv4" (X2)
+    # -------------------------------------------------------------------
+
+    def parse_dhcp(self):
+        """Parse IOS-XR DHCP relay/profile configuration.
+
+        IOS-XR uses hierarchical ``dhcp ipv4`` blocks instead of IOS
+        ``ip dhcp pool`` / ``ip dhcp snooping``::
+
+            dhcp ipv4
+             profile RELAY relay
+              helper-address vrf default 10.1.1.1 giaddr 0.0.0.0
+             !
+             interface GigabitEthernet0/0/0/1
+              relay profile RELAY
+        """
+        from confgraph.models.dhcp import DHCPConfig, DHCPPool
+
+        parse = self._get_parse_obj()
+        dhcp_objs = parse.find_objects(r"^dhcp\s+ipv4")
+        if not dhcp_objs:
+            return None
+
+        raw_lines: list[str] = []
+        line_numbers: list[int] = []
+        pools: list[DHCPPool] = []
+
+        for dhcp_obj in dhcp_objs:
+            raw_lines.append(dhcp_obj.text)
+            line_numbers.append(dhcp_obj.linenum)
+            for child in dhcp_obj.children:
+                raw_lines.append(child.text)
+                line_numbers.append(child.linenum)
+
+            # Parse profiles as pool-like entries
+            for prof_child in dhcp_obj.find_child_objects(r"^\s+profile\s+(\S+)"):
+                text = prof_child.text.strip()
+                m = re.match(r"profile\s+(\S+)(?:\s+(\S+))?", text)
+                if not m:
+                    continue
+                prof_name = m.group(1)
+
+                # Extract helper addresses from profile children
+                helpers: list[str] = []
+                for pc in prof_child.all_children:
+                    pt = pc.text.strip()
+                    hm = re.match(r"helper-address\s+(?:vrf\s+\S+\s+)?(\S+)", pt)
+                    if hm:
+                        helpers.append(hm.group(1))
+
+                pools.append(DHCPPool(
+                    name=prof_name,
+                    dns_servers=helpers,
+                ))
+
+        return DHCPConfig(
+            object_id="dhcp",
+            raw_lines=raw_lines,
+            source_os=self.os_type,
+            line_numbers=line_numbers,
+            pools=pools,
+        )
+
+    # -------------------------------------------------------------------
+    # Deletion tombstones — IOS-XR forms (X1)
+    # -------------------------------------------------------------------
+
+    def parse_deletion_commands(self) -> list[str]:
+        """Parse IOS-XR deletion commands into tombstone strings.
+
+        IOS-XR uses different syntax from IOS for deletions:
+
+          - ``no router ospf <id>``                             → ``process:ospf:<id>``
+          - ``no router bgp <asn>``                             → ``process:bgp:<asn>``
+          - ``no router isis <tag>``                             → ``process:isis:<tag>``
+          - ``no router static`` (removes all static routes)     → ``singleton:static_routes``
+          - Nested ``no`` inside ``router static`` block for
+            per-route deletion (``no address-family ...``)
+
+        IOS-XR also uses hierarchical ``no`` inside config blocks.
+        Top-level ``no`` lines are handled here; nested block deletions
+        inside ``router ospf/bgp/static`` are parsed from block children.
+        """
+        tombstones: list[str] = []
+        parse = self._get_parse_obj()
+
+        # --- process-level deletions (top-level "no router ...") ---
+        for obj in parse.find_objects(r"^no\s+router\s+ospf\s+"):
+            m = re.search(r"^no\s+router\s+ospf\s+(\S+)", obj.text)
+            if m:
+                tombstones.append(f"process:ospf:{m.group(1)}")
+
+        for obj in parse.find_objects(r"^no\s+router\s+bgp\s+"):
+            m = re.search(r"^no\s+router\s+bgp\s+(\S+)", obj.text)
+            if m:
+                tombstones.append(f"process:bgp:{m.group(1)}")
+
+        for obj in parse.find_objects(r"^no\s+router\s+isis"):
+            m = re.search(r"^no\s+router\s+isis(?:\s+(\S+))?", obj.text)
+            tag = m.group(1) if (m and m.group(1)) else ""
+            tombstones.append(f"process:isis:{tag}")
+
+        # --- whole static removal ---
+        if parse.find_objects(r"^no\s+router\s+static\s*$"):
+            tombstones.append("singleton:static_routes")
+
+        # --- per-route deletions inside "router static" ---
+        # IOS-XR: "router static" block with nested "no" inside
+        # address-family sub-blocks
+        for static_obj in parse.find_objects(r"^router\s+static"):
+            for af_child in static_obj.find_child_objects(r"^\s+address-family"):
+                for route_child in af_child.all_children:
+                    text = route_child.text.strip()
+                    m = re.match(r"no\s+(\d+\.\d+\.\d+\.\d+/\d+)\s+(\S+)", text)
+                    if m:
+                        try:
+                            dest = IPv4Network(m.group(1), strict=False)
+                            tombstones.append(f"static::{dest}")
+                        except ValueError:
+                            pass
+            # VRF routes
+            for vrf_child in static_obj.find_child_objects(r"^\s+vrf\s+(\S+)"):
+                vrf_name = self._extract_match(vrf_child.text, r"^\s+vrf\s+(\S+)")
+                if not vrf_name:
+                    continue
+                for af_child in vrf_child.find_child_objects(r"^\s+address-family"):
+                    for route_child in af_child.all_children:
+                        text = route_child.text.strip()
+                        m = re.match(r"no\s+(\d+\.\d+\.\d+\.\d+/\d+)\s+(\S+)", text)
+                        if m:
+                            try:
+                                dest = IPv4Network(m.group(1), strict=False)
+                                tombstones.append(f"static:{vrf_name}:{dest}")
+                            except ValueError:
+                                pass
+
+        # --- VRF deletion ---
+        for obj in parse.find_objects(r"^no\s+vrf\s+(\S+)"):
+            m = re.search(r"^no\s+vrf\s+(\S+)", obj.text)
+            if m and m.group(1) not in ("definition", "context"):
+                tombstones.append(f"vrf:{m.group(1)}")
+
+        # --- ACL deletion (IOS-XR: "no ipv4 access-list NAME") ---
+        for obj in parse.find_objects(r"^no\s+ipv4\s+access-list\s+"):
+            m = re.search(r"^no\s+ipv4\s+access-list\s+(\S+)", obj.text)
+            if m:
+                tombstones.append(f"acl:{m.group(1)}")
+
+        # --- route-policy deletion ---
+        for obj in parse.find_objects(r"^no\s+route-policy\s+"):
+            m = re.search(r"^no\s+route-policy\s+(\S+)", obj.text)
+            if m:
+                tombstones.append(f"route-map:{m.group(1)}")
+
+        # --- prefix-set deletion ---
+        for obj in parse.find_objects(r"^no\s+prefix-set\s+"):
+            m = re.search(r"^no\s+prefix-set\s+(\S+)", obj.text)
+            if m:
+                tombstones.append(f"prefix-list:{m.group(1)}")
+
+        # --- singleton service removals ---
+        if parse.find_objects(r"^no\s+router\s+pim"):
+            tombstones.append("singleton:multicast")
+        if parse.find_objects(r"^no\s+ntp\b"):
+            tombstones.append("singleton:ntp")
+
+        # --- DNS tombstones (IOS-XR: "no domain ...") ---
+        for obj in parse.find_objects(r"^no\s+domain\s+name-server\s+"):
+            m = re.match(r"^no\s+domain\s+name-server\s+(\S+)", obj.text.strip())
+            if m:
+                tombstones.append(f"field:dns:name_server:{m.group(1)}")
+        for obj in parse.find_objects(r"^no\s+domain\s+list\s+"):
+            m = re.match(r"^no\s+domain\s+list\s+(\S+)", obj.text.strip())
+            if m:
+                tombstones.append(f"field:dns:domain:{m.group(1)}")
+        if parse.find_objects(r"^no\s+domain\s+lookup\s*$"):
+            tombstones.append("singleton:dns")
+
+        return tombstones
+
+    # -------------------------------------------------------------------
+    # parse() override — X4: back-fill OSPF interface fields,
+    #                    X6: populate VRF RD from BGP VRF block
+    # -------------------------------------------------------------------
+
+    def parse(self) -> "ParsedConfig":
+        """Override to post-process parsed data for IOS-XR consistency fixes."""
+        from confgraph.models.parsed_config import ParsedConfig
+
+        pc = super().parse()
+
+        # X4: back-fill InterfaceConfig.ospf_area / ospf_process_id from
+        # OSPFArea.interfaces (IOS-XR stores membership on the area, not
+        # the interface).
+        if pc.ospf_instances:
+            for ospf in pc.ospf_instances:
+                for area in ospf.areas:
+                    for intf_name in area.interfaces:
+                        intf = next(
+                            (i for i in pc.interfaces if i.name == intf_name),
+                            None,
+                        )
+                        if intf and intf.ospf_area is None:
+                            intf.ospf_area = area.area_id
+                            intf.ospf_process_id = ospf.process_id
+
+        # X6: populate VRF RD from BGP VRF block (IOS-XR puts RD under
+        # "router bgp / vrf NAME / rd X:Y", not under "vrf NAME").
+        if self._bgp_vrf_rd and pc.vrfs:
+            for vrf in pc.vrfs:
+                if vrf.rd is None and vrf.name in self._bgp_vrf_rd:
+                    vrf.rd = self._bgp_vrf_rd[vrf.name]
+
+        return pc

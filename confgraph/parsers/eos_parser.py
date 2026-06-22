@@ -83,11 +83,13 @@ class EOSParser(IOSParser):
         """Extract VRF name from an EOS interface object.
 
         EOS format: ``vrf VRFNAME`` (no "forwarding" keyword).
+        Uses end-of-line anchor to avoid matching other ``vrf``-prefixed
+        sub-commands (e.g. hypothetical ``vrf-filter`` or similar).
         """
-        vrf_children = intf_obj.find_child_objects(r"^\s+vrf\s+(\S+)")
+        vrf_children = intf_obj.find_child_objects(r"^\s+vrf\s+(\S+)\s*$")
         if vrf_children:
             return self._extract_match(
-                vrf_children[0].text, r"^\s+vrf\s+(\S+)"
+                vrf_children[0].text, r"^\s+vrf\s+(\S+)\s*$"
             )
         return None
 
@@ -1232,6 +1234,96 @@ class EOSParser(IOSParser):
         )
 
     # -------------------------------------------------------------------
+    # DNS — override to scan vrf instance blocks (E6)
+    # -------------------------------------------------------------------
+
+    def parse_dns(self):
+        """Parse DNS config, including entries inside ``vrf instance`` blocks.
+
+        EOS places per-VRF DNS entries as children of ``vrf instance NAME``
+        stanzas.  The inherited IOS ``parse_dns`` only scans global lines, so
+        this override merges those with any VRF-scoped entries.
+        """
+        from confgraph.models.dns import DNSConfig
+
+        dns = super().parse_dns()
+
+        parse = self._get_parse_obj()
+        vrf_objs = parse.find_objects(r"^vrf\s+instance\s+(\S+)")
+
+        extra_servers: list[str] = []
+        extra_domain_name: str | None = None
+        extra_domain_list: list[str] = []
+        extra_lookup_disabled = False
+        extra_raw: list[str] = []
+        extra_line_numbers: list[int] = []
+
+        for vrf_obj in vrf_objs:
+            for child in vrf_obj.children:
+                t = child.text.strip()
+
+                # ip name-server [vrf NAME] A B C ...
+                m = re.match(r"ip\s+name-server\s+(.*)", t)
+                if m:
+                    extra_raw.append(child.text)
+                    extra_line_numbers.append(child.linenum)
+                    parts = m.group(1).split()
+                    # Strip optional "vrf <name>" prefix
+                    if len(parts) >= 2 and parts[0].lower() == "vrf":
+                        parts = parts[2:]
+                    extra_servers.extend(parts)
+                    continue
+
+                # ip domain name DOMAIN / ip domain-name DOMAIN
+                m = re.match(r"ip\s+domain(?:-|\s+)name\s+(\S+)", t)
+                if m:
+                    extra_raw.append(child.text)
+                    extra_line_numbers.append(child.linenum)
+                    if extra_domain_name is None:
+                        extra_domain_name = m.group(1)
+                    continue
+
+                # ip domain list DOMAIN
+                m = re.match(r"ip\s+domain\s+list\s+(\S+)", t)
+                if m:
+                    extra_raw.append(child.text)
+                    extra_line_numbers.append(child.linenum)
+                    extra_domain_list.append(m.group(1))
+                    continue
+
+                # no ip domain lookup
+                if re.match(r"no\s+ip\s+domain.lookup", t):
+                    extra_raw.append(child.text)
+                    extra_line_numbers.append(child.linenum)
+                    extra_lookup_disabled = True
+
+        if not extra_raw:
+            return dns
+
+        if dns is None:
+            dns = DNSConfig(
+                object_id="dns",
+                raw_lines=extra_raw,
+                source_os=self.os_type,
+                line_numbers=extra_line_numbers,
+                lookup_enabled=not extra_lookup_disabled,
+                domain_name=extra_domain_name,
+                domain_list=extra_domain_list,
+                name_servers=extra_servers,
+            )
+        else:
+            dns.raw_lines.extend(extra_raw)
+            dns.line_numbers.extend(extra_line_numbers)
+            dns.name_servers.extend(extra_servers)
+            if extra_domain_name and dns.domain_name is None:
+                dns.domain_name = extra_domain_name
+            dns.domain_list.extend(extra_domain_list)
+            if extra_lookup_disabled:
+                dns.lookup_enabled = False
+
+        return dns
+
+    # -------------------------------------------------------------------
     # VXLAN
     # -------------------------------------------------------------------
 
@@ -1303,7 +1395,7 @@ class EOSParser(IOSParser):
             object_id="vxlan",
             raw_lines=[vxlan_intf.text] + [c.text for c in vxlan_intf.children],
             source_os=self.os_type,
-            line_numbers=[],
+            line_numbers=[vxlan_intf.linenum] + [c.linenum for c in vxlan_intf.children],
             source_interface=source_interface,
             udp_port=udp_port,
             vni_mappings=vni_mappings,
@@ -1379,7 +1471,7 @@ class EOSParser(IOSParser):
             object_id="mpls",
             raw_lines=raw,
             source_os=self.os_type,
-            line_numbers=[],
+            line_numbers=[ldp_obj.linenum] + [c.linenum for c in ldp_obj.children],
             ldp_router_id=ldp_router_id,
             ldp_router_id_force=ldp_router_id_force,
             ldp_enabled=ldp_enabled,
@@ -1496,7 +1588,7 @@ class EOSParser(IOSParser):
             object_id="vpc",
             raw_lines=[mlag_obj.text] + [c.text for c in mlag_obj.children],
             source_os=self.os_type,
-            line_numbers=[],
+            line_numbers=[mlag_obj.linenum] + [c.linenum for c in mlag_obj.children],
             domain_id=domain_id,
             peer_link=peer_link,
             peer_keepalive_destination=peer_address,

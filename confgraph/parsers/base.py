@@ -1,7 +1,6 @@
 """Base parser class for network device configurations."""
 
 import re
-import traceback
 from abc import ABC, abstractmethod
 from typing import Any
 from ciscoconfparse2 import CiscoConfParse
@@ -543,37 +542,46 @@ class BaseParser(ABC):
         return []
 
     def _find_error_context(self, exc: Exception) -> tuple[int, str]:
-        """Extract the best-guess line number and text from a parse exception.
+        """Extract the best-guess config line number and text from a parse exception.
 
-        Walks the traceback frames looking for a local variable that is a
+        Walks the live traceback frames looking for a local variable that is a
         CiscoConfParse object with a ``linenum`` attribute (i.e. a config
-        object being iterated at the point of failure).  Falls back to
-        line 0 / empty string if nothing useful is found.
+        object being iterated at the point of failure).  Returns ``(0, "")``
+        if no config-line context can be determined — an honest "unknown" is
+        better than a misleading Python-source-line number.
         """
-        tb = traceback.extract_tb(exc.__traceback__)
-        # Walk frames in reverse (innermost first) looking for a linenum hint
-        for frame_summary in reversed(tb):
-            # CiscoConfParse objects carry .linenum; check the frame's locals
-            # via the live traceback object
-            pass
-
-        # Simpler fallback: search traceback string for a line number hint
-        tb_str = "".join(traceback.format_tb(exc.__traceback__))
-        match = re.search(r"line (\d+)", tb_str)
-        if match:
-            lineno = int(match.group(1))
-            # Map Python source line → config line if in range
-            if 1 <= lineno <= len(self.config_lines):
-                return lineno, self.config_lines[lineno - 1]
-        return 0, ""
+        # Walk outermost→innermost, keep the *last* match (innermost frame
+        # is closest to the actual failure — e.g. the neighbor line, not the
+        # router bgp section header).
+        best = (0, "")
+        tb = exc.__traceback__
+        while tb is not None:
+            frame_locals = tb.tb_frame.f_locals
+            for val in frame_locals.values():
+                if hasattr(val, "linenum") and hasattr(val, "text"):
+                    linenum = val.linenum
+                    text = val.text if isinstance(val.text, str) else ""
+                    best = (linenum, text)
+            tb = tb.tb_next
+        return best
 
     def parse(self) -> ParsedConfig:
         """Parse entire configuration and return ParsedConfig object.
 
-        Fails fast: if any protocol parser raises an exception the entire
-        parse is aborted and a ``ParseError`` is raised with the line
-        number and config text that caused the failure.  No partial
-        ``ParsedConfig`` is returned.
+        **Design decision — strict / fail-fast (intentional):**
+
+        If any protocol parser raises an exception the entire parse is
+        aborted and a ``ParseError`` is raised.  No partial ``ParsedConfig``
+        is returned.  This guarantees that a returned ``ParsedConfig`` is
+        trustworthy and complete — consumers never silently operate on
+        half-parsed data.
+
+        Resilience against malformed input is pushed down to per-field
+        guards (``try/except`` around ``int()``, ``IPv4Address()``, etc.)
+        inside individual parse methods, so a junk token skips that line
+        rather than blanking the device.  The platform layer is responsible
+        for making a parse failure first-class and visible (degraded
+        coverage, not a silent drop).
 
         Returns:
             ParsedConfig object containing all parsed configurations
@@ -593,13 +601,44 @@ class BaseParser(ABC):
                 line_number, line_text = self._find_error_context(exc)
                 raise ParseError(field, line_number, line_text, exc) from exc
 
-        return ParsedConfig(
+        pc = ParsedConfig(
             source_os=self.os_type,
             hostname=hostname,
             raw_config=self.config_text,
             unrecognized_blocks=self._collect_unrecognized_blocks(),
             **results,
         )
+
+        # M3: back-fill InterfaceConfig.ospf_passive from OSPF passive lists.
+        # Only set ospf_passive on interfaces that are known OSPF participants
+        # (explicitly named in passive_interfaces or non_passive_interfaces,
+        # or whose ospf_process_id matches). Never infer passive for L2 ports
+        # or interfaces not in any OSPF process — correctness over coverage.
+        if pc.ospf_instances and pc.interfaces:
+            intf_by_name = {i.name: i for i in pc.interfaces}
+            for ospf in pc.ospf_instances:
+                for name in ospf.passive_interfaces:
+                    intf = intf_by_name.get(name)
+                    if intf:
+                        intf.ospf_passive = True
+                for name in ospf.non_passive_interfaces:
+                    intf = intf_by_name.get(name)
+                    if intf:
+                        intf.ospf_passive = False
+                # For default-passive, only mark interfaces that belong to
+                # this process (ospf_process_id matches or listed in an area)
+                if ospf.passive_interface_default:
+                    area_intfs: set[str] = set()
+                    for area in ospf.areas:
+                        area_intfs.update(area.interfaces)
+                    non_passive_set = set(ospf.non_passive_interfaces)
+                    for intf in pc.interfaces:
+                        if intf.name in non_passive_set:
+                            continue  # already handled above
+                        if intf.name in area_intfs or intf.ospf_process_id == ospf.process_id:
+                            intf.ospf_passive = True
+
+        return pc
 
     # Helper methods for common parsing tasks
 

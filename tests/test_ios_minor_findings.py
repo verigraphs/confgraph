@@ -397,3 +397,235 @@ class TestXRLLDPCDPEnable:
         cdp = IOSParser("cdp run\n").parse_cdp()
         assert cdp is not None
         assert cdp.enabled is True
+
+
+# ---------------------------------------------------------------------------
+# M1 — _find_error_context returns (0, '') when no config object in traceback
+# ---------------------------------------------------------------------------
+
+
+class TestM1ErrorContext:
+
+    def test_returns_zero_on_no_context(self):
+        parser = IOSParser("hostname R1\n")
+        try:
+            raise ValueError("synthetic error")
+        except Exception as exc:
+            line, text = parser._find_error_context(exc)
+        assert line == 0
+        assert text == ""
+
+
+# ---------------------------------------------------------------------------
+# M3 — ospf_passive back-fill from OSPF passive lists
+# ---------------------------------------------------------------------------
+
+
+class TestM3OSPFPassive:
+
+    def test_passive_interface_explicit(self):
+        cfg = (
+            "interface GigabitEthernet0/0\n"
+            " ip address 10.0.0.1 255.255.255.0\n"
+            " ip ospf 1 area 0\n"
+            "!\n"
+            "interface GigabitEthernet0/1\n"
+            " ip address 10.0.1.1 255.255.255.0\n"
+            " ip ospf 1 area 0\n"
+            "!\n"
+            "router ospf 1\n"
+            " passive-interface GigabitEthernet0/0\n"
+            "!\n"
+        )
+        pc = IOSParser(cfg).parse()
+        g0 = next(i for i in pc.interfaces if i.name == "GigabitEthernet0/0")
+        g1 = next(i for i in pc.interfaces if i.name == "GigabitEthernet0/1")
+        assert g0.ospf_passive is True
+        assert g1.ospf_passive is False
+
+    def test_passive_interface_default(self):
+        cfg = (
+            "interface GigabitEthernet0/0\n"
+            " ip address 10.0.0.1 255.255.255.0\n"
+            " ip ospf 1 area 0\n"
+            "!\n"
+            "interface GigabitEthernet0/1\n"
+            " ip address 10.0.1.1 255.255.255.0\n"
+            " ip ospf 1 area 0\n"
+            "!\n"
+            "router ospf 1\n"
+            " passive-interface default\n"
+            " no passive-interface GigabitEthernet0/1\n"
+            "!\n"
+        )
+        pc = IOSParser(cfg).parse()
+        g0 = next(i for i in pc.interfaces if i.name == "GigabitEthernet0/0")
+        g1 = next(i for i in pc.interfaces if i.name == "GigabitEthernet0/1")
+        assert g0.ospf_passive is True
+        assert g1.ospf_passive is False
+
+    def test_default_passive_does_not_bleed_to_non_ospf(self):
+        """L2 ports not in any OSPF process must NOT get ospf_passive=True."""
+        cfg = (
+            "interface GigabitEthernet0/0\n"
+            " ip address 10.0.0.1 255.255.255.0\n"
+            " ip ospf 1 area 0\n"
+            "!\n"
+            "interface GigabitEthernet0/2\n"
+            " switchport mode access\n"
+            "!\n"
+            "router ospf 1\n"
+            " passive-interface default\n"
+            "!\n"
+        )
+        pc = IOSParser(cfg).parse()
+        g0 = next(i for i in pc.interfaces if i.name == "GigabitEthernet0/0")
+        g2 = next(i for i in pc.interfaces if i.name == "GigabitEthernet0/2")
+        assert g0.ospf_passive is True
+        assert g2.ospf_passive is False
+
+    def test_no_ospf_leaves_passive_false(self):
+        cfg = (
+            "interface GigabitEthernet0/0\n"
+            " ip address 10.0.0.1 255.255.255.0\n"
+            "!\n"
+        )
+        pc = IOSParser(cfg).parse()
+        g0 = next(i for i in pc.interfaces if i.name == "GigabitEthernet0/0")
+        assert g0.ospf_passive is False
+
+
+# ---------------------------------------------------------------------------
+# M7 — EIGRP named-mode AS from address-family
+# ---------------------------------------------------------------------------
+
+
+class TestM7EIGRPNamedMode:
+
+    def test_classic_mode_int(self):
+        cfg = (
+            "router eigrp 100\n"
+            " network 10.0.0.0 0.0.0.255\n"
+            "!\n"
+        )
+        pc = IOSParser(cfg).parse()
+        assert len(pc.eigrp_instances) == 1
+        assert pc.eigrp_instances[0].as_number == 100
+
+    def test_named_mode_reads_autonomous_system(self):
+        cfg = (
+            "router eigrp MYNET\n"
+            " address-family ipv4 unicast autonomous-system 200\n"
+            "  network 10.0.0.0 0.0.0.255\n"
+            " !\n"
+            "!\n"
+        )
+        pc = IOSParser(cfg).parse()
+        assert len(pc.eigrp_instances) == 1
+        assert pc.eigrp_instances[0].as_number == 200
+
+    def test_named_mode_without_af_keeps_name(self):
+        cfg = (
+            "router eigrp MYNET\n"
+            "!\n"
+        )
+        pc = IOSParser(cfg).parse()
+        assert len(pc.eigrp_instances) == 1
+        assert pc.eigrp_instances[0].as_number == "MYNET"
+
+
+# ---------------------------------------------------------------------------
+# M12 — Syslog enabled detection
+# ---------------------------------------------------------------------------
+
+
+class TestM12SyslogEnabled:
+
+    def test_logging_off(self):
+        cfg = "logging off\n"
+        pc = IOSParser(cfg).parse()
+        assert pc.syslog is not None
+        assert pc.syslog.enabled is False
+
+    def test_no_logging_on(self):
+        cfg = "no logging on\n"
+        pc = IOSParser(cfg).parse()
+        assert pc.syslog is not None
+        assert pc.syslog.enabled is False
+
+    def test_normal_logging_enabled(self):
+        cfg = (
+            "logging buffered 4096\n"
+            "logging host 10.0.0.1\n"
+        )
+        pc = IOSParser(cfg).parse()
+        assert pc.syslog is not None
+        assert pc.syslog.enabled is True
+
+
+# ---------------------------------------------------------------------------
+# M14 — SNMP community view/ACL heuristic
+# ---------------------------------------------------------------------------
+
+
+class TestM14SNMPViewACL:
+
+    def test_view_not_as_acl(self):
+        cfg = "snmp-server community PUBLIC ro view MYVIEW\n"
+        pc = IOSParser(cfg).parse()
+        assert pc.snmp is not None
+        comm = pc.snmp.communities[0]
+        assert comm.view == "MYVIEW"
+        assert comm.acl is None
+
+    def test_view_with_acl(self):
+        cfg = "snmp-server community PUBLIC ro view MYVIEW ACL99\n"
+        pc = IOSParser(cfg).parse()
+        comm = pc.snmp.communities[0]
+        assert comm.view == "MYVIEW"
+        assert comm.acl == "ACL99"
+
+    def test_acl_only(self):
+        cfg = "snmp-server community PUBLIC ro ACL99\n"
+        pc = IOSParser(cfg).parse()
+        comm = pc.snmp.communities[0]
+        assert comm.view is None
+        assert comm.acl == "ACL99"
+
+    def test_bare_community(self):
+        cfg = "snmp-server community PUBLIC ro\n"
+        pc = IOSParser(cfg).parse()
+        comm = pc.snmp.communities[0]
+        assert comm.view is None
+        assert comm.acl is None
+
+
+# ---------------------------------------------------------------------------
+# M15 — AAA accounting method consistency
+# ---------------------------------------------------------------------------
+
+
+class TestM15AAAAccounting:
+
+    def test_accounting_keeps_group_prefix(self):
+        cfg = (
+            "aaa new-model\n"
+            "aaa accounting exec default start-stop group tacacs+\n"
+        )
+        pc = IOSParser(cfg).parse()
+        assert pc.aaa is not None
+        acct = pc.aaa.accounting_lists[0]
+        assert "group" in acct.methods
+        assert "tacacs+" in acct.methods
+
+    def test_accounting_and_auth_consistent(self):
+        cfg = (
+            "aaa new-model\n"
+            "aaa authentication login default group tacacs+ local\n"
+            "aaa accounting exec default start-stop group tacacs+\n"
+        )
+        pc = IOSParser(cfg).parse()
+        auth_methods = pc.aaa.authentication_lists[0].methods
+        acct_methods = pc.aaa.accounting_lists[0].methods
+        assert "group" in auth_methods
+        assert "group" in acct_methods

@@ -39,7 +39,7 @@ from confgraph.models.multicast import MulticastConfig
 from confgraph.models.bgp import (
     BGPConfig, BGPNeighbor, BGPPeerGroup, BGPNeighborAF, BGPAddressFamily,
 )
-from confgraph.models.ospf import OSPFConfig, OSPFArea
+from confgraph.models.ospf import OSPFConfig, OSPFArea, OSPFAreaType
 from confgraph.models.acl import ACLConfig, ACLEntry
 from confgraph.models.static_route import StaticRoute
 
@@ -60,6 +60,10 @@ class JunOSParser(BaseParser):
         self._vrf_of_intf: dict[str, str] = {}
         self._is_set_style: bool = _is_set_style(config_text)
         self._config_lines: list[str] = config_text.splitlines()
+        # J7: populated by parse_ospf(); applied in parse() post-step
+        self._ospf_intf_attrs: dict[str, dict[str, Any]] = {}
+        # 1b: populated by _parse_bgp_block(); maps peer_ip → local-address IP str
+        self._bgp_local_addresses: dict[str, str] = {}
 
     # ------------------------------------------------------------------
     # Hierarchy access
@@ -87,6 +91,49 @@ class JunOSParser(BaseParser):
     def _collect_unrecognized_blocks(self) -> list[UnrecognizedBlock]:
         """JunOS uses a different structure; skip CiscoConfParse-based scan."""
         return []
+
+    def parse(self) -> "ParsedConfig":
+        """Override to back-fill OSPF per-interface attrs and BGP update_source."""
+        from confgraph.models.parsed_config import ParsedConfig
+        pc = super().parse()
+
+        # J7: apply OSPF per-interface attributes collected during parse_ospf
+        if self._ospf_intf_attrs:
+            for intf in pc.interfaces:
+                attrs = self._ospf_intf_attrs.get(intf.name)
+                if attrs:
+                    for key, val in attrs.items():
+                        setattr(intf, key, val)
+
+        # 1b: reverse-resolve BGP local-address IP → interface name
+        if pc.bgp_instances:
+            ip_to_intf = self._build_ip_to_intf_map(pc.interfaces)
+            for bgp_inst in pc.bgp_instances:
+                for nbr in bgp_inst.neighbors:
+                    local_addr = self._bgp_local_addresses.get(str(nbr.peer_ip))
+                    if local_addr and not nbr.update_source:
+                        resolved = ip_to_intf.get(local_addr)
+                        if resolved:
+                            nbr.update_source = resolved
+
+        return pc
+
+    @staticmethod
+    def _build_ip_to_intf_map(interfaces: list[InterfaceConfig]) -> dict[str, str]:
+        """Build IP address → interface name mapping for local-address resolution.
+
+        Keys are canonical (compressed, lowercase) IP strings so that
+        non-canonical IPv6 forms (e.g. ``2001:DB8::1``) still match.
+        """
+        result: dict[str, str] = {}
+        for intf in interfaces:
+            if intf.ip_address:
+                result[str(intf.ip_address.ip)] = intf.name
+            for sec in intf.secondary_ips:
+                result[str(sec.ip)] = intf.name
+            for v6 in intf.ipv6_addresses:
+                result[str(v6.ip)] = intf.name
+        return result
 
     def _raw_lines_for(self, *path_tokens: str) -> list[str]:
         """Return raw config lines relevant to a given object path.
@@ -166,11 +213,19 @@ class JunOSParser(BaseParser):
             intf_desc = _str_val(intf_data.get("description"))
             units = intf_data.get("unit", {})
 
+            # J13: interface-level disable
+            intf_disabled = "disable" in intf_data
+
+            # J16: MTU at the interface level
+            intf_mtu = _int_val(intf_data.get("mtu"))
+
             if not isinstance(units, dict) or not units:
                 # Interface with no units — emit once with no addressing
                 result.append(self._make_interface(
                     intf_name, intf_name, intf_desc, {}, {},
                     vrf=self._vrf_of_intf.get(intf_name),
+                    enabled=not intf_disabled,
+                    mtu=intf_mtu,
                 ))
                 continue
 
@@ -180,6 +235,10 @@ class JunOSParser(BaseParser):
 
                 full_name = f"{intf_name}.{unit_id}"
                 unit_desc = _str_val(unit_data.get("description")) or intf_desc
+
+                # J13: unit-level disable overrides interface-level
+                unit_disabled = "disable" in unit_data
+                enabled = not intf_disabled and not unit_disabled
 
                 inet_block = unit_data.get("family", {})
                 inet4: dict[str, Any] = {}
@@ -195,6 +254,8 @@ class JunOSParser(BaseParser):
                 result.append(self._make_interface(
                     full_name, intf_name, unit_desc, inet4, inet6,
                     vrf=self._vrf_of_intf.get(full_name),
+                    enabled=enabled,
+                    mtu=intf_mtu,
                 ))
 
         return result
@@ -207,6 +268,8 @@ class JunOSParser(BaseParser):
         inet4: dict[str, Any],
         inet6: dict[str, Any],
         vrf: str | None = None,
+        enabled: bool = True,
+        mtu: int | None = None,
     ) -> InterfaceConfig:
         """Construct one InterfaceConfig from parsed unit data."""
         intf_type = _junos_interface_type(base_name)
@@ -256,6 +319,12 @@ class JunOSParser(BaseParser):
             acl_in = _str_val(filter_block.get("input"))
             acl_out = _str_val(filter_block.get("output"))
 
+        # IP unnumbered: "family inet { unnumbered-address lo0.0; }"
+        unnumbered_source: str | None = None
+        unnum_val = _str_val(inet4.get("unnumbered-address"))
+        if unnum_val:
+            unnumbered_source = unnum_val.split()[0]  # strip any trailing keywords
+
         return InterfaceConfig(
             object_id=f"interface_{full_name}",
             raw_lines=self._raw_lines_for("interfaces", base_name),
@@ -264,13 +333,15 @@ class JunOSParser(BaseParser):
             name=full_name,
             interface_type=intf_type,
             description=description,
-            enabled=True,
+            enabled=enabled,
             vrf=vrf,
+            mtu=mtu,
             ip_address=ip_address,
             ipv6_addresses=ipv6_addresses,
             secondary_ips=secondary_ips,
             acl_in=acl_in,
             acl_out=acl_out,
+            unnumbered_source=unnumbered_source,
         )
 
     # ------------------------------------------------------------------
@@ -770,7 +841,7 @@ class JunOSParser(BaseParser):
         vrf: str | None,
     ) -> BGPConfig | None:
         """Build a BGPConfig from a parsed ``bgp { group … }`` dict."""
-        from ipaddress import IPv4Address
+        from ipaddress import IPv4Address, ip_address
         peer_groups: list[BGPPeerGroup] = []
         neighbors: list[BGPNeighbor] = []
 
@@ -789,7 +860,9 @@ class JunOSParser(BaseParser):
             except ValueError:
                 remote_as = peer_as_str or 0
 
-            # local-address is an IP in JunOS, not an interface name — omit as update_source
+            # 1b: local-address captured; reverse-resolved to interface in parse()
+            grp_local_addr = _str_val(grp_data.get("local-address"))
+
             pg = BGPPeerGroup(
                 name=grp_name,
                 remote_as=remote_as if remote_as != 0 else None,
@@ -804,8 +877,9 @@ class JunOSParser(BaseParser):
             for nbr_ip_str, nbr_data in nbr_block.items():
                 if not isinstance(nbr_data, dict):
                     nbr_data = {}
+                # J14: support both IPv4 and IPv6 neighbors
                 try:
-                    peer_ip = IPv4Address(nbr_ip_str)
+                    peer_ip = ip_address(nbr_ip_str)
                 except ValueError:
                     continue
 
@@ -817,11 +891,38 @@ class JunOSParser(BaseParser):
                     except ValueError:
                         pass
 
+                # J15: BGP authentication-key
+                nbr_password = (
+                    _str_val(nbr_data.get("authentication-key"))
+                    or _str_val(grp_data.get("authentication-key"))
+                )
+
                 rm_in = _str_val(nbr_data.get("import")) or _str_val(grp_data.get("import"))
                 rm_out = _str_val(nbr_data.get("export")) or _str_val(grp_data.get("export"))
 
+                # J9: resolve "internal" to the device's own ASN
+                effective_remote_as: int | str
+                if nbr_remote_as == 0 or nbr_remote_as == "internal":
+                    effective_remote_as = asn  # device's own ASN for iBGP
+                else:
+                    effective_remote_as = nbr_remote_as
+
+                # 1b: capture local-address for reverse resolution in parse()
+                local_addr = _str_val(nbr_data.get("local-address")) or grp_local_addr
+                if local_addr:
+                    # Canonicalize both peer IP key and local-address value
+                    # so IPv6 forms like 2001:DB8::1 match the map built
+                    # from parsed interface addresses.
+                    canon_peer = str(peer_ip)  # already canonical from ip_address()
+                    try:
+                        canon_local = str(ip_address(local_addr))
+                    except ValueError:
+                        canon_local = local_addr
+                    self._bgp_local_addresses[canon_peer] = canon_local
+
+                afi = "ipv6" if peer_ip.version == 6 else "ipv4"
                 af = BGPNeighborAF(
-                    afi="ipv4",
+                    afi=afi,
                     safi="unicast",
                     route_map_in=rm_in,
                     route_map_out=rm_out,
@@ -829,9 +930,10 @@ class JunOSParser(BaseParser):
 
                 neighbors.append(BGPNeighbor(
                     peer_ip=peer_ip,
-                    remote_as=nbr_remote_as if nbr_remote_as != 0 else "internal",
+                    remote_as=effective_remote_as,
                     peer_group=grp_name,
                     description=_str_val(nbr_data.get("description")),
+                    password=nbr_password,
                     route_map_in=rm_in,
                     route_map_out=rm_out,
                     address_families=[af],
@@ -975,6 +1077,7 @@ class JunOSParser(BaseParser):
             return []
 
         areas: list[OSPFArea] = []
+        passive_interfaces: list[str] = []
         area_block = ospf_data.get("area", {})
         if isinstance(area_block, dict):
             for area_id, area_data in area_block.items():
@@ -982,10 +1085,123 @@ class JunOSParser(BaseParser):
                     continue
                 intf_block = _as_named_block(area_data.get("interface", {}))
                 intf_names = list(intf_block.keys())
+
+                # J7: area type (stub / nssa)
+                area_type = OSPFAreaType.NORMAL
+                stub_no_summary = False
+                nssa_no_summary = False
+                nssa_dio = False
+                if "stub" in area_data:
+                    stub_data = area_data["stub"]
+                    if isinstance(stub_data, dict) and "no-summaries" in stub_data:
+                        area_type = OSPFAreaType.TOTALLY_STUB
+                        stub_no_summary = True
+                    else:
+                        area_type = OSPFAreaType.STUB
+                elif "nssa" in area_data:
+                    nssa_data = area_data["nssa"]
+                    if isinstance(nssa_data, dict):
+                        if "no-summaries" in nssa_data:
+                            area_type = OSPFAreaType.TOTALLY_NSSA
+                            nssa_no_summary = True
+                        else:
+                            area_type = OSPFAreaType.NSSA
+                        if "default-lsa" in nssa_data:
+                            nssa_dio = True
+                    else:
+                        area_type = OSPFAreaType.NSSA
+
+                # J7: per-interface sub-attributes (back-fill onto InterfaceConfig in parse())
+                for intf_name, intf_ospf in intf_block.items():
+                    if not isinstance(intf_ospf, dict) or not intf_ospf:
+                        continue
+                    attrs: dict[str, Any] = {"ospf_area": str(area_id)}
+                    if "passive" in intf_ospf:
+                        attrs["ospf_passive"] = True
+                        passive_interfaces.append(intf_name)
+                    metric = _int_val(intf_ospf.get("metric"))
+                    if metric is not None:
+                        attrs["ospf_cost"] = metric
+                    hello = _int_val(intf_ospf.get("hello-interval"))
+                    if hello is not None:
+                        attrs["ospf_hello_interval"] = hello
+                    dead = _int_val(intf_ospf.get("dead-interval"))
+                    if dead is not None:
+                        attrs["ospf_dead_interval"] = dead
+                    intf_type_val = _str_val(intf_ospf.get("interface-type"))
+                    if intf_type_val:
+                        attrs["ospf_network_type"] = intf_type_val
+                    priority = _int_val(intf_ospf.get("priority"))
+                    if priority is not None:
+                        attrs["ospf_priority"] = priority
+                    if "authentication" in intf_ospf:
+                        auth_data = intf_ospf["authentication"]
+                        if isinstance(auth_data, dict):
+                            if "md5" in auth_data:
+                                attrs["ospf_authentication"] = "message-digest"
+                            elif "simple-password" in auth_data:
+                                attrs["ospf_authentication"] = "simple"
+                                attrs["ospf_authentication_key"] = _str_val(
+                                    auth_data.get("simple-password")
+                                )
+                            else:
+                                attrs["ospf_authentication"] = "simple"
+                        else:
+                            attrs["ospf_authentication"] = "simple"
+                    self._ospf_intf_attrs[intf_name] = attrs
+
                 areas.append(OSPFArea(
                     area_id=str(area_id),
                     interfaces=intf_names,
+                    area_type=area_type,
+                    stub_no_summary=stub_no_summary,
+                    nssa_no_summary=nssa_no_summary,
+                    nssa_default_information_originate=nssa_dio,
                 ))
+
+        # ---- OSPF-advanced fields ----
+
+        # Reference bandwidth: "reference-bandwidth 10g" or numeric
+        auto_cost_ref_bw: int | None = None
+        ref_bw = _str_val(ospf_data.get("reference-bandwidth"))
+        if ref_bw:
+            # JunOS uses suffixes: 1k=1000, 1m=1000000, 1g=1000000000
+            m = re.match(r"(\d+)([kmg])?", ref_bw, re.IGNORECASE)
+            if m:
+                val = int(m.group(1))
+                suffix = (m.group(2) or "").lower()
+                if suffix == "k":
+                    val *= 1000
+                elif suffix == "m":
+                    val *= 1000000
+                elif suffix == "g":
+                    val *= 1000000000
+                auto_cost_ref_bw = val
+
+        # Graceful restart
+        graceful_restart = "graceful-restart" in ospf_data
+        graceful_restart_helper = False
+        gr_data = ospf_data.get("graceful-restart", {})
+        if isinstance(gr_data, dict):
+            graceful_restart_helper = "helper-disable" not in gr_data
+        elif isinstance(gr_data, str) and gr_data == "helper-disable":
+            graceful_restart_helper = False
+
+        # BFD (JunOS: "bfd-liveness-detection" under ospf or per-interface)
+        bfd_all = "bfd-liveness-detection" in ospf_data
+
+        # Overload (equivalent to max-metric router-lsa)
+        max_metric_router_lsa = "overload" in ospf_data
+
+        # Router ID
+        router_id = None
+        rid_str = _str_val(ospf_data.get("router-id"))
+        if rid_str:
+            from ipaddress import IPv4Address
+            try:
+                router_id = IPv4Address(rid_str)
+            except ValueError:
+                pass
 
         return [OSPFConfig(
             object_id="ospf_1",
@@ -993,7 +1209,14 @@ class JunOSParser(BaseParser):
             source_os=self.os_type,
             line_numbers=[],
             process_id=1,
+            router_id=router_id,
             areas=areas,
+            passive_interfaces=passive_interfaces,
+            auto_cost_reference_bandwidth=auto_cost_ref_bw,
+            graceful_restart=graceful_restart,
+            graceful_restart_helper=graceful_restart_helper,
+            bfd_all_interfaces=bfd_all,
+            max_metric_router_lsa=max_metric_router_lsa,
         )]
 
     # ------------------------------------------------------------------
@@ -1189,6 +1412,17 @@ def _str_val(v: Any) -> str | None:
             return None
         return str(keys[0]).strip('"') or None
     return str(v).strip('"')
+
+
+def _int_val(v: Any) -> int | None:
+    """Return *v* as an int, or None if not convertible."""
+    s = _str_val(v)
+    if s is None:
+        return None
+    try:
+        return int(s)
+    except ValueError:
+        return None
 
 
 def _as_named_block(v: Any) -> dict:
