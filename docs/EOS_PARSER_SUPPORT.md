@@ -375,7 +375,140 @@ router isis <instance-name>
 
 ---
 
-### 12. Extended Protocol Support (Inherited from IOSParser)
+### 12. DNS Configuration
+
+**Syntax:**
+```
+ip name-server <ip> [<ip>...]
+ip domain-name <domain>
+ip domain list <domain>
+no ip domain lookup
+
+vrf instance <name>
+   ip name-server [vrf <name>] <ip> [<ip>...]
+   ip domain-name <domain>
+   ip domain list <domain>
+   no ip domain lookup
+```
+
+**EOS-Specific Differences:**
+
+- Per-VRF DNS entries are nested under `vrf instance NAME` blocks; IOS places them at global scope only.
+- `parse_dns()` is overridden to scan all `vrf instance` stanzas and merge the discovered entries (name-servers, domain-name, domain-list, no domain lookup) with the global DNS config returned by the parent `IOSParser`.
+
+**Supported Attributes:**
+
+- Name servers
+- Domain name
+- Domain list
+- Lookup enabled/disabled
+
+**Parsing Status:** ✅ Overridden — `parse_dns()` merges VRF-scoped DNS entries from `vrf instance` blocks with global DNS config
+
+**Documentation Source:** EOS 4.35.1F - DNS Configuration
+
+---
+
+### 13. VXLAN Configuration
+
+**Syntax:**
+```
+interface Vxlan1
+   vxlan source-interface Loopback1
+   vxlan udp-port 4789
+   vxlan vlan 10 vni 10010
+   vxlan vrf TENANT-A vni 50001
+   vxlan flood vtep 10.0.0.2 10.0.0.3
+   vxlan learn-restrict any
+```
+
+**Supported Attributes:**
+
+- Source interface
+- UDP port
+- VLAN-to-VNI mappings
+- VRF-to-VNI mappings
+- Flood VTEP list
+- Learn-restrict
+
+`line_numbers` are populated for all parsed lines.
+
+**Deletion tombstones:** `no vxlan vlan <id> vni <id>` and `no vxlan vrf <name> vni <id>` inside `interface Vxlan1` emit `field:vxlan:vni:<vni_id>` tombstones via `parse_deletion_commands()`.
+
+**Parsing Status:** ✅ EOS-specific implementation — `parse_vxlan()` reads from `interface Vxlan1`
+
+**Documentation Source:** EOS 4.35.1F - VXLAN Configuration Guide
+
+---
+
+### 14. MPLS/LDP Configuration
+
+**Syntax:**
+```
+mpls ldp
+   router-id interface Loopback0
+   no shutdown
+   transport-address interface Loopback0
+   graceful-restart
+   session protection
+```
+
+**EOS-Specific Differences:**
+
+- LDP sub-commands are nested under a `mpls ldp` block (IOS uses flat `mpls ldp router-id` lines).
+- `router-id interface <name>` uses the `interface` keyword; a raw IP form is also accepted.
+
+**Supported Attributes:**
+
+- LDP router-id (interface name or IP)
+- LDP enabled
+- Graceful-restart
+- Session protection
+- Password
+
+`line_numbers` are populated for all parsed lines.
+
+**Parsing Status:** ✅ EOS-specific implementation — `parse_mpls()` handles `mpls ldp` hierarchical block
+
+**Documentation Source:** EOS 4.35.1F - MPLS Configuration Guide
+
+---
+
+### 15. MLAG (VPC) Configuration
+
+**Syntax:**
+```
+mlag configuration
+   domain-id MLAG_DOMAIN
+   local-interface Vlan4094
+   peer-address 10.0.0.2
+   peer-link Port-Channel1
+   reload-delay mlag 300
+```
+
+**EOS-Specific Differences:**
+
+- EOS uses `mlag configuration` block; the model is stored as `VPCConfig` for cross-OS compatibility.
+- `peer-address` maps to `peer_keepalive_destination`.
+
+**Supported Attributes:**
+
+- Domain ID
+- Peer link interface
+- Peer keepalive destination (peer-address)
+- Reload delay
+
+`line_numbers` are populated for all parsed lines.
+
+**Deletion tombstones:** `no peer-address` inside `mlag configuration` emits `field:vpc:peer_keepalive_destination` via `parse_deletion_commands()`.
+
+**Parsing Status:** ✅ EOS-specific implementation — `parse_vpc()` reads from `mlag configuration` block
+
+**Documentation Source:** EOS 4.35.1F - MLAG Configuration Guide
+
+---
+
+### 16. Extended Protocol Support (Inherited from IOSParser)
 
 The following protocols use IOS-identical syntax in EOS and are parsed via IOSParser inheritance without modification:
 
@@ -442,6 +575,12 @@ The EOS parser inherits from `IOSParser` because:
 5. **`parse_community_lists()`** - Regexp keyword instead of standard/expanded
 6. **`parse_as_path_lists()`** - Identical to IOS (included for completeness)
 7. **`parse_isis()`** - Modern instance-based IS-IS syntax
+8. **`parse_dns()`** - Merges VRF-scoped DNS entries from `vrf instance` blocks with global DNS config
+9. **`parse_vxlan()`** - Reads VXLAN config from `interface Vxlan1`; populates `line_numbers`
+10. **`parse_mpls()`** - Handles EOS `mpls ldp` hierarchical block; populates `line_numbers`
+11. **`parse_vpc()`** - Maps `mlag configuration` to `VPCConfig`; populates `line_numbers`
+12. **`parse_deletion_commands()`** - Adds EOS-specific VXLAN VNI and MLAG tombstones
+13. **`_extract_interface_vrf()`** - Uses `\s*$` end-of-line anchor to avoid matching `vrf`-prefixed sub-commands other than `vrf <name>`
 
 ---
 
@@ -455,16 +594,10 @@ The EOS parser inherits from `IOSParser` because:
    - **Impact:** IPv6 configurations may not be fully captured
    - **Priority:** Medium
 
-3. **VXLAN/EVPN** - Not currently parsed
-   - **Impact:** Data center fabric configurations not captured
-   - **Priority:** High for DC deployments
-
 ### Future Enhancements
 
 1. **Multi-Agent Routing Model** - Parse `service routing protocols model multi-agent`
 2. **Management API** - Parse `management api http-commands`
-3. **MLAG Configuration** - Parse MLAG peer and interface configs
-4. **VXLAN/EVPN** - Full VXLAN and EVPN configuration support
 
 ---
 
@@ -555,6 +688,6 @@ uv run python test_eos_parser.py
 
 ---
 
-**Last Updated:** 2026-03-28
+**Last Updated:** 2026-06-22
 **Parser Version:** 1.1.0
 **Documentation Version:** EOS 4.35.1F

@@ -247,7 +247,12 @@ router ospf <process-id>
 - ✅ Passive interfaces list
 - ✅ Non-passive interfaces (when default is set)
 - ✅ Default-information originate
+- ✅ `ospf_passive` back-filled on `InterfaceConfig` objects
 - ⚠️  **Not yet:** Max-LSA, distance, timers throttle SPF/LSA
+
+#### OSPF Passive Interface Back-fill
+
+- The base parser's `parse()` method back-fills `InterfaceConfig.ospf_passive` from OSPF passive-interface lists after all blocks are parsed. Back-fill is scoped to interfaces already participating in the OSPF process, preventing false positives on L2-only ports.
 
 #### OSPF Areas
 ```
@@ -381,6 +386,10 @@ ip access-list extended <name>
 - ✅ Source/destination (IP, wildcard)
 - ✅ Port operators (eq, range, gt, lt, neq)
 
+#### Notes
+
+- The `standard`/`extended` keyword is now optional in the ACL regex, supporting NX-OS style `ip access-list NAME` without the keyword. When absent, defaults to `extended`.
+
 ---
 
 ### 9. BGP Community Lists
@@ -443,6 +452,11 @@ router eigrp <as-number>
   no auto-summary
   redistribute static [metric ...]
   passive-interface <interface>
+
+router eigrp <name>
+  address-family ipv4 unicast autonomous-system <as-number>
+    network <prefix> <wildcard>
+    ...
 ```
 
 #### Parsed Attributes
@@ -451,6 +465,10 @@ router eigrp <as-number>
 - ✅ Auto-summary
 - ✅ Passive interfaces
 - ✅ Redistribution
+
+#### Notes
+
+- **Named-mode EIGRP** (`router eigrp NAME`): the real AS number is read from `address-family ipv4 unicast autonomous-system N` inside the named block. The process name is not used as the AS number.
 
 ---
 
@@ -512,6 +530,10 @@ snmp-server enable traps
 - ✅ Location, contact
 - ✅ Trap types enabled
 
+#### SNMP Community Parsing
+
+- Community strings with a `view NAME` clause now have that token stripped before the ACL heuristic runs, preventing the view name from being misidentified as the ACL name.
+
 ---
 
 ### 16. Syslog
@@ -531,6 +553,11 @@ logging facility <facility>
 - ✅ Buffered logging (size, level)
 - ✅ Trap level
 - ✅ Facility
+- ✅ Syslog disabled (`logging off`, `no logging on`)
+
+#### Syslog Disabled Detection
+
+- `logging off` and `no logging on` are both detected as syslog-disabled signals. The previous `"no logging" in t` branch that matched neither form correctly has been replaced.
 
 ---
 
@@ -828,6 +855,6 @@ uv run python test_ios_parser_detailed.py
 
 ---
 
-**Last Updated:** 2026-03-28
+**Last Updated:** 2026-06-22
 **Parser Version:** 1.1.0
 **Maintainer:** Configz Development Team

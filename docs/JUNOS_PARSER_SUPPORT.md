@@ -117,6 +117,8 @@ interfaces {
 - IPv6 addresses
 - Inbound/outbound ACL filter (`acl_in`, `acl_out`)
 - VRF assignment (cross-referenced from routing-instances)
+- Admin state (`enabled=False` when `disable;` is present on the unit or parent interface)
+- MTU (from `mtu N;` on the parent interface)
 
 **Interface type classification:**
 
@@ -129,7 +131,7 @@ interfaces {
 | `gr-`, `ip-`, `st0`, `lt-`, `mt-` | TUNNEL |
 | All others (`ge-`, `xe-`, `et-`, `fe-`) | PHYSICAL |
 
-**Parsing Status:** ✅ Implemented — `parse_interfaces()` handles brace-style unit blocks with `family inet`/`inet6` and `filter { input/output }`
+**Parsing Status:** ✅ Implemented — `parse_interfaces()` handles brace-style unit blocks with `family inet`/`inet6`, `filter { input/output }`, `disable;`, and `mtu`
 
 ---
 
@@ -190,20 +192,22 @@ routing-instances {
 - ASN and router-id are in `routing-options`, not inside `router bgp`
 - BGP is group-centric: all neighbors belong to a named group (≈ peer-group)
 - `import`/`export` reference policy-statements (≈ route-maps), not prefix-lists
-- `local-address` is an IP, not an interface name (not mapped to `update_source`)
+- `local-address` is resolved to an interface name for `update_source` (parser-side, using interface IP reverse lookup)
 - VRF BGP lives inside `routing-instances NAME { protocols { bgp { } } }`
 - No flat `neighbor IP remote-as N` syntax — always block-style within a group
+- iBGP neighbors (`type internal`) with no explicit `peer-as` inherit `remote_as` from the device ASN (not the string `"internal"`)
 
 **Supported Attributes:**
 - ASN (from `routing-options autonomous-system`)
 - Router-ID (from `routing-options router-id`)
 - Groups → `BGPPeerGroup` (name, remote-as, import/export policies)
-- Neighbors → `BGPNeighbor` with peer-group reference, import/export policies mapped to `route_map_in`/`route_map_out`
+- Neighbors → `BGPNeighbor` with peer-group reference, import/export policies mapped to `route_map_in`/`route_map_out`, `password` (from `authentication-key`), `update_source` (resolved from `local-address`)
+- IPv4 and IPv6 neighbor addresses
 - VRF BGP instances with their own groups and neighbors
 
 **Parsing Status:**
 - ✅ Implemented — `parse_bgp()` handles global `protocols bgp` and per-VRF BGP
-- ✅ Implemented — `_parse_bgp_block()` extracts groups (peer-groups) and their neighbors
+- ✅ Implemented — `_parse_bgp_block()` extracts groups (peer-groups) and their neighbors, including IPv6 neighbors, `authentication-key`, and iBGP ASN inference
 
 ---
 
@@ -219,7 +223,20 @@ protocols {
             }
             interface ge-0/0/1.0 {
                 interface-type p2p;
+                metric 10;
+                hello-interval 5;
+                dead-interval 20;
+                priority 0;
+                authentication {
+                    simple-password "secret";
+                }
             }
+        }
+        area 0.0.0.1 {
+            stub no-summaries;
+        }
+        area 0.0.0.2 {
+            nssa;
         }
     }
 }
@@ -229,12 +246,18 @@ protocols {
 - Interface membership is declared inside the OSPF block under `area N { interface NAME; }`
 - `passive;` is declared inside the interface sub-block (not as `passive-interface` at process level)
 - No process ID concept — JunOS OSPF uses process ID 1 by convention
+- Area type (`stub`, `stub no-summaries`, `nssa`, `nssa no-summaries`) sets `OSPFArea.area_type`; default is NORMAL
+- `router-id` extracted from `routing-options { router-id X; }`
+- Interface OSPF fields (`ospf_area`, `ospf_process_id`, `ospf_cost`, etc.) are back-filled on `InterfaceConfig` in the `parse()` override
 
 **Supported Attributes:**
+- Router-ID (from `routing-options router-id`)
 - Areas with interface membership lists
-- Passive interface detection (via `passive;` within the interface sub-block)
+- Area type: `NORMAL`, `STUB`, `STUB_NO_SUMMARY`, `NSSA`, `NSSA_NO_SUMMARY`
+- Per-interface sub-attributes: `metric`, `hello-interval`, `dead-interval`, `interface-type`, `priority`, `passive`, `authentication`
+- `passive_interfaces` list on `OSPFConfig`
 
-**Parsing Status:** ✅ Implemented — `parse_ospf()` handles area-nested interface blocks
+**Parsing Status:** ✅ Implemented — `parse_ospf()` handles area-nested interface blocks with area-type detection and full interface sub-attribute extraction
 
 ---
 
@@ -527,13 +550,14 @@ ParsedConfig                Standard model used by all OS types
 ## Parser Limitations
 
 1. **Set-style config not supported** — Only brace-style (hierarchical) config is parsed. Convert with `show configuration` (not `show configuration | display set`) before using confgraph.
-2. **IS-IS** — Detected in `protocols isis` block but parsed as a stub (no IS-IS model populated).
-3. **MPLS / LDP / RSVP / Segment Routing** — Not parsed.
-4. **EVPN / VXLAN** — Not parsed.
-5. **Policy-statement full semantics** — Complex if/then/else constructs and `apply-path` are best-effort; only `prefix-list`, `community`, `as-path` references in `from` blocks are extracted.
-6. **Firewall filter match conditions** — Only the action (accept/discard) is captured; source/destination address match conditions in filter terms are not parsed into ACLEntry fields.
-7. **IPv6 routing protocols** — Limited coverage.
-8. **Multi-chassis / Virtual Chassis** — Not parsed.
+2. **IS-IS** — Not implemented.
+3. **MPLS / LDP / RSVP / Segment Routing / VXLAN / Multicast** — Not parsed.
+4. **EVPN / L2 / Switching** — Not parsed.
+5. **VRRP** — Not parsed.
+6. **LLDP / BFD** — Not parsed.
+7. **AAA / DNS / DHCP** — Not parsed.
+8. **Policy-statement full semantics** — Complex if/then/else constructs and `apply-path` are best-effort; only `prefix-list`, `community`, `as-path` references in `from` blocks are extracted.
+9. **Firewall filter match conditions** — Only the action (accept/discard) is captured; source/destination address match conditions in filter terms are not parsed into ACLEntry fields.
 
 ---
 
@@ -588,5 +612,5 @@ confgraph map  samples/junos_test.cfg --os junos --lint
 
 ---
 
-**Last Updated:** 2026-04-14
+**Last Updated:** 2026-06-22
 **Parser Version:** 1.0.0

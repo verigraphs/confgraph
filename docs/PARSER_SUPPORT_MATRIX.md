@@ -4,7 +4,7 @@
 
 Comprehensive overview of parser support across all network operating systems in confgraph. Each parser inherits from either `BaseParser` (abstract base) or `IOSParser` (reference implementation). EOS, IOS-XR, and NX-OS extend IOSParser and inherit methods where syntax is compatible.
 
-**Last Updated:** June 14, 2026
+**Last Updated:** June 22, 2026
 
 ---
 
@@ -15,7 +15,7 @@ Comprehensive overview of parser support across all network operating systems in
 | **Cisco IOS / IOS-XE** | `IOSParser` | `BaseParser` | 39 methods | ✅ Reference implementation |
 | **Arista EOS** | `EOSParser` | `IOSParser` | 11 overrides + 28 inherited | ✅ Complete |
 | **Cisco IOS-XR** | `IOSXRParser` | `IOSParser` | 14 overrides + 25 inherited | ✅ Complete |
-| **Cisco NX-OS** | `NXOSParser` | `IOSParser` | 10 overrides + 31 inherited | ✅ Complete |
+| **Cisco NX-OS** | `NXOSParser` | `IOSParser` | 19 overrides + 22 inherited | ✅ Complete |
 | **Juniper JunOS** | `JunOSParser` | `BaseParser` | 13 methods | ✅ Core protocols |
 | **Palo Alto PAN-OS** | `PANOSParser` | `BaseParser` | 9 methods | ✅ Security-focused |
 
@@ -121,8 +121,8 @@ Notes:
 | **Syslog** | ✅ | ✅ (inherited) | ✅ (inherited) | ✅ | ✅ | ❌ |
 | **BFD** | ✅ | ✅ | ✅ | ✅ (inherited) | ❌ | ❌ |
 | **NetFlow** | ✅ | ✅ (inherited) | ✅ (inherited) | ✅ (inherited) | ❌ | ❌ |
-| **LLDP** | ✅ | ✅ (inherited) | ✅ (inherited) | ✅ (inherited) | ❌ | ❌ |
-| **CDP** | ✅ | ✅ (inherited) | ✅ (inherited) | ✅ (inherited) | ❌ | ❌ |
+| **LLDP** | ✅ | ✅ (inherited) | ✅ (inherited) | ✅ | ❌ | ❌ |
+| **CDP** | ✅ | ✅ (inherited) | ✅ (inherited) | ✅ | ❌ | ❌ |
 
 Notes:
 - IOS-XR NTP override handles hierarchical `ntp` block
@@ -134,7 +134,7 @@ Notes:
 
 | Protocol | IOS/IOS-XE | EOS | IOS-XR | NX-OS | JunOS | PAN-OS |
 |----------|------------|-----|--------|-------|-------|--------|
-| **AAA** | ✅ | ✅ (inherited) | ✅ (inherited) | ✅ (inherited) | ❌ | ❌ |
+| **AAA** | ✅ | ✅ (inherited) | ✅ (inherited) | ✅ | ❌ | ❌ |
 | **NAT** | ✅ | ✅ (inherited) | ✅ (inherited) | ✅ (inherited) | ❌ | ✅ |
 | **Crypto/IPsec** | ✅ | ✅ (inherited) | ✅ (inherited) | ✅ (inherited) | ❌ | ✅ |
 | **Security Zones** | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ |
@@ -147,8 +147,8 @@ Notes:
 
 | Protocol | IOS/IOS-XE | EOS | IOS-XR | NX-OS | JunOS | PAN-OS |
 |----------|------------|-----|--------|-------|-------|--------|
-| **DNS** | ✅ | ✅ (inherited) | ✅ (inherited) | ✅ (inherited) | ❌ | ❌ |
-| **DHCP** | ✅ | ✅ (inherited) | ✅ (inherited) | ✅ (inherited) | ❌ | ❌ |
+| **DNS** | ✅ | ✅ | ✅ (inherited) | ✅ | ❌ | ❌ |
+| **DHCP** | ✅ | ✅ (inherited) | ✅ | ✅ (inherited) | ❌ | ❌ |
 
 ### High Availability (Interface-Level)
 
@@ -269,7 +269,7 @@ The simulation engine in `confgraph-entrp` provides service-level impact assessm
 | `test_interface_normalize.py` | Interface name normalization | ✅ Passing |
 | `test_parser_mpls_vpc_gaps.py` | MPLS (IOS-XR, EOS, NX-OS) + EOS MLAG | ✅ Passing |
 
-**Total: 196 tests passing** (confgraph repo)
+**Total: 429 tests passing** (confgraph repo)
 
 ---
 
@@ -282,7 +282,7 @@ BaseParser (ABC) ─── 40 parse_* methods defined
 ├── IOSParser ─────── 39 implemented (reference parser)
 │   ├── EOSParser ─── 11 overrides (VRF, prefix-lists, ACLs, IS-IS, BFD, VXLAN, MPLS, MLAG, ...)
 │   ├── IOSXRParser ─ 14 overrides (VRF, interfaces, OSPF, route-maps, prefix-lists, ACLs, IS-IS, multicast, MPLS, NTP, BFD, ...)
-│   └── NXOSParser ── 10 overrides (VRF, interfaces, BGP, OSPF, static-routes, NTP, syslog, VXLAN, VPC, MPLS)
+│   └── NXOSParser ── 19 overrides (VRF, interfaces, BGP, OSPF, static-routes, NTP, syslog, VXLAN, VPC, MPLS, LLDP, CDP, DNS, AAA, deletion-commands)
 ├── JunOSParser ───── 13 methods (core routing + management)
 └── PANOSParser ───── 9 methods (routing + security/NAT/zones)
 ```

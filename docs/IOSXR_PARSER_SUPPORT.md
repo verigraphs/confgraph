@@ -14,7 +14,7 @@ The IOS-XR parser (`confgraph.parsers.iosxr_parser.IOSXRParser`) parses Cisco IO
 ## Key Syntax Differences from IOS
 
 | Feature | IOS | IOS-XR |
-|---------|-----|--------|
+| ------- | --- | ------ |
 | VRF definition | `vrf definition NAME` | `vrf NAME` (no keyword) |
 | VRF route-targets | inline children | multi-line under `import/export route-target` stanzas |
 | Interface VRF | `vrf forwarding NAME` | `vrf NAME` (no keyword) |
@@ -41,7 +41,8 @@ The IOS-XR parser (`confgraph.parsers.iosxr_parser.IOSXRParser`) parses Cisco IO
 ### 1. VRF Configuration
 
 **Syntax:**
-```
+
+```text
 vrf <name>
   description <text>
   address-family ipv4 unicast
@@ -54,24 +55,29 @@ vrf <name>
 ```
 
 **IOS-XR-Specific Differences:**
+
 - VRF defined with `vrf NAME` (no `definition` keyword)
 - Route-targets listed under `import route-target` / `export route-target` stanzas as children
 - Import/export policies use `route-policy` instead of `route-map`
 
 **Supported Attributes:**
+
 - VRF name
 - Route distinguisher (RD)
 - Route-target import/export (nested stanza format)
 - Import/export route-policies
 
-**Parsing Status:** ✅ Overridden — `parse_vrfs()` handles `vrf NAME` with nested `import/export route-target` blocks and `import/export route-policy`
+**Note:** VRF RD is populated from the `vrf NAME` block when present. If not defined there (IOS-XR commonly defines RD under `router bgp / vrf NAME / rd X:Y`), the `parse()` override back-fills `VRFConfig.rd` from the BGP VRF block after both `parse_vrfs()` and `parse_bgp()` have run.
+
+**Parsing Status:** ✅ Overridden — `parse_vrfs()` handles `vrf NAME` with nested `import/export route-target` blocks and `import/export route-policy`; `parse()` back-fills RD from BGP VRF blocks when absent
 
 ---
 
 ### 2. Interface Configuration
 
 **Syntax:**
-```
+
+```text
 interface <type><number>
   description <text>
   vrf <vrf-name>
@@ -83,12 +89,14 @@ interface <type><number>
 ```
 
 **IOS-XR-Specific Differences:**
+
 - **VRF:** `vrf NAME` (no `forwarding` keyword)
 - **IP address:** `ipv4 address X MASK` instead of `ip address X MASK`
 - **Interface ACL:** `ipv4 access-group NAME ingress|egress` instead of `ip access-group NAME in|out`
 - OSPF interface membership is declared inside the OSPF block (not on the interface)
 
 **Supported Attributes:**
+
 - All standard interface attributes (name, description, shutdown)
 - IPv4/IPv6 addresses
 - VRF membership
@@ -101,7 +109,8 @@ interface <type><number>
 ### 3. BGP Configuration
 
 **Syntax:**
-```
+
+```text
 router bgp <asn>
   bgp router-id <router-id>
   neighbor-group <name>
@@ -133,14 +142,18 @@ router bgp <asn>
 - VRF BGP as `vrf NAME` block under `router bgp`
 
 **Supported Attributes:**
+
 - All standard BGP attributes
 - Block-style neighbor parsing with per-neighbor AF policies
 - Neighbor-groups (equivalent to IOS peer-groups)
 - VRF BGP instances with route-policy in/out
 
+**Note:** `_parse_iosxr_neighbor_block` uses `.children` (direct children only) when collecting AF-level `route-policy` assignments. Using `.all_children` caused last-wins flattening when a neighbor had multiple address-family sub-blocks with distinct policies.
+
 **Parsing Status:**
+
 - ✅ Overridden — `_parse_bgp_neighbors()` handles block-style neighbor syntax
-- ✅ Overridden — `_apply_bgp_af_neighbor_policies()` reads `route-policy NAME in/out` from per-neighbor AF sub-blocks
+- ✅ Overridden — `_apply_bgp_af_neighbor_policies()` reads `route-policy NAME in/out` from per-neighbor AF sub-blocks (`.children` scoping prevents cross-AF flattening)
 - ✅ Overridden — `_parse_bgp_peer_groups()` handles `neighbor-group NAME` blocks
 - ✅ Overridden — `_parse_bgp_vrf_instances()` handles `vrf NAME` blocks with block-style VRF neighbors
 
@@ -149,7 +162,8 @@ router bgp <asn>
 ### 4. OSPF Configuration
 
 **Syntax:**
-```
+
+```text
 router ospf <process-id>
   router-id <router-id>
   log adjacency changes detail
@@ -162,25 +176,30 @@ router ospf <process-id>
 ```
 
 **IOS-XR-Specific Differences:**
+
 - Interface membership is declared inside the OSPF block under `area N` → `interface NAME` stanzas
 - Passive interfaces are indicated by `passive enable` inside the interface stanza
 - Redistribution uses `route-policy` instead of `route-map`
 
 **Supported Attributes:**
+
 - Process ID, router-id
 - Areas with nested interface assignments
 - Area types (stub, NSSA)
 - Passive interfaces (detected via `passive enable` within interface stanza)
 - Redistribution with route-policy
 
-**Parsing Status:** ✅ Overridden — `parse_ospf()` and `_parse_ospf_areas_iosxr()` handle area-nested interface blocks and `passive enable` detection
+**Note:** `InterfaceConfig.ospf_area` and `ospf_process_id` are back-filled from OSPF area blocks during a `parse()` override. Because IOS-XR declares interface→area membership inside the OSPF block (not on the interface), these fields cannot be populated during `parse_interfaces()` alone.
+
+**Parsing Status:** ✅ Overridden — `parse_ospf()`, `_parse_ospf_areas_iosxr()`, and `parse()` (back-fill) handle area-nested interface blocks, `passive enable` detection, and `InterfaceConfig.ospf_area` / `ospf_process_id` population
 
 ---
 
 ### 5. Route-Maps (Route-Policies)
 
 **Syntax:**
-```
+
+```text
 route-policy <name>
   if destination in <prefix-set> then
     set local-preference <value>
@@ -192,11 +211,13 @@ end-policy
 ```
 
 **IOS-XR-Specific Differences:**
+
 - `route-policy NAME` / `end-policy` blocks replace IOS `route-map` sequences
 - Policy body uses an if/then/else language
 - `set` and `pass`/`drop` statements replace IOS set/permit/deny
 
 **Supported Attributes:**
+
 - Policy name
 - Best-effort match extraction: `if destination in PREFIX_SET` → match clause
 - Best-effort set extraction: `set` commands → set clauses
@@ -211,7 +232,8 @@ end-policy
 ### 6. Prefix-Lists (Prefix-Sets)
 
 **Syntax:**
-```
+
+```text
 prefix-set <name>
   10.0.0.0/8 le 32,
   192.168.0.0/16 ge 24 le 32,
@@ -220,11 +242,13 @@ end-set
 ```
 
 **IOS-XR-Specific Differences:**
+
 - `prefix-set NAME` / `end-set` blocks replace IOS `ip prefix-list`
 - Entries are comma-separated within the block
 - No per-entry sequence numbers or permit/deny keywords; the set is referenced by route-policies
 
 **Supported Attributes:**
+
 - Set name
 - Prefix entries (network/length, ge/le modifiers)
 
@@ -235,7 +259,8 @@ end-set
 ### 7. AS-Path Lists (AS-Path Sets)
 
 **Syntax:**
-```
+
+```text
 as-path-set <name>
   ios-regex '^65000_',
   ios-regex '_65001_'
@@ -243,6 +268,7 @@ end-set
 ```
 
 **IOS-XR-Specific Differences:**
+
 - `as-path-set NAME` / `end-set` blocks replace IOS `ip as-path access-list`
 - Entries use `ios-regex` keyword
 
@@ -253,7 +279,8 @@ end-set
 ### 8. Community Lists (Community-Sets and Extcommunity-Sets)
 
 **Syntax:**
-```
+
+```text
 community-set <name>
   65000:100,
   65000:200
@@ -266,6 +293,7 @@ end-set
 ```
 
 **IOS-XR-Specific Differences:**
+
 - `community-set NAME` / `end-set` blocks replace IOS `ip community-list`
 - `extcommunity-set rt NAME` / `end-set` blocks capture extended communities used as route-targets; stored as `CommunityListConfig` with `list_type="extended"`
 
@@ -276,7 +304,8 @@ end-set
 ### 9. ACLs
 
 **Syntax:**
-```
+
+```text
 ipv4 access-list INBOUND-ISP1
  10 deny ipv4 any host 10.0.0.1
  20 permit ipv4 any any
@@ -297,7 +326,8 @@ ipv6 access-list INBOUND-V6
 ### 10. Static Routes
 
 **Syntax:**
-```
+
+```text
 router static
  address-family ipv4 unicast
   0.0.0.0/0 192.168.1.1
@@ -321,7 +351,8 @@ router static
 ### 11. Multicast
 
 **Syntax:**
-```
+
+```text
 router pim
  address-family ipv4
   rp-address 10.0.0.1
@@ -340,12 +371,69 @@ multicast-routing
 
 ---
 
-### 12. Extended Protocol Support (Inherited from IOSParser)
+### 12. DHCP
+
+**Syntax:**
+
+```text
+dhcp ipv4
+  profile GUEST-POOL server
+   pool
+    network 192.168.100.0/24
+    default-router 192.168.100.1
+   helper-address vrf default 10.0.0.10
+```
+
+**IOS-XR-Specific Differences:**
+
+- DHCP is configured under a `dhcp ipv4` block with named `profile` sub-blocks, not as `ip dhcp pool` (IOS)
+- Helper-address entries are nested within profile blocks
+
+**Supported Attributes:**
+
+- Pool name (from profile block name)
+- Helper addresses (extracted from `helper-address` lines within profile blocks)
+
+**Parsing Status:** ✅ Overridden — `parse_dhcp()` handles `dhcp ipv4` profile blocks; the IOS `ip dhcp pool` path is not used
+
+---
+
+### 13. Deletion Commands
+
+IOS-XR uses a different `no`-command vocabulary from IOS. `parse_deletion_commands()` is fully overridden and does **not** inherit any IOS tombstone forms.
+
+**IOS-XR tombstone forms:**
+
+| Command | Tombstone emitted |
+| ------- | ----------------- |
+| `no router ospf PROC` | `singleton:ospf` |
+| `no router bgp ASN` | `singleton:bgp` |
+| `no router isis TAG` | `singleton:isis` |
+| `no router eigrp ASN` | `singleton:eigrp` |
+| `no router rip` | `singleton:rip` |
+| `no router static` | `singleton:static_routes` |
+| `no vrf NAME` | `singleton:vrf:NAME` |
+| `no route-policy NAME` | `route_map:NAME` |
+| `no prefix-set NAME` | `prefix_list:NAME` |
+| `no community-set NAME` | `community_list:NAME` |
+| `no extcommunity-set NAME` | `extcommunity_list:NAME` |
+| `no as-path-set NAME` | `as_path_list:NAME` |
+| `no ntp` | `singleton:ntp` |
+| `no snmp-server` | `singleton:snmp` |
+| `no logging` | `singleton:logging` |
+| `no bfd` | `singleton:bfd` |
+| `no flow` | `singleton:flow` |
+
+**Parsing Status:** ✅ Overridden — `parse_deletion_commands()` maps the IOS-XR `no` forms above to tombstones; IOS tombstone logic is not called
+
+---
+
+### 14. Extended Protocol Support (Inherited from IOSParser)
 
 The following protocols use IOS-identical syntax in IOS-XR:
 
 | Protocol | Parsing Status |
-|----------|---------------|
+| -------- | -------------- |
 | NTP | ✅ Inherited from IOSParser |
 | SNMP | ✅ Inherited from IOSParser |
 | Syslog | ✅ Inherited from IOSParser |
@@ -364,12 +452,15 @@ See [IOS_PARSER_SUPPORT.md](IOS_PARSER_SUPPORT.md) for full syntax and attribute
 ## Overridden Methods Summary
 
 | Method | Reason for Override |
-|--------|---------------------|
+| ------ | ------------------- |
+| `parse()` | Back-fills `InterfaceConfig.ospf_area` / `ospf_process_id` from OSPF blocks; back-fills `VRFConfig.rd` from BGP VRF blocks |
 | `parse_vrfs()` | Handles `vrf NAME` with nested `import/export route-target` blocks and `import/export route-policy` |
 | `_extract_interface_vrf()` | Handles `vrf NAME` (no `forwarding` keyword) |
 | `parse_interfaces()` | Handles `ipv4 address X MASK`, `vrf NAME`, and `ipv4 access-group NAME ingress\|egress` |
 | `parse_acls()` | Handles `ipv4 access-list NAME` and `ipv6 access-list NAME` blocks |
 | `parse_static_routes()` | Handles `router static` block with nested `address-family` and `vrf` sub-blocks |
+| `parse_dhcp()` | Handles `dhcp ipv4` profile blocks; does not use IOS `ip dhcp pool` path |
+| `parse_deletion_commands()` | IOS-XR-specific tombstone forms; does not inherit IOS tombstone logic |
 | `_parse_bgp_neighbors()` | Handles block-style neighbor syntax (`neighbor X\n  remote-as Y`) |
 | `_apply_bgp_af_neighbor_policies()` | Reads `route-policy NAME in/out` from per-neighbor `address-family` sub-blocks |
 | `_parse_bgp_peer_groups()` | Handles `neighbor-group NAME` blocks |
@@ -397,7 +488,8 @@ See [IOS_PARSER_SUPPORT.md](IOS_PARSER_SUPPORT.md) for full syntax and attribute
 **Sample Configuration:** `samples/iosxr_test.cfg`
 
 **Validated output (`confgraph info samples/iosxr_test.cfg --os iosxr`):**
-```
+
+```text
 Hostname : XR-CORE-01
 OS       : ios_xr
 Interfaces         2
@@ -432,5 +524,5 @@ confgraph info samples/iosxr_test.cfg --os iosxr
 
 ---
 
-**Last Updated:** 2026-04-13
+**Last Updated:** 2026-06-22
 **Parser Version:** 1.2.0

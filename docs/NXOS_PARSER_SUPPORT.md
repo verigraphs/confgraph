@@ -165,29 +165,125 @@ router ospf <process-id>
 
 ---
 
-### 9. Extended Protocol Support (Inherited from IOSParser)
+### 9. VXLAN Configuration
 
-The following protocols use IOS-identical syntax in NX-OS:
+**Syntax:**
+```
+vlan <id>
+  vn-segment <vni-id>
 
-| Protocol | Parsing Status |
-|----------|---------------|
-| NTP | ✅ Inherited from IOSParser |
-| SNMP | ✅ Inherited from IOSParser |
-| Syslog | ✅ Inherited from IOSParser |
-| Banners | ✅ Inherited from IOSParser |
-| Line configs (con/vty) | ✅ Inherited from IOSParser |
-| QoS (class-map/policy-map) | ✅ Inherited from IOSParser |
-| NAT | ✅ Inherited from IOSParser |
-| Crypto/IPsec | ✅ Inherited from IOSParser |
-| BFD | ✅ Inherited from IOSParser |
-| IP SLA | ✅ Inherited from IOSParser |
-| EEM Applets | ✅ Inherited from IOSParser |
-| Object Tracking | ✅ Inherited from IOSParser |
-| Multicast (PIM/IGMP) | ✅ Inherited from IOSParser |
-| Static Routes | ✅ Inherited from IOSParser |
-| ACLs | ✅ Inherited from IOSParser |
+interface nve1
+  source-interface loopback0
+  host-reachability protocol bgp
+  member vni <l2-vni>
+    mcast-group <address>
+    suppress-arp
+  member vni <l3-vni> associate-vrf
+```
 
-See [IOS_PARSER_SUPPORT.md](IOS_PARSER_SUPPORT.md) for full syntax and attribute details.
+**Supported Attributes:**
+
+- VNI-to-VLAN mapping via `vn-segment` under VLAN blocks
+- All NVE interfaces (not just first)
+- Source interface
+- Host reachability protocol
+- Per-VNI multicast group
+- Per-VNI ARP suppression
+- L3 VNI (`associate-vrf`)
+
+**Parsing Status:** ✅ Overridden — `parse_vxlan()` handles NVE interfaces and `vn-segment` VLAN mappings
+
+---
+
+### 10. VPC Configuration
+
+**Syntax:**
+```
+vpc domain <id>
+  role priority <value>
+  system-priority <value>
+  peer-keepalive destination <ip> source <ip> vrf <vrf>
+  delay restore <seconds>
+  auto-recovery
+
+interface port-channel<N>
+  vpc peer-link
+
+interface port-channel<M>
+  vpc <vpc-id>
+```
+
+**Supported Attributes:**
+
+- VPC domain ID, role priority, system priority
+- Peer-keepalive destination, source, and VRF
+- Delay restore, auto-recovery
+- Per-interface VPC membership (parsed via interface parser)
+
+**Parsing Status:** ✅ Overridden — `parse_vpc()` handles `vpc domain` block; per-interface `vpc N` membership parsed in `parse_interfaces()`
+
+---
+
+### 11. MPLS/LDP Configuration
+
+**Syntax:**
+```
+mpls ldp configuration
+  router-id <interface>
+  graceful-restart
+  session protection
+  password required
+```
+
+**Supported Attributes:**
+
+- Router-ID interface
+- Graceful restart
+- Session protection
+- Password enforcement
+
+**Parsing Status:** ✅ Overridden — `parse_mpls()` handles `mpls ldp configuration` block
+
+---
+
+### 12. Extended Protocol Support
+
+| Protocol | Parsing Status | NX-OS Notes |
+| -------- | -------------- | ----------- |
+| NTP | ✅ Overridden | Handles `use-vrf` keyword, `ntp source-interface` |
+| Syslog | ✅ Overridden | Handles `logging server` with `use-vrf`, per-server severity, `logging off` / `no logging on` |
+| LLDP | ✅ Overridden | NX-OS uses `feature lldp` to enable; defaults to disabled |
+| CDP | ✅ Overridden | NX-OS uses `feature cdp` to enable; defaults to disabled |
+| DNS | ✅ Overridden | Scans `vrf context` blocks for per-VRF name-servers |
+| AAA | ✅ Overridden | Parses `aaa group server tacacs+/radius NAME` child `server` members |
+| Static Routes | ✅ Overridden | Parses routes inside `vrf context` blocks |
+| ACLs | ✅ Inherited | NX-OS keyword-less `ip access-list NAME` form accepted by IOS parser |
+| SNMP | ✅ Inherited from IOSParser | |
+| Banners | ✅ Inherited from IOSParser | |
+| Line configs (con/vty) | ✅ Inherited from IOSParser | |
+| QoS (class-map/policy-map) | ✅ Inherited from IOSParser | |
+| NAT | ✅ Inherited from IOSParser | |
+| Crypto/IPsec | ✅ Inherited from IOSParser | |
+| BFD | ✅ Inherited from IOSParser | |
+| IP SLA | ✅ Inherited from IOSParser | |
+| EEM Applets | ✅ Inherited from IOSParser | |
+| Object Tracking | ✅ Inherited from IOSParser | |
+| Multicast (PIM/IGMP) | ✅ Inherited from IOSParser | |
+
+See [IOS_PARSER_SUPPORT.md](IOS_PARSER_SUPPORT.md) for full syntax and attribute details on inherited protocols.
+
+---
+
+### 13. Deletion Commands
+
+NX-OS inherits all IOS tombstone types and adds the following NX-OS-specific tombstones:
+
+| Command | Tombstone Emitted |
+|---------|-------------------|
+| `no member vni <id>` | `field:vxlan:vni:<id>` |
+| `no peer-keepalive` | `field:vpc:peer_keepalive_*` |
+
+**Parsing Status:** ✅ Overridden — `parse_deletion_commands()` emits NX-OS-specific tombstones in addition to inherited IOS tombstones
 
 ---
 
@@ -197,15 +293,29 @@ See [IOS_PARSER_SUPPORT.md](IOS_PARSER_SUPPORT.md) for full syntax and attribute
 |--------|---------------------|
 | `parse_vrfs()` | Handles `vrf context NAME`, nested address-family RTs |
 | `_extract_interface_vrf()` | Handles `vrf member NAME` |
-| `parse_interfaces()` | CIDR notation + `ip router ospf` for OSPF membership |
+| `parse_interfaces()` | CIDR notation, `ip router ospf`, VPC membership |
 | `_parse_bgp_peer_groups()` | Handles `template peer NAME` blocks |
+| `_parse_bgp_neighbors()` | Handles nested neighbor blocks + `inherit peer NAME` |
 | `_parse_bgp_vrf_instances()` | Handles `vrf NAME` blocks under router bgp |
+| `parse_bgp()` | Peer-group attribute inheritance after parse |
+| `parse_ospf()` | Extracts VRF from `router ospf N vrf NAME` header |
+| `parse_static_routes()` | Parses routes inside `vrf context` blocks |
+| `parse_ntp()` | Handles `use-vrf`, `ntp source-interface` |
+| `parse_syslog()` | Handles `logging server` with `use-vrf`, `logging off` |
+| `parse_lldp()` | `feature lldp` as enable signal (NX-OS defaults disabled) |
+| `parse_cdp()` | `feature cdp` as enable signal (NX-OS defaults disabled) |
+| `parse_dns()` | Scans `vrf context` blocks for per-VRF DNS |
+| `parse_aaa()` | Parses `aaa group server` child `server` members |
+| `parse_vxlan()` | All NVE interfaces, `vn-segment`, mcast-group, suppress-arp |
+| `parse_vpc()` | `vpc domain` block + peer-link detection |
+| `parse_mpls()` | `mpls ldp configuration` block |
+| `parse_deletion_commands()` | NX-OS-specific tombstones (VNI, VPC) |
 
 ---
 
 ## Parser Limitations
 
-1. **NX-OS Fabric features** — VPC, VXLAN/EVPN, FabricPath not parsed
+1. **FabricPath** — Not parsed
 2. **IPv6 routing** — Limited IPv6 routing protocol coverage
 3. **NX-OS-specific features** — Port profiles, role-based access control not parsed
 
@@ -245,5 +355,4 @@ uv run python test_nxos_parser.py
 
 ---
 
-**Last Updated:** 2026-03-28
-**Parser Version:** 1.1.0
+**Last Updated:** 2026-06-22
