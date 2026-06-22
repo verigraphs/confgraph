@@ -844,16 +844,24 @@ class NXOSParser(IOSParser):
 
         parse = self._get_parse_obj()
         log_objs = parse.find_objects(r"^logging\s+")
-        if not log_objs:
+
+        # Check for "no logging on" separately (regex above won't match it)
+        no_log_objs = parse.find_objects(r"^no\s+logging\s+on\s*$")
+
+        if not log_objs and not no_log_objs:
             return None
 
         hosts = []
         buffered_size = buffered_level = None
         console_level = monitor_level = None
         source_interface = None
-        enabled = True
+        enabled = not bool(no_log_objs)
         raw_lines = []
         line_numbers = []
+
+        for obj in no_log_objs:
+            raw_lines.append(obj.text)
+            line_numbers.append(obj.linenum)
 
         for obj in log_objs:
             raw_lines.append(obj.text)
@@ -895,7 +903,7 @@ class NXOSParser(IOSParser):
                 console_level = self._extract_match(t, r"^logging\s+console\s+(\S+)")
             elif re.match(r"^logging\s+monitor\s+", t):
                 monitor_level = self._extract_match(t, r"^logging\s+monitor\s+(\S+)")
-            elif "no logging" in t or "logging off" in t:
+            elif t == "logging off":
                 enabled = False
 
         return SyslogConfig(
@@ -917,9 +925,14 @@ class NXOSParser(IOSParser):
     # -------------------------------------------------------------------
 
     def parse_vxlan(self) -> "VXLANConfig | None":
-        """Parse VXLAN configuration from ``interface nve1``.
+        """Parse VXLAN configuration from all ``interface nve`` interfaces.
 
         Handles::
+
+            vlan 10
+              vn-segment 10010
+            vlan 20
+              vn-segment 10020
 
             interface nve1
               no shutdown
@@ -937,34 +950,68 @@ class NXOSParser(IOSParser):
         if not nve_objs:
             return None
 
-        nve_intf = nve_objs[0]
+        # Build VNI→VLAN map from "vlan X / vn-segment Y" blocks
+        vni_to_vlan: dict[int, int] = {}
+        vlan_objs = parse.find_objects(r"^vlan\s+\d+\s*$")
+        for vlan_obj in vlan_objs:
+            vlan_m = re.match(r"^vlan\s+(\d+)", vlan_obj.text)
+            if not vlan_m:
+                continue
+            vlan_id = int(vlan_m.group(1))
+            for child in vlan_obj.children:
+                vnseg_m = re.match(r"\s+vn-segment\s+(\d+)", child.text)
+                if vnseg_m:
+                    vni_to_vlan[int(vnseg_m.group(1))] = vlan_id
+
         source_interface = None
         vni_mappings: list[VXLANVniMapping] = []
+        raw_lines: list[str] = []
+        line_numbers: list[int] = []
 
-        for child in nve_intf.children:
-            t = child.text.strip()
+        for nve_intf in nve_objs:
+            raw_lines.append(nve_intf.text)
+            line_numbers.append(nve_intf.linenum)
 
-            m = re.match(r"source-interface\s+(\S+)", t, re.IGNORECASE)
-            if m:
-                source_interface = m.group(1)
-                continue
+            for child in nve_intf.children:
+                raw_lines.append(child.text)
+                line_numbers.append(child.linenum)
+                t = child.text.strip()
 
-            m = re.match(r"member\s+vni\s+(\d+)(?:\s+associate-vrf)?", t)
-            if m:
-                vni = int(m.group(1))
-                is_l3 = "associate-vrf" in t
-                vni_mappings.append(VXLANVniMapping(
-                    vni=vni,
-                    vrf="(L3)" if is_l3 else None,
-                    vlan=None,
-                ))
-                continue
+                m = re.match(r"source-interface\s+(\S+)", t, re.IGNORECASE)
+                if m:
+                    source_interface = m.group(1)
+                    continue
+
+                m = re.match(r"member\s+vni\s+(\d+)(?:\s+associate-vrf)?", t)
+                if m:
+                    vni = int(m.group(1))
+                    is_l3 = "associate-vrf" in t
+                    # Parse sub-attributes from VNI member children
+                    mcast_group = None
+                    suppress_arp = False
+                    for sub in child.children:
+                        raw_lines.append(sub.text)
+                        line_numbers.append(sub.linenum)
+                        st = sub.text.strip()
+                        mg = re.match(r"mcast-group\s+(\S+)", st)
+                        if mg:
+                            mcast_group = mg.group(1)
+                        elif st == "suppress-arp":
+                            suppress_arp = True
+                    vni_mappings.append(VXLANVniMapping(
+                        vni=vni,
+                        vlan=vni_to_vlan.get(vni),
+                        vrf="(L3)" if is_l3 else None,
+                        mcast_group=mcast_group,
+                        suppress_arp=suppress_arp,
+                    ))
+                    continue
 
         return VXLANConfig(
             object_id="vxlan",
-            raw_lines=[nve_intf.text] + [c.text for c in nve_intf.children],
+            raw_lines=raw_lines,
             source_os=self.os_type,
-            line_numbers=[],
+            line_numbers=line_numbers,
             source_interface=source_interface,
             vni_mappings=vni_mappings,
         )
@@ -1021,10 +1068,16 @@ class NXOSParser(IOSParser):
 
             m = re.match(r"peer-keepalive\s+destination\s+(\S+)", t)
             if m:
-                peer_ka_dst = IPv4Address(m.group(1))
+                try:
+                    peer_ka_dst = IPv4Address(m.group(1))
+                except ValueError:
+                    continue
                 src_m = re.search(r"source\s+(\S+)", t)
                 if src_m:
-                    peer_ka_src = IPv4Address(src_m.group(1))
+                    try:
+                        peer_ka_src = IPv4Address(src_m.group(1))
+                    except ValueError:
+                        pass
                 vrf_m = re.search(r"vrf\s+(\S+)", t)
                 if vrf_m:
                     peer_ka_vrf = vrf_m.group(1)
@@ -1052,7 +1105,7 @@ class NXOSParser(IOSParser):
             object_id="vpc",
             raw_lines=[vpc_obj.text] + [c.text for c in vpc_obj.children],
             source_os=self.os_type,
-            line_numbers=[],
+            line_numbers=[vpc_obj.linenum] + [c.linenum for c in vpc_obj.children],
             domain_id=domain_id,
             role_priority=role_priority,
             system_priority=system_priority,
@@ -1159,7 +1212,7 @@ class NXOSParser(IOSParser):
             object_id="mpls",
             raw_lines=raw,
             source_os=self.os_type,
-            line_numbers=[],
+            line_numbers=[ldp_obj.linenum] + [c.linenum for c in ldp_obj.children],
             ldp_router_id=ldp_router_id,
             ldp_router_id_force=ldp_router_id_force,
             ldp_enabled=ldp_enabled,
@@ -1167,3 +1220,287 @@ class NXOSParser(IOSParser):
             ldp_session_protection=ldp_session_protection,
             ldp_password=ldp_password,
         )
+
+    # -------------------------------------------------------------------
+    # LLDP — NX-OS uses "feature lldp" (N7)
+    # -------------------------------------------------------------------
+
+    def parse_lldp(self):
+        """Parse LLDP, treating ``feature lldp`` as the NX-OS enable signal.
+
+        NX-OS defaults LLDP to **disabled**; ``feature lldp`` enables it.
+        The inherited IOS parser looks for ``lldp run`` which NX-OS does not
+        use.  This override checks ``feature lldp`` first, then delegates to
+        the parent for timer/holdtime/tlv-select parsing.
+        """
+        from confgraph.models.lldp import LLDPConfig
+
+        parse = self._get_parse_obj()
+
+        feature_objs = parse.find_objects(r"^(?:no\s+)?feature\s+lldp\b")
+        lldp_objs = parse.find_objects(r"^(?:no\s+)?lldp\b")
+
+        if not feature_objs and not lldp_objs:
+            return None
+
+        # NX-OS default: LLDP disabled unless "feature lldp" is present
+        enabled = False
+        for obj in feature_objs:
+            t = obj.text.strip()
+            if t == "feature lldp":
+                enabled = True
+            elif t == "no feature lldp":
+                enabled = False
+
+        timer = holdtime = reinit = None
+        tlv_select: list[str] = []
+        raw_lines: list[str] = []
+        line_numbers: list[int] = []
+
+        for obj in feature_objs:
+            raw_lines.append(obj.text)
+            line_numbers.append(obj.linenum)
+
+        for obj in lldp_objs:
+            raw_lines.append(obj.text)
+            line_numbers.append(obj.linenum)
+            t = obj.text.strip()
+            if re.match(r"^lldp\s+timer\s+", t):
+                v = self._extract_match(t, r"^lldp\s+timer\s+(\d+)")
+                if v:
+                    timer = int(v)
+            elif re.match(r"^lldp\s+holdtime\s+", t):
+                v = self._extract_match(t, r"^lldp\s+holdtime\s+(\d+)")
+                if v:
+                    holdtime = int(v)
+            elif re.match(r"^lldp\s+reinit\s+", t):
+                v = self._extract_match(t, r"^lldp\s+reinit\s+(\d+)")
+                if v:
+                    reinit = int(v)
+            elif re.match(r"^lldp\s+tlv-select\s+", t):
+                tlv = self._extract_match(t, r"^lldp\s+tlv-select\s+(\S+)")
+                if tlv:
+                    tlv_select.append(tlv)
+
+        return LLDPConfig(
+            object_id="lldp",
+            raw_lines=raw_lines,
+            source_os=self.os_type,
+            line_numbers=line_numbers,
+            enabled=enabled,
+            timer=timer,
+            holdtime=holdtime,
+            reinit=reinit,
+            tlv_select=tlv_select,
+        )
+
+    # -------------------------------------------------------------------
+    # CDP — NX-OS uses "feature cdp" (N7)
+    # -------------------------------------------------------------------
+
+    def parse_cdp(self):
+        """Parse CDP, treating ``feature cdp`` as the NX-OS enable signal.
+
+        NX-OS defaults CDP to **disabled**; ``feature cdp`` enables it.
+        """
+        from confgraph.models.cdp import CDPConfig
+
+        parse = self._get_parse_obj()
+
+        feature_objs = parse.find_objects(r"^(?:no\s+)?feature\s+cdp\b")
+        cdp_objs = parse.find_objects(r"^(?:no\s+)?cdp\b")
+
+        if not feature_objs and not cdp_objs:
+            return None
+
+        # NX-OS default: CDP disabled unless "feature cdp" is present
+        enabled = False
+        for obj in feature_objs:
+            t = obj.text.strip()
+            if t == "feature cdp":
+                enabled = True
+            elif t == "no feature cdp":
+                enabled = False
+
+        timer = holdtime = None
+        advertise_v2 = True
+        raw_lines: list[str] = []
+        line_numbers: list[int] = []
+
+        for obj in feature_objs:
+            raw_lines.append(obj.text)
+            line_numbers.append(obj.linenum)
+
+        for obj in cdp_objs:
+            raw_lines.append(obj.text)
+            line_numbers.append(obj.linenum)
+            t = obj.text.strip()
+            if re.match(r"^cdp\s+timer\s+", t):
+                v = self._extract_match(t, r"^cdp\s+timer\s+(\d+)")
+                if v:
+                    timer = int(v)
+            elif re.match(r"^cdp\s+holdtime\s+", t):
+                v = self._extract_match(t, r"^cdp\s+holdtime\s+(\d+)")
+                if v:
+                    holdtime = int(v)
+            elif "no cdp advertise-v2" in t:
+                advertise_v2 = False
+
+        return CDPConfig(
+            object_id="cdp",
+            raw_lines=raw_lines,
+            source_os=self.os_type,
+            line_numbers=line_numbers,
+            enabled=enabled,
+            timer=timer,
+            holdtime=holdtime,
+            advertise_v2=advertise_v2,
+        )
+
+    # -------------------------------------------------------------------
+    # DNS — scan vrf context blocks (N6)
+    # -------------------------------------------------------------------
+
+    def parse_dns(self):
+        """Parse DNS config, including entries inside ``vrf context`` blocks.
+
+        NX-OS places per-VRF DNS entries as children of ``vrf context NAME``
+        stanzas.  The inherited IOS ``parse_dns`` only scans global lines.
+        """
+        from confgraph.models.dns import DNSConfig
+
+        dns = super().parse_dns()
+
+        parse = self._get_parse_obj()
+        vrf_objs = parse.find_objects(r"^vrf\s+context\s+(\S+)")
+
+        extra_servers: list[str] = []
+        extra_domain_name: str | None = None
+        extra_domain_list: list[str] = []
+        extra_lookup_disabled = False
+        extra_raw: list[str] = []
+        extra_line_numbers: list[int] = []
+
+        for vrf_obj in vrf_objs:
+            for child in vrf_obj.children:
+                t = child.text.strip()
+
+                m = re.match(r"ip\s+name-server\s+(.*)", t)
+                if m:
+                    extra_raw.append(child.text)
+                    extra_line_numbers.append(child.linenum)
+                    parts = m.group(1).split()
+                    # Strip optional "vrf <name>" prefix
+                    if len(parts) >= 2 and parts[0].lower() == "vrf":
+                        parts = parts[2:]
+                    extra_servers.extend(parts)
+                    continue
+
+                m = re.match(r"ip\s+domain(?:-|\s+)name\s+(\S+)", t)
+                if m:
+                    extra_raw.append(child.text)
+                    extra_line_numbers.append(child.linenum)
+                    if extra_domain_name is None:
+                        extra_domain_name = m.group(1)
+                    continue
+
+                m = re.match(r"ip\s+domain(?:-|\s+)list\s+(\S+)", t)
+                if m:
+                    extra_raw.append(child.text)
+                    extra_line_numbers.append(child.linenum)
+                    extra_domain_list.append(m.group(1))
+                    continue
+
+                if re.match(r"no\s+ip\s+domain.lookup", t):
+                    extra_raw.append(child.text)
+                    extra_line_numbers.append(child.linenum)
+                    extra_lookup_disabled = True
+
+        if not extra_raw:
+            return dns
+
+        if dns is None:
+            dns = DNSConfig(
+                object_id="dns",
+                raw_lines=extra_raw,
+                source_os=self.os_type,
+                line_numbers=extra_line_numbers,
+                lookup_enabled=not extra_lookup_disabled,
+                domain_name=extra_domain_name,
+                domain_list=extra_domain_list,
+                name_servers=extra_servers,
+            )
+        else:
+            dns.raw_lines.extend(extra_raw)
+            dns.line_numbers.extend(extra_line_numbers)
+            dns.name_servers.extend(extra_servers)
+            if extra_domain_name and dns.domain_name is None:
+                dns.domain_name = extra_domain_name
+            dns.domain_list.extend(extra_domain_list)
+            if extra_lookup_disabled:
+                dns.lookup_enabled = False
+
+        return dns
+
+    # -------------------------------------------------------------------
+    # AAA — parse group server members (N2)
+    # -------------------------------------------------------------------
+
+    def parse_aaa(self):
+        """Parse AAA, linking ``aaa group server`` members to server definitions.
+
+        NX-OS uses ``aaa group server tacacs+ NAME`` / ``aaa group server
+        radius NAME`` blocks with child ``server <ip>`` lines.  The inherited
+        IOS parser finds these blocks but does not parse their children.
+
+        This override calls ``super().parse_aaa()`` then scans the group
+        blocks.  For each ``server <ip>`` child, if a matching server does
+        not already exist in the parsed server list, it is added with the
+        address as its name (stable identity for merge keys — fixes M8
+        collision on ``name=None``).
+        """
+        from confgraph.models.aaa import AAAConfig, TacacsServer, RadiusServer
+
+        aaa = super().parse_aaa()
+        if aaa is None:
+            return None
+
+        parse = self._get_parse_obj()
+        group_objs = parse.find_objects(r"^aaa\s+group\s+server\s+")
+
+        for obj in group_objs:
+            t = obj.text.strip()
+            m = re.match(r"aaa\s+group\s+server\s+(tacacs\+|radius)\s+(\S+)", t)
+            if not m:
+                continue
+
+            server_type = m.group(1)  # "tacacs+" or "radius"
+
+            for child in obj.children:
+                ct = child.text.strip()
+                sm = re.match(r"server\s+(\S+)", ct)
+                if not sm:
+                    continue
+                server_ref = sm.group(1)
+
+                if server_type == "tacacs+":
+                    # Add if not already present by address
+                    exists = any(s.address == server_ref for s in aaa.tacacs_servers)
+                    if not exists:
+                        aaa.tacacs_servers.append(TacacsServer(
+                            name=server_ref,
+                            address=server_ref,
+                        ))
+                    aaa.raw_lines.append(child.text)
+                    aaa.line_numbers.append(child.linenum)
+                else:
+                    exists = any(s.address == server_ref for s in aaa.radius_servers)
+                    if not exists:
+                        aaa.radius_servers.append(RadiusServer(
+                            name=server_ref,
+                            address=server_ref,
+                        ))
+                    aaa.raw_lines.append(child.text)
+                    aaa.line_numbers.append(child.linenum)
+
+        return aaa

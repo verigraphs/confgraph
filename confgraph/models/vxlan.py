@@ -10,6 +10,8 @@ class VXLANVniMapping(BaseModel):
     vni: int = Field(..., description="VXLAN Network Identifier")
     vlan: int | None = Field(default=None, description="VLAN ID mapped to this VNI (L2 VNI)")
     vrf: str | None = Field(default=None, description="VRF mapped to this VNI (L3 VNI)")
+    mcast_group: str | None = Field(default=None, description="Multicast group for BUM traffic replication")
+    suppress_arp: bool = Field(default=False, description="ARP suppression enabled on this VNI")
 
 
 class VXLANConfig(BaseConfigObject):
