@@ -805,6 +805,8 @@ class IOSParser(BaseParser):
 
             # MPLS per-interface
             mpls_ip = bool(intf_obj.find_child_objects(r"^\s+mpls\s+ip\b"))
+            if intf_obj.find_child_objects(r"^\s+no\s+mpls\s+ip\b"):
+                iface_no_commands.append(f"field:interface:{intf_name}:mpls_ip")
 
             # PIM per-interface
             pim_mode = None
