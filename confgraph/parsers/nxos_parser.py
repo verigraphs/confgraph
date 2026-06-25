@@ -1006,6 +1006,7 @@ class NXOSParser(IOSParser):
                     vni_to_vlan[int(vnseg_m.group(1))] = vlan_id
 
         source_interface = None
+        host_reachability = None
         vni_mappings: list[VXLANVniMapping] = []
         raw_lines: list[str] = []
         line_numbers: list[int] = []
@@ -1022,6 +1023,11 @@ class NXOSParser(IOSParser):
                 m = re.match(r"source-interface\s+(\S+)", t, re.IGNORECASE)
                 if m:
                     source_interface = m.group(1)
+                    continue
+
+                m = re.match(r"host-reachability\s+protocol\s+(\S+)", t)
+                if m:
+                    host_reachability = m.group(1)
                     continue
 
                 m = re.match(r"member\s+vni\s+(\d+)(?:\s+associate-vrf)?", t)
@@ -1056,6 +1062,7 @@ class NXOSParser(IOSParser):
             line_numbers=line_numbers,
             source_interface=source_interface,
             vni_mappings=vni_mappings,
+            host_reachability=host_reachability,
         )
 
     # -------------------------------------------------------------------
@@ -1175,18 +1182,21 @@ class NXOSParser(IOSParser):
         nested block deletions:
 
           - ``no member vni <id>`` inside ``interface nve``  → ``field:vxlan:vni:<id>``
+          - ``no host-reachability protocol`` inside ``interface nve`` → ``field:vxlan:host_reachability``
           - ``no peer-keepalive`` inside ``vpc domain``      → ``field:vpc:peer_keepalive_*``
         """
         tombstones = super().parse_deletion_commands()
         parse = self._get_parse_obj()
 
-        # --- VXLAN VNI removal (nested under interface nve) ---
+        # --- VXLAN nested deletions (under interface nve) ---
         for nve_obj in parse.find_objects(r"^interface\s+nve\d+"):
             for child in nve_obj.children:
                 t = child.text.strip()
                 m = re.match(r"no\s+member\s+vni\s+(\d+)", t)
                 if m:
                     tombstones.append(f"field:vxlan:vni:{m.group(1)}")
+                if re.match(r"no\s+host-reachability\s+protocol\b", t):
+                    tombstones.append("field:vxlan:host_reachability")
 
         # --- vPC peer-keepalive removal (nested under vpc domain) ---
         for vpc_obj in parse.find_objects(r"^vpc\s+domain\s+\d+"):

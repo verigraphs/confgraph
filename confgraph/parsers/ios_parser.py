@@ -6444,11 +6444,12 @@ class IOSParser(BaseParser):
                     except ValueError:
                         pass
 
-            # For single-VLAN blocks, read children for name / state
+            # For single-VLAN blocks, read children for name / state / vn-segment
             if len(vlan_ids) == 1:
                 vid = vlan_ids[0]
                 name: str | None = None
                 state = "active"
+                vn_segment: int | None = None
 
                 for child in obj.children:
                     child_text = child.text.strip()
@@ -6458,8 +6459,12 @@ class IOSParser(BaseParser):
                     sm = re.match(r"^state\s+(active|suspend)", child_text)
                     if sm:
                         state = sm.group(1)
+                    vnseg = re.match(r"^vn-segment\s+(\d+)", child_text)
+                    if vnseg:
+                        vn_segment = int(vnseg.group(1))
 
-                entries.append(VLANEntry(vlan_id=vid, name=name, state=state))
+                entries.append(VLANEntry(vlan_id=vid, name=name, state=state,
+                                         vn_segment=vn_segment))
             else:
                 # Compact form — no per-VLAN children
                 for vid in vlan_ids:

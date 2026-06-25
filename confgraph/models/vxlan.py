@@ -41,3 +41,7 @@ class VXLANConfig(BaseConfigObject):
         default=False,
         description="Restrict MAC learning to control-plane only (EVPN)",
     )
+    host_reachability: str | None = Field(
+        default=None,
+        description="Control-plane protocol for host reachability (e.g. 'bgp')",
+    )
