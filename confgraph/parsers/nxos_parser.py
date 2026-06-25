@@ -393,6 +393,98 @@ class NXOSParser(IOSParser):
     # BGP — NX-OS nested neighbor blocks + inherit peer
     # -----------------------------------------------------------------------
 
+    @staticmethod
+    def _parse_nxos_neighbor_children(ccp_node) -> dict:
+        """Extract neighbor attributes from a CiscoConfParse node's children.
+
+        Pure extractor — takes a CCP node (inline or bare ``neighbor`` line),
+        walks ``.all_children`` (which recurses into ``address-family``
+        grandchildren), and returns a dict of parsed attributes.  Callers
+        merge the dict into their model neighbor.
+        """
+        from confgraph.models.bgp import BGPTimers
+
+        nd: dict = {
+            "remote_as": None, "peer_group": None, "description": None,
+            "update_source": None, "ebgp_multihop": None, "password": None,
+            "route_map_in": None, "route_map_out": None,
+            "prefix_list_in": None, "prefix_list_out": None,
+            "filter_list_in": None, "filter_list_out": None,
+            "maximum_prefix": None, "next_hop_self": False,
+            "route_reflector_client": False, "send_community": None,
+            "fall_over_bfd": False, "shutdown": False,
+            "disable_connected_check": False, "timers": None,
+            "local_as": None, "local_as_no_prepend": False,
+            "local_as_replace_as": False,
+        }
+
+        for child in ccp_node.all_children:
+            cmd = child.text.strip()
+
+            # inherit peer NAME → peer_group
+            im = re.match(r"inherit\s+peer\s+(\S+)", cmd)
+            if im:
+                nd["peer_group"] = im.group(1)
+                continue
+            if cmd.startswith("remote-as "):
+                val = cmd.replace("remote-as ", "").strip()
+                try:
+                    nd["remote_as"] = int(val)
+                except ValueError:
+                    nd["remote_as"] = val
+            elif cmd.startswith("description "):
+                nd["description"] = cmd.replace("description ", "").strip()
+            elif cmd.startswith("update-source "):
+                nd["update_source"] = cmd.replace("update-source ", "").strip()
+            elif cmd.startswith("ebgp-multihop "):
+                nd["ebgp_multihop"] = int(cmd.replace("ebgp-multihop ", "").strip())
+            elif cmd.startswith("password "):
+                nd["password"] = cmd.replace("password ", "").strip()
+            elif cmd.startswith("route-map ") and " in" in cmd:
+                nd["route_map_in"] = cmd.replace("route-map ", "").replace(" in", "").strip()
+            elif cmd.startswith("route-map ") and " out" in cmd:
+                nd["route_map_out"] = cmd.replace("route-map ", "").replace(" out", "").strip()
+            elif cmd.startswith("prefix-list ") and " in" in cmd:
+                nd["prefix_list_in"] = cmd.replace("prefix-list ", "").replace(" in", "").strip()
+            elif cmd.startswith("prefix-list ") and " out" in cmd:
+                nd["prefix_list_out"] = cmd.replace("prefix-list ", "").replace(" out", "").strip()
+            elif cmd.startswith("maximum-prefix "):
+                parts = cmd.replace("maximum-prefix ", "").split()
+                if parts:
+                    nd["maximum_prefix"] = int(parts[0])
+            elif cmd == "next-hop-self":
+                nd["next_hop_self"] = True
+            elif cmd == "route-reflector-client":
+                nd["route_reflector_client"] = True
+            elif cmd == "fall-over bfd":
+                nd["fall_over_bfd"] = True
+            elif cmd == "shutdown":
+                nd["shutdown"] = True
+            elif cmd == "disable-connected-check":
+                nd["disable_connected_check"] = True
+            elif cmd.startswith("timers "):
+                tm = re.match(r"timers\s+(\d+)\s+(\d+)", cmd)
+                if tm:
+                    nd["timers"] = BGPTimers(keepalive=int(tm.group(1)), holdtime=int(tm.group(2)))
+            elif cmd.startswith("local-as "):
+                la_parts = cmd.replace("local-as ", "").strip().split()
+                if la_parts:
+                    try:
+                        nd["local_as"] = int(la_parts[0])
+                    except ValueError:
+                        pass
+                    nd["local_as_no_prepend"] = "no-prepend" in la_parts
+                    nd["local_as_replace_as"] = "replace-as" in la_parts
+            elif cmd.startswith("send-community"):
+                if "both" in cmd:
+                    nd["send_community"] = "both"
+                elif "extended" in cmd:
+                    nd["send_community"] = "extended"
+                else:
+                    nd["send_community"] = True
+
+        return nd
+
     def _parse_bgp_neighbors(self, bgp_obj) -> list["BGPNeighbor"]:
         """Parse BGP neighbors, adding NX-OS nested-block / ``inherit peer`` support.
 
@@ -401,6 +493,8 @@ class NXOSParser(IOSParser):
         1. **Inline** (IOS-compatible)::
 
                neighbor 10.0.0.2 remote-as 65001
+                 description spine-link
+                 password 3 abc123
 
         2. **Nested block** (NX-OS native)::
 
@@ -408,15 +502,41 @@ class NXOSParser(IOSParser):
                  inherit peer LEAF
                  description spine-link
 
-        ``super()`` handles form 1.  This override additionally scans for
-        bare ``neighbor <ip>`` lines (no trailing command) and parses their
-        child attributes, including ``inherit peer NAME`` → ``peer_group``.
+        ``super()`` handles form 1 but only captures the inline command
+        (``remote-as``).  This override:
+
+        - **Form 1b**: re-scans inline neighbors that have indented children
+          and merges child attributes (description, password, route-map, etc.)
+          into the existing neighbor objects — no new objects, no duplicates.
+        - **Form 2**: scans bare ``neighbor <ip>`` lines and builds new
+          neighbor objects from their child blocks.
         """
         from confgraph.models.bgp import BGPNeighbor, BGPTimers
 
         # --- Form 1: inline neighbors via IOS parser ---
         neighbors = super()._parse_bgp_neighbors(bgp_obj)
         seen_ips = {str(n.peer_ip) for n in neighbors}
+
+        # --- Form 1b: backfill children for inline neighbors ---
+        # super() captured remote-as from the inline line but missed indented
+        # child attributes.  Re-scan inline neighbor lines and merge children.
+        neighbor_by_ip = {str(n.peer_ip): n for n in neighbors}
+        for nb_obj in bgp_obj.find_child_objects(r"^\s+neighbor\s+\S+\s+remote-as\s+"):
+            m = re.match(r"^\s+neighbor\s+(\S+)\s+remote-as\s+", nb_obj.text)
+            if not m:
+                continue
+            peer_ip_str = m.group(1)
+            existing = neighbor_by_ip.get(peer_ip_str)
+            if existing is None or not nb_obj.all_children:
+                continue
+            nd = self._parse_nxos_neighbor_children(nb_obj)
+            # Merge non-default values into the existing neighbor
+            for key, val in nd.items():
+                if key == "remote_as":
+                    continue  # already set by super()
+                default = False if isinstance(val, bool) else None
+                if val != default:
+                    setattr(existing, key, val)
 
         # --- Form 2: nested neighbor blocks ---
         # Match bare "neighbor <ip>" lines (no command after the IP).
@@ -440,85 +560,7 @@ class NXOSParser(IOSParser):
                 except ValueError:
                     continue
 
-            # Parse child attributes
-            nd: dict = {
-                "remote_as": None, "peer_group": None, "description": None,
-                "update_source": None, "ebgp_multihop": None, "password": None,
-                "route_map_in": None, "route_map_out": None,
-                "prefix_list_in": None, "prefix_list_out": None,
-                "filter_list_in": None, "filter_list_out": None,
-                "maximum_prefix": None, "next_hop_self": False,
-                "route_reflector_client": False, "send_community": None,
-                "fall_over_bfd": False, "shutdown": False,
-                "disable_connected_check": False, "timers": None,
-                "local_as": None, "local_as_no_prepend": False,
-                "local_as_replace_as": False,
-            }
-
-            for child in nb_obj.all_children:
-                cmd = child.text.strip()
-
-                # inherit peer NAME → peer_group
-                im = re.match(r"inherit\s+peer\s+(\S+)", cmd)
-                if im:
-                    nd["peer_group"] = im.group(1)
-                    continue
-                if cmd.startswith("remote-as "):
-                    val = cmd.replace("remote-as ", "").strip()
-                    try:
-                        nd["remote_as"] = int(val)
-                    except ValueError:
-                        nd["remote_as"] = val
-                elif cmd.startswith("description "):
-                    nd["description"] = cmd.replace("description ", "").strip()
-                elif cmd.startswith("update-source "):
-                    nd["update_source"] = cmd.replace("update-source ", "").strip()
-                elif cmd.startswith("ebgp-multihop "):
-                    nd["ebgp_multihop"] = int(cmd.replace("ebgp-multihop ", "").strip())
-                elif cmd.startswith("password "):
-                    nd["password"] = cmd.replace("password ", "").strip()
-                elif cmd.startswith("route-map ") and " in" in cmd:
-                    nd["route_map_in"] = cmd.replace("route-map ", "").replace(" in", "").strip()
-                elif cmd.startswith("route-map ") and " out" in cmd:
-                    nd["route_map_out"] = cmd.replace("route-map ", "").replace(" out", "").strip()
-                elif cmd.startswith("prefix-list ") and " in" in cmd:
-                    nd["prefix_list_in"] = cmd.replace("prefix-list ", "").replace(" in", "").strip()
-                elif cmd.startswith("prefix-list ") and " out" in cmd:
-                    nd["prefix_list_out"] = cmd.replace("prefix-list ", "").replace(" out", "").strip()
-                elif cmd.startswith("maximum-prefix "):
-                    parts = cmd.replace("maximum-prefix ", "").split()
-                    if parts:
-                        nd["maximum_prefix"] = int(parts[0])
-                elif cmd == "next-hop-self":
-                    nd["next_hop_self"] = True
-                elif cmd == "route-reflector-client":
-                    nd["route_reflector_client"] = True
-                elif cmd == "fall-over bfd":
-                    nd["fall_over_bfd"] = True
-                elif cmd == "shutdown":
-                    nd["shutdown"] = True
-                elif cmd == "disable-connected-check":
-                    nd["disable_connected_check"] = True
-                elif cmd.startswith("timers "):
-                    tm = re.match(r"timers\s+(\d+)\s+(\d+)", cmd)
-                    if tm:
-                        nd["timers"] = BGPTimers(keepalive=int(tm.group(1)), holdtime=int(tm.group(2)))
-                elif cmd.startswith("local-as "):
-                    la_parts = cmd.replace("local-as ", "").strip().split()
-                    if la_parts:
-                        try:
-                            nd["local_as"] = int(la_parts[0])
-                        except ValueError:
-                            pass
-                        nd["local_as_no_prepend"] = "no-prepend" in la_parts
-                        nd["local_as_replace_as"] = "replace-as" in la_parts
-                elif cmd.startswith("send-community"):
-                    if "both" in cmd:
-                        nd["send_community"] = "both"
-                    elif "extended" in cmd:
-                        nd["send_community"] = "extended"
-                    else:
-                        nd["send_community"] = True
+            nd = self._parse_nxos_neighbor_children(nb_obj)
 
             # Skip if no remote-as, no peer-group, and not a shutdown stub
             if nd["remote_as"] is None and nd["peer_group"] is None and not nd["shutdown"]:
