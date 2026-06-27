@@ -2449,10 +2449,12 @@ class IOSParser(BaseParser):
             metric_type = None
             subnets = "subnets" in remaining
 
-            # Extract process ID for BGP/OSPF
-            process_match = re.search(r"(\d+)", remaining)
-            if process_match:
-                process_id = int(process_match.group(1))
+            # Extract process ID — only for protocols that carry one,
+            # and only as the leading positional token.
+            if protocol in ("bgp", "ospf", "eigrp", "isis"):
+                process_match = re.match(r"(\d+)", remaining)
+                if process_match:
+                    process_id = int(process_match.group(1))
 
             # Extract route-map
             rm_match = re.search(r"route-map\s+(\S+)", remaining)
@@ -4045,28 +4047,38 @@ class IOSParser(BaseParser):
             # redistribute
             redistribute = []
             for rc in eigrp_obj.find_child_objects(r"^\s+redistribute\s+"):
-                rm = re.match(r"^\s+redistribute\s+(\S+)(?:\s+(\S+))?", rc.text)
-                if rm:
-                    proto = rm.group(1)
-                    pid = rm.group(2)
-                    route_map = self._extract_match(rc.text, r"\broute-map\s+(\S+)")
-                    tag = None
-                    tm = re.search(r"\btag\s+(\d+)", rc.text)
-                    if tm:
-                        tag = int(tm.group(1))
-                    # metric bw delay reliability load mtu
-                    metric = None
-                    mm = re.search(r"\bmetric\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)", rc.text)
-                    if mm:
-                        from confgraph.models.eigrp import EIGRPMetric
-                        metric = EIGRPMetric(
-                            bandwidth=int(mm.group(1)), delay=int(mm.group(2)),
-                            reliability=int(mm.group(3)), load=int(mm.group(4)), mtu=int(mm.group(5))
-                        )
-                    from confgraph.models.eigrp import EIGRPRedistribute
-                    redistribute.append(EIGRPRedistribute(
-                        protocol=proto, process_id=pid, metric=metric, route_map=route_map, tag=tag
-                    ))
+                rm = re.match(r"^\s+redistribute\s+(\S+)", rc.text)
+                if not rm:
+                    continue
+                proto = rm.group(1)
+                remaining = rc.text[rm.end():].strip()
+
+                # Process ID — only for protocols that carry one,
+                # and only as the leading positional token.
+                pid: int | str | None = None
+                if proto in ("bgp", "ospf", "eigrp"):
+                    pid_match = re.match(r"(\d+)", remaining)
+                    if pid_match:
+                        pid = int(pid_match.group(1))
+
+                route_map = self._extract_match(rc.text, r"\broute-map\s+(\S+)")
+                tag = None
+                tm = re.search(r"\btag\s+(\d+)", rc.text)
+                if tm:
+                    tag = int(tm.group(1))
+                # metric bw delay reliability load mtu
+                metric = None
+                mm = re.search(r"\bmetric\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)", rc.text)
+                if mm:
+                    from confgraph.models.eigrp import EIGRPMetric
+                    metric = EIGRPMetric(
+                        bandwidth=int(mm.group(1)), delay=int(mm.group(2)),
+                        reliability=int(mm.group(3)), load=int(mm.group(4)), mtu=int(mm.group(5))
+                    )
+                from confgraph.models.eigrp import EIGRPRedistribute
+                redistribute.append(EIGRPRedistribute(
+                    protocol=proto, process_id=pid, metric=metric, route_map=route_map, tag=tag
+                ))
 
             # misc
             auto_summary = bool(eigrp_obj.find_child_objects(r"^\s+auto-summary"))

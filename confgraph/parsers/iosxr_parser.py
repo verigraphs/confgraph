@@ -522,9 +522,12 @@ class IOSXRParser(IOSParser):
                 remaining = rd_m.group(2).strip()
                 process_id = None
                 route_map = None
-                pid_m = re.search(r"(\d+)", remaining)
-                if pid_m:
-                    process_id = int(pid_m.group(1))
+                # Process ID — only for protocols that carry one,
+                # and only as the leading positional token.
+                if protocol in ("ospf", "eigrp", "isis"):
+                    pid_m = re.match(r"(\d+)", remaining)
+                    if pid_m:
+                        process_id = int(pid_m.group(1))
                 rm_m = re.search(r"route-policy\s+(\S+)", remaining)
                 if rm_m:
                     route_map = rm_m.group(1)
@@ -937,9 +940,12 @@ class IOSXRParser(IOSParser):
             metric = None
             metric_type = None
 
-            pid_m = re.search(r"\b(\d+)\b", remaining)
-            if pid_m:
-                process_id = int(pid_m.group(1))
+            # Process ID — only for protocols that carry one,
+            # and only as the leading positional token.
+            if protocol in ("bgp", "ospf", "eigrp", "isis"):
+                pid_m = re.match(r"(\d+)", remaining)
+                if pid_m:
+                    process_id = int(pid_m.group(1))
 
             # IOS-XR uses route-policy
             rpm = re.search(r"route-policy\s+(\S+)", remaining)

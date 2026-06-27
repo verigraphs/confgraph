@@ -1102,10 +1102,12 @@ class EOSParser(IOSParser):
                     metric_type = None
                     level = None
 
-                    # Extract process ID
-                    pid_match = re.search(r"(\d+)", remaining)
-                    if pid_match:
-                        process_id = int(pid_match.group(1))
+                    # Extract process ID — only for protocols that carry one,
+                    # and only as the leading positional token.
+                    if protocol in ("ospf", "eigrp", "bgp"):
+                        pid_match = re.match(r"(\d+)", remaining)
+                        if pid_match:
+                            process_id = int(pid_match.group(1))
 
                     # Extract route-map
                     rm_match = re.search(r"route-map\s+(\S+)", remaining)
