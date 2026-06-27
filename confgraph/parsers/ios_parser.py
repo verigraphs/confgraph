@@ -117,7 +117,15 @@ class IOSParser(BaseParser):
             if not vrf_name:
                 continue
 
-            raw_lines, line_numbers = self._get_raw_lines_and_line_numbers(vrf_obj)
+            # Capture the full VRF block, including lines nested under
+            # ``address-family ipv4`` (route-targets, route-maps). The base
+            # helper only walks direct children, so build raw_lines recursively
+            # to avoid stopping at the ``address-family ipv4`` line.
+            raw_lines = [vrf_obj.text]
+            line_numbers = [vrf_obj.linenum]
+            for child in vrf_obj.all_children:
+                raw_lines.append(child.text)
+                line_numbers.append(child.linenum)
 
             # Extract RD
             rd = None
@@ -125,36 +133,36 @@ class IOSParser(BaseParser):
             if rd_children:
                 rd = self._extract_match(rd_children[0].text, r"^\s+rd\s+(\S+)")
 
-            # Extract route-targets
+            # Extract route-targets and route-maps. On IOS these live nested
+            # under ``address-family ipv4`` / ``ipv6``, so walk all_children
+            # (recursive) rather than only direct children.
             rt_import = []
             rt_export = []
             rt_both = []
-
-            for child in vrf_obj.children:
-                if "route-target export" in child.text:
-                    rt_val = self._extract_match(child.text, r"route-target\s+export\s+(\S+)")
-                    if rt_val:
-                        rt_export.append(rt_val)
-                elif "route-target import" in child.text:
-                    rt_val = self._extract_match(child.text, r"route-target\s+import\s+(\S+)")
-                    if rt_val:
-                        rt_import.append(rt_val)
-                elif re.search(r"route-target\s+both\s+", child.text):
-                    rt_val = self._extract_match(child.text, r"route-target\s+both\s+(\S+)")
-                    if rt_val:
-                        rt_both.append(rt_val)
-
-            # Extract route-maps (within address-family ipv4)
             route_map_import = None
             route_map_export = None
-            for child in vrf_obj.children:
-                if "route-map" in child.text and "import" in child.text:
+
+            for child in vrf_obj.all_children:
+                text = child.text.strip()
+                if text.startswith("route-target export "):
+                    rt_val = self._extract_match(text, r"route-target\s+export\s+(\S+)")
+                    if rt_val and rt_val not in rt_export:
+                        rt_export.append(rt_val)
+                elif text.startswith("route-target import "):
+                    rt_val = self._extract_match(text, r"route-target\s+import\s+(\S+)")
+                    if rt_val and rt_val not in rt_import:
+                        rt_import.append(rt_val)
+                elif text.startswith("route-target both "):
+                    rt_val = self._extract_match(text, r"route-target\s+both\s+(\S+)")
+                    if rt_val and rt_val not in rt_both:
+                        rt_both.append(rt_val)
+                elif text.startswith("route-map") and "import" in text:
                     route_map_import = self._extract_match(
-                        child.text, r"route-map\s+(\S+)\s+import"
+                        text, r"route-map\s+(\S+)\s+import"
                     )
-                elif "route-map" in child.text and "export" in child.text:
+                elif text.startswith("route-map") and "export" in text:
                     route_map_export = self._extract_match(
-                        child.text, r"route-map\s+(\S+)\s+export"
+                        text, r"route-map\s+(\S+)\s+export"
                     )
 
             vrfs.append(
