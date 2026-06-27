@@ -245,6 +245,31 @@ class IOSXRParser(IOSParser):
 
         return interfaces
 
+    def _detect_interface_field_negations(
+        self, intf_obj, intf_name: str
+    ) -> list[str]:
+        """IOS-XR variant — ``no ipv4 access-group … ingress|egress``.
+
+        Only acl_in / acl_out are positively parsed on XR; service_policy and
+        nat_direction use different syntax and are not modeled, so no negation
+        detection is needed for them.
+        """
+        tombstones: list[str] = []
+        prefix = f"field:interface:{intf_name}"
+
+        for ch in intf_obj.find_child_objects(
+            r"^\s+no\s+ipv4\s+access-group\s+"
+        ):
+            m = re.match(
+                r"^\s+no\s+ipv4\s+access-group\s+\S+\s+(ingress|egress)",
+                ch.text,
+            )
+            if m:
+                field = "acl_in" if m.group(1) == "ingress" else "acl_out"
+                tombstones.append(f"{prefix}:{field}")
+
+        return tombstones
+
     # -----------------------------------------------------------------------
     # BGP — shared neighbor block parsers (single source of truth)
     # -----------------------------------------------------------------------

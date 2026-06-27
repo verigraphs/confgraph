@@ -1097,11 +1097,49 @@ class IOSParser(BaseParser):
                     cdp_enabled=cdp_enabled,
                     lldp_transmit=lldp_transmit,
                     lldp_receive=lldp_receive,
-                    no_commands=iface_no_commands,
+                    no_commands=iface_no_commands
+                    + self._detect_interface_field_negations(intf_obj, intf_name),
                 )
             )
 
         return interfaces
+
+    def _detect_interface_field_negations(
+        self, intf_obj, intf_name: str
+    ) -> list[str]:
+        """Detect interface-level ``no …`` commands that remove scalar fields.
+
+        Returns tombstones in the ``field:interface:<name>:<attr>`` format
+        consumed by ``_reset_fields_from_tombstones`` in the merger — no merger
+        changes needed.  Called from ``parse_interfaces``; NX-OS inherits via
+        ``super()``.  IOS-XR overrides with its own syntax variant.
+        """
+        tombstones: list[str] = []
+        prefix = f"field:interface:{intf_name}"
+
+        # no ip access-group … in / out
+        for ch in intf_obj.find_child_objects(r"^\s+no\s+ip\s+access-group\s+"):
+            m = re.match(r"^\s+no\s+ip\s+access-group\s+\S+\s+(in|out)", ch.text)
+            if m:
+                field = "acl_in" if m.group(1) == "in" else "acl_out"
+                tombstones.append(f"{prefix}:{field}")
+
+        # no service-policy input / output
+        for ch in intf_obj.find_child_objects(r"^\s+no\s+service-policy\s+"):
+            m = re.match(r"^\s+no\s+service-policy\s+(input|output)", ch.text)
+            if m:
+                field = (
+                    "service_policy_input"
+                    if m.group(1) == "input"
+                    else "service_policy_output"
+                )
+                tombstones.append(f"{prefix}:{field}")
+
+        # no ip nat inside / outside
+        if intf_obj.find_child_objects(r"^\s+no\s+ip\s+nat\s+(inside|outside)"):
+            tombstones.append(f"{prefix}:nat_direction")
+
+        return tombstones
 
     def parse_bgp(self) -> list[BGPConfig]:
         """Parse BGP configurations.
