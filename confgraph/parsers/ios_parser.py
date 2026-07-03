@@ -85,11 +85,203 @@ from confgraph.models.vlan import VLANEntry
 from confgraph.models.netflow import NetFlowConfig, NetFlowDestination
 
 
+# Known DIRECT child lines per high-blast-radius block — _KNOWN_TOP_LEVEL_PATTERNS one
+# level down (see BaseParser._KNOWN_CHILD_PATTERNS for the collector rules). A child
+# line of a claimed block matching none of its known patterns is emitted as an
+# UnrecognizedBlock ("<header> > <line>") so it is disclosed, not silently dropped.
+#
+# PRECISION OVER RECALL: every form a parse method consumes MUST be listed; forms we
+# are unsure about are listed too ("unsure -> known"). The lists cover IOS/IOS-XE plus
+# the NX-OS/EOS forms, since those parsers inherit this registry. "no ..." lines are
+# skipped by the collector itself (tombstone surface) and never need listing.
+_IOS_KNOWN_CHILD_PATTERNS: list[tuple[str, list[str]]] = [
+    (r"^router\s+ospf\b", [
+        r"^router-id\b",
+        r"^log-adjacency-changes\b",
+        r"^auto-cost\b",
+        r"^passive-interface\b",
+        r"^network\b",
+        r"^area\b",
+        r"^redistribute\b",
+        r"^max-metric\b",
+        r"^default-information\b",
+        r"^default-metric\b",
+        r"^distance\b",
+        r"^max-lsa\b",
+        r"^maximum-paths\b",        # unsure -> known (ECMP width, not modeled)
+        r"^timers\b",
+        r"^shutdown\b",
+        r"^graceful-restart\b",
+        r"^nsf\b",
+        r"^bfd\b",
+        r"^vrf\b",                  # NX-OS: per-VRF sub-block under router ospf
+        r"^address-family\b",       # sub-block header; body not descended (v1)
+        r"^exit-address-family\b",
+    ]),
+    (r"^router\s+bgp\b", [
+        r"^bgp\b",                  # bgp router-id / cluster-id / bestpath / confed / ...
+        r"^neighbor\b",
+        r"^network\b",
+        r"^redistribute\b",
+        r"^address-family\b",       # sub-block header; body not descended (v1)
+        r"^exit-address-family\b",
+        r"^aggregate-address\b",
+        r"^template\b",             # NX-OS: template peer <name>
+        r"^inherit\b",              # NX-OS: inherit peer <name>
+        r"^vrf\b",                  # NX-OS: vrf <name> sub-block
+        r"^timers\b",
+        r"^maximum-paths\b",
+        r"^distance\b",
+        r"^auto-summary\b",
+        r"^synchronization\b",
+        r"^default-information\b",  # unsure -> known
+        r"^default-metric\b",       # unsure -> known
+        r"^router-id\b",            # NX-OS bare form
+        r"^cluster-id\b",           # NX-OS bare form
+        r"^log-neighbor-changes\b", # NX-OS bare form
+        r"^bestpath\b",             # NX-OS bare form
+        r"^confederation\b",        # NX-OS bare form
+        r"^graceful-restart\b",
+        r"^event-history\b",        # NX-OS cosmetic
+    ]),
+    (r"^router\s+isis\b", [
+        r"^net\b",
+        r"^is-type\b",
+        r"^metric-style\b",
+        r"^metric\b",
+        r"^log-adjacency-changes\b",
+        r"^passive-interface\b",
+        r"^passive\b",              # EOS form
+        r"^redistribute\b",
+        r"^address-family\b",       # sub-block header; body not descended (v1)
+        r"^exit-address-family\b",
+        r"^spf-interval\b",
+        r"^lsp-gen-interval\b",
+        r"^lsp-refresh-interval\b",
+        r"^max-lsp-lifetime\b",
+        r"^default-information\b",
+        r"^summary-address\b",      # unsure -> known
+        r"^maximum-paths\b",        # unsure -> known
+        r"^distance\b",             # unsure -> known
+        r"^authentication\b",       # unsure -> known
+        r"^area-password\b",        # unsure -> known
+        r"^domain-password\b",      # unsure -> known
+        r"^set-overload-bit\b",     # unsure -> known
+        r"^hostname\b",             # hostname dynamic
+        r"^nsf\b",
+        r"^bfd\b",
+        r"^vrf\b",
+    ]),
+    (r"^router\s+eigrp\b", [
+        r"^network\b",
+        r"^passive-interface\b",
+        r"^redistribute\b",
+        r"^eigrp\b",                # eigrp router-id / stub / log-neighbor-changes
+        r"^address-family\b",       # named mode; body not descended (v1)
+        r"^af-interface\b",
+        r"^topology\b",
+        r"^exit-address-family\b",
+        r"^exit-af-interface\b",
+        r"^exit-af-topology\b",
+        r"^metric\b",
+        r"^variance\b",
+        r"^maximum-paths\b",
+        r"^distance\b",
+        r"^default-metric\b",
+        r"^auto-summary\b",
+        r"^summary-address\b",      # unsure -> known
+        r"^timers\b",               # unsure -> known
+        r"^neighbor\b",             # unsure -> known (static neighbors)
+        r"^nsf\b",
+        r"^bfd\b",
+        r"^shutdown\b",
+    ]),
+    (r"^interface\b", [
+        # Broad by design: the interface surface is huge and OS-divergent, so v1
+        # lists every family the IOS/NX-OS/EOS interface parsers consume plus the
+        # common benign/cosmetic families. High-signal unparsed forms (e.g.
+        # "service instance", "rate-limit") fall through and are disclosed.
+        r"^arp\b",
+        r"^authentication\b",
+        r"^bandwidth\b",
+        r"^bfd\b",
+        r"^carrier-delay\b",
+        r"^cdp\b",
+        r"^channel-group\b",
+        r"^clns\b",
+        r"^crypto\b",
+        r"^dampening\b",
+        r"^delay\b",
+        r"^description\b",
+        r"^dot1x\b",
+        r"^duplex\b",
+        r"^encapsulation\b",
+        r"^evpn\b",
+        r"^fabric\b",               # NX-OS: fabric forwarding mode anycast-gateway
+        r"^fex\b",
+        r"^flowcontrol\b",
+        r"^glbp\b",
+        r"^hold-queue\b",
+        r"^host-reachability\b",    # NX-OS NVE
+        r"^hsrp\b",                 # NX-OS sub-block header; body not descended (v1)
+        r"^ip\b",
+        r"^ipv4\b",
+        r"^ipv6\b",
+        r"^isis\b",
+        r"^keepalive\b",
+        r"^lacp\b",
+        r"^lldp\b",
+        r"^load-interval\b",
+        r"^logging\b",
+        r"^mab\b",
+        r"^mac\b",
+        r"^mac-address\b",
+        r"^mcast-group\b",          # NX-OS NVE (also under member vni)
+        r"^mdix\b",
+        r"^media-type\b",
+        r"^medium\b",
+        r"^member\b",               # NX-OS NVE: member vni ...
+        r"^mlag\b",                 # EOS
+        r"^mpls\b",
+        r"^mtu\b",
+        r"^negotiation\b",
+        r"^ntp\b",
+        r"^ospfv3\b",
+        r"^pim\b",
+        r"^port-channel\b",
+        r"^power\b",
+        r"^priority-flow-control\b",
+        r"^ptp\b",
+        r"^service-policy\b",
+        r"^shutdown\b",
+        r"^snmp\b",
+        r"^source-interface\b",     # NX-OS NVE
+        r"^spanning-tree\b",
+        r"^speed\b",
+        r"^standby\b",
+        r"^storm-control\b",
+        r"^suppress-arp\b",         # NX-OS NVE
+        r"^switchport\b",
+        r"^tunnel\b",
+        r"^udld\b",
+        r"^vpc\b",
+        r"^vrf\b",
+        r"^vrrp\b",
+        r"^vtp\b",
+        r"^vxlan\b",                # EOS: interface Vxlan1 children
+        r"^xconnect\b",
+        r"^zone-member\b",
+    ]),
+]
+
+
 class IOSParser(BaseParser):
     """Parser for Cisco IOS and IOS-XE configurations.
 
     Supports both IOS and IOS-XE syntax (they are very similar).
     """
+
+    _KNOWN_CHILD_PATTERNS: list[tuple[str, list[str]]] = _IOS_KNOWN_CHILD_PATTERNS
 
     def __init__(self, config_text: str, os_type: OSType = OSType.IOS):
         """Initialize IOS parser.
@@ -369,14 +561,29 @@ class IOSParser(BaseParser):
             )
             if trunk_allowed_children:
                 # Process all lines as ordered set operations:
-                #   'vlan <list>'     → set/replace
+                #   'vlan <list>'     → set/replace (anchors the set)
                 #   'add <list>'      → union
                 #   'remove <list>'   → difference
-                #   'except <list>'   → all-except (1-4094 minus list)
-                #   'none'            → empty set
-                #   'all'             → all (1-4094)
+                #   'except <list>'   → all-except (1-4094 minus list; absolute,
+                #                       so it anchors the set too)
+                #   'none'            → empty set (anchors the set)
+                #   'all'             → all (1-4094) (anchors the set)
+                #
+                # add/remove are *stateful* — they operate on the device's
+                # current allowed list.  In a full running config that state is
+                # anchored by a preceding absolute form ('vlan <list>', 'none',
+                # 'all', 'except <list>') and the lines fold into one set as
+                # before.  In a proposal snippet there is no anchor: the base
+                # state lives in the baseline config, which this parser never
+                # sees.  Un-anchored delta lines
+                # are therefore emitted as interface-scoped operations
+                # (field:interface:<name>:trunk_allowed_vlans:<op>:<spec>) that
+                # the merger applies against the baseline list, and
+                # trunk_allowed_vlans stays [] (= "not mentioned").
                 _ALL_VLANS = set(range(1, 4095))
                 vlan_set: set[int] = set()
+                anchored = False  # True once an absolute form fixes the base state
+                trunk_vlan_ops: list[tuple[str, str]] = []
                 for child in trunk_allowed_children:
                     vlan_str = self._extract_match(
                         child.text,
@@ -386,18 +593,43 @@ class IOSParser(BaseParser):
                         continue
                     vlan_str = vlan_str.strip()
                     if vlan_str == "none":
+                        anchored = True
+                        trunk_vlan_ops.clear()
                         vlan_set = set()
                     elif vlan_str == "all":
+                        anchored = True
+                        trunk_vlan_ops.clear()
                         vlan_set = set(_ALL_VLANS)
-                    elif vlan_str.startswith("add "):
-                        vlan_set |= set(self._parse_vlan_list(vlan_str[4:]))
-                    elif vlan_str.startswith("remove "):
-                        vlan_set -= set(self._parse_vlan_list(vlan_str[7:]))
                     elif vlan_str.startswith("except "):
-                        vlan_set = _ALL_VLANS - set(self._parse_vlan_list(vlan_str[7:]))
+                        # 'except' is absolute on the device (all VLANs minus
+                        # the list, independent of prior state) — it anchors.
+                        spec = vlan_str[7:].strip().replace(" ", "")
+                        anchored = True
+                        trunk_vlan_ops.clear()
+                        vlan_set = _ALL_VLANS - set(self._parse_vlan_list(spec))
+                    elif vlan_str.startswith(("add ", "remove ")):
+                        op, _, spec = vlan_str.partition(" ")
+                        spec = spec.strip().replace(" ", "")
+                        if not spec:
+                            continue
+                        if anchored:
+                            spec_set = set(self._parse_vlan_list(spec))
+                            if op == "add":
+                                vlan_set |= spec_set
+                            else:  # remove
+                                vlan_set -= spec_set
+                        else:
+                            trunk_vlan_ops.append((op, spec))
                     else:
+                        anchored = True
+                        trunk_vlan_ops.clear()
                         vlan_set = set(self._parse_vlan_list(vlan_str))
-                trunk_allowed_vlans = sorted(vlan_set)
+                if anchored:
+                    trunk_allowed_vlans = sorted(vlan_set)
+                for op, spec in trunk_vlan_ops:
+                    iface_no_commands.append(
+                        f"field:interface:{intf_name}:trunk_allowed_vlans:{op}:{spec}"
+                    )
 
             trunk_native_children = intf_obj.find_child_objects(
                 r"^\s+switchport\s+trunk\s+native\s+vlan\s+(\d+)"
@@ -1173,6 +1405,30 @@ class IOSParser(BaseParser):
         # no ip nat inside / outside
         if intf_obj.find_child_objects(r"^\s+no\s+ip\s+nat\s+(inside|outside)"):
             tombstones.append(f"{prefix}:nat_direction")
+
+        # no shutdown — restates the model default (enabled=True), so without a
+        # tombstone the merger treats it as "not mentioned" and a baseline
+        # `shutdown` silently survives the merge (Fable-5 review F1).  Last
+        # match wins, mirroring _is_shutdown: emit only when the final
+        # shutdown-form line in the (coalesced) block is the `no` form.
+        last_shutdown_form: str | None = None
+        for ch in intf_obj.children:
+            if re.match(r"^\s+no\s+shutdown\s*$", ch.text):
+                last_shutdown_form = "no"
+            elif re.match(r"^\s+shutdown\s*$", ch.text):
+                last_shutdown_form = "shutdown"
+        if last_shutdown_form == "no":
+            tombstones.append(f"{prefix}:enabled")
+
+        # no switchport port-security (bare form) — positive detection is a
+        # positive-only regex, so the `no` form parses to False == default and
+        # is otherwise invisible to the merger (same F1 silent pattern).
+        if intf_obj.find_child_objects(r"^\s+no\s+switchport\s+port-security\s*$"):
+            tombstones.append(f"{prefix}:port_security_enabled")
+
+        # no ip ospf mtu-ignore — same F1 silent pattern (default False).
+        if intf_obj.find_child_objects(r"^\s+no\s+ip\s+ospf\s+mtu-ignore\s*$"):
+            tombstones.append(f"{prefix}:ospf_mtu_ignore")
 
         return tombstones
 
@@ -3193,7 +3449,8 @@ class IOSParser(BaseParser):
         """Parse top-level 'no' deletion commands into tombstone strings.
 
         Handles:
-          - ``no ip route [vrf NAME] DEST MASK``         → ``static:DEST/PLEN``
+          - ``no ip route [vrf NAME] DEST MASK``         → ``static:<vrf>:DEST/PLEN``
+          - ``no ip route [vrf NAME] DEST MASK NH [AD]`` → ``static:<vrf>:DEST/PLEN:NH``
           - ``no router ospf <id>``                       → ``process:ospf:<id>``
           - ``no router bgp <asn>``                       → ``process:bgp:<asn>``
           - ``no router isis [<tag>]``                    → ``process:isis:<tag>``
@@ -3207,12 +3464,25 @@ class IOSParser(BaseParser):
         parse = self._get_parse_obj()
 
         # --- static route deletions ---
-        # Tombstone format: "static:<vrf>:<dest/plen>" where vrf="" for global.
-        # The VRF is preserved so _apply_deletions() can do a VRF-exact match
-        # and avoid deleting the same prefix from a different routing table.
+        # Tombstone format: "static:<vrf>:<dest/plen>[:<nh_spec>]" where vrf=""
+        # for global.  The VRF is preserved so _apply_deletions() can do a
+        # VRF-exact match and avoid deleting the same prefix from a different
+        # routing table.
+        #
+        # IOS ground truth: the identity of a static route is
+        # (prefix, next-hop-or-interface).  ``no ip route DEST MASK NH``
+        # removes ONLY the route via that next-hop (ECMP/floating siblings
+        # survive); the NH-less ``no ip route DEST MASK`` removes ALL routes
+        # for the prefix.  When an NH is present it is carried in the
+        # tombstone as <nh_spec> — the space-joined NH tokens exactly as the
+        # positive ``ip route`` parser would read them ("10.0.99.2", "Null0",
+        # or "GigabitEthernet0/0 10.1.1.1").  Trailing AD / tag / name /
+        # permanent / track tokens are excluded: AD is not part of the
+        # identity (re-entering the same dest+NH with a different AD replaces
+        # the entry on IOS).
         for obj in parse.find_objects(r"^no\s+ip\s+route\s+"):
             m = re.search(
-                r"^no\s+ip\s+route\s+(?:vrf\s+(\S+)\s+)?(\S+)\s+(\S+)",
+                r"^no\s+ip\s+route\s+(?:vrf\s+(\S+)\s+)?(\S+)\s+(\S+)(.*)$",
                 obj.text,
             )
             if not m:
@@ -3220,9 +3490,31 @@ class IOSParser(BaseParser):
             try:
                 vrf = m.group(1) or ""
                 dest = IPv4Network(f"{m.group(2)}/{m.group(3)}", strict=False)
-                tombstones.append(f"static:{vrf}:{dest}")
             except ValueError:
-                pass
+                continue
+            # Parse the optional next-hop spec (mirrors parse_static_routes):
+            # first token after the mask is an NH IP or an interface name; an
+            # interface may be followed by an NH IP.  A pure-numeric token can
+            # never be an NH (it would be an AD, which is invalid without an
+            # NH on IOS) — treat as NH-less defensively.
+            nh_tokens: list[str] = []
+            remaining = (m.group(4) or "").split()
+            if remaining and not remaining[0].isdigit():
+                nh_tokens.append(remaining[0])
+                try:
+                    IPv4Address(remaining[0])
+                except ValueError:
+                    # Interface name — may be followed by an explicit NH IP.
+                    if len(remaining) > 1:
+                        try:
+                            IPv4Address(remaining[1])
+                            nh_tokens.append(remaining[1])
+                        except ValueError:
+                            pass
+            if nh_tokens:
+                tombstones.append(f"static:{vrf}:{dest}:{' '.join(nh_tokens)}")
+            else:
+                tombstones.append(f"static:{vrf}:{dest}")
         # --- vlan database deletions ---
         for obj in parse.find_objects(r"^no\s+vlan\s+"):
             m = re.search(r"^no\s+vlan\s+([\d,\-]+)", obj.text)

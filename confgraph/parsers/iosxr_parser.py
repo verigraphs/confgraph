@@ -72,6 +72,13 @@ class IOSXRParser(IOSParser):
 
     _KNOWN_TOP_LEVEL_PATTERNS: list[str] = _IOSXR_KNOWN_PATTERNS
 
+    # Child-line disclosure disabled for IOS-XR (v1): XR block bodies are deeply
+    # nested and shaped differently from IOS (interfaces under OSPF areas,
+    # neighbor-groups, "address-family ipv4 unicast" bodies), so the inherited IOS
+    # known-child lists would false-flag consumed lines. Needs an XR-specific
+    # registry — see CCR confgraph_unrecognized_child_lines_in_claimed_blocks.md.
+    _KNOWN_CHILD_PATTERNS: list[tuple[str, list[str]]] = []
+
     def __init__(self, config_text: str):
         super().__init__(config_text, os_type=OSType.IOS_XR)
         self.syntax = "iosxr"

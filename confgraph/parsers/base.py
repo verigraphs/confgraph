@@ -189,6 +189,26 @@ class BaseParser(ABC):
     _KNOWN_TOP_LEVEL_PATTERNS: list[str] = _BASE_KNOWN_PATTERNS
     _BEST_GUESS_KEYWORDS: list[tuple[str, str]] = _BASE_BEST_GUESS_KEYWORDS
 
+    # Child-line registry — _KNOWN_TOP_LEVEL_PATTERNS one level down.
+    #
+    # Each entry is (block-header pattern, [known child-line patterns]). For every
+    # claimed top-level block whose header matches a block pattern, any DIRECT child
+    # line that matches none of the known child patterns is emitted as an
+    # UnrecognizedBlock ("<block header> > <child line>") so unparsed lines inside
+    # recognized blocks are disclosed instead of silently dropped (Fable-5 F3).
+    #
+    # Rules the collector applies on top of the registry:
+    #   - direct children only — sub-block bodies (address-family, NX-OS "hsrp N")
+    #     are not descended into (v1 recall limitation);
+    #   - "no ..." lines are never flagged — negations are the tombstone surface,
+    #     with their own known-negation registries;
+    #   - PRECISION OVER RECALL: a line a parse method consumes must never be
+    #     flagged. When unsure whether a form is consumed, list it as known.
+    #
+    # Default empty = mechanism off. Cisco-style parsers register their blocks;
+    # JunOS/PAN-OS override _collect_unrecognized_blocks wholesale and ignore this.
+    _KNOWN_CHILD_PATTERNS: list[tuple[str, list[str]]] = []
+
     def __init__(self, config_text: str, os_type: OSType, syntax: str = "ios"):
         """Initialize parser with configuration text.
 
@@ -451,10 +471,15 @@ class BaseParser(ABC):
         return []
 
     def _collect_unrecognized_blocks(self) -> list[UnrecognizedBlock]:
-        """Collect top-level config blocks not claimed by any parse_* method.
+        """Collect config the parse_* methods did not claim.
 
-        Walks all top-level (non-indented, non-comment) lines and returns
-        those that don't match any pattern in _KNOWN_TOP_LEVEL_PATTERNS.
+        Two walks:
+          1. top-level (non-indented, non-comment) lines that match no pattern in
+             _KNOWN_TOP_LEVEL_PATTERNS — the whole block is unrecognized;
+          2. direct child lines of CLAIMED blocks registered in
+             _KNOWN_CHILD_PATTERNS that match no known child pattern — the line is
+             unrecognized even though the block is parsed (see the registry
+             docstring on the class).
         """
         parse = self._get_parse_obj()
         blocks: list[UnrecognizedBlock] = []
@@ -469,6 +494,7 @@ class BaseParser(ABC):
                 for pattern in self._KNOWN_TOP_LEVEL_PATTERNS
             )
             if claimed:
+                blocks.extend(self._collect_unrecognized_child_lines(obj, header))
                 continue
 
             raw_lines = [obj.text] + [child.text for child in obj.all_children]
@@ -486,6 +512,47 @@ class BaseParser(ABC):
             ))
 
         return blocks
+
+    def _collect_unrecognized_child_lines(
+        self, obj, header: str
+    ) -> list[UnrecognizedBlock]:
+        """Flag direct child lines of a claimed block that no parse method consumes.
+
+        ``obj`` is the CiscoConfParse object for a claimed top-level block; returns
+        one UnrecognizedBlock per direct child line not matching any known child
+        pattern for its block type in ``_KNOWN_CHILD_PATTERNS``. Blocks with no
+        registry entry are skipped entirely (no flagging).
+        """
+        child_patterns = next(
+            (
+                patterns
+                for block_pattern, patterns in self._KNOWN_CHILD_PATTERNS
+                if re.match(block_pattern, header)
+            ),
+            None,
+        )
+        if child_patterns is None:
+            return []
+
+        flagged: list[UnrecognizedBlock] = []
+        for child in obj.children:  # direct children only — see registry docstring
+            text = child.text.strip()
+            if not text or text.startswith("!"):
+                continue
+            if text == "no" or text.startswith("no "):
+                continue  # negations belong to the tombstone registries, never here
+            if any(re.match(pattern, text) for pattern in child_patterns):
+                continue
+            flagged.append(UnrecognizedBlock(
+                block_header=f"{header} > {text}",
+                raw_lines=[child.text],
+                best_guess=next(
+                    (label for kw, label in self._BEST_GUESS_KEYWORDS
+                     if kw in text.lower()),
+                    None,
+                ),
+            ))
+        return flagged
 
     # Ordered list of (ParsedConfig field, parse method name) for the main parse loop.
     _PARSE_STEPS: list[tuple[str, str]] = [

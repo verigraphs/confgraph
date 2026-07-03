@@ -5,15 +5,23 @@ from pydantic import BaseModel, Field
 
 
 class UnrecognizedBlock(BaseModel):
-    """A top-level config block not handled by any parser method.
+    """Config not handled by any parser method.
 
-    Captures config sections for unsupported protocols/services so
-    that no configuration is silently dropped.
+    Captures config sections for unsupported protocols/services so that no
+    configuration is silently dropped. Two granularities share this model:
+    a whole top-level block no parse method claims, and a single child line
+    inside a claimed block that its parse method does not consume (the
+    header then reads '<block header> > <child line>').
     """
 
     block_header: str = Field(
         ...,
-        description="First line of the block (e.g. 'ntp server 10.0.0.1')",
+        description=(
+            "First line of an unclaimed block (e.g. 'ntp server 10.0.0.1'), or "
+            "'<block header> > <child line>' for an unrecognized child line "
+            "inside a claimed block (e.g. 'router ospf 1 > distribute-list "
+            "prefix BLOCK-ALL in')"
+        ),
     )
     raw_lines: list[str] = Field(
         ...,
