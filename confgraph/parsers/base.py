@@ -679,14 +679,23 @@ class BaseParser(ABC):
     def _is_shutdown(self, obj: Any) -> bool:
         """Check if interface/protocol is shutdown.
 
+        Uses last-match-wins so that coalesced duplicate stanzas resolve
+        correctly (e.g. ``shutdown`` in stanza 1, ``no shutdown`` in stanza 2
+        → not shutdown).
+
         Args:
             obj: CiscoConfParse config object
 
         Returns:
             True if shutdown, False otherwise
         """
-        shutdown_children = obj.find_child_objects(r"^\s+shutdown")
-        return len(shutdown_children) > 0
+        result = False
+        for child in obj.children:
+            if re.match(r"^\s+no\s+shutdown", child.text):
+                result = False
+            elif re.match(r"^\s+shutdown", child.text):
+                result = True
+        return result
 
 
 # ---------------------------------------------------------------------------

@@ -200,7 +200,7 @@ class IOSParser(BaseParser):
         if bfd_ch:
             m = re.match(
                 r"^\s+bfd\s+interval\s+(\d+)\s+min_rx\s+(\d+)\s+multiplier\s+(\d+)",
-                bfd_ch[0].text,
+                bfd_ch[-1].text,
             )
             if m:
                 bfd_interval = int(m.group(1))
@@ -208,7 +208,7 @@ class IOSParser(BaseParser):
                 bfd_multiplier = int(m.group(3))
         tmpl_ch = intf_obj.find_child_objects(r"^\s+bfd\s+template\s+")
         if tmpl_ch:
-            v = self._extract_match(tmpl_ch[0].text, r"^\s+bfd\s+template\s+(\S+)")
+            v = self._extract_match(tmpl_ch[-1].text, r"^\s+bfd\s+template\s+(\S+)")
             if v:
                 bfd_template = v
         return bfd_interval, bfd_min_rx, bfd_multiplier, bfd_template
@@ -220,6 +220,19 @@ class IOSParser(BaseParser):
 
         # Find all interface configurations
         intf_objs = parse.find_objects(r"^interface\s+")
+
+        # Coalesce duplicate interface stanzas at the line level. IOS allows
+        # the same interface to appear in multiple stanzas — the CLI merges
+        # them into one running-config interface. By extending the first
+        # object's children with subsequent stanzas' children, all
+        # find_child_objects() calls naturally see the combined block.
+        # Scalar extractions use [-1] (last match wins), mirroring IOS
+        # merge semantics where later stanzas override earlier ones.
+        # List extractions iterate all children, naturally unioning across
+        # stanzas. This avoids the model-level merge ambiguity where
+        # "field absent" vs "field explicitly set to default" are
+        # indistinguishable.
+        intf_objs = self._coalesce_interface_stanzas(intf_objs)
 
         for intf_obj in intf_objs:
             intf_name = self._extract_match(intf_obj.text, r"^interface\s+(\S+)")
@@ -237,7 +250,7 @@ class IOSParser(BaseParser):
             desc_children = intf_obj.find_child_objects(r"^\s+description\s+(.+)")
             if desc_children:
                 description = self._extract_match(
-                    desc_children[0].text, r"^\s+description\s+(.+)"
+                    desc_children[-1].text, r"^\s+description\s+(.+)"
                 )
             elif intf_obj.find_child_objects(r"^\s+no\s+description"):
                 iface_no_commands.append(f"field:interface:{intf_name}:description")
@@ -252,12 +265,12 @@ class IOSParser(BaseParser):
             ip_children = intf_obj.find_child_objects(
                 r"^\s+ip\s+address\s+(\d+\.\d+\.\d+\.\d+)\s+(\d+\.\d+\.\d+\.\d+)"
             )
-            # Filter out secondary IPs — primary is the first non-secondary match
+            # Filter out secondary IPs — primary is the last non-secondary match
             ip_children = [c for c in ip_children if "secondary" not in c.text.lower()]
             if ip_children:
                 match = re.search(
                     r"^\s+ip\s+address\s+(\d+\.\d+\.\d+\.\d+)\s+(\d+\.\d+\.\d+\.\d+)",
-                    ip_children[0].text,
+                    ip_children[-1].text,
                 )
                 if match:
                     ip = match.group(1)
@@ -293,32 +306,32 @@ class IOSParser(BaseParser):
             mtu = None
             mtu_children = intf_obj.find_child_objects(r"^\s+mtu\s+(\d+)")
             if mtu_children:
-                mtu = int(self._extract_match(mtu_children[0].text, r"^\s+mtu\s+(\d+)"))
+                mtu = int(self._extract_match(mtu_children[-1].text, r"^\s+mtu\s+(\d+)"))
 
             # IP MTU (L3 override — OSPF uses this when present)
             ip_mtu = None
             ip_mtu_children = intf_obj.find_child_objects(r"^\s+ip\s+mtu\s+(\d+)")
             if ip_mtu_children:
-                ip_mtu = int(self._extract_match(ip_mtu_children[0].text, r"^\s+ip\s+mtu\s+(\d+)"))
+                ip_mtu = int(self._extract_match(ip_mtu_children[-1].text, r"^\s+ip\s+mtu\s+(\d+)"))
 
             # Speed
             speed = None
             speed_children = intf_obj.find_child_objects(r"^\s+speed\s+(\S+)")
             if speed_children:
-                speed = self._extract_match(speed_children[0].text, r"^\s+speed\s+(\S+)")
+                speed = self._extract_match(speed_children[-1].text, r"^\s+speed\s+(\S+)")
 
             # Duplex
             duplex = None
             duplex_children = intf_obj.find_child_objects(r"^\s+duplex\s+(\S+)")
             if duplex_children:
-                duplex = self._extract_match(duplex_children[0].text, r"^\s+duplex\s+(\S+)")
+                duplex = self._extract_match(duplex_children[-1].text, r"^\s+duplex\s+(\S+)")
 
             # Bandwidth
             bandwidth = None
             bw_children = intf_obj.find_child_objects(r"^\s+bandwidth\s+(\d+)")
             if bw_children:
                 bandwidth = int(
-                    self._extract_match(bw_children[0].text, r"^\s+bandwidth\s+(\d+)")
+                    self._extract_match(bw_children[-1].text, r"^\s+bandwidth\s+(\d+)")
                 )
 
             # Delay (for EIGRP composite metric)
@@ -326,7 +339,7 @@ class IOSParser(BaseParser):
             delay_children = intf_obj.find_child_objects(r"^\s+delay\s+(\d+)")
             if delay_children:
                 delay = int(
-                    self._extract_match(delay_children[0].text, r"^\s+delay\s+(\d+)")
+                    self._extract_match(delay_children[-1].text, r"^\s+delay\s+(\d+)")
                 )
 
             # Switchport attributes
@@ -338,7 +351,7 @@ class IOSParser(BaseParser):
             sw_mode_children = intf_obj.find_child_objects(r"^\s+switchport\s+mode\s+(\S+)")
             if sw_mode_children:
                 switchport_mode = self._extract_match(
-                    sw_mode_children[0].text, r"^\s+switchport\s+mode\s+(\S+)"
+                    sw_mode_children[-1].text, r"^\s+switchport\s+mode\s+(\S+)"
                 )
 
             access_vlan_children = intf_obj.find_child_objects(
@@ -347,7 +360,7 @@ class IOSParser(BaseParser):
             if access_vlan_children:
                 access_vlan = int(
                     self._extract_match(
-                        access_vlan_children[0].text, r"^\s+switchport\s+access\s+vlan\s+(\d+)"
+                        access_vlan_children[-1].text, r"^\s+switchport\s+access\s+vlan\s+(\d+)"
                     )
                 )
 
@@ -392,7 +405,7 @@ class IOSParser(BaseParser):
             if trunk_native_children:
                 trunk_native_vlan = int(
                     self._extract_match(
-                        trunk_native_children[0].text,
+                        trunk_native_children[-1].text,
                         r"^\s+switchport\s+trunk\s+native\s+vlan\s+(\d+)",
                     )
                 )
@@ -407,7 +420,7 @@ class IOSParser(BaseParser):
             )
             if psmax_ch:
                 val = self._extract_match(
-                    psmax_ch[0].text, r"^\s+switchport\s+port-security\s+maximum\s+(\d+)"
+                    psmax_ch[-1].text, r"^\s+switchport\s+port-security\s+maximum\s+(\d+)"
                 )
                 if val:
                     port_security_max_mac = int(val)
@@ -418,7 +431,7 @@ class IOSParser(BaseParser):
             )
             if psv_ch:
                 port_security_violation = self._extract_match(
-                    psv_ch[0].text,
+                    psv_ch[-1].text,
                     r"^\s+switchport\s+port-security\s+violation\s+(\S+)",
                 )
 
@@ -436,7 +449,7 @@ class IOSParser(BaseParser):
             )
             if auth_pc_ch:
                 dot1x_port_control = self._extract_match(
-                    auth_pc_ch[0].text, r"^\s+authentication\s+port-control\s+(\S+)"
+                    auth_pc_ch[-1].text, r"^\s+authentication\s+port-control\s+(\S+)"
                 )
             else:
                 # Legacy syntax: dot1x port-control <mode>
@@ -445,7 +458,7 @@ class IOSParser(BaseParser):
                 )
                 if d1x_pc_ch:
                     dot1x_port_control = self._extract_match(
-                        d1x_pc_ch[0].text, r"^\s+dot1x\s+port-control\s+(\S+)"
+                        d1x_pc_ch[-1].text, r"^\s+dot1x\s+port-control\s+(\S+)"
                     )
 
             dot1x_host_mode = None
@@ -454,7 +467,7 @@ class IOSParser(BaseParser):
             )
             if hm_ch:
                 dot1x_host_mode = self._extract_match(
-                    hm_ch[0].text, r"^\s+authentication\s+host-mode\s+(\S+)"
+                    hm_ch[-1].text, r"^\s+authentication\s+host-mode\s+(\S+)"
                 )
 
             dot1x_mab = bool(intf_obj.find_child_objects(r"^\s+mab\s*$"))
@@ -465,7 +478,7 @@ class IOSParser(BaseParser):
             )
             if gv_ch:
                 val = self._extract_match(
-                    gv_ch[0].text,
+                    gv_ch[-1].text,
                     r"^\s+authentication\s+event\s+no-response\s+action\s+authorize\s+vlan\s+(\d+)",
                 )
                 if val:
@@ -477,7 +490,7 @@ class IOSParser(BaseParser):
             )
             if afv_ch:
                 val = self._extract_match(
-                    afv_ch[0].text,
+                    afv_ch[-1].text,
                     r"^\s+authentication\s+event\s+fail\s+action\s+authorize\s+vlan\s+(\d+)",
                 )
                 if val:
@@ -493,24 +506,24 @@ class IOSParser(BaseParser):
             stp_bpduguard: bool | None = None
             bg_ch = intf_obj.find_child_objects(r"^\s+spanning-tree\s+bpduguard\s+")
             if bg_ch:
-                stp_bpduguard = "enable" in bg_ch[0].text
+                stp_bpduguard = "enable" in bg_ch[-1].text
 
             stp_bpdufilter: bool | None = None
             bf_ch = intf_obj.find_child_objects(r"^\s+spanning-tree\s+bpdufilter\s+")
             if bf_ch:
-                stp_bpdufilter = "enable" in bf_ch[0].text
+                stp_bpdufilter = "enable" in bf_ch[-1].text
 
             stp_cost: int | None = None
             cost_ch = intf_obj.find_child_objects(r"^\s+spanning-tree\s+cost\s+(\d+)")
             if cost_ch:
-                val = self._extract_match(cost_ch[0].text, r"spanning-tree\s+cost\s+(\d+)")
+                val = self._extract_match(cost_ch[-1].text, r"spanning-tree\s+cost\s+(\d+)")
                 if val:
                     stp_cost = int(val)
 
             stp_port_priority: int | None = None
             pp_ch = intf_obj.find_child_objects(r"^\s+spanning-tree\s+port-priority\s+(\d+)")
             if pp_ch:
-                val = self._extract_match(pp_ch[0].text, r"spanning-tree\s+port-priority\s+(\d+)")
+                val = self._extract_match(pp_ch[-1].text, r"spanning-tree\s+port-priority\s+(\d+)")
                 if val:
                     stp_port_priority = int(val)
 
@@ -527,7 +540,7 @@ class IOSParser(BaseParser):
             if ch_group_children:
                 match = re.search(
                     r"^\s+channel-group\s+(\d+)\s+mode\s+(\S+)",
-                    ch_group_children[0].text,
+                    ch_group_children[-1].text,
                 )
                 if match:
                     channel_group = int(match.group(1))
@@ -539,7 +552,7 @@ class IOSParser(BaseParser):
             )
             if ml_children:
                 ml_match = re.search(
-                    r"port-channel\s+min-links\s+(\d+)", ml_children[0].text
+                    r"port-channel\s+min-links\s+(\d+)", ml_children[-1].text
                 )
                 if ml_match:
                     min_links = int(ml_match.group(1))
@@ -551,7 +564,7 @@ class IOSParser(BaseParser):
             )
             if lacp_pp_children:
                 lacp_pp_match = re.search(
-                    r"lacp\s+port-priority\s+(\d+)", lacp_pp_children[0].text
+                    r"lacp\s+port-priority\s+(\d+)", lacp_pp_children[-1].text
                 )
                 if lacp_pp_match:
                     lacp_port_priority = int(lacp_pp_match.group(1))
@@ -562,7 +575,7 @@ class IOSParser(BaseParser):
             )
             if lacp_rate_children:
                 lacp_rate_match = re.search(
-                    r"lacp\s+rate\s+(fast|normal)", lacp_rate_children[0].text
+                    r"lacp\s+rate\s+(fast|normal)", lacp_rate_children[-1].text
                 )
                 if lacp_rate_match:
                     lacp_rate = lacp_rate_match.group(1)
@@ -588,7 +601,7 @@ class IOSParser(BaseParser):
             if ospf_area_children:
                 match = re.search(
                     r"^\s+ip\s+ospf\s+(\d+)\s+area\s+(\S+)",
-                    ospf_area_children[0].text,
+                    ospf_area_children[-1].text,
                 )
                 if match:
                     ospf_process_id = int(match.group(1))
@@ -598,7 +611,7 @@ class IOSParser(BaseParser):
             ospf_cost_children = intf_obj.find_child_objects(r"^\s+ip\s+ospf\s+cost\s+(\d+)")
             if ospf_cost_children:
                 ospf_cost = int(
-                    self._extract_match(ospf_cost_children[0].text, r"^\s+ip\s+ospf\s+cost\s+(\d+)")
+                    self._extract_match(ospf_cost_children[-1].text, r"^\s+ip\s+ospf\s+cost\s+(\d+)")
                 )
             elif intf_obj.find_child_objects(r"^\s+no\s+ip\s+ospf\s+cost"):
                 iface_no_commands.append(f"field:interface:{intf_name}:ospf_cost")
@@ -610,7 +623,7 @@ class IOSParser(BaseParser):
             if ospf_priority_children:
                 ospf_priority = int(
                     self._extract_match(
-                        ospf_priority_children[0].text, r"^\s+ip\s+ospf\s+priority\s+(\d+)"
+                        ospf_priority_children[-1].text, r"^\s+ip\s+ospf\s+priority\s+(\d+)"
                     )
                 )
 
@@ -621,7 +634,7 @@ class IOSParser(BaseParser):
             if ospf_hello_children:
                 ospf_hello_interval = int(
                     self._extract_match(
-                        ospf_hello_children[0].text, r"^\s+ip\s+ospf\s+hello-interval\s+(\d+)"
+                        ospf_hello_children[-1].text, r"^\s+ip\s+ospf\s+hello-interval\s+(\d+)"
                     )
                 )
 
@@ -632,7 +645,7 @@ class IOSParser(BaseParser):
             if ospf_dead_children:
                 ospf_dead_interval = int(
                     self._extract_match(
-                        ospf_dead_children[0].text, r"^\s+ip\s+ospf\s+dead-interval\s+(\d+)"
+                        ospf_dead_children[-1].text, r"^\s+ip\s+ospf\s+dead-interval\s+(\d+)"
                     )
                 )
 
@@ -642,7 +655,7 @@ class IOSParser(BaseParser):
             )
             if ospf_network_children:
                 ospf_network_type = self._extract_match(
-                    ospf_network_children[0].text, r"^\s+ip\s+ospf\s+network\s+(.+)"
+                    ospf_network_children[-1].text, r"^\s+ip\s+ospf\s+network\s+(.+)"
                 )
 
             # ip ospf authentication (with or without mode argument)
@@ -651,7 +664,7 @@ class IOSParser(BaseParser):
             )
             if ospf_auth_children:
                 auth_mode = self._extract_match(
-                    ospf_auth_children[0].text, r"^\s+ip\s+ospf\s+authentication\s+(\S+)"
+                    ospf_auth_children[-1].text, r"^\s+ip\s+ospf\s+authentication\s+(\S+)"
                 )
                 # Bare "ip ospf authentication" (no argument) → simple-password mode
                 ospf_authentication = auth_mode if auth_mode else "simple"
@@ -662,7 +675,7 @@ class IOSParser(BaseParser):
             )
             if ospf_authkey_children:
                 ospf_authentication_key = self._extract_match(
-                    ospf_authkey_children[0].text,
+                    ospf_authkey_children[-1].text,
                     r"^\s+ip\s+ospf\s+authentication-key\s+(\S+)",
                 )
 
@@ -701,7 +714,7 @@ class IOSParser(BaseParser):
                 )
                 if tunnel_src_children:
                     tunnel_source = self._extract_match(
-                        tunnel_src_children[0].text, r"^\s+tunnel\s+source\s+(\S+)"
+                        tunnel_src_children[-1].text, r"^\s+tunnel\s+source\s+(\S+)"
                     )
 
                 tunnel_dst_children = intf_obj.find_child_objects(
@@ -709,7 +722,7 @@ class IOSParser(BaseParser):
                 )
                 if tunnel_dst_children:
                     dst_str = self._extract_match(
-                        tunnel_dst_children[0].text, r"^\s+tunnel\s+destination\s+(\S+)"
+                        tunnel_dst_children[-1].text, r"^\s+tunnel\s+destination\s+(\S+)"
                     )
                     try:
                         tunnel_destination = IPv4Address(dst_str)
@@ -721,7 +734,7 @@ class IOSParser(BaseParser):
                 )
                 if tunnel_mode_children:
                     tunnel_mode = self._extract_match(
-                        tunnel_mode_children[0].text, r"^\s+tunnel\s+mode\s+(.+)"
+                        tunnel_mode_children[-1].text, r"^\s+tunnel\s+mode\s+(.+)"
                     )
 
                 # tunnel protection ipsec profile <name>
@@ -730,7 +743,7 @@ class IOSParser(BaseParser):
                 )
                 if tp_children:
                     tunnel_protection_profile = self._extract_match(
-                        tp_children[0].text,
+                        tp_children[-1].text,
                         r"^\s+tunnel\s+protection\s+ipsec\s+profile\s+(\S+)",
                     )
 
@@ -738,7 +751,7 @@ class IOSParser(BaseParser):
                 tk_children = intf_obj.find_child_objects(r"^\s+tunnel\s+key\s+(\d+)")
                 if tk_children:
                     key_str = self._extract_match(
-                        tk_children[0].text, r"^\s+tunnel\s+key\s+(\d+)"
+                        tk_children[-1].text, r"^\s+tunnel\s+key\s+(\d+)"
                     )
                     if key_str:
                         tunnel_key = int(key_str)
@@ -749,7 +762,7 @@ class IOSParser(BaseParser):
                 )
                 if nid_children:
                     nid_str = self._extract_match(
-                        nid_children[0].text, r"^\s+ip\s+nhrp\s+network-id\s+(\d+)"
+                        nid_children[-1].text, r"^\s+ip\s+nhrp\s+network-id\s+(\d+)"
                     )
                     if nid_str:
                         nhrp_network_id = int(nid_str)
@@ -760,7 +773,7 @@ class IOSParser(BaseParser):
                 )
                 if na_children:
                     nhrp_authentication = self._extract_match(
-                        na_children[0].text, r"^\s+ip\s+nhrp\s+authentication\s+(\S+)"
+                        na_children[-1].text, r"^\s+ip\s+nhrp\s+authentication\s+(\S+)"
                     )
 
                 # ip nhrp nhs <ip> (one per line, multiple allowed)
@@ -820,19 +833,19 @@ class IOSParser(BaseParser):
             pim_mode = None
             pim_ch = intf_obj.find_child_objects(r"^\s+ip\s+pim\s+")
             if pim_ch:
-                pm = re.match(r"^\s+ip\s+pim\s+(sparse-mode|dense-mode|sparse-dense-mode)", pim_ch[0].text)
+                pm = re.match(r"^\s+ip\s+pim\s+(sparse-mode|dense-mode|sparse-dense-mode)", pim_ch[-1].text)
                 if pm:
                     pim_mode = pm.group(1)
             pim_dr_priority = None
             pdr_ch = intf_obj.find_child_objects(r"^\s+ip\s+pim\s+dr-priority\s+(\d+)")
             if pdr_ch:
-                v = self._extract_match(pdr_ch[0].text, r"^\s+ip\s+pim\s+dr-priority\s+(\d+)")
+                v = self._extract_match(pdr_ch[-1].text, r"^\s+ip\s+pim\s+dr-priority\s+(\d+)")
                 if v:
                     pim_dr_priority = int(v)
             pim_query_interval = None
             pqi_ch = intf_obj.find_child_objects(r"^\s+ip\s+pim\s+query-interval\s+(\d+)")
             if pqi_ch:
-                v = self._extract_match(pqi_ch[0].text, r"^\s+ip\s+pim\s+query-interval\s+(\d+)")
+                v = self._extract_match(pqi_ch[-1].text, r"^\s+ip\s+pim\s+query-interval\s+(\d+)")
                 if v:
                     pim_query_interval = int(v)
             pim_bfd = bool(intf_obj.find_child_objects(r"^\s+ip\s+pim\s+bfd"))
@@ -843,7 +856,7 @@ class IOSParser(BaseParser):
             if eam_ch:
                 eam = re.match(
                     r"^\s+ip\s+authentication\s+mode\s+eigrp\s+\d+\s+(\S+)",
-                    eam_ch[0].text,
+                    eam_ch[-1].text,
                 )
                 if eam:
                     eigrp_auth_mode = eam.group(1)
@@ -852,7 +865,7 @@ class IOSParser(BaseParser):
             if eakc_ch:
                 eakc = re.match(
                     r"^\s+ip\s+authentication\s+key-chain\s+eigrp\s+\d+\s+(\S+)",
-                    eakc_ch[0].text,
+                    eakc_ch[-1].text,
                 )
                 if eakc:
                     eigrp_auth_key_chain = eakc.group(1)
@@ -863,7 +876,7 @@ class IOSParser(BaseParser):
             if ehi_ch:
                 ehi = re.match(
                     r"^\s+ip\s+hello-interval\s+eigrp\s+\d+\s+(\d+)",
-                    ehi_ch[0].text,
+                    ehi_ch[-1].text,
                 )
                 if ehi:
                     eigrp_hello_interval = int(ehi.group(1))
@@ -872,7 +885,7 @@ class IOSParser(BaseParser):
             if eht_ch:
                 eht = re.match(
                     r"^\s+ip\s+hold-time\s+eigrp\s+\d+\s+(\d+)",
-                    eht_ch[0].text,
+                    eht_ch[-1].text,
                 )
                 if eht:
                     eigrp_hold_time = int(eht.group(1))
@@ -888,19 +901,19 @@ class IOSParser(BaseParser):
             igmp_version = None
             igv_ch = intf_obj.find_child_objects(r"^\s+ip\s+igmp\s+version\s+(\d)")
             if igv_ch:
-                v = self._extract_match(igv_ch[0].text, r"^\s+ip\s+igmp\s+version\s+(\d)")
+                v = self._extract_match(igv_ch[-1].text, r"^\s+ip\s+igmp\s+version\s+(\d)")
                 if v:
                     igmp_version = int(v)
             igmp_query_interval = None
             iqi_ch = intf_obj.find_child_objects(r"^\s+ip\s+igmp\s+query-interval\s+(\d+)")
             if iqi_ch:
-                v = self._extract_match(iqi_ch[0].text, r"^\s+ip\s+igmp\s+query-interval\s+(\d+)")
+                v = self._extract_match(iqi_ch[-1].text, r"^\s+ip\s+igmp\s+query-interval\s+(\d+)")
                 if v:
                     igmp_query_interval = int(v)
             igmp_query_max_response_time = None
             iqmr_ch = intf_obj.find_child_objects(r"^\s+ip\s+igmp\s+query-max-response-time\s+(\d+)")
             if iqmr_ch:
-                v = self._extract_match(iqmr_ch[0].text, r"^\s+ip\s+igmp\s+query-max-response-time\s+(\d+)")
+                v = self._extract_match(iqmr_ch[-1].text, r"^\s+ip\s+igmp\s+query-max-response-time\s+(\d+)")
                 if v:
                     igmp_query_max_response_time = int(v)
             # ip access-group applied to interface (inbound / outbound)
@@ -917,7 +930,7 @@ class IOSParser(BaseParser):
             igmp_access_group = None
             iag_ch = intf_obj.find_child_objects(r"^\s+ip\s+igmp\s+access-group\s+(\S+)")
             if iag_ch:
-                igmp_access_group = self._extract_match(iag_ch[0].text, r"^\s+ip\s+igmp\s+access-group\s+(\S+)")
+                igmp_access_group = self._extract_match(iag_ch[-1].text, r"^\s+ip\s+igmp\s+access-group\s+(\S+)")
             igmp_join_groups = []
             for jg_ch in intf_obj.find_child_objects(r"^\s+ip\s+igmp\s+join-group\s+(\S+)"):
                 v = self._extract_match(jg_ch.text, r"^\s+ip\s+igmp\s+join-group\s+(\S+)")
@@ -957,7 +970,7 @@ class IOSParser(BaseParser):
             if urpf_ch:
                 m = re.search(
                     r"^\s+ip\s+verify\s+unicast\s+source\s+reachable-via\s+(rx|any)",
-                    urpf_ch[0].text,
+                    urpf_ch[-1].text,
                 )
                 if m:
                     ip_verify_unicast = m.group(1)
@@ -967,21 +980,21 @@ class IOSParser(BaseParser):
             pbr_ch = intf_obj.find_child_objects(r"^\s+ip\s+policy\s+route-map\s+(\S+)")
             if pbr_ch:
                 ip_policy_route_map = self._extract_match(
-                    pbr_ch[0].text, r"^\s+ip\s+policy\s+route-map\s+(\S+)"
+                    pbr_ch[-1].text, r"^\s+ip\s+policy\s+route-map\s+(\S+)"
                 )
 
             # Crypto map
             crypto_map_name = None
             cm_ch = intf_obj.find_child_objects(r"^\s+crypto\s+map\s+(\S+)")
             if cm_ch:
-                crypto_map_name = self._extract_match(cm_ch[0].text, r"^\s+crypto\s+map\s+(\S+)")
+                crypto_map_name = self._extract_match(cm_ch[-1].text, r"^\s+crypto\s+map\s+(\S+)")
 
             # IP unnumbered
             unnumbered_source = None
             unnum_ch = intf_obj.find_child_objects(r"^\s+ip\s+unnumbered\s+(\S+)")
             if unnum_ch:
                 unnumbered_source = self._extract_match(
-                    unnum_ch[0].text, r"^\s+ip\s+unnumbered\s+(\S+)"
+                    unnum_ch[-1].text, r"^\s+ip\s+unnumbered\s+(\S+)"
                 )
 
             # Per-interface CDP
@@ -1103,6 +1116,28 @@ class IOSParser(BaseParser):
             )
 
         return interfaces
+
+    def _coalesce_interface_stanzas(self, intf_objs: list) -> list:
+        """Coalesce duplicate interface stanzas at the line level.
+
+        Groups ciscoconfparse objects by interface name and extends the first
+        object's children with subsequent stanzas' children.  The combined
+        object is then parsed once — normal last-match semantics apply, so
+        ``no shutdown`` after ``shutdown`` simply wins, and the model-level
+        ambiguity (field absent vs explicitly-set-to-default) never arises.
+        """
+        from collections import OrderedDict
+
+        seen: OrderedDict[str, object] = OrderedDict()
+        for obj in intf_objs:
+            name = self._extract_match(obj.text, r"^interface\s+(\S+)")
+            if not name:
+                continue
+            if name not in seen:
+                seen[name] = obj
+            else:
+                seen[name].children.extend(obj.children)
+        return list(seen.values())
 
     def _detect_interface_field_negations(
         self, intf_obj, intf_name: str
@@ -1822,7 +1857,7 @@ class IOSParser(BaseParser):
         vrf_children = intf_obj.find_child_objects(r"^\s+vrf\s+forwarding\s+(\S+)")
         if vrf_children:
             return self._extract_match(
-                vrf_children[0].text, r"^\s+vrf\s+forwarding\s+(\S+)"
+                vrf_children[-1].text, r"^\s+vrf\s+forwarding\s+(\S+)"
             )
         return None
 
@@ -1873,7 +1908,7 @@ class IOSParser(BaseParser):
         hsrp_version: int | None = None
         version_children = intf_obj.find_child_objects(r"^\s+standby\s+version\s+(\d+)")
         if version_children:
-            vm = re.search(r"standby\s+version\s+(\d+)", version_children[0].text)
+            vm = re.search(r"standby\s+version\s+(\d+)", version_children[-1].text)
             if vm:
                 hsrp_version = int(vm.group(1))
 
