@@ -1184,9 +1184,45 @@ class NXOSParser(IOSParser):
           - ``no member vni <id>`` inside ``interface nve``  → ``field:vxlan:vni:<id>``
           - ``no host-reachability protocol`` inside ``interface nve`` → ``field:vxlan:host_reachability``
           - ``no peer-keepalive`` inside ``vpc domain``      → ``field:vpc:peer_keepalive_*``
+          - ``no ip route ...`` inside ``vrf context NAME``  → ``static:NAME:<dest>[:<nh_spec>]``
+          - ``no vrf context NAME`` (top-level)              → ``field:vrfs:NAME``
+
+        The inherited static-route handling accepts both the traditional
+        ``DEST MASK`` and the NX-OS-native CIDR ``DEST/PLEN`` forms (see
+        ``IOSParser._static_route_deletion_tombstone``); the ``vrf context``
+        walk below mirrors the structure of ``parse_static_routes``, which is
+        where NX-OS VRF statics live (there is no ``ip route vrf NAME ...``
+        keyword form on NX-OS).
         """
         tombstones = super().parse_deletion_commands()
         parse = self._get_parse_obj()
+
+        # --- whole-VRF deletions ---
+        # ``no vrf context GUEST`` → ``field:vrfs:GUEST``
+        # (NX-OS equivalent of the IOS ``no vrf definition`` walk in the base
+        # parser; CCR confgraph_vrf_rt_removal_tombstones.md).  The nested
+        # ``no route-target`` / ``no rd`` removals inside ``vrf context``
+        # blocks are handled by the inherited NESTED_DELETION_RULES traversal —
+        # the registry's parent pattern matches both VRF block spellings.
+        for obj in parse.find_objects(r"^no\s+vrf\s+context\s+"):
+            m = re.match(r"^no\s+vrf\s+context\s+(\S+)", obj.text.strip())
+            if m:
+                tombstones.append(f"field:vrfs:{m.group(1)}")
+
+        # --- VRF static route deletions (nested under vrf context NAME) ---
+        for vrf_obj in parse.find_objects(r"^vrf\s+context\s+(\S+)"):
+            vrf_name = self._extract_match(vrf_obj.text, r"^vrf\s+context\s+(\S+)")
+            if not vrf_name:
+                continue
+            for child in vrf_obj.all_children:
+                m = re.match(r"no\s+ip\s+route\s+(.+)$", child.text.strip())
+                if not m:
+                    continue
+                tombstone = self._static_route_deletion_tombstone(
+                    vrf_name, m.group(1).split()
+                )
+                if tombstone:
+                    tombstones.append(tombstone)
 
         # --- VXLAN nested deletions (under interface nve) ---
         for nve_obj in parse.find_objects(r"^interface\s+nve\d+"):

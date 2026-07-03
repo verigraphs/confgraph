@@ -3443,6 +3443,60 @@ class IOSParser(BaseParser):
 
         return static_routes
 
+    def _static_route_deletion_tombstone(
+        self, vrf: str, tokens: list[str]
+    ) -> str | None:
+        """Build a ``static:<vrf>:<dest>[:<nh_spec>]`` tombstone from a route spec.
+
+        ``tokens`` is the whitespace-split remainder of a ``no ip route`` line
+        after the optional ``vrf <NAME>`` keyword form.  Two destination forms
+        are accepted:
+
+          - ``DEST MASK [NH ...]``  — IOS traditional (two tokens)
+          - ``DEST/PLEN [NH ...]``  — NX-OS/EOS CIDR (single token)
+
+        The optional next-hop spec mirrors ``parse_static_routes``: the first
+        token after the destination is an NH IP or an interface name; an
+        interface may be followed by an explicit NH IP.  A pure-numeric first
+        token can never be an NH (it would be an AD, which is invalid without
+        an NH) — treated as NH-less defensively.  Trailing AD / tag / name /
+        permanent / track tokens are excluded from the tombstone (AD is not
+        part of the route identity).  Returns ``None`` when the destination
+        does not parse.
+        """
+        if not tokens:
+            return None
+        if "/" in tokens[0]:
+            # CIDR form (NX-OS/EOS): destination is a single token.
+            dest_str = tokens[0]
+            remaining = tokens[1:]
+        else:
+            # Traditional form: destination is DEST MASK.
+            if len(tokens) < 2:
+                return None
+            dest_str = f"{tokens[0]}/{tokens[1]}"
+            remaining = tokens[2:]
+        try:
+            dest = IPv4Network(dest_str, strict=False)
+        except ValueError:
+            return None
+        nh_tokens: list[str] = []
+        if remaining and not remaining[0].isdigit():
+            nh_tokens.append(remaining[0])
+            try:
+                IPv4Address(remaining[0])
+            except ValueError:
+                # Interface name — may be followed by an explicit NH IP.
+                if len(remaining) > 1:
+                    try:
+                        IPv4Address(remaining[1])
+                        nh_tokens.append(remaining[1])
+                    except ValueError:
+                        pass
+        if nh_tokens:
+            return f"static:{vrf}:{dest}:{' '.join(nh_tokens)}"
+        return f"static:{vrf}:{dest}"
+
     def parse_deletion_commands(self) -> list[str]:
         # Handles:
         #   - ``no vlan <id>``                              → ``vlan:<id>``
@@ -3451,6 +3505,8 @@ class IOSParser(BaseParser):
         Handles:
           - ``no ip route [vrf NAME] DEST MASK``         → ``static:<vrf>:DEST/PLEN``
           - ``no ip route [vrf NAME] DEST MASK NH [AD]`` → ``static:<vrf>:DEST/PLEN:NH``
+          - ``no ip route [vrf NAME] DEST/PLEN [NH [AD]]`` (NX-OS/EOS CIDR form)
+                                                          → same tombstones
           - ``no router ospf <id>``                       → ``process:ospf:<id>``
           - ``no router bgp <asn>``                       → ``process:bgp:<asn>``
           - ``no router isis [<tag>]``                    → ``process:isis:<tag>``
@@ -3480,41 +3536,23 @@ class IOSParser(BaseParser):
         # permanent / track tokens are excluded: AD is not part of the
         # identity (re-entering the same dest+NH with a different AD replaces
         # the entry on IOS).
+        #
+        # Route-spec parsing lives in _static_route_deletion_tombstone so the
+        # NX-OS parser can reuse it for deletions nested under ``vrf context``
+        # blocks; it also accepts the NX-OS/EOS CIDR form (``DEST/PLEN`` as a
+        # single token) alongside the IOS ``DEST MASK`` form.
         for obj in parse.find_objects(r"^no\s+ip\s+route\s+"):
             m = re.search(
-                r"^no\s+ip\s+route\s+(?:vrf\s+(\S+)\s+)?(\S+)\s+(\S+)(.*)$",
+                r"^no\s+ip\s+route\s+(?:vrf\s+(\S+)\s+)?(.+)$",
                 obj.text,
             )
             if not m:
                 continue
-            try:
-                vrf = m.group(1) or ""
-                dest = IPv4Network(f"{m.group(2)}/{m.group(3)}", strict=False)
-            except ValueError:
-                continue
-            # Parse the optional next-hop spec (mirrors parse_static_routes):
-            # first token after the mask is an NH IP or an interface name; an
-            # interface may be followed by an NH IP.  A pure-numeric token can
-            # never be an NH (it would be an AD, which is invalid without an
-            # NH on IOS) — treat as NH-less defensively.
-            nh_tokens: list[str] = []
-            remaining = (m.group(4) or "").split()
-            if remaining and not remaining[0].isdigit():
-                nh_tokens.append(remaining[0])
-                try:
-                    IPv4Address(remaining[0])
-                except ValueError:
-                    # Interface name — may be followed by an explicit NH IP.
-                    if len(remaining) > 1:
-                        try:
-                            IPv4Address(remaining[1])
-                            nh_tokens.append(remaining[1])
-                        except ValueError:
-                            pass
-            if nh_tokens:
-                tombstones.append(f"static:{vrf}:{dest}:{' '.join(nh_tokens)}")
-            else:
-                tombstones.append(f"static:{vrf}:{dest}")
+            tombstone = self._static_route_deletion_tombstone(
+                m.group(1) or "", m.group(2).split()
+            )
+            if tombstone:
+                tombstones.append(tombstone)
         # --- vlan database deletions ---
         for obj in parse.find_objects(r"^no\s+vlan\s+"):
             m = re.search(r"^no\s+vlan\s+([\d,\-]+)", obj.text)
@@ -3713,6 +3751,17 @@ class IOSParser(BaseParser):
             m = re.match(r"^no\s+lldp\s+tlv-select\s+(\S+)", obj.text.strip())
             if m:
                 tombstones.append(f"field:lldp:tlv:{m.group(1)}")
+
+        # --- whole-VRF deletions ---
+        # ``no vrf definition GUEST`` → ``field:vrfs:GUEST``
+        # (CCR confgraph_vrf_rt_removal_tombstones.md).  The ``field:vrfs:…``
+        # shape (plural — the ParsedConfig field name) lets the engine
+        # classifier attribute the removal to the VRF coverage area.  The
+        # NX-OS override adds the equivalent ``no vrf context NAME`` walk.
+        for obj in parse.find_objects(r"^no\s+vrf\s+definition\s+"):
+            m = re.search(r"^no\s+vrf\s+definition\s+(\S+)", obj.text)
+            if m:
+                tombstones.append(f"field:vrfs:{m.group(1)}")
 
         # --- interface deletions ---
         # ``no interface Loopback0`` → ``interface:Loopback0``

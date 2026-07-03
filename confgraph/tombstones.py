@@ -125,4 +125,46 @@ NESTED_DELETION_RULES: list[NestedDeletionRule] = [
         child_groups=["area_id"],
         template="ospf:{pid}:area:{area_id}:nssa_reset",
     ),
+    # VRF route-target removals (CCR confgraph_vrf_rt_removal_tombstones.md).
+    # The WI-4 merge made route_target_* lists ADDITIVE (device-faithful), so
+    # the only way an RT set can shrink/replace is the ``no route-target``
+    # form — which must tombstone or tenant fragmentation is invisible.
+    # Parent covers IOS ``vrf definition NAME`` and NX-OS ``vrf context NAME``;
+    # the traversal walks all_children, so removals nested under
+    # ``address-family ipv4`` are found.  Template uses ``vrfs`` (plural — the
+    # ParsedConfig field name) so the engine classifier attributes the
+    # tombstone to the VRF coverage area via _TOP_FIELD_AREA.
+    # Proposal: ``no route-target import 65400:10`` inside ``vrf definition GUEST``
+    # Tombstone: ``field:vrfs:GUEST:route_target_import:65400:10``
+    NestedDeletionRule(
+        parent_pattern=r"^vrf\s+(?:definition|context)\s+(\S+)\s*$",
+        parent_groups=["name"],
+        child_pattern=r"^no\s+route-target\s+import\s+(\S+)\s*$",
+        child_groups=["rt"],
+        template="vrfs:{name}:route_target_import:{rt}",
+    ),
+    NestedDeletionRule(
+        parent_pattern=r"^vrf\s+(?:definition|context)\s+(\S+)\s*$",
+        parent_groups=["name"],
+        child_pattern=r"^no\s+route-target\s+export\s+(\S+)\s*$",
+        child_groups=["rt"],
+        template="vrfs:{name}:route_target_export:{rt}",
+    ),
+    NestedDeletionRule(
+        parent_pattern=r"^vrf\s+(?:definition|context)\s+(\S+)\s*$",
+        parent_groups=["name"],
+        child_pattern=r"^no\s+route-target\s+both\s+(\S+)\s*$",
+        child_groups=["rt"],
+        template="vrfs:{name}:route_target_both:{rt}",
+    ),
+    # VRF RD reset — ``no rd`` / ``no rd 65400:1`` inside a VRF block.
+    # Scalar reset: the merger sets the named VRF's rd back to None.
+    # Tombstone: ``field:vrfs:GUEST:rd``
+    NestedDeletionRule(
+        parent_pattern=r"^vrf\s+(?:definition|context)\s+(\S+)\s*$",
+        parent_groups=["name"],
+        child_pattern=r"^no\s+rd(?:\s+(\S+))?\s*$",
+        child_groups=["rd"],
+        template="vrfs:{name}:rd",
+    ),
 ]
