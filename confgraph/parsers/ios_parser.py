@@ -3752,6 +3752,70 @@ class IOSParser(BaseParser):
             if m:
                 tombstones.append(f"field:lldp:tlv:{m.group(1)}")
 
+        # --- Service entity removals: IP SLA / object track / EEM / banner ---
+        # (CCR confgraph_service_entity_removal_tombstones.md.)  Path segments
+        # use the ParsedConfig field names (the ``field:vrfs:…`` precedent) so
+        # the engine classifier attributes each removal to its coverage area
+        # (IPSLA / OBJECT_TRACKING / EEM / BANNER) via _TOP_FIELD_AREA.
+        # NX-OS/EOS inherit these walks — the syntax is identical there.
+        #
+        # Device-true "delete + re-add" = replace: when the SAME entity is
+        # positively re-asserted later in the script (``no ip sla 1`` followed
+        # by ``ip sla 1 …`` — the canonical retarget shape), the keyed replace
+        # merge already models the replacement, and a tombstone would clobber
+        # the re-added entity (deletions apply after the additive pass).  Each
+        # walk therefore suppresses the tombstone if a positive definition of
+        # the same entity appears after the negation line.
+        def _readded_later(neg_linenum: int, positive_pattern: str) -> bool:
+            return any(
+                o.linenum > neg_linenum
+                for o in parse.find_objects(positive_pattern)
+            )
+
+        # ``no ip sla <id>`` only — sub-forms (``no ip sla schedule 10``,
+        # ``no ip sla responder``) are attribute removals, not entity removal.
+        for obj in parse.find_objects(r"^no\s+ip\s+sla\s+\d"):
+            m = re.match(r"^no\s+ip\s+sla\s+(\d+)\s*$", obj.text.strip())
+            if m and not _readded_later(
+                obj.linenum, rf"^ip\s+sla\s+{m.group(1)}\s*$"
+            ):
+                tombstones.append(f"field:ip_sla_operations:{m.group(1)}")
+
+        # ``no track <id>`` only — ``no track 1 ip sla …`` (attribute negation
+        # inside a re-assert) is not a whole-entity removal.
+        for obj in parse.find_objects(r"^no\s+track\s+\d"):
+            m = re.match(r"^no\s+track\s+(\d+)\s*$", obj.text.strip())
+            if m and not _readded_later(
+                obj.linenum, rf"^track\s+{m.group(1)}\b"
+            ):
+                tombstones.append(f"field:object_tracks:{m.group(1)}")
+
+        for obj in parse.find_objects(r"^no\s+event\s+manager\s+applet\s+"):
+            m = re.match(r"^no\s+event\s+manager\s+applet\s+(\S+)", obj.text.strip())
+            if m and not _readded_later(
+                obj.linenum,
+                rf"^event\s+manager\s+applet\s+{re.escape(m.group(1))}\s*$",
+            ):
+                tombstones.append(f"field:eem_applets:{m.group(1)}")
+
+        # ``no banner <type>`` → scalar reset of the BannerConfig field.  The
+        # tombstone carries the model FIELD name (exec → exec_banner) so the
+        # merger's generic scalar-field-reset accessor applies it directly.
+        _banner_field = {
+            "motd": "motd",
+            "login": "login",
+            "exec": "exec_banner",
+            "incoming": "incoming",
+        }
+        for obj in parse.find_objects(r"^no\s+banner\s+"):
+            m = re.match(
+                r"^no\s+banner\s+(motd|login|exec|incoming)\b", obj.text.strip()
+            )
+            if m and not _readded_later(
+                obj.linenum, rf"^banner\s+{m.group(1)}\b"
+            ):
+                tombstones.append(f"field:banners:{_banner_field[m.group(1)]}")
+
         # --- whole-VRF deletions ---
         # ``no vrf definition GUEST`` → ``field:vrfs:GUEST``
         # (CCR confgraph_vrf_rt_removal_tombstones.md).  The ``field:vrfs:…``
