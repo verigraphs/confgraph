@@ -67,8 +67,16 @@ def _ops_with_verb(ops, verb):
 
 
 def _op_for_tombstone(ops, tombstone: str) -> ChangeOp:
-    """Find the op derived from a given tombstone (source_line carries it)."""
-    matches = [op for op in ops if op.source_line == tombstone]
+    """Find the op for a given tombstone.
+
+    Phase-0 derived ops carry the tombstone in ``source_line``; Phase-3
+    NATIVE ops carry the real command line instead, so match on the codec
+    path too (``":".join(path)`` IS the tombstone, byte-exact).
+    """
+    matches = [
+        op for op in ops
+        if op.source_line == tombstone or ":".join(op.path) == tombstone
+    ]
     assert matches, f"No op derived for tombstone {tombstone!r}"
     return matches[0]
 

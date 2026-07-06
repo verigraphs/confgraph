@@ -85,6 +85,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field as dc_field
 from enum import Enum
+from functools import lru_cache as _lru_cache
 from typing import Any, Callable, TYPE_CHECKING
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -98,6 +99,7 @@ __all__ = [
     "derive_ops",
     "encode_legacy",
     "is_interface_scoped_path",
+    "interface_scalar_fields",
 ]
 
 
@@ -128,6 +130,16 @@ class ChangeOp:
         source_line: Verbatim config line when known; best-effort reconstruction
                      (tombstone string / block first line) in Phase 0.
         line_no:     1-based config line number, ``-1`` when unknown.
+        origin:      ``"native"`` for ops the parser emitted directly from a
+                     command line (Phase 3 — real provenance, migrated family),
+                     ``"derived"`` for ops translated from legacy state
+                     artifacts by :func:`derive_ops`.  This is the
+                     discriminator consumers gate on: for native ops,
+                     op-existence == "the command was written" (structural),
+                     so e.g. the classifier counts them touched without the
+                     legacy ``_is_set`` value heuristic.  Provenance fields
+                     are NOT a reliable discriminator (derived SET ops carry
+                     real block line numbers too).
     """
 
     verb: Verb
@@ -135,6 +147,7 @@ class ChangeOp:
     value: Any = None
     source_line: str = ""
     line_no: int = -1
+    origin: str = "derived"
 
 
 # Ordered — device apply order is semantic (Phase 0 deriver emits canonical
@@ -248,6 +261,7 @@ _SKIP_TOP_FIELDS: frozenset[str] = frozenset(
         "no_commands",
         "unrecognized_blocks",
         "change_ops",
+        "native_change_ops",
     }
 )
 
@@ -255,6 +269,38 @@ _SKIP_TOP_FIELDS: frozenset[str] = frozenset(
 _PROVENANCE_FIELDS: frozenset[str] = frozenset(
     {"object_id", "raw_lines", "line_numbers", "source_os", "no_commands", "name"}
 )
+
+
+@_lru_cache(maxsize=1)
+def interface_scalar_fields() -> frozenset[str]:
+    """Family-1 boundary: InterfaceConfig scalar/boolean field names.
+
+    Phase-3 family 1 (CCR Appendix D) — the fields the line-based parsers
+    emit NATIVE ops for.  Defined structurally so a future scalar model
+    field automatically joins the family: a model field with a declared
+    Pydantic default and no ``default_factory``, excluding provenance /
+    identity fields (``_PROVENANCE_FIELDS`` + ``interface_type``).
+
+    Collection-shaped fields (lists/dicts — trunk_allowed_vlans,
+    secondary_ips, ipv6_addresses, FHRP groups, helper_addresses,
+    nhrp_nhs/nhrp_map, igmp groups, ospf_message_digest_keys) all carry
+    ``default_factory`` and are therefore excluded — they belong to later
+    families.
+    """
+    from pydantic_core import PydanticUndefined
+
+    from confgraph.models.interface import InterfaceConfig
+
+    fields: set[str] = set()
+    for name, info in InterfaceConfig.model_fields.items():
+        if name in _PROVENANCE_FIELDS or name == "interface_type":
+            continue
+        if info.default_factory is not None:
+            continue  # collection-shaped — later families
+        if info.default is PydanticUndefined:
+            continue  # required identity field — no default to compare against
+        fields.add(name)
+    return frozenset(fields)
 
 
 def _static_nh_key(r: Any) -> str:
@@ -400,15 +446,33 @@ def _derive_set_ops(proposal: "ParsedConfig") -> ChangeSet:
 
 
 def derive_ops(proposal: "ParsedConfig") -> ChangeSet:
-    """Mechanically translate a legacy-parsed proposal into a ChangeSet.
+    """Translate a legacy-parsed proposal into the full, composed ChangeSet.
 
-    Reproduces today's semantics exactly (including blind spots) — this is
-    the compatibility bridge, not the improvement.  Canonical op order
-    mirrors the legacy merge apply order: SET ops (additive pass), BGP-scoped
-    deletions, top-level deletions, interface-scoped deletions, then
-    UNRECOGNIZED markers.  Crash-free on any ParsedConfig, including
-    baselines (which simply produce SET ops and no deletions).
+    Two sources compose (CCR Appendix D — Phase 3 hybrid derivation):
+
+    1. **Native ops** (``proposal.native_change_ops``) — emitted directly by
+       the parser for migrated families (family 1: interface scalars /
+       booleans), with real provenance.  They come FIRST in the result.
+    2. **Derived ops** — the Phase-0 mechanical translation of the remaining
+       legacy artifacts, reproducing today's semantics exactly (including
+       blind spots).  Canonical order mirrors the legacy merge apply order:
+       SET ops (additive pass), BGP-scoped deletions, top-level deletions,
+       interface-scoped deletions, then UNRECOGNIZED markers.
+
+    Composition rule: a derived op whose ``path`` collides with a native
+    op's path is dropped (the native op is the same intent with better
+    provenance — family-1 SET paths are identical by construction, and
+    family-1 tombstones are themselves regenerated from the native UNSET
+    ops, byte-exact).  Path-dedupe is deliberately used instead of a
+    family-list skip: if native emission ever under-covers, the derived op
+    SURVIVES and behavior degrades to legacy parity instead of silently
+    dropping intent.  The anti-rot test pins that family-1 ops are in fact
+    all native.
+
+    Crash-free on any ParsedConfig, including baselines (which simply
+    produce SET ops and no deletions).
     """
+    natives: ChangeSet = list(getattr(proposal, "native_change_ops", None) or [])
     ops: ChangeSet = []
 
     # 1. Additive intent → SET ops.
@@ -468,7 +532,13 @@ def derive_ops(proposal: "ParsedConfig") -> ChangeSet:
             )
         )
 
-    return ops
+    if not natives:
+        return ops
+
+    # Compose: natives first, then every derived op whose path a native op
+    # does not already claim (see docstring — dedupe, not family-skip).
+    native_paths = {op.path for op in natives}
+    return natives + [op for op in ops if op.path not in native_paths]
 
 
 # ---------------------------------------------------------------------------

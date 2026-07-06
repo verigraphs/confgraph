@@ -247,6 +247,14 @@ class ParsedConfig(BaseModel):
     # persistent artifact, this can be promoted to a real field together with
     # the corresponding downstream registry entries.
     _change_ops: Any = PrivateAttr(default=None)
+    # Phase-3 NATIVE ops (CCR Appendix D): ops the parser emitted directly
+    # from command lines for migrated families (family 1: interface
+    # scalars/booleans).  Kept SEPARATE from ``change_ops`` so the engine's
+    # single-derivation cache (`ops_for_proposal`, which returns
+    # ``change_ops`` as-is when non-None) always goes through
+    # ``derive_ops`` — which composes natives with the derived remainder
+    # into the full ChangeSet.  Same private-attr rationale as above.
+    _native_change_ops: Any = PrivateAttr(default=None)
 
     class Config:
         """Pydantic model configuration."""
@@ -265,6 +273,24 @@ class ParsedConfig(BaseModel):
     @change_ops.setter
     def change_ops(self, value: Any) -> None:
         self._change_ops = value
+
+    @property
+    def native_change_ops(self) -> Any:
+        """Parser-emitted native ChangeOps for migrated command families.
+
+        ``None`` for parsers that do not emit native ops (JunOS/PAN-OS until
+        Phase 5) and for configs parsed before Phase 3.  Populated
+        unconditionally by the IOS-family parsers (baselines included —
+        their ops are simply never consumed).  Consumers must not read this
+        directly for the full ChangeSet; use
+        :func:`confgraph.change_ir.derive_ops`, which composes native +
+        derived ops.
+        """
+        return self._native_change_ops
+
+    @native_change_ops.setter
+    def native_change_ops(self, value: Any) -> None:
+        self._native_change_ops = value
 
     def get_interface_by_name(self, name: str) -> InterfaceConfig | None:
         """Get interface by name."""

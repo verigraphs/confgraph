@@ -426,6 +426,11 @@ class IOSParser(BaseParser):
         # indistinguishable.
         intf_objs = self._coalesce_interface_stanzas(intf_objs)
 
+        # Change-IR Phase 3 family 1: native UNSET ops collected inline at
+        # each negation site (their tombstones are generated from the ops);
+        # attached to the ParsedConfig at parse finalization.
+        self._pending_native_unset_ops = []
+
         for intf_obj in intf_objs:
             intf_name = self._extract_match(intf_obj.text, r"^interface\s+(\S+)")
             if not intf_name:
@@ -438,14 +443,20 @@ class IOSParser(BaseParser):
 
             # Basic attributes
             iface_no_commands: list[str] = []
+            iface_unset_ops: list = []
             description = None
             desc_children = intf_obj.find_child_objects(r"^\s+description\s+(.+)")
             if desc_children:
                 description = self._extract_match(
                     desc_children[-1].text, r"^\s+description\s+(.+)"
                 )
-            elif intf_obj.find_child_objects(r"^\s+no\s+description"):
-                iface_no_commands.append(f"field:interface:{intf_name}:description")
+            else:
+                no_desc = intf_obj.find_child_objects(r"^\s+no\s+description")
+                if no_desc:
+                    self._native_iface_unset(
+                        iface_unset_ops, iface_no_commands,
+                        intf_name, "description", no_desc[-1],
+                    )
 
             enabled = not self._is_shutdown(intf_obj)
 
@@ -845,8 +856,13 @@ class IOSParser(BaseParser):
                 ospf_cost = int(
                     self._extract_match(ospf_cost_children[-1].text, r"^\s+ip\s+ospf\s+cost\s+(\d+)")
                 )
-            elif intf_obj.find_child_objects(r"^\s+no\s+ip\s+ospf\s+cost"):
-                iface_no_commands.append(f"field:interface:{intf_name}:ospf_cost")
+            else:
+                no_cost = intf_obj.find_child_objects(r"^\s+no\s+ip\s+ospf\s+cost")
+                if no_cost:
+                    self._native_iface_unset(
+                        iface_unset_ops, iface_no_commands,
+                        intf_name, "ospf_cost", no_cost[-1],
+                    )
 
             # ip ospf priority
             ospf_priority_children = intf_obj.find_child_objects(
@@ -1058,8 +1074,12 @@ class IOSParser(BaseParser):
 
             # MPLS per-interface
             mpls_ip = bool(intf_obj.find_child_objects(r"^\s+mpls\s+ip\b"))
-            if intf_obj.find_child_objects(r"^\s+no\s+mpls\s+ip\b"):
-                iface_no_commands.append(f"field:interface:{intf_name}:mpls_ip")
+            no_mpls = intf_obj.find_child_objects(r"^\s+no\s+mpls\s+ip\b")
+            if no_mpls:
+                self._native_iface_unset(
+                    iface_unset_ops, iface_no_commands,
+                    intf_name, "mpls_ip", no_mpls[-1],
+                )
 
             # PIM per-interface
             pim_mode = None
@@ -1124,10 +1144,13 @@ class IOSParser(BaseParser):
 
             # BFD per-interface (platform-specific hook)
             bfd_interval, bfd_min_rx, bfd_multiplier, bfd_template = self._parse_iface_bfd(intf_obj)
-            if intf_obj.find_child_objects(r"^\s+no\s+bfd\s+interval"):
-                iface_no_commands.append(f"field:interface:{intf_name}:bfd_interval")
-                iface_no_commands.append(f"field:interface:{intf_name}:bfd_min_rx")
-                iface_no_commands.append(f"field:interface:{intf_name}:bfd_multiplier")
+            no_bfd = intf_obj.find_child_objects(r"^\s+no\s+bfd\s+interval")
+            if no_bfd:
+                for bfd_field in ("bfd_interval", "bfd_min_rx", "bfd_multiplier"):
+                    self._native_iface_unset(
+                        iface_unset_ops, iface_no_commands,
+                        intf_name, bfd_field, no_bfd[-1],
+                    )
 
             # IGMP per-interface
             igmp_version = None
@@ -1242,6 +1265,21 @@ class IOSParser(BaseParser):
             if intf_obj.find_child_objects(r"^\s+no\s+lldp\s+receive"):
                 lldp_receive = False
 
+            # Field-negation UNSET ops (F1/WI-1 families) — their legacy
+            # tombstones are generated from the ops via encode_legacy
+            # (byte-identical to the pre-Phase-3 bespoke strings).
+            negation_ops = self._detect_interface_field_negation_ops(
+                intf_obj, intf_name
+            )
+            negation_tombstones: list[str] = []
+            if negation_ops:
+                from confgraph.change_ir import encode_legacy
+
+                negation_tombstones = encode_legacy(
+                    negation_ops
+                ).interface_no_commands.get(intf_name, [])
+            self._pending_native_unset_ops.extend(iface_unset_ops + negation_ops)
+
             interfaces.append(
                 InterfaceConfig(
                     object_id=f"interface_{intf_name}",
@@ -1342,8 +1380,7 @@ class IOSParser(BaseParser):
                     cdp_enabled=cdp_enabled,
                     lldp_transmit=lldp_transmit,
                     lldp_receive=lldp_receive,
-                    no_commands=iface_no_commands
-                    + self._detect_interface_field_negations(intf_obj, intf_name),
+                    no_commands=iface_no_commands + negation_tombstones,
                 )
             )
 
@@ -1371,25 +1408,224 @@ class IOSParser(BaseParser):
                 seen[name].children.extend(obj.children)
         return list(seen.values())
 
-    def _detect_interface_field_negations(
+    # ------------------------------------------------------------------
+    # Change-IR Phase 3 family 1 — native op emission for interface
+    # scalars/booleans (CCR change_ir_proposal_operations.md, Appendix D).
+    #
+    # UNSET ops are emitted inline at each negation-detection site with the
+    # verbatim `no …` line as provenance; the legacy tombstone string is
+    # generated FROM the op via encode_legacy (single source — the bespoke
+    # f-string emission is gone).  SET ops are emitted at parse
+    # finalization from the FINAL interface state (after every subclass
+    # post-patch), see _attach_native_change_ops / _native_iface_set_ops.
+    # ------------------------------------------------------------------
+
+    # Per-field command-line patterns used to locate REAL provenance for
+    # state-derived SET ops (last matching line in the interface block
+    # wins, mirroring the scalar extraction's [-1] semantics).  Fields
+    # without an entry (or with no matching line) fall back to the block
+    # header — provenance quality never affects semantics.
+    _IFACE_OP_LINE_PATTERNS: dict[str, str] = {
+        "enabled": r"^\s+(?:no\s+)?shutdown\s*$",
+        "description": r"^\s+description\s+",
+        "vrf": r"^\s+(?:ip\s+)?vrf\s+(?:forwarding|member)\s+",
+        "ip_address": r"^\s+ip(?:v4)?\s+address\s+",
+        "mtu": r"^\s+mtu\s+\d+",
+        "ip_mtu": r"^\s+ip\s+mtu\s+\d+",
+        "speed": r"^\s+speed\s+",
+        "duplex": r"^\s+duplex\s+",
+        "bandwidth": r"^\s+bandwidth\s+\d+",
+        "delay": r"^\s+delay\s+\d+",
+        "switchport_mode": r"^\s+switchport\s+mode\s+",
+        "access_vlan": r"^\s+switchport\s+access\s+vlan\s+",
+        "trunk_native_vlan": r"^\s+switchport\s+trunk\s+native\s+vlan\s+",
+        "channel_group": r"^\s+channel-group\s+\d+",
+        "channel_group_mode": r"^\s+channel-group\s+\d+\s+mode\s+",
+        "mpls_ip": r"^\s+mpls\s+ip\b",
+        "ospf_cost": r"^\s+ip\s+ospf\s+cost\s+",
+        "ospf_area": r"^\s+ip\s+(?:router\s+)?ospf\s+(?:\S+\s+)?area\s+",
+        "ospf_process_id": r"^\s+ip\s+(?:router\s+)?ospf\s+\d+\s+area\s+",
+        "ospf_priority": r"^\s+ip\s+ospf\s+priority\s+",
+        "ospf_hello_interval": r"^\s+ip\s+ospf\s+hello-interval\s+",
+        "ospf_dead_interval": r"^\s+ip\s+ospf\s+dead-interval\s+",
+        "ospf_network_type": r"^\s+ip\s+ospf\s+network\s+",
+        "ospf_mtu_ignore": r"^\s+ip\s+ospf\s+mtu-ignore\s*$",
+        "cdp_enabled": r"^\s+(?:no\s+)?cdp\s+enable\s*$",
+        "lldp_transmit": r"^\s+(?:no\s+)?lldp\s+transmit\s*$",
+        "lldp_receive": r"^\s+(?:no\s+)?lldp\s+receive\s*$",
+        "port_security_enabled": r"^\s+switchport\s+port-security\s*$",
+        "nat_direction": r"^\s+ip\s+nat\s+(?:inside|outside)\s*$",
+        "acl_in": r"^\s+ip(?:v4)?\s+access-group\s+\S+\s+(?:in\b|ingress)",
+        "acl_out": r"^\s+ip(?:v4)?\s+access-group\s+\S+\s+(?:out\b|egress)",
+        "service_policy_input": r"^\s+service-policy\s+input\s+",
+        "service_policy_output": r"^\s+service-policy\s+output\s+",
+    }
+
+    # Positive re-asserts of the True-default visibility booleans — the
+    # capability family 1 unlocks: `lldp transmit` after a baseline
+    # `no lldp transmit` restates the model default, so the state snapshot
+    # (and therefore legacy mode) is structurally blind to it.  A SET op
+    # with value == default is emitted iff the positive line is present AND
+    # the final parsed value is True (a negation anywhere in the block wins,
+    # mirroring the extraction's negative-presence semantics).
+    _IFACE_POSITIVE_RESTATE_PATTERNS: dict[str, str] = {
+        "lldp_transmit": r"^\s+lldp\s+transmit\s*$",
+        "lldp_receive": r"^\s+lldp\s+receive\s*$",
+        "cdp_enabled": r"^\s+cdp\s+enable\s*$",
+    }
+
+    def _native_iface_unset(
+        self,
+        ops: list,
+        no_commands: list[str],
+        intf_name: str,
+        field: str,
+        child=None,
+    ) -> None:
+        """Emit one native UNSET op + its codec-generated legacy tombstone.
+
+        The tombstone string appended to *no_commands* is produced from the
+        op via ``encode_legacy`` (byte-exact ``":".join(path)``) — the op is
+        the single source; parse artifacts are an encoding of it.
+        """
+        from confgraph.change_ir import ChangeOp, Verb, encode_legacy
+
+        op = ChangeOp(
+            verb=Verb.UNSET,
+            path=("field", "interface", intf_name, field),
+            value=None,
+            source_line=(child.text.strip() if child is not None else ""),
+            line_no=(child.linenum if child is not None else -1),
+            origin="native",
+        )
+        ops.append(op)
+        no_commands.extend(encode_legacy([op]).interface_no_commands[intf_name])
+
+    def _native_iface_set_ops(self, iface) -> list:
+        """Native SET ops for one FINAL InterfaceConfig (family 1).
+
+        State-derived part: every family-1 field whose final value differs
+        from its declared default — identical, by construction, to what the
+        Phase-0 deriver would emit for the field (parity gate), but with
+        real per-line provenance where ``_IFACE_OP_LINE_PATTERNS`` locates
+        the command.  Restate part: positive re-asserts of the True-default
+        visibility booleans (value == default — the new capability).
+        """
+        from confgraph.change_ir import ChangeOp, Verb, interface_scalar_fields
+        from confgraph.utils.interface import normalize_interface_name
+
+        family = interface_scalar_fields()
+        norm = normalize_interface_name(iface.name)
+        raw_lines = iface.raw_lines or []
+        line_numbers = iface.line_numbers or []
+
+        def _provenance(pattern: "str | None") -> tuple[str, int]:
+            if pattern:
+                for i in range(len(raw_lines) - 1, -1, -1):
+                    if re.match(pattern, raw_lines[i]):
+                        num = line_numbers[i] if i < len(line_numbers) else -1
+                        return raw_lines[i].strip(), num
+            if raw_lines:
+                return raw_lines[0].strip(), (line_numbers[0] if line_numbers else -1)
+            return "", -1
+
+        ops: list = []
+        model_fields = type(iface).model_fields
+        for field_name, field_info in model_fields.items():
+            if field_name not in family:
+                continue
+            value = getattr(iface, field_name)
+            if value != field_info.default:
+                source_line, line_no = _provenance(
+                    self._IFACE_OP_LINE_PATTERNS.get(field_name)
+                )
+                ops.append(
+                    ChangeOp(
+                        verb=Verb.SET,
+                        path=("interface", norm, field_name),
+                        value=value,
+                        source_line=source_line,
+                        line_no=line_no,
+                        origin="native",
+                    )
+                )
+        # Positive re-asserts (value == default True) — only when the final
+        # value IS True; with a negation present the state-derived part
+        # above already emitted SET False.
+        for field_name, pattern in self._IFACE_POSITIVE_RESTATE_PATTERNS.items():
+            if getattr(iface, field_name, None) is not True:
+                continue
+            for i in range(len(raw_lines) - 1, -1, -1):
+                if re.match(pattern, raw_lines[i]):
+                    num = line_numbers[i] if i < len(line_numbers) else -1
+                    ops.append(
+                        ChangeOp(
+                            verb=Verb.SET,
+                            path=("interface", norm, field_name),
+                            value=True,
+                            source_line=raw_lines[i].strip(),
+                            line_no=num,
+                            origin="native",
+                        )
+                    )
+                    break
+        return ops
+
+    def _attach_native_change_ops(self, pc) -> None:
+        """Populate ``ParsedConfig.native_change_ops`` (family 1).
+
+        Called by ``BaseParser.parse`` at finalization — AFTER every
+        subclass interface post-patch (NX-OS CIDR, EOS ospf-area, IOS-XR
+        ipv4-address) and the M3 ospf_passive backfill, so SET values are
+        the final parsed state.  Order: per interface (in parse order) —
+        state SETs (model-field order), restate SETs, then that interface's
+        UNSETs (line order).  Unconditional on every parse; baselines get
+        ops too (never consumed — nothing derives ops for a baseline).
+        """
+        unsets_by_iface: dict[str, list] = {}
+        for op in getattr(self, "_pending_native_unset_ops", None) or []:
+            unsets_by_iface.setdefault(op.path[2], []).append(op)
+
+        ops: list = []
+        for iface in pc.interfaces:
+            ops.extend(self._native_iface_set_ops(iface))
+            ops.extend(unsets_by_iface.pop(iface.name, []))
+        for leftover in unsets_by_iface.values():  # defensive — should be empty
+            ops.extend(leftover)
+        pc.native_change_ops = ops
+
+    def _detect_interface_field_negation_ops(
         self, intf_obj, intf_name: str
-    ) -> list[str]:
+    ) -> list:
         """Detect interface-level ``no …`` commands that remove scalar fields.
 
-        Returns tombstones in the ``field:interface:<name>:<attr>`` format
-        consumed by ``_reset_fields_from_tombstones`` in the merger — no merger
-        changes needed.  Called from ``parse_interfaces``; NX-OS inherits via
-        ``super()``.  IOS-XR overrides with its own syntax variant.
+        Returns native UNSET ChangeOps (verbatim `no …` line provenance) in
+        the ``("field","interface",<name>,<attr>)`` codec shape — their
+        legacy tombstones are generated from these ops by the caller via
+        ``encode_legacy`` (byte-identical to the pre-Phase-3 f-strings).
+        Called from ``parse_interfaces``; NX-OS inherits via ``super()``.
+        IOS-XR overrides with its own syntax variant.
         """
-        tombstones: list[str] = []
-        prefix = f"field:interface:{intf_name}"
+        from confgraph.change_ir import ChangeOp, Verb
+
+        def _unset(field: str, child) -> "ChangeOp":
+            return ChangeOp(
+                verb=Verb.UNSET,
+                path=("field", "interface", intf_name, field),
+                value=None,
+                source_line=child.text.strip(),
+                line_no=child.linenum,
+                origin="native",
+            )
+
+        ops: list = []
 
         # no ip access-group … in / out
         for ch in intf_obj.find_child_objects(r"^\s+no\s+ip\s+access-group\s+"):
             m = re.match(r"^\s+no\s+ip\s+access-group\s+\S+\s+(in|out)", ch.text)
             if m:
                 field = "acl_in" if m.group(1) == "in" else "acl_out"
-                tombstones.append(f"{prefix}:{field}")
+                ops.append(_unset(field, ch))
 
         # no service-policy input / output
         for ch in intf_obj.find_child_objects(r"^\s+no\s+service-policy\s+"):
@@ -1400,11 +1636,12 @@ class IOSParser(BaseParser):
                     if m.group(1) == "input"
                     else "service_policy_output"
                 )
-                tombstones.append(f"{prefix}:{field}")
+                ops.append(_unset(field, ch))
 
         # no ip nat inside / outside
-        if intf_obj.find_child_objects(r"^\s+no\s+ip\s+nat\s+(inside|outside)"):
-            tombstones.append(f"{prefix}:nat_direction")
+        nat_ch = intf_obj.find_child_objects(r"^\s+no\s+ip\s+nat\s+(inside|outside)")
+        if nat_ch:
+            ops.append(_unset("nat_direction", nat_ch[-1]))
 
         # no shutdown — restates the model default (enabled=True), so without a
         # tombstone the merger treats it as "not mentioned" and a baseline
@@ -1412,25 +1649,29 @@ class IOSParser(BaseParser):
         # match wins, mirroring _is_shutdown: emit only when the final
         # shutdown-form line in the (coalesced) block is the `no` form.
         last_shutdown_form: str | None = None
+        last_no_shutdown_child = None
         for ch in intf_obj.children:
             if re.match(r"^\s+no\s+shutdown\s*$", ch.text):
                 last_shutdown_form = "no"
+                last_no_shutdown_child = ch
             elif re.match(r"^\s+shutdown\s*$", ch.text):
                 last_shutdown_form = "shutdown"
         if last_shutdown_form == "no":
-            tombstones.append(f"{prefix}:enabled")
+            ops.append(_unset("enabled", last_no_shutdown_child))
 
         # no switchport port-security (bare form) — positive detection is a
         # positive-only regex, so the `no` form parses to False == default and
         # is otherwise invisible to the merger (same F1 silent pattern).
-        if intf_obj.find_child_objects(r"^\s+no\s+switchport\s+port-security\s*$"):
-            tombstones.append(f"{prefix}:port_security_enabled")
+        ps_ch = intf_obj.find_child_objects(r"^\s+no\s+switchport\s+port-security\s*$")
+        if ps_ch:
+            ops.append(_unset("port_security_enabled", ps_ch[-1]))
 
         # no ip ospf mtu-ignore — same F1 silent pattern (default False).
-        if intf_obj.find_child_objects(r"^\s+no\s+ip\s+ospf\s+mtu-ignore\s*$"):
-            tombstones.append(f"{prefix}:ospf_mtu_ignore")
+        mi_ch = intf_obj.find_child_objects(r"^\s+no\s+ip\s+ospf\s+mtu-ignore\s*$")
+        if mi_ch:
+            ops.append(_unset("ospf_mtu_ignore", mi_ch[-1]))
 
-        return tombstones
+        return ops
 
     def parse_bgp(self) -> list[BGPConfig]:
         """Parse BGP configurations.

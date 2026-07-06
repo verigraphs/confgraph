@@ -705,7 +705,23 @@ class BaseParser(ABC):
                         if intf.name in area_intfs or intf.ospf_process_id == ospf.process_id:
                             intf.ospf_passive = True
 
+        # Change-IR Phase 3: native op emission for migrated command
+        # families (CCR change_ir_proposal_operations.md, Appendix D).
+        # Runs LAST so op values reflect the final parsed state (all
+        # subclass post-patches and the M3 backfill above included).
+        # Default is a no-op; the IOS-family line-based parsers override.
+        self._attach_native_change_ops(pc)
+
         return pc
+
+    def _attach_native_change_ops(self, pc: ParsedConfig) -> None:
+        """Hook: populate ``pc.native_change_ops`` for migrated families.
+
+        Base implementation intentionally does nothing (JunOS/PAN-OS keep
+        full legacy derivation until Phase 5).  The IOS parser family
+        overrides this with family-1 interface scalar/boolean emission.
+        """
+        return None
 
     # Helper methods for common parsing tasks
 
