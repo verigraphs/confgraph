@@ -1522,6 +1522,18 @@ class IOSParser(BaseParser):
         "cdp_enabled": r"^\s+cdp\s+enable\s*$",
     }
 
+    # Family 3 (service entities): banner CLI keyword ↔ BannerConfig field
+    # name (``exec`` is a Python keyword-adjacent name, hence exec_banner).
+    # Used by both the removal walk (tombstone/op paths) and the native
+    # per-field banner SET emission.
+    _BANNER_FIELD_BY_CLI: dict[str, str] = {
+        "motd": "motd",
+        "login": "login",
+        "exec": "exec_banner",
+        "incoming": "incoming",
+    }
+    _BANNER_CLI_BY_FIELD: dict[str, str] = {v: k for k, v in _BANNER_FIELD_BY_CLI.items()}
+
     def _native_iface_unset(
         self,
         ops: list,
@@ -1642,7 +1654,7 @@ class IOSParser(BaseParser):
         return ops
 
     def _attach_native_change_ops(self, pc) -> None:
-        """Populate ``ParsedConfig.native_change_ops`` (families 1 + 2).
+        """Populate ``ParsedConfig.native_change_ops`` (families 1 + 2 + 3).
 
         Called by ``BaseParser.parse`` at finalization — AFTER every
         subclass interface post-patch (NX-OS CIDR, EOS ospf-area, IOS-XR
@@ -1652,8 +1664,10 @@ class IOSParser(BaseParser):
         then that interface's pending codec-path ops in emission order
         (family-1 UNSETs and family-2 trunk delta ops interleaved exactly
         like their tombstones — both carry the interface name at path[2],
-        the grouping key).  Unconditional on every parse; baselines get
-        ops too (never consumed — nothing derives ops for a baseline).
+        the grouping key); then the family-3 service-entity ops in true
+        script order (see ``_native_service_entity_ops``).  Unconditional
+        on every parse; baselines get ops too (never consumed — nothing
+        derives ops for a baseline).
         """
         unsets_by_iface: dict[str, list] = {}
         for op in getattr(self, "_pending_native_unset_ops", None) or []:
@@ -1665,7 +1679,88 @@ class IOSParser(BaseParser):
             ops.extend(unsets_by_iface.pop(iface.name, []))
         for leftover in unsets_by_iface.values():  # defensive — should be empty
             ops.extend(leftover)
+        ops.extend(self._native_service_entity_ops(pc))
         pc.native_change_ops = ops
+
+    def _native_service_entity_ops(self, pc) -> list:
+        """Native family-3 ops (CCR Appendix F) in true script order.
+
+        Both sides of every service-entity lifecycle, ordered by line so
+        delete-then-recreate and create-then-delete are different (and
+        correct) op sequences — the ordering the ``_readded_later``
+        tombstone-suppression guard approximates for legacy consumers:
+
+        - **Create side** (state-derived, parity-with-deriver by
+          construction): one ``SET (<field>, <key>)`` per entity in the
+          keyed collections (``ip_sla_operations`` / ``object_tracks`` /
+          ``eem_applets``; value = the final parsed object, position = the
+          entity block's first recorded line — for re-created SLA ids the
+          parser's last-block-wins dict already carries the re-creation
+          block), plus one ``SET ("banners", <field>)`` per non-default
+          banner field (per FIELD so each banner type orders independently
+          against its own ``no banner <type>``; positioned at the LAST
+          ``banner <type>`` line — the same "positive after the negation"
+          predicate the legacy guard evaluates).
+        - **Delete side**: the pending unsuppressed ops queued by the
+          ``parse_deletion_commands`` walks at their negation lines.
+
+        Stable sort by ``line_no`` (unknown positions last — unreachable
+        for these entities, which always record line numbers).
+        """
+        from confgraph.change_ir import (
+            ChangeOp,
+            Verb,
+            banner_scalar_fields,
+            service_entity_key,
+            service_entity_list_fields,
+        )
+
+        entity_ops: list = []
+        for field_name in sorted(service_entity_list_fields()):
+            for item in getattr(pc, field_name, None) or []:
+                raw_lines = item.raw_lines or []
+                line_numbers = item.line_numbers or []
+                entity_ops.append(
+                    ChangeOp(
+                        verb=Verb.SET,
+                        path=(field_name, *service_entity_key(field_name, item)),
+                        value=item,
+                        source_line=(raw_lines[0].strip() if raw_lines else ""),
+                        line_no=(line_numbers[0] if line_numbers else -1),
+                        origin="native",
+                    )
+                )
+
+        banners = getattr(pc, "banners", None)
+        if banners is not None:
+            parse = self._get_parse_obj()
+            model_fields = type(banners).model_fields
+            family = banner_scalar_fields()
+            # model-field order — deterministic (frozensets are not)
+            for field_name in (f for f in model_fields if f in family):
+                value = getattr(banners, field_name)
+                if value == model_fields[field_name].default:
+                    continue
+                cli = self._BANNER_CLI_BY_FIELD.get(field_name, field_name)
+                positives = parse.find_objects(rf"^banner\s+{cli}\b")
+                entity_ops.append(
+                    ChangeOp(
+                        verb=Verb.SET,
+                        path=("banners", field_name),
+                        value=value,
+                        source_line=(
+                            positives[-1].text.strip() if positives else ""
+                        ),
+                        line_no=(positives[-1].linenum if positives else -1),
+                        origin="native",
+                    )
+                )
+
+        entity_ops.extend(getattr(self, "_pending_native_entity_ops", None) or [])
+        entity_ops.sort(
+            key=lambda op: op.line_no if op.line_no >= 0 else float("inf")
+        )
+        return entity_ops
 
     def _detect_interface_field_negation_ops(
         self, intf_obj, intf_name: str
@@ -3826,6 +3921,13 @@ class IOSParser(BaseParser):
         tombstones: list[str] = []
         parse = self._get_parse_obj()
 
+        # Change-IR Phase 3 family 3: native service-entity deletion ops
+        # (ip sla / track / EEM applet / banner walks below) collected here
+        # UNSUPPRESSED at their true script positions; attached to the
+        # ParsedConfig at parse finalization, interleaved with the entity
+        # (re)creation SET ops by line order.  Re-initialized per call.
+        self._pending_native_entity_ops: list = []
+
         # --- static route deletions ---
         # Tombstone format: "static:<vrf>:<dest/plen>[:<nh_spec>]" where vrf=""
         # for global.  The VRF is preserved so _apply_deletions() can do a
@@ -4071,57 +4173,90 @@ class IOSParser(BaseParser):
         # by ``ip sla 1 …`` — the canonical retarget shape), the keyed replace
         # merge already models the replacement, and a tombstone would clobber
         # the re-added entity (deletions apply after the additive pass).  Each
-        # walk therefore suppresses the tombstone if a positive definition of
+        # walk therefore suppresses the TOMBSTONE if a positive definition of
         # the same entity appears after the negation line.
+        #
+        # Change-IR Phase 3 family 3 (CCR change_ir_proposal_operations.md,
+        # Appendix F): the native ChangeOp is emitted UNCONDITIONALLY at the
+        # negation's true script position — ops mode orders delete vs
+        # (re)create structurally, so it needs no suppression.  The guard now
+        # gates only the LEGACY ENCODING: the tombstone string is generated
+        # from the just-emitted op via encode_legacy at the same append site
+        # (byte-identical content and order; single source).  Full guard
+        # retirement is Phase 4.
+        from confgraph.change_ir import ChangeOp, Verb, encode_legacy
+
         def _readded_later(neg_linenum: int, positive_pattern: str) -> bool:
             return any(
                 o.linenum > neg_linenum
                 for o in parse.find_objects(positive_pattern)
             )
 
+        def _native_entity_delete(obj, verb, path: tuple) -> "ChangeOp":
+            op = ChangeOp(
+                verb=verb,
+                path=path,
+                value=None,
+                source_line=obj.text.strip(),
+                line_no=obj.linenum,
+                origin="native",
+            )
+            self._pending_native_entity_ops.append(op)
+            return op
+
         # ``no ip sla <id>`` only — sub-forms (``no ip sla schedule 10``,
         # ``no ip sla responder``) are attribute removals, not entity removal.
         for obj in parse.find_objects(r"^no\s+ip\s+sla\s+\d"):
             m = re.match(r"^no\s+ip\s+sla\s+(\d+)\s*$", obj.text.strip())
-            if m and not _readded_later(
-                obj.linenum, rf"^ip\s+sla\s+{m.group(1)}\s*$"
-            ):
-                tombstones.append(f"field:ip_sla_operations:{m.group(1)}")
+            if not m:
+                continue
+            op = _native_entity_delete(
+                obj, Verb.OBJECT_DELETE, ("field", "ip_sla_operations", m.group(1))
+            )
+            if not _readded_later(obj.linenum, rf"^ip\s+sla\s+{m.group(1)}\s*$"):
+                tombstones.extend(encode_legacy([op]).no_commands)
 
         # ``no track <id>`` only — ``no track 1 ip sla …`` (attribute negation
         # inside a re-assert) is not a whole-entity removal.
         for obj in parse.find_objects(r"^no\s+track\s+\d"):
             m = re.match(r"^no\s+track\s+(\d+)\s*$", obj.text.strip())
-            if m and not _readded_later(
-                obj.linenum, rf"^track\s+{m.group(1)}\b"
-            ):
-                tombstones.append(f"field:object_tracks:{m.group(1)}")
+            if not m:
+                continue
+            op = _native_entity_delete(
+                obj, Verb.OBJECT_DELETE, ("field", "object_tracks", m.group(1))
+            )
+            if not _readded_later(obj.linenum, rf"^track\s+{m.group(1)}\b"):
+                tombstones.extend(encode_legacy([op]).no_commands)
 
         for obj in parse.find_objects(r"^no\s+event\s+manager\s+applet\s+"):
             m = re.match(r"^no\s+event\s+manager\s+applet\s+(\S+)", obj.text.strip())
-            if m and not _readded_later(
+            if not m:
+                continue
+            op = _native_entity_delete(
+                obj, Verb.OBJECT_DELETE, ("field", "eem_applets", m.group(1))
+            )
+            if not _readded_later(
                 obj.linenum,
                 rf"^event\s+manager\s+applet\s+{re.escape(m.group(1))}\s*$",
             ):
-                tombstones.append(f"field:eem_applets:{m.group(1)}")
+                tombstones.extend(encode_legacy([op]).no_commands)
 
         # ``no banner <type>`` → scalar reset of the BannerConfig field.  The
         # tombstone carries the model FIELD name (exec → exec_banner) so the
         # merger's generic scalar-field-reset accessor applies it directly.
-        _banner_field = {
-            "motd": "motd",
-            "login": "login",
-            "exec": "exec_banner",
-            "incoming": "incoming",
-        }
         for obj in parse.find_objects(r"^no\s+banner\s+"):
             m = re.match(
                 r"^no\s+banner\s+(motd|login|exec|incoming)\b", obj.text.strip()
             )
-            if m and not _readded_later(
-                obj.linenum, rf"^banner\s+{m.group(1)}\b"
-            ):
-                tombstones.append(f"field:banners:{_banner_field[m.group(1)]}")
+            if not m:
+                continue
+            op = _native_entity_delete(
+                obj,
+                Verb.UNSET,
+                ("field", "banners", self._BANNER_FIELD_BY_CLI[m.group(1)]),
+            )
+            if not _readded_later(obj.linenum, rf"^banner\s+{m.group(1)}\b"):
+                tombstones.extend(encode_legacy([op]).no_commands)
 
         # --- whole-VRF deletions ---
         # ``no vrf definition GUEST`` → ``field:vrfs:GUEST``

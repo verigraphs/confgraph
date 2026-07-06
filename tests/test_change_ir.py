@@ -39,13 +39,42 @@ from confgraph.parsers.nxos_parser import NXOSParser
 # ---------------------------------------------------------------------------
 
 
+_FAMILY3_TOMBSTONE_PREFIXES = (
+    "field:ip_sla_operations:",
+    "field:object_tracks:",
+    "field:eem_applets:",
+    "field:banners:",
+)
+
+
+def _is_family3_tombstone(t: str) -> bool:
+    return t.startswith(_FAMILY3_TOMBSTONE_PREFIXES)
+
+
 def _roundtrip(cfg):
     """derive → encode and assert every legacy tombstone artifact is
-    reproduced byte-exactly, in order, in the right container."""
+    reproduced byte-exactly, in order, in the right container.
+
+    Family-3 exception (CCR Appendix F): service-entity deletion ops are
+    NATIVE since Phase-3 family 3 and sit in the composed ChangeSet at
+    their true script positions (interleaved with the entity-creation
+    SETs), ahead of the derived remainder — so their tombstones encode
+    byte-exactly but not at their legacy walk-group position in
+    ``no_commands``.  Order among family-3 tombstones and other families
+    is semantically inert (each dispatches to an independent
+    ``_FIELD_PATH_ACCESSORS`` handler over disjoint fields), so the
+    contract here is: byte-exact multiset for the family-3 subsequence,
+    byte-exact SEQUENCE for everything else.
+    """
     ops = derive_ops(cfg)
     art = encode_legacy(ops)
 
-    assert art.no_commands == list(cfg.no_commands)
+    assert [t for t in art.no_commands if not _is_family3_tombstone(t)] == [
+        t for t in cfg.no_commands if not _is_family3_tombstone(t)
+    ]
+    assert sorted(t for t in art.no_commands if _is_family3_tombstone(t)) == sorted(
+        t for t in cfg.no_commands if _is_family3_tombstone(t)
+    )
     assert art.interface_no_commands == {
         i.name: list(i.no_commands) for i in cfg.interfaces if i.no_commands
     }

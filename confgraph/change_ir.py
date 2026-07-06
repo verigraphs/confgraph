@@ -101,6 +101,11 @@ __all__ = [
     "is_interface_scoped_path",
     "interface_scalar_fields",
     "interface_list_replace_fields",
+    "service_entity_list_fields",
+    "service_entity_singleton_fields",
+    "banner_scalar_fields",
+    "service_entity_key",
+    "is_native_service_entity_op",
 ]
 
 
@@ -322,6 +327,98 @@ def interface_list_replace_fields() -> frozenset[str]:
     families.
     """
     return frozenset({"trunk_allowed_vlans"})
+
+
+@_lru_cache(maxsize=1)
+def service_entity_list_fields() -> frozenset[str]:
+    """Family-3 boundary, keyed-collection half (CCR Appendix F).
+
+    The top-level ParsedConfig collections whose WI-8 whole-entity removal
+    walks carry the ``_readded_later`` suppression guard: IP SLA operations
+    (``no ip sla <id>``), object tracks (``no track <id>``) and EEM applets
+    (``no event manager applet <name>``).  Their merge semantics are keyed
+    whole-object replace (``_SIMPLE_LIST_FIELDS`` in the engine merger).
+    """
+    return frozenset({"ip_sla_operations", "object_tracks", "eem_applets"})
+
+
+@_lru_cache(maxsize=1)
+def service_entity_singleton_fields() -> frozenset[str]:
+    """Family-3 boundary, singleton half: ``banners`` (per-FIELD ops).
+
+    ``no banner <type>`` resets one BannerConfig scalar; the native create
+    side emits one ``SET ("banners", <field>)`` per non-default banner
+    field so different banner types order independently against their own
+    negations (a single whole-object op provably cannot — see Appendix F).
+    """
+    return frozenset({"banners"})
+
+
+@_lru_cache(maxsize=1)
+def banner_scalar_fields() -> frozenset[str]:
+    """Structural walk of BannerConfig scalar fields (family 3, banners).
+
+    Same discipline as :func:`interface_scalar_fields`: declared default,
+    no ``default_factory``, provenance/identity excluded — a future banner
+    type added to the model automatically joins the family.
+    """
+    from pydantic_core import PydanticUndefined
+
+    from confgraph.models.banner import BannerConfig
+
+    fields: set[str] = set()
+    for name, info in BannerConfig.model_fields.items():
+        if name in _PROVENANCE_FIELDS:
+            continue
+        if info.default_factory is not None:
+            continue
+        if info.default is PydanticUndefined:
+            continue
+        fields.add(name)
+    return frozenset(fields)
+
+
+def service_entity_key(field_name: str, item: Any) -> tuple[str, ...]:
+    """Identity path segments for a family-3 keyed entity.
+
+    Delegates to the same key functions the deriver uses
+    (``_TOP_LIST_KEYS``), so native create-op paths are identical to the
+    derived SET paths by construction (the composition dedupe relies on
+    this).
+    """
+    return _TOP_LIST_KEYS[field_name](item)
+
+
+def is_native_service_entity_op(op: "ChangeOp") -> bool:
+    """True iff *op* is a parser-emitted family-3 service-entity op.
+
+    The four shapes (all ``origin == "native"``):
+
+    - ``SET (<list_field>, <key>)``          — entity (re)creation
+    - ``SET ("banners", <field>)``           — banner field write
+    - ``OBJECT_DELETE ("field", <list_field>, <key>)`` — entity removal
+    - ``UNSET ("field", "banners", <field>)``          — banner field reset
+
+    Owned by the codec module (CCR Appendix F): the engine's ordered-apply
+    pass and its ``_proposal_from_ops`` skip MUST share this predicate,
+    never re-implement the shapes.  Derived ops with identical paths
+    return False (origin gate) and keep flowing through the batched
+    legacy apply path.
+    """
+    if getattr(op, "origin", "derived") != "native":
+        return False
+    path = op.path
+    if op.verb is Verb.SET and len(path) == 2:
+        return (
+            path[0] in service_entity_list_fields()
+            or path[0] in service_entity_singleton_fields()
+        )
+    if len(path) == 3 and path[0] == "field":
+        if op.verb is Verb.OBJECT_DELETE and path[1] in service_entity_list_fields():
+            return True
+        if op.verb is Verb.UNSET and path[1] in service_entity_singleton_fields():
+            return True
+    return False
 
 
 def _static_nh_key(r: Any) -> str:
@@ -559,8 +656,23 @@ def derive_ops(proposal: "ParsedConfig") -> ChangeSet:
 
     # Compose: natives first, then every derived op whose path a native op
     # does not already claim (see docstring — dedupe, not family-skip).
+    #
+    # Container-claim extension (family 3, CCR Appendix F): a derived op
+    # whose path is a proper PREFIX of a native op's path is also dropped —
+    # the native ops address INSIDE the container the derived op would
+    # overwrite wholesale.  Today this retires exactly the derived
+    # whole-object ``SET ("banners",)`` when native per-field banner ops
+    # exist; those are emitted structurally for every non-default banner
+    # field, so the whole-object op is redundant by construction.
     native_paths = {op.path for op in natives}
-    return natives + [op for op in ops if op.path not in native_paths]
+    native_prefix_claims = {
+        op.path[:i] for op in natives for i in range(1, len(op.path))
+    }
+    return natives + [
+        op
+        for op in ops
+        if op.path not in native_paths and op.path not in native_prefix_claims
+    ]
 
 
 # ---------------------------------------------------------------------------
