@@ -266,11 +266,14 @@ class TestHybridComposition:
         n_native = len(pc.native_change_ops)
         assert [op.origin for op in ops[:n_native]] == ["native"] * n_native
         assert all(op.origin == "derived" for op in ops[n_native:])
-        # Non-migrated families still derived: trunk delta (family 2),
-        # top-level SET (ntp), static-route removal.
-        derived = ops[n_native:]
+        # Family 2 migrated (WI-15): the trunk delta is NATIVE now.
+        natives = ops[:n_native]
         assert any(op.verb is Verb.LIST_ADD and "trunk_allowed_vlans" in op.path
-                   for op in derived)
+                   for op in natives)
+        # Non-migrated families still derived: top-level SET (ntp),
+        # static-route removal.
+        derived = ops[n_native:]
+        assert not any("trunk_allowed_vlans" in op.path for op in derived)
         assert any(op.path == ("ntp",) for op in derived)
         assert any(op.verb is Verb.LIST_REMOVE and op.path[0] == "static"
                    for op in derived)

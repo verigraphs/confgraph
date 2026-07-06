@@ -100,6 +100,7 @@ __all__ = [
     "encode_legacy",
     "is_interface_scoped_path",
     "interface_scalar_fields",
+    "interface_list_replace_fields",
 ]
 
 
@@ -303,6 +304,26 @@ def interface_scalar_fields() -> frozenset[str]:
     return frozenset(fields)
 
 
+@_lru_cache(maxsize=1)
+def interface_list_replace_fields() -> frozenset[str]:
+    """Family-2 boundary: InterfaceConfig list fields with FULL-REPLACE
+    merge semantics plus stateful delta command spellings.
+
+    Phase-3 family 2 (CCR Appendix E) — today exactly
+    ``trunk_allowed_vlans``: ``switchport trunk allowed vlan <list>`` is an
+    absolute replacement on the device (see the merger's
+    ``_IFACE_INCREMENTAL_LISTS`` exclusion note), while un-anchored
+    ``add``/``remove`` lines are stateful deltas emitted as native
+    LIST_ADD/LIST_REMOVE ops.
+
+    Unlike family 1 this boundary is an explicit set, not structural: the
+    other ``default_factory`` list fields (secondary_ips, helper_addresses,
+    FHRP groups, …) have union/keyed merge semantics and belong to later
+    families.
+    """
+    return frozenset({"trunk_allowed_vlans"})
+
+
 def _static_nh_key(r: Any) -> str:
     """Stable NH identity segment for a static route (mirrors merger identity)."""
     nh = r.next_hop
@@ -452,7 +473,8 @@ def derive_ops(proposal: "ParsedConfig") -> ChangeSet:
 
     1. **Native ops** (``proposal.native_change_ops``) — emitted directly by
        the parser for migrated families (family 1: interface scalars /
-       booleans), with real provenance.  They come FIRST in the result.
+       booleans; family 2: trunk allowed-VLAN SETs and delta ops), with
+       real provenance.  They come FIRST in the result.
     2. **Derived ops** — the Phase-0 mechanical translation of the remaining
        legacy artifacts, reproducing today's semantics exactly (including
        blind spots).  Canonical order mirrors the legacy merge apply order:

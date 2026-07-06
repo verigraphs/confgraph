@@ -428,8 +428,13 @@ class IOSParser(BaseParser):
 
         # Change-IR Phase 3 family 1: native UNSET ops collected inline at
         # each negation site (their tombstones are generated from the ops);
-        # attached to the ParsedConfig at parse finalization.
+        # attached to the ParsedConfig at parse finalization.  Family 2:
+        # interfaces whose trunk allowed-VLAN list anchored to EMPTY
+        # ('… vlan none', or delta lines folding to nothing) — final state
+        # equals the factory default, so only the parser knows the command
+        # was written; a native SET [] op is emitted at finalization.
         self._pending_native_unset_ops = []
+        self._pending_native_trunk_none: set[str] = set()
 
         for intf_obj in intf_objs:
             intf_name = self._extract_match(intf_obj.text, r"^interface\s+(\S+)")
@@ -594,7 +599,7 @@ class IOSParser(BaseParser):
                 _ALL_VLANS = set(range(1, 4095))
                 vlan_set: set[int] = set()
                 anchored = False  # True once an absolute form fixes the base state
-                trunk_vlan_ops: list[tuple[str, str]] = []
+                trunk_vlan_ops: list[tuple] = []  # (op, spec, source child)
                 for child in trunk_allowed_children:
                     vlan_str = self._extract_match(
                         child.text,
@@ -630,17 +635,56 @@ class IOSParser(BaseParser):
                             else:  # remove
                                 vlan_set -= spec_set
                         else:
-                            trunk_vlan_ops.append((op, spec))
+                            trunk_vlan_ops.append((op, spec, child))
                     else:
                         anchored = True
                         trunk_vlan_ops.clear()
                         vlan_set = set(self._parse_vlan_list(vlan_str))
                 if anchored:
                     trunk_allowed_vlans = sorted(vlan_set)
-                for op, spec in trunk_vlan_ops:
-                    iface_no_commands.append(
-                        f"field:interface:{intf_name}:trunk_allowed_vlans:{op}:{spec}"
+                    if not vlan_set:
+                        # Anchored to EMPTY ('none', or an absolute form whose
+                        # deltas fold to nothing): final state == the factory
+                        # default [], so the state walk in
+                        # _native_iface_set_ops cannot see that the command
+                        # was written.  Record it — a native SET [] op is
+                        # emitted at finalization (Change-IR family 2, the
+                        # shape legacy artifacts are structurally blind to).
+                        self._pending_native_trunk_none.add(intf_name)
+                # Change-IR Phase 3 family 2: un-anchored delta lines emit
+                # native LIST_ADD/LIST_REMOVE ops with verbatim provenance;
+                # the legacy tombstone string is generated FROM the op via
+                # encode_legacy (single source — byte-identical to the
+                # pre-family-2 bespoke f-string, same position/order).
+                if trunk_vlan_ops:
+                    from confgraph.change_ir import (
+                        ChangeOp,
+                        Verb,
+                        encode_legacy,
                     )
+
+                    for op, spec, child in trunk_vlan_ops:
+                        change_op = ChangeOp(
+                            verb=Verb.LIST_ADD if op == "add" else Verb.LIST_REMOVE,
+                            path=(
+                                "field",
+                                "interface",
+                                intf_name,
+                                "trunk_allowed_vlans",
+                                op,
+                                spec,
+                            ),
+                            value=spec,
+                            source_line=child.text.strip(),
+                            line_no=child.linenum,
+                            origin="native",
+                        )
+                        iface_unset_ops.append(change_op)
+                        iface_no_commands.extend(
+                            encode_legacy([change_op]).interface_no_commands[
+                                intf_name
+                            ]
+                        )
 
             trunk_native_children = intf_obj.find_child_objects(
                 r"^\s+switchport\s+trunk\s+native\s+vlan\s+(\d+)"
@@ -1409,15 +1453,18 @@ class IOSParser(BaseParser):
         return list(seen.values())
 
     # ------------------------------------------------------------------
-    # Change-IR Phase 3 family 1 — native op emission for interface
-    # scalars/booleans (CCR change_ir_proposal_operations.md, Appendix D).
+    # Change-IR Phase 3 families 1+2 — native op emission for interface
+    # scalars/booleans (Appendix D) and trunk allowed-VLAN ops (Appendix E)
+    # of CCR change_ir_proposal_operations.md.
     #
     # UNSET ops are emitted inline at each negation-detection site with the
-    # verbatim `no …` line as provenance; the legacy tombstone string is
-    # generated FROM the op via encode_legacy (single source — the bespoke
-    # f-string emission is gone).  SET ops are emitted at parse
-    # finalization from the FINAL interface state (after every subclass
-    # post-patch), see _attach_native_change_ops / _native_iface_set_ops.
+    # verbatim `no …` line as provenance, and trunk delta LIST_ADD/
+    # LIST_REMOVE ops inline at the trunk parse site; every legacy
+    # tombstone string is generated FROM its op via encode_legacy (single
+    # source — the bespoke f-string emissions are gone).  SET ops are
+    # emitted at parse finalization from the FINAL interface state (after
+    # every subclass post-patch), see _attach_native_change_ops /
+    # _native_iface_set_ops.
     # ------------------------------------------------------------------
 
     # Per-field command-line patterns used to locate REAL provenance for
@@ -1439,6 +1486,7 @@ class IOSParser(BaseParser):
         "switchport_mode": r"^\s+switchport\s+mode\s+",
         "access_vlan": r"^\s+switchport\s+access\s+vlan\s+",
         "trunk_native_vlan": r"^\s+switchport\s+trunk\s+native\s+vlan\s+",
+        "trunk_allowed_vlans": r"^\s+switchport\s+trunk\s+allowed\s+vlan\s+",
         "channel_group": r"^\s+channel-group\s+\d+",
         "channel_group_mode": r"^\s+channel-group\s+\d+\s+mode\s+",
         "mpls_ip": r"^\s+mpls\s+ip\b",
@@ -1502,19 +1550,29 @@ class IOSParser(BaseParser):
         no_commands.extend(encode_legacy([op]).interface_no_commands[intf_name])
 
     def _native_iface_set_ops(self, iface) -> list:
-        """Native SET ops for one FINAL InterfaceConfig (family 1).
+        """Native SET ops for one FINAL InterfaceConfig (families 1 + 2).
 
-        State-derived part: every family-1 field whose final value differs
-        from its declared default — identical, by construction, to what the
-        Phase-0 deriver would emit for the field (parity gate), but with
-        real per-line provenance where ``_IFACE_OP_LINE_PATTERNS`` locates
-        the command.  Restate part: positive re-asserts of the True-default
-        visibility booleans (value == default — the new capability).
+        State-derived part: every family-1 scalar (and family-2 list) field
+        whose final value differs from its declared default — identical, by
+        construction, to what the Phase-0 deriver would emit for the field
+        (parity gate), but with real per-line provenance where
+        ``_IFACE_OP_LINE_PATTERNS`` locates the command.  Restate parts
+        (value == default — the new capabilities): positive re-asserts of
+        the True-default visibility booleans (family 1), and trunk
+        allowed-VLAN lists anchored to EMPTY (`… vlan none` / delta folds
+        to nothing — recorded in ``_pending_native_trunk_none``, family 2).
         """
-        from confgraph.change_ir import ChangeOp, Verb, interface_scalar_fields
+        from confgraph.change_ir import (
+            ChangeOp,
+            Verb,
+            interface_list_replace_fields,
+            interface_scalar_fields,
+        )
         from confgraph.utils.interface import normalize_interface_name
 
         family = interface_scalar_fields()
+        family2 = interface_list_replace_fields()
+        trunk_none = getattr(self, "_pending_native_trunk_none", None) or set()
         norm = normalize_interface_name(iface.name)
         raw_lines = iface.raw_lines or []
         line_numbers = iface.line_numbers or []
@@ -1532,10 +1590,22 @@ class IOSParser(BaseParser):
         ops: list = []
         model_fields = type(iface).model_fields
         for field_name, field_info in model_fields.items():
-            if field_name not in family:
+            in_family2 = field_name in family2
+            if field_name not in family and not in_family2:
                 continue
             value = getattr(iface, field_name)
-            if value != field_info.default:
+            if in_family2:
+                # Family-2 list fields carry a default_factory ([]) — compare
+                # factory-aware; anchored-empty restate counts as explicit.
+                default = (
+                    field_info.default_factory()
+                    if field_info.default_factory is not None
+                    else field_info.default
+                )
+                explicit = value != default or iface.name in trunk_none
+            else:
+                explicit = value != field_info.default
+            if explicit:
                 source_line, line_no = _provenance(
                     self._IFACE_OP_LINE_PATTERNS.get(field_name)
                 )
@@ -1572,14 +1642,17 @@ class IOSParser(BaseParser):
         return ops
 
     def _attach_native_change_ops(self, pc) -> None:
-        """Populate ``ParsedConfig.native_change_ops`` (family 1).
+        """Populate ``ParsedConfig.native_change_ops`` (families 1 + 2).
 
         Called by ``BaseParser.parse`` at finalization — AFTER every
         subclass interface post-patch (NX-OS CIDR, EOS ospf-area, IOS-XR
         ipv4-address) and the M3 ospf_passive backfill, so SET values are
         the final parsed state.  Order: per interface (in parse order) —
-        state SETs (model-field order), restate SETs, then that interface's
-        UNSETs (line order).  Unconditional on every parse; baselines get
+        state SETs (model-field order, trunk SETs included), restate SETs,
+        then that interface's pending codec-path ops in emission order
+        (family-1 UNSETs and family-2 trunk delta ops interleaved exactly
+        like their tombstones — both carry the interface name at path[2],
+        the grouping key).  Unconditional on every parse; baselines get
         ops too (never consumed — nothing derives ops for a baseline).
         """
         unsets_by_iface: dict[str, list] = {}
