@@ -1,6 +1,8 @@
 """Parsed configuration container model."""
 
-from pydantic import BaseModel, Field
+from typing import Any
+
+from pydantic import BaseModel, Field, PrivateAttr
 from confgraph.models.vrf import VRFConfig
 from confgraph.models.interface import InterfaceConfig
 from confgraph.models.bgp import BGPConfig
@@ -233,10 +235,36 @@ class ParsedConfig(BaseModel):
         default_factory=list,
         description="Top-level config blocks not handled by any parser method",
     )
+    # Change-IR ChangeSet (Phase 0 — CCR change_ir_proposal_operations.md).
+    #
+    # Deliberately a PRIVATE attribute exposed through the ``change_ops``
+    # property below rather than a model field: Phase 0 must be a pure shadow
+    # (zero serialization change, zero ripple into downstream field-map
+    # registries that enumerate ``ParsedConfig.model_fields``).  A private
+    # attribute is structurally invisible to ``model_dump()`` /
+    # ``model_json_schema()`` / ``model_fields`` while still surviving
+    # ``copy.deepcopy`` and ``model_copy``.  When a later phase makes ops a
+    # persistent artifact, this can be promoted to a real field together with
+    # the corresponding downstream registry entries.
+    _change_ops: Any = PrivateAttr(default=None)
 
     class Config:
         """Pydantic model configuration."""
         use_enum_values = True
+
+    @property
+    def change_ops(self) -> Any:
+        """Change-IR ChangeSet (``list[confgraph.change_ir.ChangeOp]``).
+
+        ``None`` for baselines and all legacy parses (Phase 0: only
+        :func:`confgraph.change_ir.derive_ops` produces a value, and nothing
+        consumes it yet).
+        """
+        return self._change_ops
+
+    @change_ops.setter
+    def change_ops(self, value: Any) -> None:
+        self._change_ops = value
 
     def get_interface_by_name(self, name: str) -> InterfaceConfig | None:
         """Get interface by name."""
