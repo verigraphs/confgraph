@@ -260,3 +260,67 @@ def canonical_to_display(canonical_name: str) -> str:
             return short + suffix
 
     return canonical_name
+
+
+# ---------------------------------------------------------------------------
+# Interface type inference (name → InterfaceType)
+# ---------------------------------------------------------------------------
+# Single source of truth for classifying an interface name into an
+# InterfaceType.  The per-OS parsers delegate here
+# (IOSParser._determine_interface_type, junos_parser._junos_interface_type),
+# and the Change-IR apply path (confgraph-entrp apply_ops — CCR
+# change_ir_proposal_operations.md, Phase 1) uses it to reconstruct
+# InterfaceConfig objects from ops, which do not carry the required
+# ``interface_type`` field (it is derivable from the name).
+
+
+def _infer_interface_type_junos(name: str):
+    """JunOS interface name → InterfaceType (verbatim junos parser rules)."""
+    from confgraph.models.interface import InterfaceType
+
+    n = name.lower()
+    if n.startswith("lo"):
+        return InterfaceType.LOOPBACK
+    if n.startswith(("fxp", "em", "me", "re")):
+        return InterfaceType.MANAGEMENT
+    if n.startswith("ae"):
+        return InterfaceType.PORTCHANNEL
+    if n.startswith(("irb", "vlan")):
+        return InterfaceType.SVI
+    if n.startswith(("gr-", "ip-", "st0", "lt-", "mt-")):
+        return InterfaceType.TUNNEL
+    return InterfaceType.PHYSICAL
+
+
+def infer_interface_type(name: str, source_os: str | None = None):
+    """Classify an interface *name* into an :class:`InterfaceType`.
+
+    Mirrors the line-based parsers' shared rules (IOS/IOS-XE/IOS-XR/NX-OS/EOS
+    inherit ``IOSParser._determine_interface_type``); JunOS names use the
+    JunOS-specific prefix rules when ``source_os`` says so.
+
+    Args:
+        name:      Interface name, as-written or canonical.
+        source_os: OS type string (e.g. ``"ios"``, ``"junos"``); any non-JunOS
+                   value (or None) selects the IOS-family rules.
+    """
+    from confgraph.models.interface import InterfaceType
+
+    if source_os is not None and str(source_os).lower().replace("-", "_") == "junos":
+        return _infer_interface_type_junos(name)
+
+    name_lower = name.lower()
+    if "loopback" in name_lower:
+        return InterfaceType.LOOPBACK
+    elif "port-channel" in name_lower or "po" == name_lower[:2]:
+        return InterfaceType.PORTCHANNEL
+    elif "vlan" in name_lower:
+        return InterfaceType.SVI
+    elif "tunnel" in name_lower:
+        return InterfaceType.TUNNEL
+    elif "management" in name_lower or "mgmt" in name_lower:
+        return InterfaceType.MANAGEMENT
+    elif "null" in name_lower:
+        return InterfaceType.NULL
+    else:
+        return InterfaceType.PHYSICAL

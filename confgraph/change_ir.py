@@ -97,6 +97,7 @@ __all__ = [
     "LegacyArtifacts",
     "derive_ops",
     "encode_legacy",
+    "is_interface_scoped_path",
 ]
 
 
@@ -511,6 +512,12 @@ def _is_interface_scoped_path(path: tuple[str, ...]) -> bool:
         and path[3] == "trunk_allowed_vlans"
         and path[4] in ("add", "remove", "except")
     )
+
+
+# Public alias — the op consumer (confgraph-entrp ``apply_ops``, Phase 1)
+# needs the same container-routing predicate the encoder uses.  The codec
+# stays owned by this module; consumers must not re-implement path shapes.
+is_interface_scoped_path = _is_interface_scoped_path
 
 
 def encode_legacy(ops: ChangeSet) -> LegacyArtifacts:

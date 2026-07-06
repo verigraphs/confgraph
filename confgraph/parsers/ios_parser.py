@@ -2118,22 +2118,15 @@ class IOSParser(BaseParser):
         return None
 
     def _determine_interface_type(self, intf_name: str) -> InterfaceType:
-        """Determine interface type from interface name."""
-        name_lower = intf_name.lower()
-        if "loopback" in name_lower:
-            return InterfaceType.LOOPBACK
-        elif "port-channel" in name_lower or "po" == name_lower[:2]:
-            return InterfaceType.PORTCHANNEL
-        elif "vlan" in name_lower:
-            return InterfaceType.SVI
-        elif "tunnel" in name_lower:
-            return InterfaceType.TUNNEL
-        elif "management" in name_lower or "mgmt" in name_lower:
-            return InterfaceType.MANAGEMENT
-        elif "null" in name_lower:
-            return InterfaceType.NULL
-        else:
-            return InterfaceType.PHYSICAL
+        """Determine interface type from interface name.
+
+        Delegates to the shared ``infer_interface_type`` util (single source
+        of truth — also used by the Change-IR apply path to reconstruct
+        InterfaceConfig objects, CCR change_ir_proposal_operations.md).
+        """
+        from confgraph.utils.interface import infer_interface_type
+
+        return infer_interface_type(intf_name)
 
     def _parse_vlan_list(self, vlan_str: str) -> list[int]:
         """Parse VLAN list string into list of VLAN IDs.

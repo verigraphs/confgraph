@@ -1444,16 +1444,12 @@ def _as_named_block(v: Any) -> dict:
 
 
 def _junos_interface_type(name: str) -> InterfaceType:
-    """Classify a JunOS interface name into an InterfaceType."""
-    n = name.lower()
-    if n.startswith("lo"):
-        return InterfaceType.LOOPBACK
-    if n.startswith(("fxp", "em", "me", "re")):
-        return InterfaceType.MANAGEMENT
-    if n.startswith("ae"):
-        return InterfaceType.PORTCHANNEL
-    if n.startswith(("irb", "vlan")):
-        return InterfaceType.SVI
-    if n.startswith(("gr-", "ip-", "st0", "lt-", "mt-")):
-        return InterfaceType.TUNNEL
-    return InterfaceType.PHYSICAL
+    """Classify a JunOS interface name into an InterfaceType.
+
+    Delegates to the shared ``infer_interface_type`` util (single source of
+    truth — also used by the Change-IR apply path, CCR
+    change_ir_proposal_operations.md).
+    """
+    from confgraph.utils.interface import infer_interface_type
+
+    return infer_interface_type(name, source_os="junos")
