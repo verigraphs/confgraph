@@ -1680,7 +1680,72 @@ class IOSParser(BaseParser):
         for leftover in unsets_by_iface.values():  # defensive — should be empty
             ops.extend(leftover)
         ops.extend(self._native_service_entity_ops(pc))
+        ops.extend(self._native_static_ops(pc))
         pc.native_change_ops = ops
+
+    def _queue_native_static_delete(self, tombstone: str, obj):
+        """Build + queue a native family-4 static LIST_REMOVE op from a
+        ``static:<vrf>:<dest>[:<nh_spec>]`` tombstone, returning its
+        ``encode_legacy`` artifacts so the caller can re-emit the byte-exact
+        legacy tombstone from the op (single source).
+
+        The op path is the colon-split of the tombstone (identical to the
+        deriver's path — the codec is ``":".join(path)``), so dedupe matches
+        and ``encode_legacy`` reproduces the string byte-for-byte, including
+        NH specs that themselves contain a colon (channelized interfaces).
+        Reused by the NX-OS ``vrf context`` deletion override.
+        """
+        from confgraph.change_ir import ChangeOp, Verb, encode_legacy
+
+        op = ChangeOp(
+            verb=Verb.LIST_REMOVE,
+            path=tuple(tombstone.split(":")),
+            value=None,
+            source_line=obj.text.strip(),
+            line_no=obj.linenum,
+            origin="native",
+        )
+        self._pending_native_static_ops.append(op)
+        return encode_legacy([op])
+
+    def _native_static_ops(self, pc) -> list:
+        """Native family-4 static-route ops (CCR Appendix G) in script order.
+
+        Both sides of the static-route lifecycle, ordered by line so
+        delete-then-readd and add-then-delete are different (and correct) op
+        sequences — the ordering the legacy batched adds-then-deletes apply
+        gets WRONG for delete-then-readd (no ``_readded_later`` guard exists
+        for statics; W5, Appendix G.4):
+
+        - **Create side** (state-derived, parity-with-deriver by construction):
+          one ``SET ("static_routes", *key)`` per route in the FINAL
+          ``pc.static_routes`` (value = the parsed object, position = the
+          route block's first recorded line — a re-added route carries the
+          re-creation line, a plain add carries the add line).
+        - **Delete side**: the pending ``LIST_REMOVE`` ops queued by the
+          static-deletion walks at their negation lines.
+
+        Stable sort by ``line_no`` (unknown positions last).
+        """
+        from confgraph.change_ir import ChangeOp, Verb, static_route_key
+
+        ops: list = []
+        for route in getattr(pc, "static_routes", None) or []:
+            raw_lines = route.raw_lines or []
+            line_numbers = route.line_numbers or []
+            ops.append(
+                ChangeOp(
+                    verb=Verb.SET,
+                    path=("static_routes", *static_route_key(route)),
+                    value=route,
+                    source_line=(raw_lines[0].strip() if raw_lines else ""),
+                    line_no=(line_numbers[0] if line_numbers else -1),
+                    origin="native",
+                )
+            )
+        ops.extend(getattr(self, "_pending_native_static_ops", None) or [])
+        ops.sort(key=lambda op: op.line_no if op.line_no >= 0 else float("inf"))
+        return ops
 
     def _native_service_entity_ops(self, pc) -> list:
         """Native family-3 ops (CCR Appendix F) in true script order.
@@ -3927,6 +3992,11 @@ class IOSParser(BaseParser):
         # ParsedConfig at parse finalization, interleaved with the entity
         # (re)creation SET ops by line order.  Re-initialized per call.
         self._pending_native_entity_ops: list = []
+        # Change-IR Phase 3 family 4 (CCR Appendix G): native static-route
+        # LIST_REMOVE ops queued UNSUPPRESSED at their true script positions;
+        # attached at finalization, interleaved with the route (re)creation
+        # SET ops by line order.  Re-initialized per call.
+        self._pending_native_static_ops: list = []
 
         # --- static route deletions ---
         # Tombstone format: "static:<vrf>:<dest/plen>[:<nh_spec>]" where vrf=""
@@ -3961,7 +4031,13 @@ class IOSParser(BaseParser):
                 m.group(1) or "", m.group(2).split()
             )
             if tombstone:
-                tombstones.append(tombstone)
+                # Change-IR family 4: queue the native LIST_REMOVE op and
+                # regenerate the tombstone FROM it (single source, byte-exact).
+                # Unconditional — statics have no _readded_later guard; the
+                # ops-mode ordered apply fixes delete-then-readd instead.
+                tombstones.extend(
+                    self._queue_native_static_delete(tombstone, obj).no_commands
+                )
         # --- vlan database deletions ---
         for obj in parse.find_objects(r"^no\s+vlan\s+"):
             m = re.search(r"^no\s+vlan\s+([\d,\-]+)", obj.text)

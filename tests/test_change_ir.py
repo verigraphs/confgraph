@@ -47,33 +47,40 @@ _FAMILY3_TOMBSTONE_PREFIXES = (
 )
 
 
-def _is_family3_tombstone(t: str) -> bool:
-    return t.startswith(_FAMILY3_TOMBSTONE_PREFIXES)
+def _is_reordered_native_tombstone(t: str) -> bool:
+    """Tombstones whose emitting family is native since Phase 3 and therefore
+    hoisted to the front of the composed ChangeSet (multiset, not sequence).
+
+    Family 3 (service entities) + family 4 (``static:`` route removals,
+    CCR Appendix G) — both encode byte-exactly but no longer at their legacy
+    walk-group position in ``no_commands``.
+    """
+    return t.startswith(_FAMILY3_TOMBSTONE_PREFIXES) or t.startswith("static:")
 
 
 def _roundtrip(cfg):
     """derive → encode and assert every legacy tombstone artifact is
     reproduced byte-exactly, in order, in the right container.
 
-    Family-3 exception (CCR Appendix F): service-entity deletion ops are
-    NATIVE since Phase-3 family 3 and sit in the composed ChangeSet at
-    their true script positions (interleaved with the entity-creation
-    SETs), ahead of the derived remainder — so their tombstones encode
-    byte-exactly but not at their legacy walk-group position in
-    ``no_commands``.  Order among family-3 tombstones and other families
-    is semantically inert (each dispatches to an independent
-    ``_FIELD_PATH_ACCESSORS`` handler over disjoint fields), so the
-    contract here is: byte-exact multiset for the family-3 subsequence,
-    byte-exact SEQUENCE for everything else.
+    Native-family exception (CCR Appendices F/G): service-entity (family 3)
+    and static-route (family 4) deletion ops are NATIVE and sit in the
+    composed ChangeSet at their true script positions, ahead of the derived
+    remainder — so their tombstones encode byte-exactly but not at their
+    legacy walk-group position in ``no_commands``.  Order among them and
+    other families is semantically inert (each dispatches to an independent
+    handler over disjoint fields), so the contract here is: byte-exact
+    multiset for those subsequences, byte-exact SEQUENCE for everything else.
     """
     ops = derive_ops(cfg)
     art = encode_legacy(ops)
 
-    assert [t for t in art.no_commands if not _is_family3_tombstone(t)] == [
-        t for t in cfg.no_commands if not _is_family3_tombstone(t)
+    assert [t for t in art.no_commands if not _is_reordered_native_tombstone(t)] == [
+        t for t in cfg.no_commands if not _is_reordered_native_tombstone(t)
     ]
-    assert sorted(t for t in art.no_commands if _is_family3_tombstone(t)) == sorted(
-        t for t in cfg.no_commands if _is_family3_tombstone(t)
+    assert sorted(
+        t for t in art.no_commands if _is_reordered_native_tombstone(t)
+    ) == sorted(
+        t for t in cfg.no_commands if _is_reordered_native_tombstone(t)
     )
     assert art.interface_no_commands == {
         i.name: list(i.no_commands) for i in cfg.interfaces if i.no_commands

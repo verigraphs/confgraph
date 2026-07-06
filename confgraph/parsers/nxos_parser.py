@@ -1222,7 +1222,13 @@ class NXOSParser(IOSParser):
                     vrf_name, m.group(1).split()
                 )
                 if tombstone:
-                    tombstones.append(tombstone)
+                    # Change-IR family 4 (CCR Appendix G): queue the native
+                    # LIST_REMOVE op and regenerate the tombstone from it
+                    # (single source).  super().parse_deletion_commands()
+                    # already initialised _pending_native_static_ops.
+                    tombstones.extend(
+                        self._queue_native_static_delete(tombstone, child).no_commands
+                    )
 
         # --- VXLAN nested deletions (under interface nve) ---
         for nve_obj in parse.find_objects(r"^interface\s+nve\d+"):

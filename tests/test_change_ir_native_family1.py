@@ -270,13 +270,16 @@ class TestHybridComposition:
         natives = ops[:n_native]
         assert any(op.verb is Verb.LIST_ADD and "trunk_allowed_vlans" in op.path
                    for op in natives)
-        # Non-migrated families still derived: top-level SET (ntp),
-        # static-route removal.
+        # Family 4 migrated (WI-17): static-route removal is NATIVE now — the
+        # composition control flips from derived to native.
+        assert any(op.verb is Verb.LIST_REMOVE and op.path[0] == "static"
+                   for op in natives)
+        # Non-migrated family still derived (control): top-level SET (ntp).
         derived = ops[n_native:]
         assert not any("trunk_allowed_vlans" in op.path for op in derived)
         assert any(op.path == ("ntp",) for op in derived)
-        assert any(op.verb is Verb.LIST_REMOVE and op.path[0] == "static"
-                   for op in derived)
+        assert not any(op.path and op.path[0] in ("static", "static_routes")
+                       for op in derived)
 
     def test_no_duplicate_paths_after_dedupe(self):
         pc = _parse(KITCHEN_SINK)

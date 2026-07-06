@@ -106,6 +106,9 @@ __all__ = [
     "banner_scalar_fields",
     "service_entity_key",
     "is_native_service_entity_op",
+    "static_route_fields",
+    "static_route_key",
+    "is_native_static_op",
 ]
 
 
@@ -418,6 +421,56 @@ def is_native_service_entity_op(op: "ChangeOp") -> bool:
             return True
         if op.verb is Verb.UNSET and path[1] in service_entity_singleton_fields():
             return True
+    return False
+
+
+@_lru_cache(maxsize=1)
+def static_route_fields() -> frozenset[str]:
+    """Family-4 boundary (CCR Appendix G): the keyed static-route collection.
+
+    Today exactly ``static_routes`` — every IPv4 ``ip route`` / ``no ip route``
+    line (global, ``vrf NAME`` IOS keyword, NX-OS ``vrf context``, EOS) that
+    the shared static walk parses.  Enumerated like family 2/3 (not
+    structural): a future IPv6-static model field would be added here.
+    ``ipv6 route`` is not modelled today, so it is out of family 4.
+    """
+    return frozenset({"static_routes"})
+
+
+def static_route_key(item: Any) -> tuple[str, ...]:
+    """Identity path segments for a static route (mirrors ``_TOP_LIST_KEYS``).
+
+    ``("static_routes", *static_route_key(r))`` is the native create-op path,
+    identical by construction to the derived keyed-list SET path — the
+    composition dedupe relies on it.  Codec-owned; the parser must not
+    re-implement the key.
+    """
+    return _TOP_LIST_KEYS["static_routes"](item)
+
+
+def is_native_static_op(op: "ChangeOp") -> bool:
+    """True iff *op* is a parser-emitted family-4 static-route op.
+
+    Two shapes (both ``origin == "native"``):
+
+    - ``SET ("static_routes", <vrf>, <dest>, <nh_key>)``   — route (re)creation
+    - ``LIST_REMOVE ("static", <vrf>, <dest>[, <nh_spec>…])`` — route removal
+
+    Owned by the codec module (CCR Appendix G): the engine's ordered-apply
+    pass and its ``_proposal_from_ops`` skip MUST share this predicate.
+    Derived ops with identical paths return False (origin gate) and keep
+    flowing through the batched legacy apply path so natives-less producers
+    retain exact legacy parity.
+    """
+    if getattr(op, "origin", "derived") != "native":
+        return False
+    path = op.path
+    if not path:
+        return False
+    if op.verb is Verb.SET and path[0] in static_route_fields():
+        return True
+    if op.verb is Verb.LIST_REMOVE and path[0] == "static":
+        return True
     return False
 
 
