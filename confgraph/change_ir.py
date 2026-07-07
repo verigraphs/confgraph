@@ -111,6 +111,9 @@ __all__ = [
     "is_native_static_op",
     "bgp_neighbor_fields",
     "bgp_neighbor_key",
+    "bgp_peer_group_key",
+    "bgp_network_key",
+    "bgp_redistribute_key",
     "is_native_bgp_op",
 ]
 
@@ -526,6 +529,22 @@ def bgp_network_key(network: Any) -> tuple[str, ...]:
     return (str(network.prefix),)
 
 
+def bgp_redistribute_key(redist: Any) -> tuple[str, ...]:
+    """Identity path segments for a GLOBAL BGP ``redistribute`` member (5c-A).
+
+    ``("bgp_instances", str(asn), vrf or "", "redistribute", *bgp_redistribute_key(r))``
+    is the native create op path for a ``BGPConfig.redistribute`` (instance-level,
+    NON-AF) member.  The identity is ``(protocol, str(process_id) or "")`` — the
+    same key ``_merge_bgp_instances`` uses for its ``redistribute`` incremental
+    merge.  The NEGATIVE side (``no redistribute`` → the generic
+    ``field:bgp:<asn>:af:ipv4:redistribute:<proto>:<pid>`` tombstone) STAYS DERIVED
+    (it targets AF redistribute via ``_access_bgp_af_redistribute``, disjoint from
+    this instance-level positive) — the family-5c-A coexistence.  Codec-owned.
+    """
+    pid = getattr(redist, "process_id", None)
+    return (redist.protocol, str(pid) if pid is not None else "")
+
+
 def _is_bgp_peer_group_delete(path: tuple[str, ...]) -> bool:
     """True for the family-5b Candidate-B peer-group-deletion op path.
 
@@ -596,6 +615,22 @@ def is_native_bgp_op(op: "ChangeOp") -> bool:
     - ``LIST_REMOVE ("bgp_instance", asn, vrf, "network", <prefix>)``
           ops-only ``no network`` withdrawal (no legacy twin).
 
+    Family 5c-A (whole-instance scalar/bestpath/redistribute surface — CCR
+    Appendix J), positive-only SETs on the PLURAL container (the whole-instance
+    derived SET still survives — 5c-A does NOT retire it):
+
+    - ``SET ("bgp_instances", asn, vrf, "scalar", <field>)``
+          instance scalar (router_id / cluster_id / confederation_id /
+          confederation_peers / rpki_server — parity scalars; and the
+          new-capability ``log_neighbor_changes`` tri-state True-default +
+          ``default_local_preference`` anchored default).  value = the scalar.
+    - ``SET ("bgp_instances", asn, vrf, "bestpath", <option_field>)``
+          one ``bgp bestpath …`` option → the ``bestpath_options`` sub-object.
+    - ``SET ("bgp_instances", asn, vrf, "redistribute", <proto>, <pid>)``
+          GLOBAL (non-AF) ``redistribute`` member.  value = ``BGPRedistribute``.
+          Its NEGATIVE (``no redistribute``) stays DERIVED (AF-scoped generic
+          tombstone, disjoint) — the 5c-A coexistence.
+
     Owned by the codec module (CCR Appendix H/I): the engine's ordered-apply
     pass (``_apply_native_bgp_ops``) and its ``_proposal_from_ops`` skip MUST
     share this predicate.  Derived twins (same path, ``origin="derived"``)
@@ -615,9 +650,10 @@ def is_native_bgp_op(op: "ChangeOp") -> bool:
         return False
     if op.verb is Verb.SET:
         return (
-            len(path) == 5
+            len(path) >= 5
             and path[0] == "bgp_instances"
-            and path[3] in ("neighbor", "peer_group", "network")
+            and path[3]
+            in ("neighbor", "peer_group", "network", "scalar", "bestpath", "redistribute")
         )
     if op.verb is Verb.OBJECT_DELETE:
         if len(path) >= 5 and path[0] == "bgp_instance" and path[3] == "neighbor":

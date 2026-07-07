@@ -1778,6 +1778,7 @@ class IOSParser(BaseParser):
             bgp_neighbor_key,
             bgp_network_key,
             bgp_peer_group_key,
+            bgp_redistribute_key,
         )
 
         parse = self._get_parse_obj()
@@ -1880,6 +1881,142 @@ class IOSParser(BaseParser):
                         value=net,
                         source_line=(positives[-1].text.strip() if positives else ""),
                         line_no=(positives[-1].linenum if positives else -1),
+                        origin="native",
+                    )
+                )
+
+            # Family 5c-A (CCR Appendix J): whole-instance scalar / bestpath /
+            # global-redistribute native ops.  The derived whole-instance SET
+            # STILL survives (co-existing exactly like 5a/5b — 5c-A does NOT
+            # retire it); the engine strips these fields from the surviving SET
+            # in ops mode (natively-handled instances only) and replays these
+            # ops in ChangeSet order.  address_families stay on the derived SET
+            # (that decomposition is 5c-B).
+            def _first_line(pat, _cands=candidates):
+                for c in _cands:
+                    if re.match(pat, c.text):
+                        return c.text.strip(), c.linenum
+                return "", -1
+
+            def _emit_scalar(field, value, sl, ln):
+                ops.append(
+                    ChangeOp(
+                        verb=Verb.SET,
+                        path=("bgp_instances", asn_s, vrf_s, "scalar", field),
+                        value=value,
+                        source_line=sl,
+                        line_no=ln,
+                        origin="native",
+                    )
+                )
+
+            # Parity scalars — state-derived, positive-only.  These have NO
+            # negation tombstone today (documented honestly in Appendix J); the
+            # positive rides a native SET, mirroring what the derived
+            # whole-instance SET carried and what _merge_bgp_instances applied.
+            for field, pat in (
+                ("router_id", r"^\s+bgp\s+router-id\b"),
+                ("cluster_id", r"^\s+bgp\s+cluster-id\b"),
+                ("confederation_id", r"^\s+bgp\s+confederation\s+identifier\b"),
+                ("rpki_server", r"^\s+bgp\s+rpki\s+server\b"),
+            ):
+                val = getattr(bgp, field, None)
+                if val is not None:
+                    sl, ln = _first_line(pat)
+                    _emit_scalar(field, val, sl, ln)
+            if bgp.confederation_peers:
+                sl, ln = _first_line(r"^\s+bgp\s+confederation\s+peers\b")
+                _emit_scalar(
+                    "confederation_peers", list(bgp.confederation_peers), sl, ln
+                )
+
+            # Tri-state True-default (family-1 mechanism): log_neighbor_changes.
+            # One SET per line (positive → True, negation → False); ordered
+            # replay is device-correct where the parser state walk is order-blind.
+            for c in candidates:
+                if re.match(r"^\s+bgp\s+log-neighbor-changes\s*$", c.text):
+                    _emit_scalar(
+                        "log_neighbor_changes", True, c.text.strip(), c.linenum
+                    )
+                elif re.match(r"^\s+no\s+bgp\s+log-neighbor-changes\s*$", c.text):
+                    _emit_scalar(
+                        "log_neighbor_changes", False, c.text.strip(), c.linenum
+                    )
+
+            # Anchored non-falsy default (family-2 mechanism):
+            # default_local_preference (default 100 — value==default is invisible
+            # to a pure state walk).
+            for c in candidates:
+                m = re.match(
+                    r"^\s+bgp\s+default\s+local-preference\s+(\d+)\s*$", c.text
+                )
+                if m:
+                    _emit_scalar(
+                        "default_local_preference",
+                        int(m.group(1)),
+                        c.text.strip(),
+                        c.linenum,
+                    )
+                elif re.match(
+                    r"^\s+no\s+bgp\s+default\s+local-preference\b", c.text
+                ):
+                    _emit_scalar(
+                        "default_local_preference", 100, c.text.strip(), c.linenum
+                    )
+
+            # Best-path options (nested sub-object) — state-derived (each option
+            # defaults False; True ⇒ the ``bgp bestpath …`` line was written).
+            bp = bgp.bestpath_options
+            for opt, pat in (
+                ("as_path_ignore", r"^\s+bgp\s+bestpath\s+as-path\s+ignore"),
+                (
+                    "as_path_multipath_relax",
+                    r"^\s+bgp\s+bestpath\s+as-path\s+multipath-relax",
+                ),
+                ("compare_routerid", r"^\s+bgp\s+bestpath\s+compare-routerid"),
+                ("med_confed", r"^\s+bgp\s+bestpath\s+med\s+confed"),
+                (
+                    "med_missing_as_worst",
+                    r"^\s+bgp\s+bestpath\s+med\s+missing-as-worst",
+                ),
+                ("always_compare_med", r"^\s+bgp\s+bestpath\s+always-compare-med"),
+            ):
+                if getattr(bp, opt):
+                    sl, ln = _first_line(pat)
+                    ops.append(
+                        ChangeOp(
+                            verb=Verb.SET,
+                            path=("bgp_instances", asn_s, vrf_s, "bestpath", opt),
+                            value=True,
+                            source_line=sl,
+                            line_no=ln,
+                            origin="native",
+                        )
+                    )
+
+            # Global (non-AF) redistribute members — state-derived positives.
+            # NEGATIVE (`no redistribute`) stays DERIVED: the generic
+            # `field:bgp:<asn>:af:ipv4:redistribute:…` tombstone targets AF
+            # redistribute (disjoint from this instance-level positive), so the
+            # native-positive / derived-negative coexistence needs NO change to
+            # the generic NESTED_DELETION_RULES machinery (verified — Appendix J).
+            for r in bgp.redistribute:
+                sl, ln = _first_line(
+                    rf"^\s+redistribute\s+{re.escape(r.protocol)}\b"
+                )
+                ops.append(
+                    ChangeOp(
+                        verb=Verb.SET,
+                        path=(
+                            "bgp_instances",
+                            asn_s,
+                            vrf_s,
+                            "redistribute",
+                            *bgp_redistribute_key(r),
+                        ),
+                        value=r,
+                        source_line=sl,
+                        line_no=ln,
                         origin="native",
                     )
                 )
