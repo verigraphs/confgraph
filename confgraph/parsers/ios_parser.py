@@ -1940,13 +1940,14 @@ class IOSParser(BaseParser):
         return ops
 
     def _native_ospf_ops(self, pc) -> list:
-        """Native family-6c OSPF core (non-area) ops (CCR Appendix O) in script order.
+        """Native family-6c/6d OSPF ops (CCR Appendices O and P) in script order.
 
-        Whole-protocol decomposition of the NON-AREA surface of
-        ``pc.ospf_instances`` beside the SURVIVING derived whole-instance SET
-        (co-existence, like 6a/6b; retirement is 6e).  ``areas`` are NEVER
-        emitted here — they stay on the surviving derived SET (Appendix O.0;
-        6d's surface).  The engine strips the natively-covered content from the
+        Whole-protocol decomposition of ``pc.ospf_instances`` beside the
+        SURVIVING derived whole-instance SET (co-existence, like 6a/6b;
+        retirement is 6e).  Family 6d (Appendix P) adds the nested keyed
+        ``areas`` decomposition — per-area create/final-state shell + scalar /
+        range / virtual_link / interface member SETs, the 5c-B.1 AF-container
+        pattern.  The engine strips the natively-covered content from the
         surviving SET (``_strip_native_ospf``) and replays these ops.
 
         - **Positive side** (state-derived, parity-with-deriver by construction):
@@ -1971,6 +1972,8 @@ class IOSParser(BaseParser):
         from confgraph.change_ir import (
             ChangeOp,
             Verb,
+            ospf_area_range_key,
+            ospf_area_virtual_link_key,
             ospf_network_key,
             ospf_redistribute_key,
         )
@@ -1979,7 +1982,8 @@ class IOSParser(BaseParser):
         # value differs from the parser-absence default (== the model default
         # for every field listed here — audited in Appendix O.1).  The trap
         # field ``log_adjacency_changes`` is deliberately ABSENT (line-detected
-        # in parse_ospf); ``areas`` are deliberately absent (O.0).
+        # in parse_ospf); ``areas`` are decomposed by the family-6d walk below
+        # (Appendix P — no longer left on the surviving SET).
         _OSPF_SCALARS = (
             ("router_id", None),
             ("log_adjacency_changes_detail", False),
@@ -2006,6 +2010,26 @@ class IOSParser(BaseParser):
             ("graceful_restart", False),
             ("graceful_restart_helper", False),
             ("bfd_all_interfaces", False),
+        )
+
+        # Area scalars → SET (…, "area", aid, "scalar", field).  Parser-absence
+        # == model default for EVERY OSPFArea field (audited in Appendix P.1 —
+        # no Finding-2-class trap; ``nssa_translate``/``default_cost`` are
+        # unparsed → never non-default at IOS/NX-OS, listed for the state-walk
+        # model mirror).  ``area_type`` compares against the NORMAL enum (the
+        # runtime value is the plain string — ``use_enum_values`` — and
+        # OSPFAreaType is a str Enum, so the comparison is spelling-exact).
+        _OSPF_AREA_SCALARS = (
+            ("area_type", OSPFAreaType.NORMAL),
+            ("stub_no_summary", False),
+            ("nssa_no_summary", False),
+            ("nssa_default_information_originate", False),
+            ("nssa_default_information_originate_always", False),
+            ("nssa_translate", None),
+            ("default_cost", None),
+            ("authentication", None),
+            ("filter_list_in", None),
+            ("filter_list_out", None),
         )
 
         ops: list = []
@@ -2041,6 +2065,32 @@ class IOSParser(BaseParser):
                 _emit("non_passive_interface", name, name)
             for redist in ospf.redistribute:
                 _emit("redistribute", redist, *ospf_redistribute_key(redist))
+
+            # Family 6d (CCR Appendix P): nested keyed area decomposition.
+            # One create/final-state SHELL per parsed area (value = the full
+            # OSPFArea — the engine appends it only when the area is absent,
+            # mirroring the legacy keyed-merge append branch) + one member op
+            # per non-default scalar / range / virtual-link / interface (the
+            # field-level restate surface — mirroring _merge_entry_fields'
+            # non-default override and the nested keyed merges at
+            # merger.py:2346-2349).  ``interfaces`` is only ever populated by
+            # the IOS-XR parser (state-derived here; additive in the replay).
+            for area in ospf.areas:
+                aid = area.area_id
+                _emit("area", area, aid)
+                for field, default in _OSPF_AREA_SCALARS:
+                    val = getattr(area, field, default)
+                    if val != default:
+                        _emit("area", val, aid, "scalar", field)
+                for rng in area.ranges:
+                    _emit("area", rng, aid, "range", *ospf_area_range_key(rng))
+                for vl in area.virtual_links:
+                    _emit(
+                        "area", vl, aid, "virtual_link",
+                        *ospf_area_virtual_link_key(vl),
+                    )
+                for if_name in area.interfaces:
+                    _emit("area", if_name, aid, "interface", if_name)
 
         ops.extend(getattr(self, "_pending_native_ospf_ops", None) or [])
         ops.sort(key=lambda op: op.line_no if op.line_no >= 0 else float("inf"))
@@ -3070,6 +3120,68 @@ class IOSParser(BaseParser):
                         value=None,
                         source_line=nnc.text.strip(),
                         line_no=nnc.linenum,
+                        origin="native",
+                    )
+                )
+
+            # Family 6d (CCR Appendix P.3): ops-only ``no area N range A M``
+            # withdrawal.  The positive area walk (_parse_ospf_areas) never
+            # matches a ``no area`` line and the merged nested ``ranges`` list
+            # is additive-keyed, so the line is silently dropped by the legacy
+            # parser (no tombstone) — the CONFIRMED ABR-summarization
+            # capability (igp.py abr_area_ranges).  Emit a native LIST_REMOVE
+            # with NO legacy twin (encode_legacy silent), identity
+            # (area_id, str(prefix)) through the SAME
+            # ``IPv4Network(f"{addr}/{mask}")`` construction the positive
+            # range parse uses (canonicalization consistency — unparseable
+            # masks are dropped on BOTH walks).  SUPPRESSION (WI-8
+            # ``_readded_later`` pattern, mirroring the ``no network`` walk
+            # above): the positive area SETs carry the block's first line as
+            # provenance (coarse), so suppress the removal when the SAME
+            # (area_id, prefix) reappears as a positive range line LATER in
+            # the block (refresh → re-add wins → device truth and legacy
+            # parity).
+            positive_range_last_line: dict[tuple[str, str], int] = {}
+            for rc in ospf_obj.find_child_objects(r"^\s+area\s+\S+\s+range\s+"):
+                rm = re.match(r"^\s+area\s+(\S+)\s+range\s+(\S+)\s+(\S+)", rc.text)
+                if not rm:
+                    continue
+                try:
+                    rng_pfx = IPv4Network(f"{rm.group(2)}/{rm.group(3)}")
+                except ValueError:
+                    continue
+                rkey = (rm.group(1), str(rng_pfx))
+                positive_range_last_line[rkey] = max(
+                    positive_range_last_line.get(rkey, -1), rc.linenum
+                )
+            for nrc in ospf_obj.find_child_objects(r"^\s+no\s+area\s+\S+\s+range\s+"):
+                nrm = re.match(
+                    r"^\s+no\s+area\s+(\S+)\s+range\s+(\S+)\s+(\S+)", nrc.text
+                )
+                if not nrm:
+                    continue
+                try:
+                    rng_pfx = IPv4Network(f"{nrm.group(2)}/{nrm.group(3)}")
+                except ValueError:
+                    continue
+                rkey = (nrm.group(1), str(rng_pfx))
+                if positive_range_last_line.get(rkey, -1) > nrc.linenum:
+                    continue  # re-added later in the block — removal suppressed
+                self._pending_native_ospf_ops.append(
+                    ChangeOp(
+                        verb=Verb.LIST_REMOVE,
+                        path=(
+                            "ospf_instance",
+                            str(process_id),
+                            ospf_vrf or "",
+                            "area",
+                            rkey[0],
+                            "range",
+                            rkey[1],
+                        ),
+                        value=None,
+                        source_line=nrc.text.strip(),
+                        line_no=nrc.linenum,
                         origin="native",
                     )
                 )

@@ -144,17 +144,23 @@ def test_default_scalars_emit_no_set():
     assert scalars == []
 
 
-def test_areas_never_emitted_natively():
-    # Appendix O.0: areas stay ENTIRELY on the derived whole-instance SET.
+def test_areas_now_emitted_natively_family6d():
+    # Appendix O.0 pinned areas OFF the native surface for 6c; family 6d
+    # (Appendix P) lifts them on — this pin is UPDATED, not deleted: areas
+    # must now be decomposed (shell per parsed area), and the non-area kinds
+    # keep their 6c shapes.  Full 6d coverage lives in
+    # test_change_ir_native_family6d.py.
     pc = _parse(OSPF_FULL)
     assert pc.ospf_instances[0].areas  # the fixture parses an area
+    kinds = set()
     for op in _f6c(pc):
-        assert "area" not in op.path[3:4], op.path
         if op.verb is Verb.SET:
+            kinds.add(op.path[3])
             assert op.path[3] in {
                 "scalar", "network", "passive_interface",
-                "non_passive_interface", "redistribute",
+                "non_passive_interface", "redistribute", "area",
             }
+    assert "area" in kinds
 
 
 def test_native_set_values_are_model_objects():

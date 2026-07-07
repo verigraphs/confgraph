@@ -132,8 +132,11 @@ __all__ = [
     "is_native_eigrp_network_removal_op",
     "ospf_redistribute_key",
     "ospf_network_key",
+    "ospf_area_range_key",
+    "ospf_area_virtual_link_key",
     "is_native_ospf_op",
     "is_native_ospf_network_removal_op",
+    "is_native_ospf_area_range_removal_op",
 ]
 
 
@@ -1115,12 +1118,15 @@ def is_native_eigrp_op(op: "ChangeOp") -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Family 6c — native OSPF core (non-area) op codec (CCR Appendix O)
+# Families 6c + 6d — native OSPF op codec (CCR Appendices O and P)
 # ---------------------------------------------------------------------------
 # Mirrors family 6b (EIGRP) on the two-segment ``(str(process_id), vrf or "")``
-# instance key.  The derived whole-instance OSPF SET SURVIVES (co-existence — 6c
-# does NOT retire it; retirement is 6e) and ``areas`` stay ENTIRELY on that
-# surviving SET (6d's surface — never emitted, stripped or replayed here).
+# instance key.  The derived whole-instance OSPF SET SURVIVES (co-existence —
+# neither 6c nor 6d retires it; retirement is 6e).  Family 6d (Appendix P)
+# lifts ``areas`` off that surviving SET: nested keyed decomposition
+# (``kind == "area"``, the 5c-B.1 AF-container pattern) plus the ops-only
+# ``no area N range`` withdrawal; the stub/nssa area-reset tombstones stay
+# DERIVED (coexistence handled by the engine's replay suppress-set — P.2).
 # Parser-absence == model default for every migrated field EXCEPT
 # ``log_adjacency_changes`` (model default True, parser-absence False — the
 # 5c-A Finding-2 trap, Appendix O.1): that field is LINE-detected at emission
@@ -1151,10 +1157,43 @@ def ospf_network_key(statement: Any) -> tuple[str, ...]:
     return (str(statement[0]), statement[1])
 
 
+def ospf_area_range_key(rng: Any) -> tuple[str, ...]:
+    """Identity segment for an ``OSPFArea.ranges`` member (family 6d).
+
+    ``("ospf_instances", pid, vrf, "area", aid, "range", *key)`` — identity
+    ``(str(prefix),)``, the same key the legacy nested keyed merge uses
+    (merger.py:2348 ``{"ranges": (lambda r: str(r.prefix), True)}``).  The
+    ops-only ``no area N range A M`` LIST_REMOVE matches on the same segment,
+    normalized through the SAME ``IPv4Network(f"{addr}/{mask}")`` construction
+    the positive range parse uses (Appendix P.3 — matching can never drift).
+    Codec-owned.
+    """
+    return (str(rng.prefix),)
+
+
+def ospf_area_virtual_link_key(vl: Any) -> tuple[str, ...]:
+    """Identity segment for an ``OSPFArea.virtual_links`` member (family 6d).
+
+    ``("ospf_instances", pid, vrf, "area", aid, "virtual_link", *key)`` —
+    identity ``(str(neighbor_router_id),)``, the same key the legacy nested
+    keyed merge uses (merger.py:2349).  Codec-owned.
+    """
+    return (str(vl.neighbor_router_id),)
+
+
 # OSPF instance-decomposition ``kind`` tokens carried at ``path[3]`` of a
 # ``("ospf_instances", pid, vrf, kind, *key)`` native SET (the EIGRP two-segment
-# keyed-member precedent).  NOTE: no ``area`` kind — areas stay on the surviving
-# derived whole-instance SET (Appendix O.0; 6d's surface).
+# keyed-member precedent).  Family 6d (CCR Appendix P) adds the nested-keyed
+# ``area`` kind — the recursive second-level surface, mirroring the 5c-B.1 BGP
+# AF container (Appendix K):
+#
+# - ``SET (…, "area", <aid>)``                       create / final-state shell
+#       (value = the full parsed OSPFArea; applied only when the area is absent).
+# - ``SET (…, "area", <aid>, "scalar", <field>)``    per non-default area scalar.
+# - ``SET (…, "area", <aid>, "range", <prefix>)``    nested keyed OSPFRange.
+# - ``SET (…, "area", <aid>, "virtual_link", <rid>)`` nested keyed OSPFVirtualLink.
+# - ``SET (…, "area", <aid>, "interface", <name>)``  additive (IOS-XR only in
+#       practice — the IOS/NX-OS parsers never populate ``OSPFArea.interfaces``).
 _OSPF_SET_KINDS: frozenset[str] = frozenset(
     {
         "scalar",
@@ -1162,6 +1201,7 @@ _OSPF_SET_KINDS: frozenset[str] = frozenset(
         "passive_interface",
         "non_passive_interface",
         "redistribute",
+        "area",
     }
 )
 
@@ -1169,7 +1209,9 @@ _OSPF_SET_KINDS: frozenset[str] = frozenset(
 # ``("ospf_instance", pid, vrf, kind, <cidr>, <area>)`` LIST_REMOVE.  Only
 # ``network`` is emitted in 6c (the CONFIRMED withdrawal → adjacency capability);
 # the other reachable removals (redistribute / default-information originate)
-# are documented deferrals (Appendix O.4).
+# are documented deferrals (Appendix O.4).  The family-6d area-range removal
+# carries the nested ``(…, "area", <aid>, "range", <prefix>)`` shape and is
+# recognized by ``_is_ospf_area_range_removal`` instead.
 _OSPF_REMOVAL_KINDS: frozenset[str] = frozenset({"network"})
 
 
@@ -1206,6 +1248,40 @@ def is_native_ospf_network_removal_op(op: "ChangeOp") -> bool:
     )
 
 
+def _is_ospf_area_range_removal(path: tuple[str, ...]) -> bool:
+    """True for the family-6d ops-only ``no area N range A M`` removal path.
+
+    ``("ospf_instance", pid, vrf, "area", <aid>, "range", <prefix>)`` — a
+    LIST_REMOVE with NO legacy twin (``encode_legacy`` emits nothing; a
+    ``no area N range`` under ``router ospf`` is silently dropped by every
+    legacy parser today — the positive area walk is anchored ``^\\s+area`` and
+    no NESTED_DELETION_RULES entry exists for ranges).  Appendix P.3: the
+    CONFIRMED ABR-summarization withdrawal capability.
+    """
+    return (
+        len(path) == 7
+        and path[0] == "ospf_instance"
+        and path[3] == "area"
+        and path[5] == "range"
+    )
+
+
+def is_native_ospf_area_range_removal_op(op: "ChangeOp") -> bool:
+    """True iff *op* is the family-6d ops-only area-range removal op.
+
+    Consumed by :func:`encode_legacy` to emit NOTHING (no legacy twin): a
+    ``no area N range A M`` under ``router ospf`` is silently dropped by every
+    legacy parser today, so ops mode gains an ABR-summarization-withdrawal
+    capability legacy cannot see while legacy-mode artifacts stay
+    byte-identical (CCR Appendix P.3).
+    """
+    return (
+        getattr(op, "origin", "derived") == "native"
+        and op.verb is Verb.LIST_REMOVE
+        and _is_ospf_area_range_removal(op.path)
+    )
+
+
 def _is_ospf_process_delete(path: tuple[str, ...]) -> bool:
     """True for the whole-process ``no router ospf <pid>`` op path.
 
@@ -1234,14 +1310,19 @@ def is_native_ospf_op(op: "ChangeOp") -> bool:
     - ``SET ("ospf_instances", pid, vrf, "passive_interface", <name>)`` additive.
     - ``SET ("ospf_instances", pid, vrf, "non_passive_interface", <name>)`` "".
     - ``SET ("ospf_instances", pid, vrf, "redistribute", <proto>, <pid>)`` keyed.
+    - ``SET ("ospf_instances", pid, vrf, "area", <aid>[, sub…])``  family-6d
+          nested keyed area decomposition (shell / scalar / range /
+          virtual_link / interface — see ``_OSPF_SET_KINDS``, CCR Appendix P).
     - ``OBJECT_DELETE ("process", "ospf", <pid>)``  whole-process removal
           (``no router ospf`` — applied DELETE-WINS, VRF-blind, in 6c).
     - ``LIST_REMOVE ("ospf_instance", pid, vrf, "network", <cidr>, <area>)``
           ops-only ``no network`` withdrawal (SINGULAR scope, no legacy twin).
+    - ``LIST_REMOVE ("ospf_instance", pid, vrf, "area", <aid>, "range",
+          <prefix>)``  family-6d ops-only area-range withdrawal (no legacy twin).
 
-    ``areas`` never appear here (Appendix O.0 — the derived whole-instance SET
-    carries them in both modes; 6d owns that surface).  Owned by the codec
-    module: the engine's ``_apply_native_ospf_ops`` pass and its
+    The stub/nssa area-reset tombstones stay DERIVED (Appendix P.2 — the
+    coexistence suppress-set lives in the engine replay, not here).  Owned by
+    the codec module: the engine's ``_apply_native_ospf_ops`` pass and its
     ``_proposal_from_ops`` skip MUST share this predicate.  Derived twins
     (same path, ``origin="derived"``) return False (origin gate).
     """
@@ -1259,7 +1340,7 @@ def is_native_ospf_op(op: "ChangeOp") -> bool:
     if op.verb is Verb.OBJECT_DELETE:
         return _is_ospf_process_delete(path)
     if op.verb is Verb.LIST_REMOVE:
-        return _is_ospf_network_removal(path)
+        return _is_ospf_network_removal(path) or _is_ospf_area_range_removal(path)
     return False
 
 
@@ -1622,10 +1703,13 @@ def encode_legacy(ops: ChangeSet) -> LegacyArtifacts:
         # today) — emit nothing so legacy-mode artifacts stay byte-identical.
         if is_native_eigrp_network_removal_op(op):
             continue
-        # Family-6c ops-only ``no network A W area X`` (CCR Appendix O): NO
-        # legacy twin (the line is silently dropped by every legacy parser
+        # Family-6c ops-only ``no network A W area X`` (CCR Appendix O) and
+        # family-6d ops-only ``no area N range A M`` (CCR Appendix P): NO
+        # legacy twin (both lines are silently dropped by every legacy parser
         # today) — emit nothing so legacy-mode artifacts stay byte-identical.
-        if is_native_ospf_network_removal_op(op):
+        # (The stub/nssa area-reset tombstones are DERIVED ops and keep their
+        # byte-exact legacy twins via the top-level fall-through below.)
+        if is_native_ospf_network_removal_op(op) or is_native_ospf_area_range_removal_op(op):
             continue
         if op.path and op.path[0] == "bgp_instance":
             key = (op.path[1], op.path[2])
