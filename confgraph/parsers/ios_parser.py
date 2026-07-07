@@ -1772,7 +1772,13 @@ class IOSParser(BaseParser):
         derived whole-instance SET, which co-exists (Appendix H codec
         adjustment).  Stable sort by ``line_no`` (unknown positions last).
         """
-        from confgraph.change_ir import ChangeOp, Verb, bgp_neighbor_key
+        from confgraph.change_ir import (
+            ChangeOp,
+            Verb,
+            bgp_neighbor_key,
+            bgp_network_key,
+            bgp_peer_group_key,
+        )
 
         parse = self._get_parse_obj()
         roots: dict[int, object] = {}
@@ -1816,6 +1822,62 @@ class IOSParser(BaseParser):
                             *bgp_neighbor_key(nb),
                         ),
                         value=nb,
+                        source_line=(positives[-1].text.strip() if positives else ""),
+                        line_no=(positives[-1].linenum if positives else -1),
+                        origin="native",
+                    )
+                )
+            # Family 5b (CCR Appendix I): peer-group create/re-add SETs,
+            # symmetric to the neighbor SETs (position = the peer-group
+            # definition line ``neighbor GROUP peer-group``).
+            for pg in bgp.peer_groups:
+                positives = [
+                    c
+                    for c in candidates
+                    if re.match(
+                        rf"^\s*neighbor\s+{re.escape(pg.name)}\s+peer-group\s*$",
+                        c.text,
+                    )
+                ]
+                ops.append(
+                    ChangeOp(
+                        verb=Verb.SET,
+                        path=(
+                            "bgp_instances",
+                            asn_s,
+                            vrf_s,
+                            "peer_group",
+                            *bgp_peer_group_key(pg),
+                        ),
+                        value=pg,
+                        source_line=(positives[-1].text.strip() if positives else ""),
+                        line_no=(positives[-1].linenum if positives else -1),
+                        origin="native",
+                    )
+                )
+            # Family 5b: instance-level ``network`` statement SETs (global
+            # ``router bgp`` + per-VRF-AF ``BGPConfig.networks``; AF-BLOCK
+            # networks stay in the derived whole-instance SET — 5c).  Position
+            # = the matching ``network <prefix>`` line, canonically identified.
+            for net in bgp.networks:
+                prefix = str(net.prefix)
+                positives = [
+                    c
+                    for c in candidates
+                    if re.match(r"^\s*network\s+", c.text)
+                    and self._bgp_network_prefix_from_line(c.text) == prefix
+                ]
+                ops.append(
+                    ChangeOp(
+                        verb=Verb.SET,
+                        path=(
+                            "bgp_instances",
+                            asn_s,
+                            vrf_s,
+                            "network",
+                            *bgp_network_key(net),
+                        ),
+                        value=net,
                         source_line=(positives[-1].text.strip() if positives else ""),
                         line_no=(positives[-1].linenum if positives else -1),
                         origin="native",
@@ -2105,9 +2167,13 @@ class IOSParser(BaseParser):
             neighbors = self._parse_bgp_neighbors(bgp_obj)
             peer_groups = self._parse_bgp_peer_groups(bgp_obj)
 
-            # 'no neighbor X' tombstones (full removal + field-level resets)
+            # 'no neighbor X' tombstones (full removal + field-level resets),
+            # plus family-5b Candidate-B peer-group deletion + no-network ops.
             bgp_no_commands: list[str] = self._parse_bgp_neighbor_tombstones(
-                bgp_obj, asn=asn, vrf=None
+                bgp_obj,
+                asn=asn,
+                vrf=None,
+                peer_group_names={pg.name for pg in peer_groups},
             )
 
             # Populate per-neighbor AF policies from address-family blocks
@@ -2940,7 +3006,11 @@ class IOSParser(BaseParser):
     ]
 
     def _parse_bgp_neighbor_tombstones(
-        self, bgp_or_af_obj, asn: int | None = None, vrf: str | None = None
+        self,
+        bgp_or_af_obj,
+        asn: int | None = None,
+        vrf: str | None = None,
+        peer_group_names: set[str] | None = None,
     ) -> list[str]:
         """Parse 'no neighbor X ...' lines under a BGP process or AF block.
 
@@ -2970,17 +3040,26 @@ class IOSParser(BaseParser):
         from confgraph.change_ir import ChangeOp, Verb, encode_legacy
 
         tombstones: list[str] = []
+        pg_names = peer_group_names or set()
 
-        def _emit(tombstone: str, node) -> None:
-            """Queue the native op and append its byte-exact legacy string."""
+        def _emit(tombstone: str, node, verb: "Verb | None" = None) -> None:
+            """Queue the native op and append its byte-exact legacy string.
+
+            *verb* overrides the default verb selection (used by the family-5b
+            Candidate-B peer-group deletion: ``no neighbor GROUP peer-group``
+            emits the SAME ``field:neighbor:GROUP:peer_group`` legacy string as
+            today — byte-identical — but a native ``OBJECT_DELETE`` op so ops
+            mode removes the group AND its members).
+            """
             if asn is None:
                 tombstones.append(tombstone)
                 return
-            verb = (
-                Verb.OBJECT_DELETE
-                if tombstone.startswith("neighbor:")
-                else Verb.UNSET
-            )
+            if verb is None:
+                verb = (
+                    Verb.OBJECT_DELETE
+                    if tombstone.startswith("neighbor:")
+                    else Verb.UNSET
+                )
             op = ChangeOp(
                 verb=verb,
                 path=("bgp_instance", str(asn), vrf or "")
@@ -3025,6 +3104,21 @@ class IOSParser(BaseParser):
                     _emit(f"field:neighbor:{peer}:{field}", nc)
                 continue
 
+            # Family 5b Candidate-B (CCR Appendix I): ``no neighbor GROUP
+            # peer-group`` where GROUP names a peer-group deletes the GROUP AND
+            # all its member neighbors (Cisco documented behavior).  Legacy
+            # emits the SAME ``field:neighbor:GROUP:peer_group`` string
+            # (byte-identical — the group survives, the documented modeling
+            # gap); ops mode gets an OBJECT_DELETE native op that removes the
+            # group and its members in ChangeSet order.
+            if attr == "peer-group" and self._is_bgp_peer_group_ref(peer, pg_names):
+                _emit(
+                    f"field:neighbor:{peer}:peer_group",
+                    nc,
+                    verb=Verb.OBJECT_DELETE,
+                )
+                continue
+
             # Simple prefix-match table
             for prefix, field_name in self._BGP_NEIGHBOR_NO_FIELD_MAP:
                 if prefix in ("route-map", "prefix-list", "filter-list"):
@@ -3033,6 +3127,27 @@ class IOSParser(BaseParser):
                     _emit(f"field:neighbor:{peer}:{field_name}", nc)
                     break
             # Unrecognised attribute — skip silently (do not emit a full-removal tombstone)
+
+        # Family 5b (CCR Appendix I): instance-level ``no network <prefix>`` —
+        # an OPS-ONLY native LIST_REMOVE with NO legacy twin (the line is
+        # silently dropped by the legacy parser today; encode_legacy emits
+        # nothing).  Ops mode gains a route-withdrawal capability legacy cannot
+        # see; legacy artifacts stay byte-identical.  Only in native mode.
+        if asn is not None:
+            for nc in bgp_or_af_obj.find_child_objects(r"^\s+no\s+network\s+\S+"):
+                prefix = self._bgp_network_prefix_from_line(nc.text)
+                if prefix is None:
+                    continue
+                self._pending_native_bgp_ops.append(
+                    ChangeOp(
+                        verb=Verb.LIST_REMOVE,
+                        path=("bgp_instance", str(asn), vrf or "", "network", prefix),
+                        value=None,
+                        source_line=nc.text.strip(),
+                        line_no=nc.linenum,
+                        origin="native",
+                    )
+                )
 
         return tombstones
 
@@ -3418,6 +3533,50 @@ class IOSParser(BaseParser):
     # ------------------------------------------------------------------
     # Shared BGP helpers — single source of truth for network/redistribute
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _is_bgp_peer_group_ref(peer: str, pg_names: set[str]) -> bool:
+        """True iff *peer* names a peer-group rather than a neighbor address.
+
+        ``no neighbor <X> peer-group`` is ambiguous in isolation: if X is an IP
+        it removes that neighbor from its group (per-neighbor field reset); if X
+        is a peer-group NAME it deletes the group (family-5b Candidate-B).  IOS
+        resolves the shared neighbor namespace the same way — a peer-group can
+        never be named as an IP — so a non-IP token is unambiguously a group.
+        The plumbed proposal name set (CCR owner decision #3) is an additional
+        signal for the rare script that redefines the group in the same delta.
+        """
+        if peer in pg_names:
+            return True
+        for cls in (IPv4Address, IPv6Address):
+            try:
+                cls(peer)
+                return False  # a valid IP is a neighbor, never a peer-group
+            except ValueError:
+                continue
+        return True  # non-IP token in the neighbor namespace ⇒ peer-group name
+
+    @staticmethod
+    def _bgp_network_prefix_from_line(text: str) -> str | None:
+        """Canonical prefix string for a ``[no] network …`` line, or None.
+
+        Mirrors ``_parse_bgp_network_stmts`` canonicalization so the family-5b
+        native network ops (positive SET line-matching AND ``no network``
+        LIST_REMOVE) share the exact identity key ``str(BGPNetwork.prefix)``
+        that ``_merge_bgp_instances`` uses for the ``networks`` merge.
+        """
+        m = re.search(r"^\s*(?:no\s+)?network\s+(\S+)(?:\s+mask\s+(\S+))?", text)
+        if not m:
+            return None
+        prefix_str, mask_str = m.group(1), m.group(2)
+        try:
+            if mask_str:
+                return str(IPv4Network(f"{prefix_str}/{mask_str}", strict=False))
+            if ":" in prefix_str:
+                return str(IPv6Network(prefix_str, strict=False))
+            return str(IPv4Network(prefix_str, strict=False))
+        except ValueError:
+            return None
 
     def _parse_bgp_network_stmts(self, config_objs) -> list["BGPNetwork"]:
         """Parse ``network`` statements from a list of config-line objects.
@@ -3909,9 +4068,10 @@ class IOSParser(BaseParser):
                 vrf_af_child.find_child_objects(r"^\s+redistribute\s+(\S+)")
             )
 
-            # 'no neighbor X ...' tombstones for VRF instance
+            # 'no neighbor X ...' tombstones for VRF instance (per-VRF AF has no
+            # peer-groups today — empty name set; no-network ops still emitted).
             vrf_no_commands = self._parse_bgp_neighbor_tombstones(
-                vrf_af_child, asn=asn, vrf=vrf_name
+                vrf_af_child, asn=asn, vrf=vrf_name, peer_group_names=set()
             )
 
             # Create VRF BGP instance

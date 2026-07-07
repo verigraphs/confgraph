@@ -505,10 +505,75 @@ def bgp_neighbor_key(neighbor: Any) -> tuple[str, ...]:
     return (str(neighbor.peer_ip),)
 
 
-def is_native_bgp_op(op: "ChangeOp") -> bool:
-    """True iff *op* is a parser-emitted family-5a BGP-neighbor op.
+def bgp_peer_group_key(peer_group: Any) -> tuple[str, ...]:
+    """Identity path segment for a BGP peer-group (its name — family 5b).
 
-    Three shapes (all ``origin == "native"``):
+    ``("bgp_instances", str(asn), vrf or "", "peer_group", *bgp_peer_group_key(pg))``
+    is the native create/re-add op path, symmetric to :func:`bgp_neighbor_key`.
+    Codec-owned; the parser must not re-implement the key.
+    """
+    return (peer_group.name,)
+
+
+def bgp_network_key(network: Any) -> tuple[str, ...]:
+    """Identity path segment for a BGP ``network`` statement (family 5b).
+
+    ``("bgp_instances", str(asn), vrf or "", "network", *bgp_network_key(n))``
+    is the native create op path.  The identity is the canonical prefix string
+    (``str(BGPNetwork.prefix)``) — the same key ``_merge_bgp_instances`` uses
+    for its ``networks`` incremental merge.  Codec-owned.
+    """
+    return (str(network.prefix),)
+
+
+def _is_bgp_peer_group_delete(path: tuple[str, ...]) -> bool:
+    """True for the family-5b Candidate-B peer-group-deletion op path.
+
+    ``("bgp_instance", asn, vrf, "field", "neighbor", GROUP, "peer_group")`` —
+    an OBJECT_DELETE emitted for ``no neighbor GROUP peer-group`` when GROUP
+    names a peer-group.  The path is DELIBERATELY the same shape the derived
+    ``field:neighbor:GROUP:peer_group`` tombstone produces (so ``encode_legacy``
+    reproduces that legacy string byte-exact and exact-path dedupe retires the
+    derived UNSET twin); only the VERB differs (OBJECT_DELETE, not UNSET).
+    """
+    return (
+        len(path) == 7
+        and path[0] == "bgp_instance"
+        and path[3] == "field"
+        and path[4] == "neighbor"
+        and path[6] == "peer_group"
+    )
+
+
+def _is_bgp_network_removal(path: tuple[str, ...]) -> bool:
+    """True for the family-5b ops-only ``no network`` op path.
+
+    ``("bgp_instance", asn, vrf, "network", <prefix>)`` — a LIST_REMOVE with
+    NO legacy twin (``encode_legacy`` emits nothing; legacy mode stays blind,
+    exactly as today — the line is silently dropped by the legacy parser).
+    """
+    return len(path) == 5 and path[0] == "bgp_instance" and path[3] == "network"
+
+
+def is_native_bgp_network_removal_op(op: "ChangeOp") -> bool:
+    """True iff *op* is the family-5b ops-only ``no network`` removal op.
+
+    Consumed by :func:`encode_legacy` to emit NOTHING (no legacy twin): the
+    ``no network`` / ``no aggregate-address`` single-line forms are silently
+    dropped by every legacy parser today, so ops mode gains a route-withdrawal
+    capability legacy cannot see, and legacy-mode artifacts stay byte-identical.
+    """
+    return (
+        getattr(op, "origin", "derived") == "native"
+        and op.verb is Verb.LIST_REMOVE
+        and _is_bgp_network_removal(op.path)
+    )
+
+
+def is_native_bgp_op(op: "ChangeOp") -> bool:
+    """True iff *op* is a parser-emitted family-5a/5b BGP op.
+
+    Family 5a (neighbor lifecycle):
 
     - ``SET ("bgp_instances", asn, vrf, "neighbor", peer)``
           neighbor (re)creation / field write — value = the ``BGPNeighbor``.
@@ -519,7 +584,19 @@ def is_native_bgp_op(op: "ChangeOp") -> bool:
     - ``UNSET ("bgp_instance", asn, vrf, "field", "neighbor", peer…, field)``
           per-neighbor / peer-group field reset (``no neighbor X <attr>``).
 
-    Owned by the codec module (CCR Appendix H): the engine's ordered-apply
+    Family 5b (peer-groups + instance-level networks — CCR Appendix I):
+
+    - ``SET ("bgp_instances", asn, vrf, "peer_group", name)``
+          peer-group (re)creation — value = the ``BGPPeerGroup``.
+    - ``SET ("bgp_instances", asn, vrf, "network", <prefix>)``
+          instance-level ``network`` statement — value = the ``BGPNetwork``.
+    - ``OBJECT_DELETE ("bgp_instance", asn, vrf, "field", "neighbor", GROUP,
+          "peer_group")`` — Candidate-B peer-group deletion (``no neighbor
+          GROUP peer-group``): removes the group AND its member neighbors.
+    - ``LIST_REMOVE ("bgp_instance", asn, vrf, "network", <prefix>)``
+          ops-only ``no network`` withdrawal (no legacy twin).
+
+    Owned by the codec module (CCR Appendix H/I): the engine's ordered-apply
     pass (``_apply_native_bgp_ops``) and its ``_proposal_from_ops`` skip MUST
     share this predicate.  Derived twins (same path, ``origin="derived"``)
     return False (origin gate) and keep flowing through the batched legacy
@@ -528,7 +605,8 @@ def is_native_bgp_op(op: "ChangeOp") -> bool:
     Note the SET side uses the PLURAL ``bgp_instances`` container name (a
     keyed top-level list-member SET, classifier-routed to BGP by existence),
     while the deletion sides carry the SINGULAR ``bgp_instance`` scope prefix
-    (``encode_legacy`` returns them to ``BGPConfig.no_commands``, byte-exact).
+    (``encode_legacy`` returns them to ``BGPConfig.no_commands`` byte-exact,
+    except the network-removal LIST_REMOVE which has no legacy twin).
     """
     if getattr(op, "origin", "derived") != "native":
         return False
@@ -536,9 +614,15 @@ def is_native_bgp_op(op: "ChangeOp") -> bool:
     if not path:
         return False
     if op.verb is Verb.SET:
-        return len(path) == 5 and path[0] == "bgp_instances" and path[3] == "neighbor"
+        return (
+            len(path) == 5
+            and path[0] == "bgp_instances"
+            and path[3] in ("neighbor", "peer_group", "network")
+        )
     if op.verb is Verb.OBJECT_DELETE:
-        return len(path) >= 5 and path[0] == "bgp_instance" and path[3] == "neighbor"
+        if len(path) >= 5 and path[0] == "bgp_instance" and path[3] == "neighbor":
+            return True
+        return _is_bgp_peer_group_delete(path)
     if op.verb is Verb.UNSET:
         return (
             len(path) >= 7
@@ -546,6 +630,8 @@ def is_native_bgp_op(op: "ChangeOp") -> bool:
             and path[3] == "field"
             and path[4] == "neighbor"
         )
+    if op.verb is Verb.LIST_REMOVE:
+        return _is_bgp_network_removal(path)
     return False
 
 
@@ -876,6 +962,11 @@ def encode_legacy(ops: ChangeSet) -> LegacyArtifacts:
     for op in ops:
         if op.verb is Verb.UNRECOGNIZED:
             artifacts.unrecognized_blocks.append(op.value)
+            continue
+        # Family-5b ops-only ``no network``: NO legacy twin (the line is
+        # silently dropped by every legacy parser today) — emit nothing so
+        # legacy-mode artifacts stay byte-identical.
+        if is_native_bgp_network_removal_op(op):
             continue
         if op.path and op.path[0] == "bgp_instance":
             key = (op.path[1], op.path[2])
