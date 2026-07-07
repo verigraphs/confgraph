@@ -114,7 +114,12 @@ __all__ = [
     "bgp_peer_group_key",
     "bgp_network_key",
     "bgp_redistribute_key",
+    "bgp_af_key",
+    "bgp_af_network_key",
+    "bgp_af_aggregate_key",
     "is_native_bgp_op",
+    "is_native_bgp_network_removal_op",
+    "is_native_bgp_af_aggregate_removal_op",
 ]
 
 
@@ -545,6 +550,77 @@ def bgp_redistribute_key(redist: Any) -> tuple[str, ...]:
     return (redist.protocol, str(pid) if pid is not None else "")
 
 
+def bgp_af_key(af: Any) -> tuple[str, ...]:
+    """Identity path segments for a BGP address-family block (family 5c-B.1).
+
+    ``("bgp_instances", str(asn), vrf or "", "af", *bgp_af_key(af))`` is the
+    native AF *create* op path (a 7-segment SET carrying a SHELL
+    ``BGPAddressFamily`` — identity + default scalars, empty sub-collections —
+    so ``_apply_native_bgp_ops`` materializes the AF on the merged instance and
+    the per-member ops below fill its content).  Identity = ``(afi, safi,
+    af.vrf or "")`` — the exact key ``_merge_bgp_address_families`` matches on
+    (``merger.py``).  ``af.vrf`` is structurally ``None`` for every AF the IOS
+    parser emits today (global ``address-family ipv4`` blocks set ``vrf=None``;
+    per-VRF instances are separate ``BGPConfig`` objects) — the segment is kept
+    for exact key parity and future-proofing.  Codec-owned.
+    """
+    return (af.afi, af.safi, af.vrf or "")
+
+
+def bgp_af_network_key(network: Any) -> tuple[str, ...]:
+    """Identity segment for an AF-block ``network`` statement (family 5c-B.1).
+
+    ``(…, "af", afi, safi, afvrf, "network", *bgp_af_network_key(n))`` — the
+    canonical prefix string, the key ``_merge_bgp_af`` uses for its incremental
+    ``networks`` merge.  Closes the 5b instance-network deferral for AF-block
+    networks (Appendix I boundary).  Codec-owned.
+    """
+    return (str(network.prefix),)
+
+
+def bgp_af_aggregate_key(aggregate: Any) -> tuple[str, ...]:
+    """Identity segment for an AF ``aggregate-address`` (family 5c-B.1).
+
+    ``(…, "af", afi, safi, afvrf, "aggregate", *bgp_af_aggregate_key(a))`` — the
+    canonical prefix string, the key ``_merge_bgp_af`` uses for its incremental
+    ``aggregate_addresses`` merge.  Also the identity for the ops-only
+    ``no aggregate-address`` LIST_REMOVE (singular ``bgp_instance`` prefix, no
+    legacy twin — the AF-scoped ``no aggregate-address`` line is silently
+    dropped by every legacy parser today).  Codec-owned.
+    """
+    return (str(aggregate.prefix),)
+
+
+def _is_bgp_af_aggregate_removal(path: tuple[str, ...]) -> bool:
+    """True for the family-5c-B.1 ops-only AF ``no aggregate-address`` op path.
+
+    ``("bgp_instance", asn, vrf, "af", afi, safi, afvrf, "aggregate", <prefix>)``
+    — a LIST_REMOVE with NO legacy twin (``encode_legacy`` emits nothing;
+    legacy mode stays blind exactly as today, mirroring the 5b ``no network``
+    discipline).
+    """
+    return (
+        len(path) == 9
+        and path[0] == "bgp_instance"
+        and path[3] == "af"
+        and path[7] == "aggregate"
+    )
+
+
+def is_native_bgp_af_aggregate_removal_op(op: "ChangeOp") -> bool:
+    """True iff *op* is the family-5c-B.1 ops-only AF ``no aggregate-address`` op.
+
+    Consumed by :func:`encode_legacy` to emit NOTHING (no legacy twin), so ops
+    mode gains an AF-aggregate-withdrawal capability legacy cannot see while
+    legacy-mode artifacts stay byte-identical.
+    """
+    return (
+        getattr(op, "origin", "derived") == "native"
+        and op.verb is Verb.LIST_REMOVE
+        and _is_bgp_af_aggregate_removal(op.path)
+    )
+
+
 def _is_bgp_peer_group_delete(path: tuple[str, ...]) -> bool:
     """True for the family-5b Candidate-B peer-group-deletion op path.
 
@@ -631,6 +707,34 @@ def is_native_bgp_op(op: "ChangeOp") -> bool:
           Its NEGATIVE (``no redistribute``) stays DERIVED (AF-scoped generic
           tombstone, disjoint) — the 5c-A coexistence.
 
+    Family 5c-B.1 (AF-container decomposition — CCR Appendix K), the recursive
+    second-level surface.  All SETs on the PLURAL container (the whole-instance
+    derived SET STILL survives — 5c-B.1 does NOT retire it; retirement is 5c-B.2
+    / task #23):
+
+    - ``SET ("bgp_instances", asn, vrf, "af", afi, safi, afvrf)``
+          AF create / final-state (7-seg).  value = a SHELL ``BGPAddressFamily``
+          (identity + default scalars, empty sub-collections) — materializes the
+          AF; the per-member ops below fill it.
+    - ``SET (…, "af", afi, safi, afvrf, "network", <prefix>)``
+          AF-block ``network`` (closes the 5b instance-network deferral).
+    - ``SET (…, "af", afi, safi, afvrf, "redistribute", <proto>, <pid>)``
+          AF ``redistribute`` positive member.  Its NEGATIVE stays DERIVED
+          (generic ``field:bgp:<asn>:af:<afi>:redistribute:…`` tombstone, SAME
+          list) — the 5c-B.1 coexistence: ``_apply_native_bgp_ops`` suppresses a
+          same-key native re-add when a same-scope derived removal is present, so
+          same-key delete/re-add resolves delete-wins IDENTICALLY to legacy (both
+          engines are order-blind here — the accepted ordering deviation).
+    - ``SET (…, "af", afi, safi, afvrf, "aggregate", <prefix>)``
+          AF ``aggregate-address`` positive member.
+    - ``SET (…, "af", afi, safi, afvrf, "scalar", <field>)``
+          AF scalar (``maximum_paths`` / ``maximum_paths_ibgp`` — positive-only;
+          tri-state None-default ``prefix_validate_allow_invalid``).
+    - ``LIST_REMOVE ("bgp_instance", asn, vrf, "af", afi, safi, afvrf,
+          "aggregate", <prefix>)`` — ops-only AF ``no aggregate-address``
+          withdrawal (SINGULAR scope prefix, no legacy twin — encode_legacy
+          emits nothing), mirroring the 5b ``no network`` discipline.
+
     Owned by the codec module (CCR Appendix H/I): the engine's ordered-apply
     pass (``_apply_native_bgp_ops``) and its ``_proposal_from_ops`` skip MUST
     share this predicate.  Derived twins (same path, ``origin="derived"``)
@@ -653,7 +757,15 @@ def is_native_bgp_op(op: "ChangeOp") -> bool:
             len(path) >= 5
             and path[0] == "bgp_instances"
             and path[3]
-            in ("neighbor", "peer_group", "network", "scalar", "bestpath", "redistribute")
+            in (
+                "neighbor",
+                "peer_group",
+                "network",
+                "scalar",
+                "bestpath",
+                "redistribute",
+                "af",
+            )
         )
     if op.verb is Verb.OBJECT_DELETE:
         if len(path) >= 5 and path[0] == "bgp_instance" and path[3] == "neighbor":
@@ -667,7 +779,7 @@ def is_native_bgp_op(op: "ChangeOp") -> bool:
             and path[4] == "neighbor"
         )
     if op.verb is Verb.LIST_REMOVE:
-        return _is_bgp_network_removal(path)
+        return _is_bgp_network_removal(path) or _is_bgp_af_aggregate_removal(path)
     return False
 
 
@@ -999,10 +1111,11 @@ def encode_legacy(ops: ChangeSet) -> LegacyArtifacts:
         if op.verb is Verb.UNRECOGNIZED:
             artifacts.unrecognized_blocks.append(op.value)
             continue
-        # Family-5b ops-only ``no network``: NO legacy twin (the line is
-        # silently dropped by every legacy parser today) — emit nothing so
-        # legacy-mode artifacts stay byte-identical.
-        if is_native_bgp_network_removal_op(op):
+        # Family-5b ops-only ``no network`` / family-5c-B.1 ops-only AF
+        # ``no aggregate-address``: NO legacy twin (both lines are silently
+        # dropped by every legacy parser today) — emit nothing so legacy-mode
+        # artifacts stay byte-identical.
+        if is_native_bgp_network_removal_op(op) or is_native_bgp_af_aggregate_removal_op(op):
             continue
         if op.path and op.path[0] == "bgp_instance":
             key = (op.path[1], op.path[2])

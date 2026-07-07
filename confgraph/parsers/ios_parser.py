@@ -1775,11 +1775,15 @@ class IOSParser(BaseParser):
         from confgraph.change_ir import (
             ChangeOp,
             Verb,
+            bgp_af_aggregate_key,
+            bgp_af_key,
+            bgp_af_network_key,
             bgp_neighbor_key,
             bgp_network_key,
             bgp_peer_group_key,
             bgp_redistribute_key,
         )
+        from confgraph.models.bgp import BGPAddressFamily
 
         parse = self._get_parse_obj()
         roots: dict[int, object] = {}
@@ -2020,6 +2024,179 @@ class IOSParser(BaseParser):
                         origin="native",
                     )
                 )
+
+            # Family 5c-B.1 (CCR Appendix K): AF-container decomposition — the
+            # recursive second-level surface.  Per-AF keyed native ops: AF create
+            # (shell), AF-block networks (closes the 5b deferral), AF aggregates
+            # (+ ops-only `no aggregate-address`, no legacy twin), AF redistribute
+            # positives (negative stays derived — coexistence per Appendix K), and
+            # AF scalars (maximum_paths[_ibgp], tri-state
+            # prefix_validate_allow_invalid).  The three UNPARSED AF scalars
+            # (default_information_originate/auto_summary/synchronization) are
+            # never set by the AF parser (always model default) → nothing to
+            # emit; they ride the surviving derived SET untouched (task #22).
+            # NX-OS VRF instances carry no AFs (address_families=[]) → no-op.
+            for af in bgp.address_families:
+                af_node = None
+                for c in candidates:
+                    am = re.match(
+                        r"^address-family\s+(ipv4|ipv6)(?:\s+(unicast|multicast))?\s*$",
+                        c.text.strip(),
+                    )
+                    if (
+                        am
+                        and am.group(1) == af.afi
+                        and (am.group(2) or "unicast") == af.safi
+                    ):
+                        af_node = c
+                        break
+                af_children = list(af_node.children) if af_node is not None else []
+                af_prefix = ("bgp_instances", asn_s, vrf_s, "af", *bgp_af_key(af))
+
+                def _af_line(pat, _cands=af_children):
+                    for c in _cands:
+                        if re.match(pat, c.text):
+                            return c.text.strip(), c.linenum
+                    return "", -1
+
+                # AF create / final-state — SHELL (identity only; sub-ops fill it).
+                shell = BGPAddressFamily(afi=af.afi, safi=af.safi, vrf=af.vrf)
+                ops.append(
+                    ChangeOp(
+                        verb=Verb.SET,
+                        path=af_prefix,
+                        value=shell,
+                        source_line=(
+                            af_node.text.strip() if af_node is not None else ""
+                        ),
+                        line_no=(af_node.linenum if af_node is not None else -1),
+                        origin="native",
+                    )
+                )
+                for net in af.networks:
+                    prefix = str(net.prefix)
+                    poss = [
+                        c
+                        for c in af_children
+                        if re.match(r"^\s*network\s+", c.text)
+                        and self._bgp_network_prefix_from_line(c.text) == prefix
+                    ]
+                    ops.append(
+                        ChangeOp(
+                            verb=Verb.SET,
+                            path=af_prefix + ("network", *bgp_af_network_key(net)),
+                            value=net,
+                            source_line=(poss[-1].text.strip() if poss else ""),
+                            line_no=(poss[-1].linenum if poss else -1),
+                            origin="native",
+                        )
+                    )
+                for r in af.redistribute:
+                    sl2, ln2 = _af_line(
+                        rf"^\s*redistribute\s+{re.escape(r.protocol)}\b"
+                    )
+                    ops.append(
+                        ChangeOp(
+                            verb=Verb.SET,
+                            path=af_prefix
+                            + ("redistribute", *bgp_redistribute_key(r)),
+                            value=r,
+                            source_line=sl2,
+                            line_no=ln2,
+                            origin="native",
+                        )
+                    )
+                for agg in af.aggregate_addresses:
+                    prefix = str(agg.prefix)
+                    poss = [
+                        c
+                        for c in af_children
+                        if re.match(r"^\s*aggregate-address\s+", c.text)
+                        and self._bgp_aggregate_prefix_from_line(c.text) == prefix
+                    ]
+                    ops.append(
+                        ChangeOp(
+                            verb=Verb.SET,
+                            path=af_prefix
+                            + ("aggregate", *bgp_af_aggregate_key(agg)),
+                            value=agg,
+                            source_line=(poss[-1].text.strip() if poss else ""),
+                            line_no=(poss[-1].linenum if poss else -1),
+                            origin="native",
+                        )
+                    )
+                # AF scalars (state-derived positive-only / tri-state None-default).
+                if af.maximum_paths is not None:
+                    sl2, ln2 = _af_line(r"^\s*maximum-paths\s+(?!ibgp)\d+")
+                    ops.append(
+                        ChangeOp(
+                            verb=Verb.SET,
+                            path=af_prefix + ("scalar", "maximum_paths"),
+                            value=af.maximum_paths,
+                            source_line=sl2,
+                            line_no=ln2,
+                            origin="native",
+                        )
+                    )
+                if af.maximum_paths_ibgp is not None:
+                    sl2, ln2 = _af_line(r"^\s*maximum-paths\s+ibgp\s+\d+")
+                    ops.append(
+                        ChangeOp(
+                            verb=Verb.SET,
+                            path=af_prefix + ("scalar", "maximum_paths_ibgp"),
+                            value=af.maximum_paths_ibgp,
+                            source_line=sl2,
+                            line_no=ln2,
+                            origin="native",
+                        )
+                    )
+                if af.prefix_validate_allow_invalid is not None:
+                    if af.prefix_validate_allow_invalid:
+                        sl2, ln2 = _af_line(
+                            r"^\s*bgp\s+bestpath\s+prefix-validate\s+allow-invalid"
+                        )
+                    else:
+                        sl2, ln2 = _af_line(
+                            r"^\s*no\s+bgp\s+bestpath\s+prefix-validate\s+allow-invalid"
+                        )
+                    ops.append(
+                        ChangeOp(
+                            verb=Verb.SET,
+                            path=af_prefix
+                            + ("scalar", "prefix_validate_allow_invalid"),
+                            value=af.prefix_validate_allow_invalid,
+                            source_line=sl2,
+                            line_no=ln2,
+                            origin="native",
+                        )
+                    )
+                # ops-only AF `no aggregate-address` (no legacy twin) —
+                # line-detected so delete/re-add of an aggregate is order-correct
+                # (both sides native, ChangeSet-ordered).
+                for c in af_children:
+                    if not re.match(r"^\s*no\s+aggregate-address\s+", c.text):
+                        continue
+                    prefix = self._bgp_aggregate_prefix_from_line(c.text)
+                    if prefix is None:
+                        continue
+                    ops.append(
+                        ChangeOp(
+                            verb=Verb.LIST_REMOVE,
+                            path=(
+                                "bgp_instance",
+                                asn_s,
+                                vrf_s,
+                                "af",
+                                *bgp_af_key(af),
+                                "aggregate",
+                                prefix,
+                            ),
+                            value=None,
+                            source_line=c.text.strip(),
+                            line_no=c.linenum,
+                            origin="native",
+                        )
+                    )
         ops.extend(getattr(self, "_pending_native_bgp_ops", None) or [])
         ops.sort(key=lambda op: op.line_no if op.line_no >= 0 else float("inf"))
         return ops
@@ -3709,6 +3886,31 @@ class IOSParser(BaseParser):
         try:
             if mask_str:
                 return str(IPv4Network(f"{prefix_str}/{mask_str}", strict=False))
+            if ":" in prefix_str:
+                return str(IPv6Network(prefix_str, strict=False))
+            return str(IPv4Network(prefix_str, strict=False))
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _bgp_aggregate_prefix_from_line(text: str) -> str | None:
+        """Canonical prefix string for a ``[no] aggregate-address …`` line.
+
+        Mirrors ``_parse_bgp_address_families`` aggregate canonicalization so the
+        family-5c-B.1 native AF aggregate ops (positive SET line-matching AND the
+        ops-only ``no aggregate-address`` LIST_REMOVE) share the exact identity
+        key ``str(BGPAggregate.prefix)`` that ``_merge_bgp_af`` uses for the
+        ``aggregate_addresses`` merge.
+        """
+        m = re.search(
+            r"^\s*(?:no\s+)?aggregate-address\s+(\S+)(?:\s+(\S+))?", text
+        )
+        if not m:
+            return None
+        prefix_str, mask_or_len = m.group(1), m.group(2)
+        try:
+            if mask_or_len and "." in mask_or_len:
+                return str(IPv4Network(f"{prefix_str}/{mask_or_len}", strict=False))
             if ":" in prefix_str:
                 return str(IPv6Network(prefix_str, strict=False))
             return str(IPv4Network(prefix_str, strict=False))
