@@ -125,11 +125,13 @@ __all__ = [
     "isis_redistribute_key",
     "is_native_isis_op",
     "is_native_isis_net_removal_op",
+    "is_native_isis_instance_create_op",
     "eigrp_redistribute_key",
     "eigrp_network_key",
     "eigrp_summary_key",
     "is_native_eigrp_op",
     "is_native_eigrp_network_removal_op",
+    "is_native_eigrp_instance_create_op",
     "ospf_redistribute_key",
     "ospf_network_key",
     "ospf_area_range_key",
@@ -137,6 +139,7 @@ __all__ = [
     "is_native_ospf_op",
     "is_native_ospf_network_removal_op",
     "is_native_ospf_area_range_removal_op",
+    "is_native_ospf_instance_create_op",
 ]
 
 
@@ -900,6 +903,32 @@ def is_native_isis_net_removal_op(op: "ChangeOp") -> bool:
     )
 
 
+def is_native_isis_instance_create_op(op: "ChangeOp") -> bool:
+    """True iff *op* is the family-6e IS-IS whole-instance CREATE op.
+
+    ``SET ("isis_instances", tag, "instance")`` (3-seg — the IS-IS instance key
+    is the single tag, incl. the bare-tag ``""`` form) — emitted by the parser
+    for every FULLY-NATIVE IS-IS instance (retirement gate: NOT emitted for
+    gated shapes — IOS-XR and EOS instances, whose OWN ``parse_isis`` walks are
+    Phase-5 surface — so their derived whole-instance SET survives).  value =
+    the parsed ``ISISConfig`` (the engine seeds a new instance from it via
+    ``_isis_creation_seed``).  This op CLAIMS its ``("isis_instances", tag)``
+    prefix in :func:`derive_ops` so the derived whole-instance SET is RETIRED
+    for fully-native instances (CCR Appendix Q — the Appendix L pattern); the
+    scalar/net/interface/etc. sub-ops still do not claim (they address inside
+    the container, and a gated instance's surviving SET must not be claimed
+    away).
+    """
+    path = op.path
+    return (
+        getattr(op, "origin", "derived") == "native"
+        and op.verb is Verb.SET
+        and len(path) == 3
+        and path[0] == "isis_instances"
+        and path[2] == "instance"
+    )
+
+
 def _is_isis_process_delete(path: tuple[str, ...]) -> bool:
     """True for the whole-process ``no router isis [<tag>]`` op path.
 
@@ -914,13 +943,15 @@ def _is_isis_process_delete(path: tuple[str, ...]) -> bool:
 
 
 def is_native_isis_op(op: "ChangeOp") -> bool:
-    """True iff *op* is a parser-emitted family-6a IS-IS op (CCR Appendix M).
+    """True iff *op* is a parser-emitted family-6a/6e IS-IS op (CCR Appendix M/Q).
 
-    The IS-IS whole-protocol decomposition co-exists with the SURVIVING derived
-    whole-instance SET (like 5a/5b/5c-A; retirement is 6e).  Shapes (all
-    ``origin == "native"``), on the PLURAL ``isis_instances`` container for SETs
-    (classifier-routed to ISIS by keyed-member existence) and the SINGULAR
-    ``isis_instance`` / top-level ``process`` scope for deletions:
+    Family 6e RETIRED the derived whole-instance SET for fully-native instances:
+    the 3-seg ``SET ("isis_instances", tag, "instance")`` CREATE op claims the
+    instance prefix in ``derive_ops`` (gated IOS-XR/EOS instances emit no create
+    op — their derived SET still survives and co-exists like 5a/5b/5c-A).
+    Shapes (all ``origin == "native"``), on the PLURAL ``isis_instances``
+    container for SETs (classifier-routed to ISIS by keyed-member existence) and
+    the SINGULAR ``isis_instance`` / top-level ``process`` scope for deletions:
 
     - ``SET ("isis_instances", tag, "scalar", <field>)``
           instance scalar (is_type / metric_style / log_adjacency_changes /
@@ -950,6 +981,8 @@ def is_native_isis_op(op: "ChangeOp") -> bool:
     if not path:
         return False
     if op.verb is Verb.SET:
+        if len(path) == 3 and path[0] == "isis_instances" and path[2] == "instance":
+            return True  # family 6e whole-instance CREATE op
         return (
             len(path) >= 4
             and path[0] == "isis_instances"
@@ -1062,6 +1095,29 @@ def is_native_eigrp_network_removal_op(op: "ChangeOp") -> bool:
     )
 
 
+def is_native_eigrp_instance_create_op(op: "ChangeOp") -> bool:
+    """True iff *op* is the family-6e EIGRP whole-instance CREATE op.
+
+    ``SET ("eigrp_instances", asn, vrf, "instance")`` (4-seg — the BGP
+    Appendix-L shape on the EIGRP two-segment key) — emitted for EVERY parsed
+    EIGRP instance (never gated: no parser overrides ``parse_eigrp``, so parse
+    and native emission are the same IOS-family code path; JunOS/PAN-OS emit no
+    native ops at all and keep the derived SET).  value = the parsed
+    ``EIGRPConfig`` (the engine seeds a new instance from it via
+    ``_eigrp_creation_seed``).  Claims its ``("eigrp_instances", asn, vrf)``
+    prefix in :func:`derive_ops` → the derived whole-instance SET is RETIRED
+    (CCR Appendix Q).
+    """
+    path = op.path
+    return (
+        getattr(op, "origin", "derived") == "native"
+        and op.verb is Verb.SET
+        and len(path) == 4
+        and path[0] == "eigrp_instances"
+        and path[3] == "instance"
+    )
+
+
 def _is_eigrp_process_delete(path: tuple[str, ...]) -> bool:
     """True for the whole-process ``no router eigrp <asn>`` op path.
 
@@ -1105,6 +1161,8 @@ def is_native_eigrp_op(op: "ChangeOp") -> bool:
     if not path:
         return False
     if op.verb is Verb.SET:
+        if len(path) == 4 and path[0] == "eigrp_instances" and path[3] == "instance":
+            return True  # family 6e whole-instance CREATE op
         return (
             len(path) >= 5
             and path[0] == "eigrp_instances"
@@ -1282,6 +1340,34 @@ def is_native_ospf_area_range_removal_op(op: "ChangeOp") -> bool:
     )
 
 
+def is_native_ospf_instance_create_op(op: "ChangeOp") -> bool:
+    """True iff *op* is the family-6e OSPF whole-instance CREATE op.
+
+    ``SET ("ospf_instances", pid, vrf, "instance")`` (4-seg — the BGP
+    Appendix-L shape on the OSPF two-segment key) — emitted for every
+    FULLY-NATIVE OSPF instance (retirement gate: NOT emitted for IOS-XR
+    instances, whose OWN ``parse_ospf`` is Phase-5 surface — no line-detected
+    ``log_adjacency_changes`` tri-state for the XR spelling, no removals — so
+    their derived whole-instance SET survives with the keep-parser-value
+    strip).  value = the parsed ``OSPFConfig`` (the engine seeds a new
+    instance from it via ``_ospf_creation_seed``, which keeps the O.1 trap
+    field at the parser value and strips natively-decomposed areas; for an
+    EXISTING instance the engine applies only the audited residual — the
+    parser-absence ``log_adjacency_changes=False`` non-default override the
+    retired SET performed through ``_merge_entry_fields``).  Claims its
+    ``("ospf_instances", pid, vrf)`` prefix in :func:`derive_ops` → the
+    derived whole-instance SET is RETIRED (CCR Appendix Q).
+    """
+    path = op.path
+    return (
+        getattr(op, "origin", "derived") == "native"
+        and op.verb is Verb.SET
+        and len(path) == 4
+        and path[0] == "ospf_instances"
+        and path[3] == "instance"
+    )
+
+
 def _is_ospf_process_delete(path: tuple[str, ...]) -> bool:
     """True for the whole-process ``no router ospf <pid>`` op path.
 
@@ -1332,6 +1418,8 @@ def is_native_ospf_op(op: "ChangeOp") -> bool:
     if not path:
         return False
     if op.verb is Verb.SET:
+        if len(path) == 4 and path[0] == "ospf_instances" and path[3] == "instance":
+            return True  # family 6e whole-instance CREATE op
         return (
             len(path) >= 5
             and path[0] == "ospf_instances"
@@ -1607,15 +1695,27 @@ def derive_ops(proposal: "ParsedConfig") -> ChangeSet:
         and not is_native_ospf_op(op)
         for i in range(1, len(op.path))
     }
-    # 5c-B.2 retirement (CCR Appendix L — the one authorized derive_ops touch):
-    # the native whole-instance CREATE op claims its ``("bgp_instances", asn,
-    # vrf)`` prefix, so the derived whole-instance SET is DROPPED for every
-    # FULLY-NATIVE instance.  GATED instances (NX-OS VRF etc.) emit no create op
-    # → their prefix is not claimed → the derived SET SURVIVES (today's 5a/5b/5c
-    # coexistence, unchanged).  Only the len-3 instance prefix is claimed (not
-    # the len-1/2 partials), so no cross-instance over-claim.
+    # 5c-B.2 retirement (CCR Appendix L — the one authorized derive_ops touch),
+    # extended by family 6e (CCR Appendix Q) to the three routing protocols:
+    # the native whole-instance CREATE op claims its instance prefix
+    # (``("bgp_instances", asn, vrf)`` / ``("ospf_instances", pid, vrf)`` /
+    # ``("eigrp_instances", asn, vrf)`` — len 3; ``("isis_instances", tag)`` —
+    # len 2, the IS-IS key is the single tag), so the derived whole-instance
+    # SET is DROPPED for every FULLY-NATIVE instance.  GATED instances (NX-OS
+    # VRF BGP; IOS-XR OSPF/IS-IS; EOS IS-IS) emit no create op → their prefix
+    # is not claimed → the derived SET SURVIVES (the 5a/5b/5c coexistence,
+    # unchanged).  Only the exact instance prefix is claimed (not the len-1
+    # partials), so no cross-instance over-claim; the claim is
+    # create-op-scoped, so families 1–5 dedupe semantics are untouched.
     native_prefix_claims |= {
-        op.path[:3] for op in natives if is_native_bgp_instance_create_op(op)
+        op.path[:3]
+        for op in natives
+        if is_native_bgp_instance_create_op(op)
+        or is_native_eigrp_instance_create_op(op)
+        or is_native_ospf_instance_create_op(op)
+    }
+    native_prefix_claims |= {
+        op.path[:2] for op in natives if is_native_isis_instance_create_op(op)
     }
     return natives + [
         op

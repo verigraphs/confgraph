@@ -1826,6 +1826,31 @@ class IOSParser(BaseParser):
                     )
                 )
 
+            # Family 6e retirement (CCR Appendix Q): the whole-instance CREATE
+            # op.  Emitted for every FULLY-NATIVE instance so it claims the
+            # ``("isis_instances", tag)`` prefix in derive_ops → the derived
+            # whole-instance SET is RETIRED.  GATED instances (IOS-XR/EOS —
+            # own parse_isis walks) keep the derived SET (no create op).
+            # value = the parsed ISISConfig; the engine seeds a NEW instance
+            # from it (_isis_creation_seed — parser-absence == model default
+            # for every migrated field, M.4) and no-ops for an EXISTING one
+            # (the retired SET was fully inert for existing instances — all
+            # stripped fields at model default, Q.0).  Block provenance (not
+            # blank) so the "SET provenance uses block raw lines" contract
+            # holds for the first instance-scoped op; position is irrelevant
+            # (consumed by an order-independent pre-pass).
+            if not self._isis_instance_gated(isis):
+                ops.append(
+                    ChangeOp(
+                        verb=Verb.SET,
+                        path=("isis_instances", tag, "instance"),
+                        value=isis,
+                        source_line=sl,
+                        line_no=ln,
+                        origin="native",
+                    )
+                )
+
             for field, default in _ISIS_SCALARS:
                 val = getattr(isis, field, default)
                 if val != default:
@@ -1914,6 +1939,26 @@ class IOSParser(BaseParser):
                         verb=Verb.SET,
                         path=("eigrp_instances", asn, vrf, kind, *key),
                         value=value,
+                        source_line=sl,
+                        line_no=ln,
+                        origin="native",
+                    )
+                )
+
+            # Family 6e retirement (CCR Appendix Q): the whole-instance CREATE
+            # op — claims the ``("eigrp_instances", asn, vrf)`` prefix in
+            # derive_ops → the derived whole-instance SET is RETIRED.  EIGRP is
+            # never gated (no parser overrides parse_eigrp — the gate documents
+            # that invariant).  value = the parsed EIGRPConfig; the engine
+            # seeds a NEW instance from it (_eigrp_creation_seed — no
+            # Finding-2-class trap, N.4) and no-ops for an EXISTING one (the
+            # retired SET was fully inert for existing instances, Q.0).
+            if not self._eigrp_instance_gated(eigrp):
+                ops.append(
+                    ChangeOp(
+                        verb=Verb.SET,
+                        path=("eigrp_instances", asn, vrf, "instance"),
+                        value=eigrp,
                         source_line=sl,
                         line_no=ln,
                         origin="native",
@@ -2053,6 +2098,29 @@ class IOSParser(BaseParser):
                     )
                 )
 
+            # Family 6e retirement (CCR Appendix Q): the whole-instance CREATE
+            # op — claims the ``("ospf_instances", pid, vrf)`` prefix in
+            # derive_ops → the derived whole-instance SET is RETIRED.  GATED
+            # instances (IOS-XR — own parse_ospf, Phase-5 surface) keep the
+            # derived SET (no create op).  value = the parsed OSPFConfig; the
+            # engine seeds a NEW instance from it (_ospf_creation_seed — keeps
+            # the O.1 trap field at the parser value, strips natively-
+            # decomposed areas) and, for an EXISTING instance, applies ONLY
+            # the audited residual (the parser-absence
+            # ``log_adjacency_changes=False`` non-default override the retired
+            # SET performed through _merge_entry_fields — Q.0).
+            if not self._ospf_instance_gated(ospf):
+                ops.append(
+                    ChangeOp(
+                        verb=Verb.SET,
+                        path=("ospf_instances", pid, vrf, "instance"),
+                        value=ospf,
+                        source_line=sl,
+                        line_no=ln,
+                        origin="native",
+                    )
+                )
+
             for field, default in _OSPF_SCALARS:
                 val = getattr(ospf, field, default)
                 if val != default:
@@ -2095,6 +2163,56 @@ class IOSParser(BaseParser):
         ops.extend(getattr(self, "_pending_native_ospf_ops", None) or [])
         ops.sort(key=lambda op: op.line_no if op.line_no >= 0 else float("inf"))
         return ops
+
+    def _isis_instance_gated(self, isis) -> bool:
+        """6e retirement gate for IS-IS (CCR Appendix Q): True iff *isis*'s
+        derived whole-instance SET must SURVIVE (no CREATE op emitted, prefix
+        not claimed).
+
+        Gated parser paths are the ones whose IS-IS content is NOT produced by
+        this class's ``parse_isis`` walk (Phase-5 surface — the model-walk SETs
+        still co-exist with the surviving SET exactly as in 6a):
+
+        - **IOS-XR** — ``iosxr_parser.parse_isis`` is its own walk (no
+          ``no net`` emission, no ``_pending_native_isis_ops`` channel), and
+          XR's own ``parse_deletion_commands`` emits DERIVED process
+          tombstones.
+        - **EOS** — ``eos_parser.parse_isis`` is likewise its own walk (the
+          same hole class; flagged in Appendix Q.2).
+        """
+        os_val = getattr(self.os_type, "value", self.os_type)
+        return os_val in ("ios_xr", "eos")
+
+    def _eigrp_instance_gated(self, eigrp) -> bool:
+        """6e retirement gate for EIGRP (CCR Appendix Q): never gated.
+
+        NO parser overrides ``parse_eigrp`` — IOS / NX-OS / EOS / IOS-XR all
+        inherit the single IOS walk, so parse and native emission are the same
+        code path (coverage complete by construction).  JunOS/PAN-OS subclass
+        BaseParser and emit no native ops at all (no create op → their derived
+        SET survives → exact legacy parity, the natives-less posture).  Kept as
+        an explicit predicate for rot-safety symmetry with the other gates: a
+        future subclass ``parse_eigrp`` override must add itself here.
+        """
+        return False
+
+    def _ospf_instance_gated(self, ospf) -> bool:
+        """6e retirement gate for OSPF (CCR Appendix Q): True iff *ospf*'s
+        derived whole-instance SET must SURVIVE (no CREATE op emitted).
+
+        Today exactly **IOS-XR**: ``iosxr_parser.parse_ospf`` is its own walk
+        (Phase-5 surface) — no line-detected ``log_adjacency_changes``
+        tri-state for the XR spelling (``log adjacency changes``), no
+        ``no network`` removal walk, and XR's own ``parse_deletion_commands``
+        emits DERIVED process tombstones.  Keeping the derived SET (with the
+        keep-parser-value strip, Appendix O.1 XR note) is the rot-safe posture
+        until Phase 5.  NX-OS is NOT gated — its ``parse_ospf`` is a thin
+        ``super()`` wrapper + VRF backfill, and the same-pid backfill mislabel
+        cannot cause a wrong-instance retirement (create op and derived SET
+        key from the same model instance — Appendix Q.2).
+        """
+        os_val = getattr(self.os_type, "value", self.os_type)
+        return os_val == "ios_xr"
 
     def _bgp_instance_gated(self, bgp) -> bool:
         """5c-B.2 retirement gate (CCR Appendix L): True iff *bgp*'s derived

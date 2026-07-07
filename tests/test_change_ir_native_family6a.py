@@ -190,24 +190,34 @@ def test_process_delete_native_byte_exact_bare_tag():
     assert encode_legacy([op]).no_commands == ["process:isis:"]
 
 
-# --- co-existence: derived whole-instance SET SURVIVES ---------------------
+# --- retirement: derived whole-instance SET RETIRED (6e, CCR Appendix Q) ---
+# Pin flip history (the L.4 pattern): these asserted "SET survives" through
+# 6a–6d co-existence; 6e's create-op prefix claim retires the derived SET for
+# fully-native instances.
 
-def test_derived_whole_instance_set_survives_composition():
+def test_derived_whole_instance_set_retired_composition():
     pc = _parse(ISIS_FULL)
     ops = derive_ops(pc)
     inst_sets = [
         op for op in ops
         if op.path == ("isis_instances", "CORE") and op.verb is Verb.SET
     ]
-    assert len(inst_sets) == 1  # co-exists (6a does NOT retire it)
-    # …and it carries the full instance (retirement/decomposition is engine-side).
-    assert inst_sets[0].value.tag == "CORE"
+    assert inst_sets == []  # RETIRED (6e)
+    creates = [
+        op for op in ops
+        if op.path == ("isis_instances", "CORE", "instance") and op.verb is Verb.SET
+    ]
+    assert len(creates) == 1 and creates[0].origin == "native"
+    # …and the create op carries the full parsed instance (the engine seeds
+    # a new instance from it; the seed strip is engine-side).
+    assert creates[0].value.tag == "CORE"
 
 
-def test_bare_tag_instance_set_survives():
+def test_bare_tag_instance_set_retired():
     pc = _parse("router isis\n net 49.0001.0000.0000.0001.00\n")
     ops = derive_ops(pc)
-    assert any(op.path == ("isis_instances", "") for op in ops)
+    assert not any(op.path == ("isis_instances", "") for op in ops)  # RETIRED
+    assert any(op.path == ("isis_instances", "", "instance") for op in ops)
 
 
 # --- anti-rot: every family-6a-shaped op is native -------------------------
@@ -236,13 +246,14 @@ def test_families_1_5_dedupe_unchanged():
     )
     ops = derive_ops(pc)
     # BGP is fully retired (5c-B.2): a native whole-instance CREATE op, and NO
-    # derived whole-instance SET.  IS-IS is co-existing (6a): the derived
-    # whole-instance SET SURVIVES beside the native decomposition.
+    # derived whole-instance SET.  IS-IS is now retired too (6e, CCR Appendix
+    # Q — this pin previously asserted the 6a co-existence survival).
     assert any(
         op.path == ("bgp_instances", "65000", "", "instance") for op in ops
     )
     assert not any(op.path == ("bgp_instances", "65000", "") for op in ops)
-    assert any(op.path == ("isis_instances", "CORE") for op in ops)
+    assert any(op.path == ("isis_instances", "CORE", "instance") for op in ops)
+    assert not any(op.path == ("isis_instances", "CORE") for op in ops)
     # native BGP + native IS-IS ops both present and origin-native.
     assert any(is_native_bgp_op(op) for op in ops)
     assert any(is_native_isis_op(op) for op in ops)

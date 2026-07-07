@@ -207,17 +207,25 @@ def test_named_mode_as_resolution():
     assert rem and rem[0].path[1] == "65001"
 
 
-# --- co-existence: derived whole-instance SET SURVIVES ---------------------
+# --- retirement: derived whole-instance SET RETIRED (6e, CCR Appendix Q) ---
+# Pin flip (the L.4 pattern): asserted "SET survives" through the 6b
+# co-existence; 6e's create-op prefix claim retires it.
 
-def test_derived_whole_instance_set_survives_composition():
+def test_derived_whole_instance_set_retired_composition():
     pc = _parse(EIGRP_FULL)
     ops = derive_ops(pc)
     inst_sets = [
         op for op in ops
         if op.path == ("eigrp_instances", "100", "") and op.verb is Verb.SET
     ]
-    assert len(inst_sets) == 1  # co-exists (6b does NOT retire it)
-    assert str(inst_sets[0].value.as_number) == "100"
+    assert inst_sets == []  # RETIRED (6e)
+    creates = [
+        op for op in ops
+        if op.path == ("eigrp_instances", "100", "", "instance")
+        and op.verb is Verb.SET
+    ]
+    assert len(creates) == 1 and creates[0].origin == "native"
+    assert str(creates[0].value.as_number) == "100"
 
 
 # --- anti-rot: every family-6b-shaped op is native -------------------------
@@ -235,15 +243,18 @@ def test_anti_rot_family6b_never_derived():
 
 
 def test_families_isis_eigrp_coexist():
-    # Interleaved IS-IS + EIGRP: both co-existing (6a/6b), derived whole-instance
-    # SETs SURVIVE beside the native decompositions.
+    # Interleaved IS-IS + EIGRP: both RETIRED (6e, CCR Appendix Q — this pin
+    # previously asserted the 6a/6b co-existence survival): one native CREATE
+    # op each, no derived whole-instance SETs.
     pc = _parse(
         "router isis CORE\n net 49.0001.0000.0000.0001.00\n"
         "router eigrp 100\n network 10.0.0.0\n"
     )
     ops = derive_ops(pc)
-    assert any(op.path == ("isis_instances", "CORE") for op in ops)
-    assert any(op.path == ("eigrp_instances", "100", "") for op in ops)
+    assert any(op.path == ("isis_instances", "CORE", "instance") for op in ops)
+    assert any(op.path == ("eigrp_instances", "100", "", "instance") for op in ops)
+    assert not any(op.path == ("isis_instances", "CORE") for op in ops)
+    assert not any(op.path == ("eigrp_instances", "100", "") for op in ops)
     assert any(is_native_isis_op(op) for op in ops)
     assert any(is_native_eigrp_op(op) for op in ops)
 

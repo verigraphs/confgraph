@@ -156,11 +156,14 @@ def test_areas_now_emitted_natively_family6d():
     for op in _f6c(pc):
         if op.verb is Verb.SET:
             kinds.add(op.path[3])
+            # "instance" joined the shape set in 6e (CCR Appendix Q — the
+            # whole-instance CREATE op that retires the derived SET).
             assert op.path[3] in {
                 "scalar", "network", "passive_interface",
-                "non_passive_interface", "redistribute", "area",
+                "non_passive_interface", "redistribute", "area", "instance",
             }
     assert "area" in kinds
+    assert "instance" in kinds
 
 
 def test_native_set_values_are_model_objects():
@@ -322,19 +325,27 @@ def test_vrf_instance_keys_carry_vrf():
     assert rem and rem[0].path[:3] == ("ospf_instance", "10", "CUST")
 
 
-# --- co-existence: derived whole-instance SET SURVIVES ---------------------
+# --- retirement: derived whole-instance SET RETIRED (6e, CCR Appendix Q) ---
+# Pin flip (the L.4 pattern): asserted "SET survives" through the 6c
+# co-existence; 6e's create-op prefix claim retires it.
 
-def test_derived_whole_instance_set_survives_composition():
+def test_derived_whole_instance_set_retired_composition():
     pc = _parse(OSPF_FULL)
     ops = derive_ops(pc)
     inst_sets = [
         op for op in ops
         if op.path == ("ospf_instances", "1", "") and op.verb is Verb.SET
     ]
-    assert len(inst_sets) == 1  # co-exists (6c does NOT retire it)
-    assert str(inst_sets[0].value.process_id) == "1"
-    # areas ride the surviving SET, untouched (O.0).
-    assert inst_sets[0].value.areas
+    assert inst_sets == []  # RETIRED (6e)
+    creates = [
+        op for op in ops
+        if op.path == ("ospf_instances", "1", "", "instance") and op.verb is Verb.SET
+    ]
+    assert len(creates) == 1 and creates[0].origin == "native"
+    assert str(creates[0].value.process_id) == "1"
+    # areas ride the create-op VALUE (the engine's creation seed strips the
+    # natively-decomposed ones; the shell + member ops rebuild them — P.4/Q.1).
+    assert creates[0].value.areas
 
 
 # --- anti-rot: every family-6c-shaped op is native -------------------------
@@ -352,17 +363,21 @@ def test_anti_rot_family6c_never_derived():
 
 
 def test_families_igp_coexist():
-    # Interleaved IS-IS + EIGRP + OSPF: all co-existing (6a/6b/6c), derived
-    # whole-instance SETs SURVIVE beside the native decompositions.
+    # Interleaved IS-IS + EIGRP + OSPF: all RETIRED (6e, CCR Appendix Q —
+    # this pin previously asserted the 6a/6b/6c co-existence survival): one
+    # native CREATE op each, no derived whole-instance SETs.
     pc = _parse(
         "router isis CORE\n net 49.0001.0000.0000.0001.00\n"
         "router eigrp 100\n network 10.0.0.0\n"
         "router ospf 1\n network 10.0.0.0 0.0.0.255 area 0\n"
     )
     ops = derive_ops(pc)
-    assert any(op.path == ("isis_instances", "CORE") for op in ops)
-    assert any(op.path == ("eigrp_instances", "100", "") for op in ops)
-    assert any(op.path == ("ospf_instances", "1", "") for op in ops)
+    assert any(op.path == ("isis_instances", "CORE", "instance") for op in ops)
+    assert any(op.path == ("eigrp_instances", "100", "", "instance") for op in ops)
+    assert any(op.path == ("ospf_instances", "1", "", "instance") for op in ops)
+    assert not any(op.path == ("isis_instances", "CORE") for op in ops)
+    assert not any(op.path == ("eigrp_instances", "100", "") for op in ops)
+    assert not any(op.path == ("ospf_instances", "1", "") for op in ops)
     assert any(is_native_isis_op(op) for op in ops)
     assert any(is_native_eigrp_op(op) for op in ops)
     assert any(is_native_ospf_op(op) for op in ops)

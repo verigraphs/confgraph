@@ -277,17 +277,25 @@ def test_vrf_parent_reset_gap_documented():
 
 # --- composition + anti-rot ---------------------------------------------------
 
-def test_derived_whole_instance_set_survives_composition():
+def test_derived_whole_instance_set_retired_composition():
+    # Pin flip (6e, CCR Appendix Q, the L.4 pattern): 6d rode the 6c
+    # co-existence and this asserted "SET survives"; the create-op prefix
+    # claim now retires the derived SET.
     pc = _parse(OSPF_AREAS_FULL)
     ops = derive_ops(pc)
     inst_sets = [
         op for op in ops
         if op.verb is Verb.SET and op.path == ("ospf_instances", "1", "")
     ]
-    assert len(inst_sets) == 1
-    # The surviving SET still CARRIES areas at composition time — the engine
-    # strips the natively-decomposed ones at apply time (P.4), not the codec.
-    assert inst_sets[0].value.areas
+    assert inst_sets == []  # RETIRED (6e)
+    creates = [
+        op for op in ops
+        if op.verb is Verb.SET and op.path == ("ospf_instances", "1", "", "instance")
+    ]
+    assert len(creates) == 1 and creates[0].origin == "native"
+    # The create-op VALUE still CARRIES areas at composition time — the engine
+    # strips the natively-decomposed ones at seed time (P.4/Q.1), not the codec.
+    assert creates[0].value.areas
 
 
 def test_anti_rot_family6d_every_area_op_native():
