@@ -109,6 +109,9 @@ __all__ = [
     "static_route_fields",
     "static_route_key",
     "is_native_static_op",
+    "bgp_neighbor_fields",
+    "bgp_neighbor_key",
+    "is_native_bgp_op",
 ]
 
 
@@ -474,6 +477,78 @@ def is_native_static_op(op: "ChangeOp") -> bool:
     return False
 
 
+@_lru_cache(maxsize=1)
+def bgp_neighbor_fields() -> frozenset[str]:
+    """Family-5a boundary (CCR Appendix H): the per-neighbor lifecycle surface.
+
+    Phase-3 family 5a (WI-18a) migrates the BGP *neighbor* lifecycle only —
+    neighbor add/re-add, full removal, and per-neighbor field reset — at both
+    parser emission call sites (global ``router bgp`` and per-VRF
+    ``address-family ipv4 vrf N``), IOS + inherited NX-OS single-line forms.
+    The boundary is the model sub-collection ``BGPConfig.neighbors``; the
+    remaining BGP surface (peer-group create/delete, ``network`` statements,
+    AF-scoped neighbor migration, the whole-instance positive decomposition)
+    stays derived until family 5b — see Appendix H boundary lists.
+    """
+    return frozenset({"neighbors"})
+
+
+def bgp_neighbor_key(neighbor: Any) -> tuple[str, ...]:
+    """Identity path segment for a BGP neighbor (the peer address, as-written).
+
+    ``("bgp_instances", str(asn), vrf or "", "neighbor", *bgp_neighbor_key(n))``
+    is the native create/re-add op path.  The peer address is kept as a SINGLE
+    tuple element even for IPv6 peers (whose text contains colons) so the
+    consumer never has to re-split it — codec-owned; the parser must not
+    re-implement the key.
+    """
+    return (str(neighbor.peer_ip),)
+
+
+def is_native_bgp_op(op: "ChangeOp") -> bool:
+    """True iff *op* is a parser-emitted family-5a BGP-neighbor op.
+
+    Three shapes (all ``origin == "native"``):
+
+    - ``SET ("bgp_instances", asn, vrf, "neighbor", peer)``
+          neighbor (re)creation / field write — value = the ``BGPNeighbor``.
+    - ``OBJECT_DELETE ("bgp_instance", asn, vrf, "neighbor", peer…)``
+          full neighbor removal (``no neighbor X``).  ``peer…`` may span
+          several path segments for IPv6 peers (colon-split); the consumer
+          rejoins ``path[3:]`` into the legacy tombstone string.
+    - ``UNSET ("bgp_instance", asn, vrf, "field", "neighbor", peer…, field)``
+          per-neighbor / peer-group field reset (``no neighbor X <attr>``).
+
+    Owned by the codec module (CCR Appendix H): the engine's ordered-apply
+    pass (``_apply_native_bgp_ops``) and its ``_proposal_from_ops`` skip MUST
+    share this predicate.  Derived twins (same path, ``origin="derived"``)
+    return False (origin gate) and keep flowing through the batched legacy
+    apply path so natives-less producers retain exact legacy parity.
+
+    Note the SET side uses the PLURAL ``bgp_instances`` container name (a
+    keyed top-level list-member SET, classifier-routed to BGP by existence),
+    while the deletion sides carry the SINGULAR ``bgp_instance`` scope prefix
+    (``encode_legacy`` returns them to ``BGPConfig.no_commands``, byte-exact).
+    """
+    if getattr(op, "origin", "derived") != "native":
+        return False
+    path = op.path
+    if not path:
+        return False
+    if op.verb is Verb.SET:
+        return len(path) == 5 and path[0] == "bgp_instances" and path[3] == "neighbor"
+    if op.verb is Verb.OBJECT_DELETE:
+        return len(path) >= 5 and path[0] == "bgp_instance" and path[3] == "neighbor"
+    if op.verb is Verb.UNSET:
+        return (
+            len(path) >= 7
+            and path[0] == "bgp_instance"
+            and path[3] == "field"
+            and path[4] == "neighbor"
+        )
+    return False
+
+
 def _static_nh_key(r: Any) -> str:
     """Stable NH identity segment for a static route (mirrors merger identity)."""
     nh = r.next_hop
@@ -718,8 +793,19 @@ def derive_ops(proposal: "ParsedConfig") -> ChangeSet:
     # exist; those are emitted structurally for every non-default banner
     # field, so the whole-object op is redundant by construction.
     native_paths = {op.path for op in natives}
+    # Container-claim (prefix) dedupe — family 3.  EXCLUDE family-5a BGP
+    # neighbor ops (CCR Appendix H, approved codec adjustment): a native
+    # neighbor SET path ``("bgp_instances", asn, vrf, "neighbor", peer)`` must
+    # NOT claim its ``("bgp_instances", asn, vrf)`` prefix — the derived
+    # whole-instance SET (still owning scalars/networks/AFs/peer-groups in 5a)
+    # has to SURVIVE alongside the native neighbor ops.  The neighbor sub-path
+    # is thus withheld from the prefix-claim set.  Family 1-4 ops are not BGP
+    # ops, so their container-claim semantics are unchanged.
     native_prefix_claims = {
-        op.path[:i] for op in natives for i in range(1, len(op.path))
+        op.path[:i]
+        for op in natives
+        if not is_native_bgp_op(op)
+        for i in range(1, len(op.path))
     }
     return natives + [
         op

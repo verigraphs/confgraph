@@ -107,11 +107,19 @@ def _op_for_tombstone(ops, tombstone: str) -> ChangeOp:
 
     Phase-0 derived ops carry the tombstone in ``source_line``; Phase-3
     NATIVE ops carry the real command line instead, so match on the codec
-    path too (``":".join(path)`` IS the tombstone, byte-exact).
+    path too (``":".join(path)`` IS the tombstone, byte-exact).  Family-5a
+    BGP-neighbor ops carry the ``("bgp_instance", asn, vrf)`` scope prefix, so
+    the tombstone is the rejoin of ``path[3:]`` (what ``encode_legacy`` uses).
     """
     matches = [
         op for op in ops
-        if op.source_line == tombstone or ":".join(op.path) == tombstone
+        if op.source_line == tombstone
+        or ":".join(op.path) == tombstone
+        or (
+            op.path
+            and op.path[0] == "bgp_instance"
+            and ":".join(op.path[3:]) == tombstone
+        )
     ]
     assert matches, f"No op derived for tombstone {tombstone!r}"
     return matches[0]

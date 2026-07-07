@@ -1681,6 +1681,7 @@ class IOSParser(BaseParser):
             ops.extend(leftover)
         ops.extend(self._native_service_entity_ops(pc))
         ops.extend(self._native_static_ops(pc))
+        ops.extend(self._native_bgp_ops(pc))
         pc.native_change_ops = ops
 
     def _queue_native_static_delete(self, tombstone: str, obj):
@@ -1744,6 +1745,83 @@ class IOSParser(BaseParser):
                 )
             )
         ops.extend(getattr(self, "_pending_native_static_ops", None) or [])
+        ops.sort(key=lambda op: op.line_no if op.line_no >= 0 else float("inf"))
+        return ops
+
+    def _native_bgp_ops(self, pc) -> list:
+        """Native family-5a BGP-neighbor ops (CCR Appendix H) in script order.
+
+        Both sides of the neighbor lifecycle, ordered by line so
+        delete-then-readd and reset-then-reassert are different (and correct)
+        op sequences — the ordering the legacy batched merge gets WRONG (BGP
+        neighbor tombstones apply AFTER the additive pass in
+        ``_merge_bgp_instances``, silently dropping a re-added neighbor and
+        letting a field-reset win over a later re-set):
+
+        - **Create/re-add side** (state-derived, parity-with-deriver by
+          construction): one ``SET ("bgp_instances", asn, vrf, "neighbor",
+          peer)`` per neighbor in the FINAL parsed instance (value = the parsed
+          ``BGPNeighbor``; position = the LAST positive ``neighbor <peer> …``
+          line for that peer — the "positive after negation" predicate, so a
+          re-added neighbor carries the re-creation line).
+        - **Delete side**: the ``OBJECT_DELETE`` / ``UNSET`` ops queued by
+          ``_parse_bgp_neighbor_tombstones`` at their ``no neighbor`` lines.
+
+        Only the NEIGHBOR sub-collection is migrated here (family 5a); the
+        whole-instance positive (scalars/networks/AFs/peer-groups) stays the
+        derived whole-instance SET, which co-exists (Appendix H codec
+        adjustment).  Stable sort by ``line_no`` (unknown positions last).
+        """
+        from confgraph.change_ir import ChangeOp, Verb, bgp_neighbor_key
+
+        parse = self._get_parse_obj()
+        roots: dict[int, object] = {}
+        for obj in parse.find_objects(r"^router\s+bgp\s+\d+"):
+            m = re.match(r"^router\s+bgp\s+(\d+)", obj.text)
+            if m:
+                roots[int(m.group(1))] = obj
+
+        ops: list = []
+        for bgp in pc.bgp_instances:
+            asn_s = str(bgp.asn)
+            vrf_s = bgp.vrf or ""
+            root = roots.get(bgp.asn)
+            scope = root
+            if bgp.vrf and root is not None:
+                for c in root.children:
+                    t = c.text.strip()
+                    if re.match(
+                        rf"^address-family\s+ipv4\s+vrf\s+{re.escape(bgp.vrf)}(\s|$)",
+                        t,
+                    ) or re.match(rf"^vrf\s+{re.escape(bgp.vrf)}(\s|$)", t):
+                        scope = c
+                        break
+            candidates = list(scope.children) if scope is not None else []
+            for nb in bgp.neighbors:
+                peer = str(nb.peer_ip)
+                positives = [
+                    c
+                    for c in candidates
+                    if re.match(rf"^\s*neighbor\s+{re.escape(peer)}(\s|$)", c.text)
+                    and not re.match(r"^\s*no\s+neighbor\b", c.text)
+                ]
+                ops.append(
+                    ChangeOp(
+                        verb=Verb.SET,
+                        path=(
+                            "bgp_instances",
+                            asn_s,
+                            vrf_s,
+                            "neighbor",
+                            *bgp_neighbor_key(nb),
+                        ),
+                        value=nb,
+                        source_line=(positives[-1].text.strip() if positives else ""),
+                        line_no=(positives[-1].linenum if positives else -1),
+                        origin="native",
+                    )
+                )
+        ops.extend(getattr(self, "_pending_native_bgp_ops", None) or [])
         ops.sort(key=lambda op: op.line_no if op.line_no >= 0 else float("inf"))
         return ops
 
@@ -1914,6 +1992,16 @@ class IOSParser(BaseParser):
         bgp_instances = []
         parse = self._get_parse_obj()
 
+        # Change-IR Phase 3 family 5a (CCR Appendix H): native BGP-neighbor
+        # lifecycle ops.  The deletion ops (``no neighbor X`` full removal and
+        # ``no neighbor X <attr>`` field reset) are queued here at their true
+        # script positions by _parse_bgp_neighbor_tombstones; the positive
+        # neighbor (re)creation SET ops are emitted at parse finalization by
+        # _native_bgp_ops, interleaved with the deletions by line order so
+        # delete-then-readd / reset-then-reassert become correctly-ordered op
+        # sequences.  Re-initialized per parse.
+        self._pending_native_bgp_ops = []
+
         # Find all BGP router configs
         bgp_objs = parse.find_objects(r"^router\s+bgp\s+(\d+)")
 
@@ -2018,7 +2106,9 @@ class IOSParser(BaseParser):
             peer_groups = self._parse_bgp_peer_groups(bgp_obj)
 
             # 'no neighbor X' tombstones (full removal + field-level resets)
-            bgp_no_commands: list[str] = self._parse_bgp_neighbor_tombstones(bgp_obj)
+            bgp_no_commands: list[str] = self._parse_bgp_neighbor_tombstones(
+                bgp_obj, asn=asn, vrf=None
+            )
 
             # Populate per-neighbor AF policies from address-family blocks
             self._apply_bgp_af_neighbor_policies(bgp_obj, neighbors)
@@ -2849,7 +2939,9 @@ class IOSParser(BaseParser):
         ("peer-group",              "peer_group"),
     ]
 
-    def _parse_bgp_neighbor_tombstones(self, bgp_or_af_obj) -> list[str]:
+    def _parse_bgp_neighbor_tombstones(
+        self, bgp_or_af_obj, asn: int | None = None, vrf: str | None = None
+    ) -> list[str]:
         """Parse 'no neighbor X ...' lines under a BGP process or AF block.
 
         Returns a list of tombstone strings using two formats:
@@ -2866,8 +2958,42 @@ class IOSParser(BaseParser):
         "no neighbor X..." was treated as a full neighbor removal tombstone,
         which incorrectly removed the entire neighbor when only a single field
         was being cleared (e.g. "no neighbor 1.1.1.1 shutdown").
+
+        Change-IR Phase 3 family 5a (CCR Appendix H): when *asn* is supplied,
+        each tombstone is ALSO queued as a native ChangeOp on
+        ``_pending_native_bgp_ops`` at its true script position, and the
+        returned legacy string is REGENERATED from that op via ``encode_legacy``
+        (single source, byte-exact — including IPv6 peers whose text contains
+        colons).  Legacy mode still consumes ``BGPConfig.no_commands`` exactly
+        as today; ops mode replays the native ops in order.
         """
+        from confgraph.change_ir import ChangeOp, Verb, encode_legacy
+
         tombstones: list[str] = []
+
+        def _emit(tombstone: str, node) -> None:
+            """Queue the native op and append its byte-exact legacy string."""
+            if asn is None:
+                tombstones.append(tombstone)
+                return
+            verb = (
+                Verb.OBJECT_DELETE
+                if tombstone.startswith("neighbor:")
+                else Verb.UNSET
+            )
+            op = ChangeOp(
+                verb=verb,
+                path=("bgp_instance", str(asn), vrf or "")
+                + tuple(tombstone.split(":")),
+                value=None,
+                source_line=node.text.strip(),
+                line_no=node.linenum,
+                origin="native",
+            )
+            self._pending_native_bgp_ops.append(op)
+            tombstones.extend(
+                encode_legacy([op]).bgp_no_commands[(str(asn), vrf or "")]
+            )
 
         for nc in bgp_or_af_obj.find_child_objects(r"^\s+no\s+neighbor\s+\S+"):
             m = re.search(r"^\s+no\s+neighbor\s+(\S+)(?:\s+(.+))?$", nc.text)
@@ -2879,24 +3005,24 @@ class IOSParser(BaseParser):
 
             if not attr:
                 # "no neighbor X" — full neighbor removal
-                tombstones.append(f"neighbor:{peer}")
+                _emit(f"neighbor:{peer}", nc)
                 continue
 
             # Directional policy objects: attribute starts with keyword + name + direction
             if attr.startswith("route-map "):
                 field = "route_map_in" if attr.endswith(" in") else "route_map_out" if attr.endswith(" out") else None
                 if field:
-                    tombstones.append(f"field:neighbor:{peer}:{field}")
+                    _emit(f"field:neighbor:{peer}:{field}", nc)
                 continue
             if attr.startswith("prefix-list "):
                 field = "prefix_list_in" if attr.endswith(" in") else "prefix_list_out" if attr.endswith(" out") else None
                 if field:
-                    tombstones.append(f"field:neighbor:{peer}:{field}")
+                    _emit(f"field:neighbor:{peer}:{field}", nc)
                 continue
             if attr.startswith("filter-list "):
                 field = "filter_list_in" if attr.endswith(" in") else "filter_list_out" if attr.endswith(" out") else None
                 if field:
-                    tombstones.append(f"field:neighbor:{peer}:{field}")
+                    _emit(f"field:neighbor:{peer}:{field}", nc)
                 continue
 
             # Simple prefix-match table
@@ -2904,7 +3030,7 @@ class IOSParser(BaseParser):
                 if prefix in ("route-map", "prefix-list", "filter-list"):
                     continue  # already handled above
                 if attr == prefix or attr.startswith(prefix + " "):
-                    tombstones.append(f"field:neighbor:{peer}:{field_name}")
+                    _emit(f"field:neighbor:{peer}:{field_name}", nc)
                     break
             # Unrecognised attribute — skip silently (do not emit a full-removal tombstone)
 
@@ -3784,7 +3910,9 @@ class IOSParser(BaseParser):
             )
 
             # 'no neighbor X ...' tombstones for VRF instance
-            vrf_no_commands = self._parse_bgp_neighbor_tombstones(vrf_af_child)
+            vrf_no_commands = self._parse_bgp_neighbor_tombstones(
+                vrf_af_child, asn=asn, vrf=vrf_name
+            )
 
             # Create VRF BGP instance
             vrf_instances.append(
