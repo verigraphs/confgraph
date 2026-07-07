@@ -121,6 +121,10 @@ __all__ = [
     "is_native_bgp_network_removal_op",
     "is_native_bgp_af_aggregate_removal_op",
     "is_native_bgp_instance_create_op",
+    "isis_interface_key",
+    "isis_redistribute_key",
+    "is_native_isis_op",
+    "is_native_isis_net_removal_op",
 ]
 
 
@@ -811,6 +815,141 @@ def is_native_bgp_op(op: "ChangeOp") -> bool:
     return False
 
 
+# ---------------------------------------------------------------------------
+# Family 6a — IS-IS whole-protocol decomposition (CCR Appendix M)
+# ---------------------------------------------------------------------------
+
+
+def isis_interface_key(iface: Any) -> tuple[str, ...]:
+    """Identity segment for an IS-IS per-interface config (family 6a).
+
+    ``("isis_instances", tag, "interface", *isis_interface_key(i))`` is the
+    native create/re-add op path.  Identity = the interface name — the same key
+    the legacy ``_fieldlevel_list_rule("isis_instances")`` uses for its keyed
+    ``interfaces`` merge.  Codec-owned; the parser must not re-implement it.
+    """
+    return (iface.name,)
+
+
+def isis_redistribute_key(redist: Any) -> tuple[str, ...]:
+    """Identity segments for an IS-IS ``redistribute`` member (family 6a).
+
+    ``("isis_instances", tag, "redistribute", *isis_redistribute_key(r))`` — the
+    identity is ``(protocol, str(process_id) or "")``, the same key the legacy
+    ``_fieldlevel_list_rule("isis_instances")`` uses for its keyed
+    ``redistribute`` merge.  Positive-only (the ``no redistribute`` negation has
+    no tombstone today AND no reachable service consumer — merge-only, documented
+    in Appendix M).  Codec-owned.
+    """
+    pid = getattr(redist, "process_id", None)
+    return (redist.protocol, str(pid) if pid is not None else "")
+
+
+# IS-IS instance-decomposition ``kind`` tokens carried at ``path[2]`` of a
+# ``("isis_instances", tag, kind, *key)`` native SET (mirrors the BGP
+# ``bgp_instances`` keyed-member precedent, one identity segment shorter — the
+# IS-IS instance key is the single ``tag``, not ``(asn, vrf)``).
+_ISIS_SET_KINDS: frozenset[str] = frozenset(
+    {
+        "scalar",
+        "net",
+        "passive_interface",
+        "non_passive_interface",
+        "interface",
+        "redistribute",
+    }
+)
+
+
+def _is_isis_net_removal(path: tuple[str, ...]) -> bool:
+    """True for the family-6a ops-only ``no net <addr>`` op path.
+
+    ``("isis_instance", tag, "net", <addr>)`` — a LIST_REMOVE with NO legacy twin
+    (``encode_legacy`` emits nothing; the line is silently dropped by the legacy
+    parser today, exactly like the 5b ``no network`` discipline).  NET strings
+    contain dots but never colons, so the address is a single path segment.
+    """
+    return len(path) == 4 and path[0] == "isis_instance" and path[2] == "net"
+
+
+def is_native_isis_net_removal_op(op: "ChangeOp") -> bool:
+    """True iff *op* is the family-6a ops-only ``no net`` removal op.
+
+    Consumed by :func:`encode_legacy` to emit NOTHING (no legacy twin): a bare
+    ``no net <addr>`` under ``router isis`` is silently dropped by every legacy
+    parser today (the positive ``net`` walk does not match a ``no net`` line and
+    the list is additive), so ops mode gains a NET-withdrawal capability legacy
+    cannot see while legacy-mode artifacts stay byte-identical.
+    """
+    return (
+        getattr(op, "origin", "derived") == "native"
+        and op.verb is Verb.LIST_REMOVE
+        and _is_isis_net_removal(op.path)
+    )
+
+
+def _is_isis_process_delete(path: tuple[str, ...]) -> bool:
+    """True for the whole-process ``no router isis [<tag>]`` op path.
+
+    ``("process", "isis", <tag>)`` — the byte-exact colon-split of the legacy
+    ``process:isis:<tag>`` tombstone (``<tag>`` is ``""`` for a bare
+    ``no router isis``).  Emitted NATIVE + line-numbered (family 6a) so 6e can
+    build ordered instance delete/recreate on it; in 6a it is applied
+    DELETE-WINS (the surviving derived SET still creates the instance, and the
+    native delete removes it last — parity with legacy, both orders).
+    """
+    return len(path) == 3 and path[0] == "process" and path[1] == "isis"
+
+
+def is_native_isis_op(op: "ChangeOp") -> bool:
+    """True iff *op* is a parser-emitted family-6a IS-IS op (CCR Appendix M).
+
+    The IS-IS whole-protocol decomposition co-exists with the SURVIVING derived
+    whole-instance SET (like 5a/5b/5c-A; retirement is 6e).  Shapes (all
+    ``origin == "native"``), on the PLURAL ``isis_instances`` container for SETs
+    (classifier-routed to ISIS by keyed-member existence) and the SINGULAR
+    ``isis_instance`` / top-level ``process`` scope for deletions:
+
+    - ``SET ("isis_instances", tag, "scalar", <field>)``
+          instance scalar (is_type / metric_style / log_adjacency_changes /
+          passive_interface_default / authentication_mode / authentication_key /
+          max_lsp_lifetime / lsp_refresh_interval / spf_interval /
+          default_information_originate(+_route_map)) — state-derived,
+          positive-only (no negation tombstone exists today).
+    - ``SET ("isis_instances", tag, "net", <addr>)``          additive NET member.
+    - ``SET ("isis_instances", tag, "passive_interface", <name>)``     additive.
+    - ``SET ("isis_instances", tag, "non_passive_interface", <name>)`` additive.
+    - ``SET ("isis_instances", tag, "interface", <name>)``   keyed ISISInterface.
+    - ``SET ("isis_instances", tag, "redistribute", <proto>, <pid>)``  keyed.
+    - ``OBJECT_DELETE ("process", "isis", <tag>)``  whole-process removal
+          (``no router isis`` — applied DELETE-WINS in 6a).
+    - ``LIST_REMOVE ("isis_instance", tag, "net", <addr>)``  ops-only ``no net``
+          NET withdrawal (SINGULAR scope prefix, no legacy twin).
+
+    Owned by the codec module: the engine's ``_apply_native_isis_ops`` pass and
+    its ``_proposal_from_ops`` skip MUST share this predicate.  Derived twins
+    (same path, ``origin="derived"``) return False (origin gate) and keep flowing
+    through the batched legacy apply path so natives-less producers (JunOS/PAN-OS,
+    hand-built configs) retain exact legacy parity.
+    """
+    if getattr(op, "origin", "derived") != "native":
+        return False
+    path = op.path
+    if not path:
+        return False
+    if op.verb is Verb.SET:
+        return (
+            len(path) >= 4
+            and path[0] == "isis_instances"
+            and path[2] in _ISIS_SET_KINDS
+        )
+    if op.verb is Verb.OBJECT_DELETE:
+        return _is_isis_process_delete(path)
+    if op.verb is Verb.LIST_REMOVE:
+        return _is_isis_net_removal(path)
+    return False
+
+
 def _static_nh_key(r: Any) -> str:
     """Stable NH identity segment for a static route (mirrors merger identity)."""
     nh = r.next_hop
@@ -1056,15 +1195,19 @@ def derive_ops(proposal: "ParsedConfig") -> ChangeSet:
     # field, so the whole-object op is redundant by construction.
     native_paths = {op.path for op in natives}
     # Container-claim (prefix) dedupe — family 3.  EXCLUDE BGP native ops
-    # (CCR Appendix H codec adjustment): a native BGP sub-op path such as
-    # ``("bgp_instances", asn, vrf, "neighbor", peer)`` must NOT claim its
-    # ``("bgp_instances", asn, vrf)`` prefix on its own — see the retirement
-    # narrowing below.  Family 1-4 ops are not BGP ops, so their container-claim
-    # semantics are unchanged.
+    # (CCR Appendix H codec adjustment) AND IS-IS native ops (CCR Appendix M,
+    # same adjustment): a native BGP sub-op path such as
+    # ``("bgp_instances", asn, vrf, "neighbor", peer)`` — or an IS-IS sub-op
+    # ``("isis_instances", tag, "scalar", field)`` — must NOT claim its
+    # ``("bgp_instances", asn, vrf)`` / ``("isis_instances", tag)`` prefix on its
+    # own, so the co-existing derived whole-instance SET SURVIVES (6a does NOT
+    # retire it; BGP retirement is the create-op narrowing below, IS-IS
+    # retirement is 6e).  Family 1-4 ops are not BGP/IS-IS ops, so their
+    # container-claim semantics are unchanged.
     native_prefix_claims = {
         op.path[:i]
         for op in natives
-        if not is_native_bgp_op(op)
+        if not is_native_bgp_op(op) and not is_native_isis_op(op)
         for i in range(1, len(op.path))
     }
     # 5c-B.2 retirement (CCR Appendix L — the one authorized derive_ops touch):
@@ -1152,6 +1295,11 @@ def encode_legacy(ops: ChangeSet) -> LegacyArtifacts:
         # dropped by every legacy parser today) — emit nothing so legacy-mode
         # artifacts stay byte-identical.
         if is_native_bgp_network_removal_op(op) or is_native_bgp_af_aggregate_removal_op(op):
+            continue
+        # Family-6a ops-only ``no net`` (CCR Appendix M): NO legacy twin (the
+        # bare ``no net`` line is silently dropped by every legacy parser today)
+        # — emit nothing so legacy-mode artifacts stay byte-identical.
+        if is_native_isis_net_removal_op(op):
             continue
         if op.path and op.path[0] == "bgp_instance":
             key = (op.path[1], op.path[2])

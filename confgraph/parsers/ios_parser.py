@@ -1682,6 +1682,7 @@ class IOSParser(BaseParser):
         ops.extend(self._native_service_entity_ops(pc))
         ops.extend(self._native_static_ops(pc))
         ops.extend(self._native_bgp_ops(pc))
+        ops.extend(self._native_isis_ops(pc))
         pc.native_change_ops = ops
 
     def _queue_native_static_delete(self, tombstone: str, obj):
@@ -1745,6 +1746,100 @@ class IOSParser(BaseParser):
                 )
             )
         ops.extend(getattr(self, "_pending_native_static_ops", None) or [])
+        ops.sort(key=lambda op: op.line_no if op.line_no >= 0 else float("inf"))
+        return ops
+
+    def _native_isis_ops(self, pc) -> list:
+        """Native family-6a IS-IS ops (CCR Appendix M) in script order.
+
+        Whole-protocol decomposition of ``pc.isis_instances`` beside the
+        SURVIVING derived whole-instance SET (co-existence, like 5a/5b/5c-A;
+        retirement is 6e).  The engine strips the natively-covered content from
+        the surviving derived SET (``_strip_native_isis``) and replays these ops.
+
+        - **Positive side** (state-derived, parity-with-deriver by construction):
+          one SET per non-default scalar, per NET address, per (non-)passive
+          interface, per keyed ISISInterface, and per keyed ``redistribute``
+          member of every parsed instance.  Provenance is COARSE — the positive
+          SETs carry the instance block's FIRST recorded line, not the specific
+          command line — so a same-NET refresh cannot be resolved by line-ordered
+          replay alone.  ``parse_isis`` therefore SUPPRESSES a ``no net X``
+          removal when the same NET reappears as a positive ``net X`` line later
+          in the block (the WI-8 ``_readded_later`` pattern, validator Finding 1);
+          all other positives are idempotent additive/keyed merges where the
+          coarse provenance is inert.
+        - **Delete side**: the pending ``no net`` LIST_REMOVE ops (queued —
+          unsuppressed — at their negation lines by ``parse_isis``) and the
+          ``no router isis`` OBJECT_DELETE ops (queued by
+          ``parse_deletion_commands``).
+
+        Stable sort by ``line_no`` (unknown positions last) → true script order,
+        so 6e can build ordered instance delete/recreate on the line-numbered
+        process-delete op (in 6a the engine applies the process delete
+        DELETE-WINS — parity, both orders).
+        """
+        from confgraph.change_ir import (
+            ChangeOp,
+            Verb,
+            isis_interface_key,
+            isis_redistribute_key,
+        )
+
+        # Instance scalars → SET (…, "scalar", field).  Emitted only when the
+        # value differs from the parser-absence default (== the model default
+        # for every IS-IS scalar — audited in Appendix M, no trap), so the SET
+        # set equals what the surviving whole-instance SET carried.  Guards
+        # against emitting a redundant default (parity with the deriver).
+        _ISIS_SCALARS = (
+            ("is_type", None),
+            ("metric_style", None),
+            ("log_adjacency_changes", False),
+            ("passive_interface_default", False),
+            ("authentication_mode", None),
+            ("authentication_key", None),
+            ("max_lsp_lifetime", None),
+            ("lsp_refresh_interval", None),
+            ("spf_interval", None),
+            ("default_information_originate", False),
+            ("default_information_originate_route_map", None),
+        )
+
+        ops: list = []
+        for isis in getattr(pc, "isis_instances", None) or []:
+            tag = isis.tag or ""
+            raw_lines = isis.raw_lines or []
+            line_numbers = isis.line_numbers or []
+            sl = raw_lines[0].strip() if raw_lines else ""
+            ln = line_numbers[0] if line_numbers else -1
+
+            def _emit(kind, value, *key):
+                ops.append(
+                    ChangeOp(
+                        verb=Verb.SET,
+                        path=("isis_instances", tag, kind, *key),
+                        value=value,
+                        source_line=sl,
+                        line_no=ln,
+                        origin="native",
+                    )
+                )
+
+            for field, default in _ISIS_SCALARS:
+                val = getattr(isis, field, default)
+                if val != default:
+                    _emit("scalar", val, field)
+            for net_addr in isis.net:
+                _emit("net", net_addr, net_addr)
+            for name in isis.passive_interfaces:
+                _emit("passive_interface", name, name)
+            for name in isis.non_passive_interfaces:
+                _emit("non_passive_interface", name, name)
+            for iface in isis.interfaces:
+                _emit("interface", iface, *isis_interface_key(iface))
+            for redist in isis.redistribute:
+                _emit("redistribute", redist, *isis_redistribute_key(redist))
+
+        ops.extend(getattr(self, "_pending_native_isis_ops", None) or [])
         ops.sort(key=lambda op: op.line_no if op.line_no >= 0 else float("inf"))
         return ops
 
@@ -4652,6 +4747,8 @@ class IOSParser(BaseParser):
           - ``no ip prefix-list <name> seq <num>``        → ``prefix-list:<name>:seq:<num>``
           - ``no <seq>`` inside ip access-list blocks    → ``acl-seq:<name>:<seq>``
         """
+        from confgraph.change_ir import ChangeOp, Verb, encode_legacy
+
         tombstones: list[str] = []
         parse = self._get_parse_obj()
 
@@ -4739,7 +4836,28 @@ class IOSParser(BaseParser):
         for obj in parse.find_objects(r"^no\s+router\s+isis"):
             m = re.search(r"^no\s+router\s+isis(?:\s+(\S+))?", obj.text)
             tag = m.group(1) if (m and m.group(1)) else ""
-            tombstones.append(f"process:isis:{tag}")
+            # Change-IR Phase 3 family 6a (CCR Appendix M): the whole-process
+            # ``no router isis [<tag>]`` delete migrated to a NATIVE, line-numbered
+            # OBJECT_DELETE (``("process","isis",tag)``) so 6e can build ordered
+            # instance delete/recreate on it.  The byte-exact legacy tombstone is
+            # regenerated FROM the op via encode_legacy (single source): a top-level
+            # ``process:isis:<tag>`` string, byte-identical to today (incl. the
+            # bare-tag ``""`` form).  In 6a the engine applies it DELETE-WINS (the
+            # surviving derived SET creates the instance, the native delete removes
+            # it last) — parity with legacy, both orders.  parse_isis reset the
+            # channel; here we append (getattr-safe).
+            op = ChangeOp(
+                verb=Verb.OBJECT_DELETE,
+                path=("process", "isis", tag),
+                value=None,
+                source_line=obj.text.strip(),
+                line_no=obj.linenum,
+                origin="native",
+            )
+            if not hasattr(self, "_pending_native_isis_ops"):
+                self._pending_native_isis_ops = []
+            self._pending_native_isis_ops.append(op)
+            tombstones.extend(encode_legacy([op]).no_commands)
 
         for obj in parse.find_objects(r"^no\s+router\s+eigrp\s+"):
             m = re.search(r"^no\s+router\s+eigrp\s+(\S+)", obj.text)
@@ -5387,8 +5505,16 @@ class IOSParser(BaseParser):
 
     def parse_isis(self) -> list[ISISConfig]:
         """Parse IS-IS configurations."""
+        from confgraph.change_ir import ChangeOp, Verb
+
         isis_instances = []
         parse = self._get_parse_obj()
+
+        # Change-IR Phase 3 family 6a (CCR Appendix M): reset the native-op
+        # channel for this parse.  parse_isis runs BEFORE parse_deletion_commands
+        # (the ``process:isis`` whole-process delete emitter, which APPENDS
+        # getattr-safe), so the reset here owns the per-parse lifecycle.
+        self._pending_native_isis_ops = []
 
         # Find all IS-IS router configs
         isis_objs = parse.find_objects(r"^router\s+isis\s*(\S*)")
@@ -5402,13 +5528,51 @@ class IOSParser(BaseParser):
 
             raw_lines, line_numbers = self._get_raw_lines_and_line_numbers(isis_obj)
 
-            # NET addresses
+            # NET addresses.  Track the LAST positive-line number per NET so the
+            # ``no net`` suppression below can compare positions (WI-8 pattern).
             net = []
+            positive_net_last_line: dict[str, int] = {}
             net_children = isis_obj.find_child_objects(r"^\s+net\s+(\S+)")
             for net_child in net_children:
                 net_addr = self._extract_match(net_child.text, r"^\s+net\s+(\S+)")
                 if net_addr:
                     net.append(net_addr)
+                    positive_net_last_line[net_addr] = max(
+                        positive_net_last_line.get(net_addr, -1), net_child.linenum
+                    )
+
+            # Family 6a (CCR Appendix M): ops-only ``no net <addr>`` withdrawal.
+            # The positive ``net`` walk above does not match a ``no net`` line and
+            # the merged ``net`` list is additive, so a bare ``no net`` is
+            # silently dropped by the legacy parser (no tombstone) — a capability
+            # candidate (NET → IS-IS area → adjacency).  Emit a native LIST_REMOVE
+            # with NO legacy twin (encode_legacy silent), scoped to this
+            # instance's tag.  SUPPRESSION (validator Finding 1, the WI-8
+            # ``_readded_later`` pattern): the positive SETs carry the block's
+            # first line as provenance (coarse), so a line-ordered replay cannot
+            # by itself resolve a same-NET refresh (``no net X`` then ``net X`` →
+            # device keeps X).  Suppress the removal when the SAME NET reappears
+            # as a positive ``net`` line LATER in the block (re-add wins) — device
+            # truth and legacy parity.  A ``no net X`` with no later ``net X`` (the
+            # withdrawal, or ``net X`` earlier then ``no net X``) stands: the
+            # confirmed capability direction.
+            for nc in isis_obj.find_child_objects(r"^\s+no\s+net\s+\S+"):
+                nm = re.match(r"^\s+no\s+net\s+(\S+)", nc.text)
+                if not nm:
+                    continue
+                addr = nm.group(1)
+                if positive_net_last_line.get(addr, -1) > nc.linenum:
+                    continue  # re-added later in the block — removal suppressed
+                self._pending_native_isis_ops.append(
+                    ChangeOp(
+                        verb=Verb.LIST_REMOVE,
+                        path=("isis_instance", tag or "", "net", addr),
+                        value=None,
+                        source_line=nc.text.strip(),
+                        line_no=nc.linenum,
+                        origin="native",
+                    )
+                )
 
             # IS type
             is_type = None

@@ -52,10 +52,16 @@ def _is_reordered_native_tombstone(t: str) -> bool:
     hoisted to the front of the composed ChangeSet (multiset, not sequence).
 
     Family 3 (service entities) + family 4 (``static:`` route removals,
-    CCR Appendix G) — both encode byte-exactly but no longer at their legacy
-    walk-group position in ``no_commands``.
+    CCR Appendix G) + family 6a (``process:isis:`` whole-process removal,
+    CCR Appendix M) — each encodes byte-exactly but no longer at its legacy
+    walk-group position in ``no_commands``.  (Only ``process:isis:`` is native;
+    ``process:ospf/bgp/eigrp:`` stay derived until families 6b/6c.)
     """
-    return t.startswith(_FAMILY3_TOMBSTONE_PREFIXES) or t.startswith("static:")
+    return (
+        t.startswith(_FAMILY3_TOMBSTONE_PREFIXES)
+        or t.startswith("static:")
+        or t.startswith("process:isis:")
+    )
 
 
 def _roundtrip(cfg):
