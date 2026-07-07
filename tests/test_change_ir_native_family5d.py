@@ -192,8 +192,12 @@ def test_no_aggregate_address_not_in_legacy_tombstones():
     assert not any("aggregate" in t for b in pc.bgp_instances for t in b.no_commands)
 
 
-def test_whole_instance_set_survives_composition():
-    # 5c-B.1 does NOT retire the derived whole-instance SET (H.3 unchanged).
+def test_whole_instance_set_retired_composition():
+    # 5c-B.2 (CCR Appendix L) RETIRES the derived whole-instance SET for this
+    # fully-native IOS instance — the native CREATE op claims the prefix (H.3
+    # narrowing).  (Was ``…_survives`` under 5c-B.1, which kept it.)
+    from confgraph.change_ir import is_native_bgp_instance_create_op
+
     pc = _parse(AF_CFG)
     ops = derive_ops(pc)
     inst_sets = [
@@ -201,8 +205,8 @@ def test_whole_instance_set_survives_composition():
         for o in ops
         if o.verb is Verb.SET and o.path == ("bgp_instances", "65000", "")
     ]
-    assert len(inst_sets) == 1, "derived whole-instance SET must survive (co-existence)"
-    assert inst_sets[0].origin == "derived"
+    assert inst_sets == [], "derived whole-instance SET must be retired (5c-B.2)"
+    assert len([o for o in ops if is_native_bgp_instance_create_op(o)]) == 1
 
 
 def test_anti_rot_every_af_form_native():
@@ -242,3 +246,87 @@ def test_bgp_af_key_identity():
     pc = _parse(AF_CFG)
     af = pc.bgp_instances[0].address_families[0]
     assert bgp_af_key(af) == ("ipv4", "unicast", "")
+
+
+# ---------------------------------------------------------------------------
+# 5c-B.2 retirement (CCR Appendix L) — whole-instance SET retirement + gate
+# ---------------------------------------------------------------------------
+
+from confgraph.change_ir import is_native_bgp_instance_create_op  # noqa: E402
+
+
+def _whole_instance_sets(ops):
+    return [
+        o
+        for o in ops
+        if o.verb is Verb.SET and len(o.path) == 3 and o.path[0] == "bgp_instances"
+    ]
+
+
+def test_fully_native_ios_instance_retires_set_and_emits_create():
+    pc = _parse(AF_CFG)
+    ops = derive_ops(pc)
+    assert _whole_instance_sets(ops) == []
+    creates = [o for o in ops if is_native_bgp_instance_create_op(o)]
+    assert len(creates) == 1
+    assert creates[0].path == ("bgp_instances", "65000", "", "instance")
+    assert creates[0].origin == "native"
+    # The create op carries the parsed BGPConfig (the engine seeds from it).
+    assert creates[0].value.asn == 65000
+
+
+def test_ios_vrf_af_instance_is_fully_native_retired():
+    pc = _parse(
+        "router bgp 65000\n neighbor 2.2.2.2 remote-as 65000\n"
+        " address-family ipv4 vrf CUST\n"
+        "  neighbor 9.9.9.9 remote-as 65001\n  redistribute static\n"
+    )
+    ops = derive_ops(pc)
+    # Both the global and the VRF-AF instance are fully native → 0 surviving SETs.
+    assert _whole_instance_sets(ops) == []
+    keys = {(o.path[1], o.path[2]) for o in ops if is_native_bgp_instance_create_op(o)}
+    assert keys == {("65000", ""), ("65000", "CUST")}
+
+
+def test_gated_nxos_vrf_instance_keeps_set_no_create():
+    pc = _parse(
+        "feature bgp\nrouter bgp 65000\n router-id 1.1.1.1\n"
+        " neighbor 2.2.2.2\n  remote-as 65000\n"
+        " vrf CUST\n  neighbor 9.9.9.9 remote-as 65001\n  redistribute static\n",
+        NXOSParser,
+    )
+    ops = derive_ops(pc)
+    # NX-OS VRF instance is GATED → its derived whole-instance SET SURVIVES and
+    # it emits NO create op; the NX-OS GLOBAL instance is fully native → retired.
+    surviving = {(o.path[1], o.path[2]) for o in _whole_instance_sets(ops)}
+    assert surviving == {("65000", "CUST")}
+    create_keys = {
+        (o.path[1], o.path[2]) for o in ops if is_native_bgp_instance_create_op(o)
+    }
+    assert ("65000", "CUST") not in create_keys  # gated → no create op
+    assert ("65000", "") in create_keys  # global retired
+
+
+def test_anti_rot_inverse_no_whole_instance_set_for_fully_native():
+    # Inverse pin (5c-B.2): the deriver emits NO whole-instance SET for a config
+    # whose instances are all fully native.  Kitchen-sink IOS BGP.
+    pc = _parse(
+        "router bgp 65000\n bgp router-id 10.0.0.1\n bgp log-neighbor-changes\n"
+        " neighbor 2.2.2.2 remote-as 65000\n neighbor UP peer-group\n"
+        " network 100.64.0.0 mask 255.255.0.0\n redistribute connected\n"
+        " address-family ipv4\n  network 10.1.0.0 mask 255.255.0.0\n"
+        "  aggregate-address 10.0.0.0 255.0.0.0 summary-only\n  maximum-paths 4\n"
+    )
+    assert _whole_instance_sets(derive_ops(pc)) == []
+
+
+def test_gated_predicate_matches_only_nxos_vrf():
+    # Mechanical gate: NX-OS VRF only; IOS (global + VRF-AF) and NX-OS global
+    # are ungated.
+    ios = IOSParser("router bgp 1\n address-family ipv4 vrf V\n  neighbor 2.2.2.2 remote-as 2\n")
+    ios_pc = ios.parse()
+    assert not any(ios._bgp_instance_gated(b) for b in ios_pc.bgp_instances)
+    nx = NXOSParser("feature bgp\nrouter bgp 1\n vrf V\n  neighbor 2.2.2.2 remote-as 2\n")
+    nx_pc = nx.parse()
+    gated = {(b.asn, b.vrf) for b in nx_pc.bgp_instances if nx._bgp_instance_gated(b)}
+    assert gated == {(1, "V")}

@@ -149,15 +149,20 @@ class TestLegacyByteIdentity:
 
 
 class TestCompositionAndAntiRot:
-    def test_derived_whole_instance_set_survives(self):
+    def test_derived_whole_instance_set_retired(self):
+        # 5c-B.2 (CCR Appendix L): retired for this fully-native IOS instance
+        # (was ``…_survives`` through 5a/5b/5c — the native CREATE op now claims
+        # the prefix; H.3 narrowing).
+        from confgraph.change_ir import is_native_bgp_instance_create_op
+
         pc = _parse(PG_AND_NETWORK)
         ops = derive_ops(pc)
         whole = [
             op for op in ops
             if op.verb is Verb.SET and op.path == ("bgp_instances", "65000", "")
         ]
-        assert len(whole) == 1
-        assert whole[0].origin == "derived"
+        assert whole == []
+        assert len([o for o in ops if is_native_bgp_instance_create_op(o)]) == 1
 
     def test_candidate_b_derived_twin_deduped(self):
         # The derived UNSET twin (same path as the native OBJECT_DELETE) must be

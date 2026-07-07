@@ -1748,6 +1748,25 @@ class IOSParser(BaseParser):
         ops.sort(key=lambda op: op.line_no if op.line_no >= 0 else float("inf"))
         return ops
 
+    def _bgp_instance_gated(self, bgp) -> bool:
+        """5c-B.2 retirement gate (CCR Appendix L): True iff *bgp*'s derived
+        whole-instance SET must SURVIVE (no CREATE op emitted, prefix not claimed).
+
+        A gated instance is one whose content native emission cannot fully
+        reconstruct, so the whole-instance SET stays authoritative (today's
+        5a/5b/5c coexistence).  Today exactly **NX-OS VRF instances**:
+        ``nxos_parser._parse_bgp_vrf_instances`` drops block-form ``vrf`` neighbors
+        (the inline-only ``neighbor X <cmd>`` regex never matches a bare block
+        header) and never parses VRF address-families (``address_families=[]``),
+        so those instances can carry content invisible to native ops — keeping the
+        derived SET is the rot-safe posture.  Every other IOS/NX-OS instance
+        (global ``router bgp`` + IOS ``address-family ipv4 vrf N``, whose neighbors
+        ARE parsed inline) is fully native → retired.  Verified empirically across
+        the corpus (Appendix L gated-exception enumeration).
+        """
+        os_val = getattr(self.os_type, "value", self.os_type)
+        return os_val == "nxos" and bgp.vrf is not None
+
     def _native_bgp_ops(self, pc) -> list:
         """Native family-5a BGP-neighbor ops (CCR Appendix H) in script order.
 
@@ -1796,6 +1815,29 @@ class IOSParser(BaseParser):
         for bgp in pc.bgp_instances:
             asn_s = str(bgp.asn)
             vrf_s = bgp.vrf or ""
+            # Family 5c-B.2 retirement (CCR Appendix L): the whole-instance CREATE
+            # op.  Emitted for every FULLY-NATIVE instance so it claims the
+            # ``("bgp_instances", asn, vrf)`` prefix in derive_ops → the derived
+            # whole-instance SET is RETIRED.  GATED instances keep the derived SET
+            # (no create op).  Gate = NX-OS VRF instances: `_parse_bgp_vrf_instances`
+            # (nxos) drops block-form VRF neighbors and never parses VRF AFs, so
+            # native ops cannot fully reconstruct them — the derived SET must
+            # survive (rot-safe; enumerated + corpus-verified in Appendix L).
+            # value = the parsed BGPConfig; the engine seeds a NEW instance from it
+            # (parser-absence scalars, e.g. log_neighbor_changes, intact) and
+            # no-ops for an EXISTING one (the surviving SET was already inert for
+            # existing instances — all scalar overrides None/default post-strip).
+            if not self._bgp_instance_gated(bgp):
+                ops.append(
+                    ChangeOp(
+                        verb=Verb.SET,
+                        path=("bgp_instances", asn_s, vrf_s, "instance"),
+                        value=bgp,
+                        source_line="",
+                        line_no=-1,
+                        origin="native",
+                    )
+                )
             root = roots.get(bgp.asn)
             scope = root
             if bgp.vrf and root is not None:

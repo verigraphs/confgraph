@@ -145,17 +145,24 @@ class TestByteIdentityAndComposition:
         art = encode_legacy(derive_ops(pc))
         assert art.bgp_no_commands[("65000", "")] == ["neighbor:2001:db8::1"]
 
-    def test_derived_instance_set_survives(self):
-        """Approved codec adjustment: the derived whole-instance SET co-exists
-        with native neighbor ops (container-claim exclusion)."""
+    def test_derived_instance_set_retired(self):
+        """5c-B.2 (CCR Appendix L): the derived whole-instance SET is now RETIRED
+        for this fully-native IOS instance — the native whole-instance CREATE op
+        claims the ``("bgp_instances", asn, vrf)`` prefix (H.3 narrowing).  This
+        pin was ``…_survives`` through 5a/5b/5c (the SET co-existed); the atomic
+        retirement flips it to asserting exactly one NATIVE create op and zero
+        derived SET."""
+        from confgraph.change_ir import is_native_bgp_instance_create_op
+
         pc = _parse(DELETE_READD)
         ops = derive_ops(pc)
         instance_sets = [
             o for o in ops
             if o.verb is Verb.SET and o.path == ("bgp_instances", "65000", "")
         ]
-        assert len(instance_sets) == 1
-        assert instance_sets[0].origin == "derived"
+        assert instance_sets == []
+        creates = [o for o in ops if is_native_bgp_instance_create_op(o)]
+        assert len(creates) == 1 and creates[0].origin == "native"
 
     def test_derived_neighbor_tombstones_deduped(self):
         pc = _parse(DELETE_READD)

@@ -237,7 +237,11 @@ def test_scalar_sets_encode_to_set_fields_not_no_commands():
     assert la.bgp_no_commands == {}
 
 
-def test_whole_instance_set_survives_composition():
+def test_whole_instance_set_retired_composition():
+    # 5c-B.2 (CCR Appendix L): retired for this fully-native IOS instance (was
+    # ``…_survives`` — the native CREATE op claims the prefix; H.3 narrowing).
+    from confgraph.change_ir import is_native_bgp_instance_create_op
+
     pc = _parse(GLOBAL)
     comp = derive_ops(pc)
     inst = [
@@ -245,7 +249,8 @@ def test_whole_instance_set_survives_composition():
         for o in comp
         if o.verb is Verb.SET and o.path == ("bgp_instances", "65001", "")
     ]
-    assert len(inst) == 1 and inst[0].origin == "derived"
+    assert inst == []
+    assert len([o for o in comp if is_native_bgp_instance_create_op(o)]) == 1
 
 
 def test_anti_rot_no_5c_a_form_derived():

@@ -120,6 +120,7 @@ __all__ = [
     "is_native_bgp_op",
     "is_native_bgp_network_removal_op",
     "is_native_bgp_af_aggregate_removal_op",
+    "is_native_bgp_instance_create_op",
 ]
 
 
@@ -621,6 +622,31 @@ def is_native_bgp_af_aggregate_removal_op(op: "ChangeOp") -> bool:
     )
 
 
+def is_native_bgp_instance_create_op(op: "ChangeOp") -> bool:
+    """True iff *op* is the family-5c-B.2 whole-instance CREATE op.
+
+    ``SET ("bgp_instances", asn, vrf, "instance")`` (4-seg) — emitted by the
+    parser for every FULLY-NATIVE BGP instance (retirement gate: NOT emitted for
+    gated shapes, e.g. NX-OS VRF instances whose neighbors/AFs are unparsed, so
+    their derived whole-instance SET survives).  value = the parsed
+    ``BGPConfig`` (the engine seeds a new instance from it, parser-absence
+    scalars intact).  This op CLAIMS its ``("bgp_instances", asn, vrf)`` prefix
+    in :func:`derive_ops` so the derived whole-instance SET is RETIRED for
+    fully-native instances (CCR Appendix L) — the one BGP native op that claims
+    the container prefix; the neighbor/af/scalar/etc. ops still do not (they
+    address inside the container, and for a gated instance the surviving SET
+    must not be claimed away).
+    """
+    path = op.path
+    return (
+        getattr(op, "origin", "derived") == "native"
+        and op.verb is Verb.SET
+        and len(path) == 4
+        and path[0] == "bgp_instances"
+        and path[3] == "instance"
+    )
+
+
 def _is_bgp_peer_group_delete(path: tuple[str, ...]) -> bool:
     """True for the family-5b Candidate-B peer-group-deletion op path.
 
@@ -753,6 +779,8 @@ def is_native_bgp_op(op: "ChangeOp") -> bool:
     if not path:
         return False
     if op.verb is Verb.SET:
+        if len(path) == 4 and path[0] == "bgp_instances" and path[3] == "instance":
+            return True  # family 5c-B.2 whole-instance CREATE op
         return (
             len(path) >= 5
             and path[0] == "bgp_instances"
@@ -1027,19 +1055,27 @@ def derive_ops(proposal: "ParsedConfig") -> ChangeSet:
     # exist; those are emitted structurally for every non-default banner
     # field, so the whole-object op is redundant by construction.
     native_paths = {op.path for op in natives}
-    # Container-claim (prefix) dedupe — family 3.  EXCLUDE family-5a BGP
-    # neighbor ops (CCR Appendix H, approved codec adjustment): a native
-    # neighbor SET path ``("bgp_instances", asn, vrf, "neighbor", peer)`` must
-    # NOT claim its ``("bgp_instances", asn, vrf)`` prefix — the derived
-    # whole-instance SET (still owning scalars/networks/AFs/peer-groups in 5a)
-    # has to SURVIVE alongside the native neighbor ops.  The neighbor sub-path
-    # is thus withheld from the prefix-claim set.  Family 1-4 ops are not BGP
-    # ops, so their container-claim semantics are unchanged.
+    # Container-claim (prefix) dedupe — family 3.  EXCLUDE BGP native ops
+    # (CCR Appendix H codec adjustment): a native BGP sub-op path such as
+    # ``("bgp_instances", asn, vrf, "neighbor", peer)`` must NOT claim its
+    # ``("bgp_instances", asn, vrf)`` prefix on its own — see the retirement
+    # narrowing below.  Family 1-4 ops are not BGP ops, so their container-claim
+    # semantics are unchanged.
     native_prefix_claims = {
         op.path[:i]
         for op in natives
         if not is_native_bgp_op(op)
         for i in range(1, len(op.path))
+    }
+    # 5c-B.2 retirement (CCR Appendix L — the one authorized derive_ops touch):
+    # the native whole-instance CREATE op claims its ``("bgp_instances", asn,
+    # vrf)`` prefix, so the derived whole-instance SET is DROPPED for every
+    # FULLY-NATIVE instance.  GATED instances (NX-OS VRF etc.) emit no create op
+    # → their prefix is not claimed → the derived SET SURVIVES (today's 5a/5b/5c
+    # coexistence, unchanged).  Only the len-3 instance prefix is claimed (not
+    # the len-1/2 partials), so no cross-instance over-claim.
+    native_prefix_claims |= {
+        op.path[:3] for op in natives if is_native_bgp_instance_create_op(op)
     }
     return natives + [
         op
