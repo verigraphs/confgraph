@@ -125,6 +125,11 @@ __all__ = [
     "isis_redistribute_key",
     "is_native_isis_op",
     "is_native_isis_net_removal_op",
+    "eigrp_redistribute_key",
+    "eigrp_network_key",
+    "eigrp_summary_key",
+    "is_native_eigrp_op",
+    "is_native_eigrp_network_removal_op",
 ]
 
 
@@ -950,6 +955,161 @@ def is_native_isis_op(op: "ChangeOp") -> bool:
     return False
 
 
+# ---------------------------------------------------------------------------
+# Family 6b — EIGRP whole-protocol decomposition (CCR Appendix N)
+# ---------------------------------------------------------------------------
+# Mirrors family 6a (IS-IS) but on the two-segment ``(str(as_number), vrf or "")``
+# instance key (like BGP, one segment richer than IS-IS's single ``tag``).  The
+# derived whole-instance EIGRP SET SURVIVES (co-existence — 6b does NOT retire it;
+# retirement is 6e).  Parser-absence == model default for every migrated field
+# (audited in Appendix N — no Finding-2-class trap), so the engine strips the
+# surviving SET to defaults and native ops rebuild it value-identically.
+
+
+def eigrp_redistribute_key(redist: Any) -> tuple[str, ...]:
+    """Identity segments for an EIGRP ``redistribute`` member (family 6b).
+
+    ``("eigrp_instances", asn, vrf, "redistribute", *eigrp_redistribute_key(r))``
+    — identity ``(protocol, str(process_id) or "")``, the same key the legacy
+    ``_fieldlevel_list_rule("eigrp_instances")`` uses for its keyed ``redistribute``
+    merge (merger.py:2365).  Codec-owned.
+    """
+    pid = getattr(redist, "process_id", None)
+    return (redist.protocol, str(pid) if pid is not None else "")
+
+
+def eigrp_network_key(network: Any) -> tuple[str, ...]:
+    """Identity segment for an EIGRP ``network`` statement (family 6b).
+
+    ``networks`` is an ADDITIVE list (merger.py:2363 set-union) — identity is the
+    network CIDR string (``str(EIGRPNetwork.network)``), which is the segment the
+    ops-only ``no network`` LIST_REMOVE matches on.  CIDR strings contain dots but
+    never colons, so the address is one path segment.  Codec-owned.
+    """
+    return (str(network.network),)
+
+
+def eigrp_summary_key(sa: Any) -> tuple[str, ...]:
+    """Identity segment for an EIGRP ``summary-address`` member (family 6b).
+
+    ``("eigrp_instances", asn, vrf, "summary_address", *eigrp_summary_key(s))`` —
+    identity ``str(prefix)``, the same key the legacy
+    ``_fieldlevel_list_rule("eigrp_instances")`` uses for its keyed
+    ``summary_addresses`` merge (merger.py:2366).  Positive-only (``no
+    summary-address`` withdrawal is reachable but benign — Appendix N).
+    Codec-owned.
+    """
+    return (str(sa.prefix),)
+
+
+# EIGRP instance-decomposition ``kind`` tokens carried at ``path[3]`` of a
+# ``("eigrp_instances", asn, vrf, kind, *key)`` native SET (the BGP two-segment
+# keyed-member precedent).
+_EIGRP_SET_KINDS: frozenset[str] = frozenset(
+    {
+        "scalar",
+        "network",
+        "passive_interface",
+        "non_passive_interface",
+        "redistribute",
+        "summary_address",
+    }
+)
+
+# EIGRP ops-only removal ``kind`` tokens carried at ``path[3]`` of an
+# ``("eigrp_instance", asn, vrf, kind, <key>)`` LIST_REMOVE.  Only ``network`` is
+# emitted in 6b (the CONFIRMED NET-withdrawal → adjacency capability); the other
+# reachable removals (redistribute) are documented deferrals (Appendix N).
+_EIGRP_REMOVAL_KINDS: frozenset[str] = frozenset({"network"})
+
+
+def _is_eigrp_network_removal(path: tuple[str, ...]) -> bool:
+    """True for the family-6b ops-only ``no network <addr>`` removal path.
+
+    ``("eigrp_instance", asn, vrf, "network", <addr>)`` — a LIST_REMOVE with NO
+    legacy twin (``encode_legacy`` emits nothing; a bare ``no network`` under
+    ``router eigrp`` is silently dropped by every legacy parser today, exactly
+    like the 5b ``no network`` and 6a ``no net`` discipline).
+    """
+    return (
+        len(path) == 5
+        and path[0] == "eigrp_instance"
+        and path[3] in _EIGRP_REMOVAL_KINDS
+    )
+
+
+def is_native_eigrp_network_removal_op(op: "ChangeOp") -> bool:
+    """True iff *op* is the family-6b ops-only ``no network`` removal op.
+
+    Consumed by :func:`encode_legacy` to emit NOTHING (no legacy twin): a bare
+    ``no network <addr>`` under ``router eigrp`` is silently dropped by every
+    legacy parser today (the positive ``network`` walk does not match a ``no
+    network`` line and the list is additive), so ops mode gains a
+    network-withdrawal capability legacy cannot see while legacy-mode artifacts
+    stay byte-identical.
+    """
+    return (
+        getattr(op, "origin", "derived") == "native"
+        and op.verb is Verb.LIST_REMOVE
+        and _is_eigrp_network_removal(op.path)
+    )
+
+
+def _is_eigrp_process_delete(path: tuple[str, ...]) -> bool:
+    """True for the whole-process ``no router eigrp <asn>`` op path.
+
+    ``("process", "eigrp", <asn>)`` — the byte-exact colon-split of the legacy
+    ``process:eigrp:<asn>`` tombstone.  Emitted NATIVE + line-numbered (family
+    6b) so 6e can build ordered instance delete/recreate on it; in 6b it is
+    applied DELETE-WINS (VRF-blind, matching the legacy ``_del_process_eigrp``
+    which compares ``str(as_number)`` only — Appendix N).
+    """
+    return len(path) == 3 and path[0] == "process" and path[1] == "eigrp"
+
+
+def is_native_eigrp_op(op: "ChangeOp") -> bool:
+    """True iff *op* is a parser-emitted family-6b EIGRP op (CCR Appendix N).
+
+    Shapes (all ``origin == "native"``), on the PLURAL ``eigrp_instances``
+    container for SETs (classifier-routed to EIGRP by keyed-member existence) and
+    the SINGULAR ``eigrp_instance`` / top-level ``process`` scope for deletions:
+
+    - ``SET ("eigrp_instances", asn, vrf, "scalar", <field>)``  instance scalar
+          (router_id / passive_interface_default / auto_summary / variance /
+          maximum_paths / distance_internal / distance_external / default_metric /
+          log_neighbor_changes / k_values / stub) — state-derived, positive-only.
+    - ``SET ("eigrp_instances", asn, vrf, "network", <cidr>)``       additive.
+    - ``SET ("eigrp_instances", asn, vrf, "passive_interface", <name>)`` additive.
+    - ``SET ("eigrp_instances", asn, vrf, "non_passive_interface", <name>)`` "".
+    - ``SET ("eigrp_instances", asn, vrf, "redistribute", <proto>, <pid>)`` keyed.
+    - ``SET ("eigrp_instances", asn, vrf, "summary_address", <prefix>)``  keyed.
+    - ``OBJECT_DELETE ("process", "eigrp", <asn>)``  whole-process removal
+          (``no router eigrp`` — applied DELETE-WINS, VRF-blind, in 6b).
+    - ``LIST_REMOVE ("eigrp_instance", asn, vrf, "network", <cidr>)``  ops-only
+          ``no network`` withdrawal (SINGULAR scope prefix, no legacy twin).
+
+    Owned by the codec module: the engine's ``_apply_native_eigrp_ops`` pass and
+    its ``_proposal_from_ops`` skip MUST share this predicate.  Derived twins
+    (same path, ``origin="derived"``) return False (origin gate).
+    """
+    if getattr(op, "origin", "derived") != "native":
+        return False
+    path = op.path
+    if not path:
+        return False
+    if op.verb is Verb.SET:
+        return (
+            len(path) >= 5
+            and path[0] == "eigrp_instances"
+            and path[3] in _EIGRP_SET_KINDS
+        )
+    if op.verb is Verb.OBJECT_DELETE:
+        return _is_eigrp_process_delete(path)
+    if op.verb is Verb.LIST_REMOVE:
+        return _is_eigrp_network_removal(path)
+    return False
+
+
 def _static_nh_key(r: Any) -> str:
     """Stable NH identity segment for a static route (mirrors merger identity)."""
     nh = r.next_hop
@@ -1207,7 +1367,9 @@ def derive_ops(proposal: "ParsedConfig") -> ChangeSet:
     native_prefix_claims = {
         op.path[:i]
         for op in natives
-        if not is_native_bgp_op(op) and not is_native_isis_op(op)
+        if not is_native_bgp_op(op)
+        and not is_native_isis_op(op)
+        and not is_native_eigrp_op(op)
         for i in range(1, len(op.path))
     }
     # 5c-B.2 retirement (CCR Appendix L — the one authorized derive_ops touch):
@@ -1300,6 +1462,11 @@ def encode_legacy(ops: ChangeSet) -> LegacyArtifacts:
         # bare ``no net`` line is silently dropped by every legacy parser today)
         # — emit nothing so legacy-mode artifacts stay byte-identical.
         if is_native_isis_net_removal_op(op):
+            continue
+        # Family-6b ops-only ``no network`` (CCR Appendix N): NO legacy twin (the
+        # bare ``no network`` line is silently dropped by every legacy parser
+        # today) — emit nothing so legacy-mode artifacts stay byte-identical.
+        if is_native_eigrp_network_removal_op(op):
             continue
         if op.path and op.path[0] == "bgp_instance":
             key = (op.path[1], op.path[2])

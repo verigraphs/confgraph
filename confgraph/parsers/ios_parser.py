@@ -1683,6 +1683,7 @@ class IOSParser(BaseParser):
         ops.extend(self._native_static_ops(pc))
         ops.extend(self._native_bgp_ops(pc))
         ops.extend(self._native_isis_ops(pc))
+        ops.extend(self._native_eigrp_ops(pc))
         pc.native_change_ops = ops
 
     def _queue_native_static_delete(self, tombstone: str, obj):
@@ -1840,6 +1841,100 @@ class IOSParser(BaseParser):
                 _emit("redistribute", redist, *isis_redistribute_key(redist))
 
         ops.extend(getattr(self, "_pending_native_isis_ops", None) or [])
+        ops.sort(key=lambda op: op.line_no if op.line_no >= 0 else float("inf"))
+        return ops
+
+    def _native_eigrp_ops(self, pc) -> list:
+        """Native family-6b EIGRP ops (CCR Appendix N) in script order.
+
+        Whole-protocol decomposition of ``pc.eigrp_instances`` beside the
+        SURVIVING derived whole-instance SET (co-existence, like 6a; retirement is
+        6e).  The engine strips the natively-covered content from the surviving
+        derived SET (``_strip_native_eigrp``) and replays these ops.
+
+        - **Positive side** (state-derived, parity-with-deriver by construction):
+          one SET per non-default scalar, per network CIDR, per (non-)passive
+          interface, per keyed ``redistribute`` member, and per keyed
+          ``summary_address`` of every parsed instance.  Provenance is COARSE (the
+          instance block's FIRST recorded line), so a same-network refresh cannot
+          be resolved by line-ordered replay alone — ``parse_eigrp`` therefore
+          SUPPRESSES a ``no network X`` removal when the same network reappears as
+          a positive ``network X`` line later in the block (the WI-8
+          ``_readded_later`` pattern, mirroring 6a's Finding-1).
+        - **Delete side**: the pending ``no network`` LIST_REMOVE ops (queued —
+          unsuppressed — at their negation lines by ``parse_eigrp``) and the
+          ``no router eigrp`` OBJECT_DELETE ops (queued by
+          ``parse_deletion_commands``).
+
+        Every migrated field's parser-absence value equals its pydantic model
+        default (audited in Appendix N — no Finding-2-class trap), so the SETs
+        equal what the surviving whole-instance SET carried.  Stable sort by
+        ``line_no`` → true script order (6e groundwork).
+        """
+        from confgraph.change_ir import (
+            ChangeOp,
+            Verb,
+            eigrp_network_key,
+            eigrp_redistribute_key,
+            eigrp_summary_key,
+        )
+
+        # Instance scalars → SET (…, "scalar", field).  Emitted only when the
+        # value differs from the parser-absence default (== the model default for
+        # every EIGRP scalar — audited in Appendix N).  ``default_metric`` and
+        # ``k_values`` are whole-value scalars (EIGRPMetric / list); ``stub`` IS
+        # parsed (verified empirically, contradicting the WI-24 enumeration flag).
+        _EIGRP_SCALARS = (
+            ("router_id", None),
+            ("passive_interface_default", False),
+            ("auto_summary", False),
+            ("variance", None),
+            ("maximum_paths", None),
+            ("distance_internal", None),
+            ("distance_external", None),
+            ("default_metric", None),
+            ("log_neighbor_changes", False),
+            ("k_values", None),
+            ("stub", None),
+        )
+
+        ops: list = []
+        for eigrp in getattr(pc, "eigrp_instances", None) or []:
+            asn = str(eigrp.as_number)
+            vrf = eigrp.vrf or ""
+            raw_lines = eigrp.raw_lines or []
+            line_numbers = eigrp.line_numbers or []
+            sl = raw_lines[0].strip() if raw_lines else ""
+            ln = line_numbers[0] if line_numbers else -1
+
+            def _emit(kind, value, *key):
+                ops.append(
+                    ChangeOp(
+                        verb=Verb.SET,
+                        path=("eigrp_instances", asn, vrf, kind, *key),
+                        value=value,
+                        source_line=sl,
+                        line_no=ln,
+                        origin="native",
+                    )
+                )
+
+            for field, default in _EIGRP_SCALARS:
+                val = getattr(eigrp, field, default)
+                if val != default:
+                    _emit("scalar", val, field)
+            for net in eigrp.networks:
+                _emit("network", net, *eigrp_network_key(net))
+            for name in eigrp.passive_interfaces:
+                _emit("passive_interface", name, name)
+            for name in eigrp.non_passive_interfaces:
+                _emit("non_passive_interface", name, name)
+            for redist in eigrp.redistribute:
+                _emit("redistribute", redist, *eigrp_redistribute_key(redist))
+            for sa in eigrp.summary_addresses:
+                _emit("summary_address", sa, *eigrp_summary_key(sa))
+
+        ops.extend(getattr(self, "_pending_native_eigrp_ops", None) or [])
         ops.sort(key=lambda op: op.line_no if op.line_no >= 0 else float("inf"))
         return ops
 
@@ -4862,7 +4957,28 @@ class IOSParser(BaseParser):
         for obj in parse.find_objects(r"^no\s+router\s+eigrp\s+"):
             m = re.search(r"^no\s+router\s+eigrp\s+(\S+)", obj.text)
             if m:
-                tombstones.append(f"process:eigrp:{m.group(1)}")
+                # Change-IR Phase 3 family 6b (CCR Appendix N): the whole-process
+                # ``no router eigrp <asn>`` delete migrated to a NATIVE,
+                # line-numbered OBJECT_DELETE (``("process","eigrp",asn)``) so 6e
+                # can build ordered instance delete/recreate on it.  The byte-exact
+                # legacy tombstone is regenerated FROM the op via encode_legacy
+                # (single source): a top-level ``process:eigrp:<asn>`` string,
+                # byte-identical to today.  In 6b the engine applies it DELETE-WINS,
+                # VRF-blind (matching legacy ``_del_process_eigrp`` — str(as_number)
+                # match only).  parse_eigrp reset the channel; here we append
+                # (getattr-safe).
+                op = ChangeOp(
+                    verb=Verb.OBJECT_DELETE,
+                    path=("process", "eigrp", m.group(1)),
+                    value=None,
+                    source_line=obj.text.strip(),
+                    line_no=obj.linenum,
+                    origin="native",
+                )
+                if not hasattr(self, "_pending_native_eigrp_ops"):
+                    self._pending_native_eigrp_ops = []
+                self._pending_native_eigrp_ops.append(op)
+                tombstones.extend(encode_legacy([op]).no_commands)
 
         for obj in parse.find_objects(r"^no\s+ip\s+access-list\s+"):
             m = re.search(
@@ -5805,8 +5921,16 @@ class IOSParser(BaseParser):
 
     def parse_eigrp(self) -> list[EIGRPConfig]:
         """Parse EIGRP configurations."""
+        from confgraph.change_ir import ChangeOp, Verb
+
         parse = self._get_parse_obj()
         eigrp_instances = []
+
+        # Change-IR Phase 3 family 6b (CCR Appendix N): reset the native-op
+        # channel for this parse.  parse_eigrp runs BEFORE parse_deletion_commands
+        # (the ``process:eigrp`` whole-process delete emitter, which APPENDS
+        # getattr-safe), so the reset here owns the per-parse lifecycle.
+        self._pending_native_eigrp_ops = []
 
         for eigrp_obj in parse.find_objects(r"^router\s+eigrp\s+"):
             m = re.match(r"^router\s+eigrp\s+(\S+)", eigrp_obj.text)
@@ -5832,6 +5956,16 @@ class IOSParser(BaseParser):
 
             raw_lines, line_numbers = self._get_raw_lines_and_line_numbers(eigrp_obj)
 
+            # VRF context — computed early (family-6b ``no network`` removal ops
+            # are scoped to (asn, vrf)).  Reused for the final EIGRPConfig below.
+            vrf_early = None
+            _vc2_early = eigrp_obj.find_child_objects(
+                r"^\s+address-family\s+ipv4\s+vrf\s+(\S+)"
+            )
+            if _vc2_early:
+                vrf_early = self._extract_match(_vc2_early[0].text, r"\bvrf\s+(\S+)")
+            vrf_early = vrf_early or ""
+
             # router-id
             router_id = None
             rid_ch = eigrp_obj.find_child_objects(r"^\s+eigrp\s+router-id\s+(\S+)")
@@ -5844,27 +5978,76 @@ class IOSParser(BaseParser):
                     except Exception:
                         pass
 
-            # networks
+            # networks.  Track the LAST positive-line number per network CIDR so
+            # the ``no network`` suppression below can compare positions (WI-8
+            # pattern, mirroring 6a's ``no net``).
             networks = []
+            positive_net_last_line: dict[str, int] = {}
+
+            def _eigrp_net(net_addr, wildcard):
+                from ipaddress import IPv4Network
+                if wildcard:
+                    wild_parts = wildcard.split(".")
+                    mask_parts = [str(255 - int(p)) for p in wild_parts]
+                    prefix = ".".join(mask_parts)
+                    return IPv4Network(f"{net_addr}/{prefix}", strict=False)
+                return IPv4Network(net_addr, strict=False)
+
             for nc in eigrp_obj.find_child_objects(r"^\s+network\s+"):
                 nm = re.match(r"^\s+network\s+(\S+)(?:\s+(\S+))?", nc.text)
                 if nm:
                     try:
-                        from ipaddress import IPv4Network, IPv4Address
                         net_addr = nm.group(1)
                         wildcard = nm.group(2)
-                        if wildcard:
-                            # convert wildcard to prefix for IPv4Network
-                            wild_parts = wildcard.split(".")
-                            mask_parts = [str(255 - int(p)) for p in wild_parts]
-                            prefix = ".".join(mask_parts)
-                            net = IPv4Network(f"{net_addr}/{prefix}", strict=False)
-                        else:
-                            net = IPv4Network(net_addr, strict=False)
+                        net = _eigrp_net(net_addr, wildcard)
                         from confgraph.models.eigrp import EIGRPNetwork
                         networks.append(EIGRPNetwork(network=net, wildcard=wildcard))
+                        cidr = str(net)
+                        positive_net_last_line[cidr] = max(
+                            positive_net_last_line.get(cidr, -1), nc.linenum
+                        )
                     except Exception:
                         pass
+
+            # Family 6b (CCR Appendix N): ops-only ``no network <addr>`` withdrawal.
+            # The positive ``network`` walk above does not match a ``no network``
+            # line and the merged ``networks`` list is additive, so a bare ``no
+            # network`` is silently dropped by the legacy parser (no tombstone) — a
+            # capability candidate (network → EIGRP interface enablement → adjacency,
+            # via igp.py ``_is_eigrp_enabled``).  Emit a native LIST_REMOVE with NO
+            # legacy twin (encode_legacy silent), scoped to this instance's
+            # (asn, vrf).  SUPPRESSION (WI-8 ``_readded_later`` pattern, 6a Finding
+            # 1): the positive SETs carry the block's first line as provenance
+            # (coarse), so suppress the removal when the SAME network reappears as a
+            # positive ``network`` line LATER in the block (refresh → re-add wins →
+            # device truth and legacy parity).  A ``no network X`` with no later
+            # re-add stands: the confirmed capability direction.
+            for nnc in eigrp_obj.find_child_objects(r"^\s+no\s+network\s+"):
+                nnm = re.match(r"^\s+no\s+network\s+(\S+)(?:\s+(\S+))?", nnc.text)
+                if not nnm:
+                    continue
+                try:
+                    cidr = str(_eigrp_net(nnm.group(1), nnm.group(2)))
+                except Exception:
+                    continue
+                if positive_net_last_line.get(cidr, -1) > nnc.linenum:
+                    continue  # re-added later in the block — removal suppressed
+                self._pending_native_eigrp_ops.append(
+                    ChangeOp(
+                        verb=Verb.LIST_REMOVE,
+                        path=(
+                            "eigrp_instance",
+                            str(as_number),
+                            vrf_early,
+                            "network",
+                            cidr,
+                        ),
+                        value=None,
+                        source_line=nnc.text.strip(),
+                        line_no=nnc.linenum,
+                        origin="native",
+                    )
+                )
 
             # passive-interface
             passive_default = bool(eigrp_obj.find_child_objects(r"^\s+passive-interface\s+default"))
@@ -5987,10 +6170,7 @@ class IOSParser(BaseParser):
                     except Exception:
                         pass
 
-            vrf = None
-            vc2 = eigrp_obj.find_child_objects(r"^\s+address-family\s+ipv4\s+vrf\s+(\S+)")
-            if vc2:
-                vrf = self._extract_match(vc2[0].text, r"\bvrf\s+(\S+)")
+            vrf = vrf_early or None
 
             eigrp_instances.append(EIGRPConfig(
                 object_id=f"eigrp_{as_number}",
