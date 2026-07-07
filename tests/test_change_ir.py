@@ -54,16 +54,17 @@ def _is_reordered_native_tombstone(t: str) -> bool:
     Family 3 (service entities) + family 4 (``static:`` route removals,
     CCR Appendix G) + family 6a (``process:isis:`` whole-process removal,
     CCR Appendix M) + family 6b (``process:eigrp:`` whole-process removal,
-    CCR Appendix N) — each encodes byte-exactly but no longer at its legacy
-    walk-group position in ``no_commands``.  (``process:isis:`` and
-    ``process:eigrp:`` are native; ``process:ospf/bgp:`` stay derived until
-    families 6c/5a-retirement.)
+    CCR Appendix N) + family 6c (``process:ospf:`` whole-process removal,
+    CCR Appendix O) — each encodes byte-exactly but no longer at its legacy
+    walk-group position in ``no_commands``.  (``process:bgp:`` stays derived
+    until 5a-retirement.)
     """
     return (
         t.startswith(_FAMILY3_TOMBSTONE_PREFIXES)
         or t.startswith("static:")
         or t.startswith("process:isis:")
         or t.startswith("process:eigrp:")
+        or t.startswith("process:ospf:")
     )
 
 

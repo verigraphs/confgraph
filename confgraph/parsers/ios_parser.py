@@ -1684,6 +1684,7 @@ class IOSParser(BaseParser):
         ops.extend(self._native_bgp_ops(pc))
         ops.extend(self._native_isis_ops(pc))
         ops.extend(self._native_eigrp_ops(pc))
+        ops.extend(self._native_ospf_ops(pc))
         pc.native_change_ops = ops
 
     def _queue_native_static_delete(self, tombstone: str, obj):
@@ -1935,6 +1936,113 @@ class IOSParser(BaseParser):
                 _emit("summary_address", sa, *eigrp_summary_key(sa))
 
         ops.extend(getattr(self, "_pending_native_eigrp_ops", None) or [])
+        ops.sort(key=lambda op: op.line_no if op.line_no >= 0 else float("inf"))
+        return ops
+
+    def _native_ospf_ops(self, pc) -> list:
+        """Native family-6c OSPF core (non-area) ops (CCR Appendix O) in script order.
+
+        Whole-protocol decomposition of the NON-AREA surface of
+        ``pc.ospf_instances`` beside the SURVIVING derived whole-instance SET
+        (co-existence, like 6a/6b; retirement is 6e).  ``areas`` are NEVER
+        emitted here — they stay on the surviving derived SET (Appendix O.0;
+        6d's surface).  The engine strips the natively-covered content from the
+        surviving SET (``_strip_native_ospf``) and replays these ops.
+
+        - **Positive side** (state-derived, parity-with-deriver by construction):
+          one SET per non-default scalar, per ``(network, area)`` statement
+          tuple, per (non-)passive interface and per keyed ``redistribute``
+          member of every parsed instance.  ``log_adjacency_changes`` is
+          EXCLUDED from the state walk — it is the 5c-A Finding-2 trap (model
+          default True, parser-absence False; Appendix O.1) and is LINE-detected
+          by ``parse_ospf`` instead (queued tri-state SETs at their true lines).
+          Positive provenance is COARSE (the block's FIRST recorded line), so a
+          same-statement refresh cannot be resolved by line-ordered replay alone
+          — ``parse_ospf`` SUPPRESSES a ``no network`` removal when the same
+          (cidr, area) reappears as a positive line LATER in the block (the WI-8
+          ``_readded_later`` pattern, mirroring 6a/6b).
+        - **Delete side**: the pending ``no network`` LIST_REMOVE ops (queued —
+          unsuppressed — at their negation lines by ``parse_ospf``) and the
+          ``no router ospf`` OBJECT_DELETE ops (queued by
+          ``parse_deletion_commands``).
+
+        Stable sort by ``line_no`` → true script order (6e groundwork).
+        """
+        from confgraph.change_ir import (
+            ChangeOp,
+            Verb,
+            ospf_network_key,
+            ospf_redistribute_key,
+        )
+
+        # Instance scalars → SET (…, "scalar", field).  Emitted only when the
+        # value differs from the parser-absence default (== the model default
+        # for every field listed here — audited in Appendix O.1).  The trap
+        # field ``log_adjacency_changes`` is deliberately ABSENT (line-detected
+        # in parse_ospf); ``areas`` are deliberately absent (O.0).
+        _OSPF_SCALARS = (
+            ("router_id", None),
+            ("log_adjacency_changes_detail", False),
+            ("auto_cost_reference_bandwidth", None),
+            ("passive_interface_default", False),
+            ("default_information_originate", False),
+            ("default_information_originate_always", False),
+            ("default_information_originate_metric", None),
+            ("default_information_originate_metric_type", None),
+            ("default_information_originate_route_map", None),
+            ("default_metric", None),
+            ("distance", None),
+            ("distance_intra_area", None),
+            ("distance_inter_area", None),
+            ("distance_external", None),
+            ("max_lsa", None),
+            ("max_metric_router_lsa", False),
+            ("max_metric_router_lsa_on_startup", None),
+            ("timers_throttle_spf_initial", None),
+            ("timers_throttle_spf_min", None),
+            ("timers_throttle_spf_max", None),
+            ("timers_throttle_lsa_all", None),
+            ("shutdown", False),
+            ("graceful_restart", False),
+            ("graceful_restart_helper", False),
+            ("bfd_all_interfaces", False),
+        )
+
+        ops: list = []
+        for ospf in getattr(pc, "ospf_instances", None) or []:
+            pid = str(ospf.process_id)
+            vrf = ospf.vrf or ""
+            raw_lines = ospf.raw_lines or []
+            line_numbers = ospf.line_numbers or []
+            sl = raw_lines[0].strip() if raw_lines else ""
+            ln = line_numbers[0] if line_numbers else -1
+
+            def _emit(kind, value, *key):
+                ops.append(
+                    ChangeOp(
+                        verb=Verb.SET,
+                        path=("ospf_instances", pid, vrf, kind, *key),
+                        value=value,
+                        source_line=sl,
+                        line_no=ln,
+                        origin="native",
+                    )
+                )
+
+            for field, default in _OSPF_SCALARS:
+                val = getattr(ospf, field, default)
+                if val != default:
+                    _emit("scalar", val, field)
+            for stmt in ospf.network_statements:
+                _emit("network", stmt, *ospf_network_key(stmt))
+            for name in ospf.passive_interfaces:
+                _emit("passive_interface", name, name)
+            for name in ospf.non_passive_interfaces:
+                _emit("non_passive_interface", name, name)
+            for redist in ospf.redistribute:
+                _emit("redistribute", redist, *ospf_redistribute_key(redist))
+
+        ops.extend(getattr(self, "_pending_native_ospf_ops", None) or [])
         ops.sort(key=lambda op: op.line_no if op.line_no >= 0 else float("inf"))
         return ops
 
@@ -2766,8 +2874,17 @@ class IOSParser(BaseParser):
 
     def parse_ospf(self) -> list[OSPFConfig]:
         """Parse OSPF configurations."""
+        from confgraph.change_ir import ChangeOp, Verb
+
         ospf_instances = []
         parse = self._get_parse_obj()
+
+        # Change-IR Phase 3 family 6c (CCR Appendix O): reset the native-op
+        # channel for this parse.  parse_ospf runs BEFORE parse_deletion_commands
+        # (the ``process:ospf`` whole-process delete emitter, which APPENDS
+        # getattr-safe), so the reset here owns the per-parse lifecycle.  NX-OS
+        # inherits this walk (nxos_parser.parse_ospf wraps super().parse_ospf()).
+        self._pending_native_ospf_ops = []
 
         # Find all OSPF router configs
         ospf_objs = parse.find_objects(r"^router\s+ospf\s+(\d+)")
@@ -2802,6 +2919,36 @@ class IOSParser(BaseParser):
             log_adjacency_changes_detail = len(
                 ospf_obj.find_child_objects(r"^\s+log-adjacency-changes\s+detail")
             ) > 0
+
+            # Family 6c (CCR Appendix O.1) — THE TRAP: ``log_adjacency_changes``
+            # has model default True but parser-absence False (the presence walk
+            # above), the 5c-A Finding-2 shape.  It is therefore LINE-detected:
+            # one native SET per matching child line at its true position
+            # (positive → True, exact ``no log-adjacency-changes`` → False), so
+            # ordered replay is device-correct in both textual orders while the
+            # engine's ``_strip_native_ospf`` KEEPS the parser value (never
+            # resets to the model default — new-instance creation parity).  The
+            # ``no log-adjacency-changes detail`` form stays silently dropped
+            # (legacy parity, documented).  The state walk above is untouched.
+            _lac_path = ("ospf_instances", str(process_id), ospf_vrf or "",
+                         "scalar", "log_adjacency_changes")
+            for lac_child in ospf_obj.children:
+                if re.match(r"^\s+log-adjacency-changes\b", lac_child.text):
+                    lac_val = True
+                elif re.match(r"^\s+no\s+log-adjacency-changes\s*$", lac_child.text):
+                    lac_val = False
+                else:
+                    continue
+                self._pending_native_ospf_ops.append(
+                    ChangeOp(
+                        verb=Verb.SET,
+                        path=_lac_path,
+                        value=lac_val,
+                        source_line=lac_child.text.strip(),
+                        line_no=lac_child.linenum,
+                        origin="native",
+                    )
+                )
 
             # Auto-cost reference bandwidth
             auto_cost_ref_bw = None
@@ -2848,7 +2995,21 @@ class IOSParser(BaseParser):
 
             # Network statements: "network <addr> <wildcard> area <area-id>"
             # Wildcard is the inverse of the subnet mask — convert to IPv4Network.
+            # _ospf_net is the SINGLE normalization for BOTH the positive walk
+            # and the family-6c ``no network`` removal walk below (Appendix O.2
+            # — removal matching must never drift from the positive parse).
+            def _ospf_net(addr_str: str, wildcard_str: str) -> IPv4Network:
+                addr = IPv4Address(addr_str)
+                wildcard = IPv4Address(wildcard_str)
+                # Invert wildcard to get subnet mask, then build prefix
+                mask = IPv4Address(int(wildcard) ^ 0xFFFFFFFF)
+                return IPv4Network(f"{addr}/{mask}", strict=False)
+
             network_statements: list[tuple[IPv4Network, str]] = []
+            # Track the LAST positive-line number per (cidr, area) so the
+            # ``no network`` suppression below can compare positions (WI-8
+            # pattern, mirroring 6a/6b).
+            positive_net_last_line: dict[tuple[str, str], int] = {}
             net_children = ospf_obj.find_child_objects(
                 r"^\s+network\s+\S+\s+\S+\s+area\s+\S+"
             )
@@ -2859,14 +3020,59 @@ class IOSParser(BaseParser):
                 if m:
                     addr_str, wildcard_str, area_id = m.group(1), m.group(2), m.group(3)
                     try:
-                        addr = IPv4Address(addr_str)
-                        wildcard = IPv4Address(wildcard_str)
-                        # Invert wildcard to get subnet mask, then build prefix
-                        mask = IPv4Address(int(wildcard) ^ 0xFFFFFFFF)
-                        net = IPv4Network(f"{addr}/{mask}", strict=False)
+                        net = _ospf_net(addr_str, wildcard_str)
                         network_statements.append((net, area_id))
+                        nkey = (str(net), area_id)
+                        positive_net_last_line[nkey] = max(
+                            positive_net_last_line.get(nkey, -1), nc.linenum
+                        )
                     except ValueError:
                         pass
+
+            # Family 6c (CCR Appendix O): ops-only ``no network A W area X``
+            # withdrawal.  The positive walk above never matches a ``no
+            # network`` line and the merged ``network_statements`` list is
+            # additive, so the line is silently dropped by the legacy parser
+            # (no tombstone) — the CONFIRMED capability (network statement →
+            # OSPF interface enablement → adjacency, via igp.py
+            # ``_is_ospf_enabled``).  Emit a native LIST_REMOVE with NO legacy
+            # twin (encode_legacy silent), scoped to this instance's
+            # (pid, vrf), identity (cidr, area) through the SAME _ospf_net
+            # normalization as the positive parse.  SUPPRESSION (WI-8
+            # ``_readded_later`` pattern): the positive SETs carry the block's
+            # first line as provenance (coarse), so suppress the removal when
+            # the SAME (cidr, area) reappears as a positive line LATER in the
+            # block (refresh → re-add wins → device truth and legacy parity).
+            for nnc in ospf_obj.find_child_objects(r"^\s+no\s+network\s+"):
+                nnm = re.match(
+                    r"^\s+no\s+network\s+(\S+)\s+(\S+)\s+area\s+(\S+)", nnc.text
+                )
+                if not nnm:
+                    continue
+                try:
+                    rem_net = _ospf_net(nnm.group(1), nnm.group(2))
+                except ValueError:
+                    continue
+                rem_key = (str(rem_net), nnm.group(3))
+                if positive_net_last_line.get(rem_key, -1) > nnc.linenum:
+                    continue  # re-added later in the block — removal suppressed
+                self._pending_native_ospf_ops.append(
+                    ChangeOp(
+                        verb=Verb.LIST_REMOVE,
+                        path=(
+                            "ospf_instance",
+                            str(process_id),
+                            ospf_vrf or "",
+                            "network",
+                            rem_key[0],
+                            rem_key[1],
+                        ),
+                        value=None,
+                        source_line=nnc.text.strip(),
+                        line_no=nnc.linenum,
+                        origin="native",
+                    )
+                )
 
             # Parse areas
             areas = self._parse_ospf_areas(ospf_obj)
@@ -4921,7 +5127,30 @@ class IOSParser(BaseParser):
         for obj in parse.find_objects(r"^no\s+router\s+ospf\s+"):
             m = re.search(r"^no\s+router\s+ospf\s+(\S+)", obj.text)
             if m:
-                tombstones.append(f"process:ospf:{m.group(1)}")
+                # Change-IR Phase 3 family 6c (CCR Appendix O): the whole-process
+                # ``no router ospf <pid>`` delete migrated to a NATIVE,
+                # line-numbered OBJECT_DELETE (``("process","ospf",pid)``) so 6e
+                # can build ordered instance delete/recreate on it.  The
+                # byte-exact legacy tombstone is regenerated FROM the op via
+                # encode_legacy (single source): a top-level ``process:ospf:<pid>``
+                # string, byte-identical to today — the ``(\S+)`` token capture is
+                # unchanged, so ``no router ospf 1 vrf CUST`` still keys on "1"
+                # (VRF token discarded, matching the VRF-BLIND legacy
+                # ``_del_process_ospf``).  In 6c the engine applies it DELETE-WINS
+                # (VRF-blind).  parse_ospf reset the channel; here we append
+                # (getattr-safe).
+                op = ChangeOp(
+                    verb=Verb.OBJECT_DELETE,
+                    path=("process", "ospf", m.group(1)),
+                    value=None,
+                    source_line=obj.text.strip(),
+                    line_no=obj.linenum,
+                    origin="native",
+                )
+                if not hasattr(self, "_pending_native_ospf_ops"):
+                    self._pending_native_ospf_ops = []
+                self._pending_native_ospf_ops.append(op)
+                tombstones.extend(encode_legacy([op]).no_commands)
 
         for obj in parse.find_objects(r"^no\s+router\s+bgp\s+"):
             m = re.search(r"^no\s+router\s+bgp\s+(\S+)", obj.text)

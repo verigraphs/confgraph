@@ -130,6 +130,10 @@ __all__ = [
     "eigrp_summary_key",
     "is_native_eigrp_op",
     "is_native_eigrp_network_removal_op",
+    "ospf_redistribute_key",
+    "ospf_network_key",
+    "is_native_ospf_op",
+    "is_native_ospf_network_removal_op",
 ]
 
 
@@ -1110,6 +1114,155 @@ def is_native_eigrp_op(op: "ChangeOp") -> bool:
     return False
 
 
+# ---------------------------------------------------------------------------
+# Family 6c — native OSPF core (non-area) op codec (CCR Appendix O)
+# ---------------------------------------------------------------------------
+# Mirrors family 6b (EIGRP) on the two-segment ``(str(process_id), vrf or "")``
+# instance key.  The derived whole-instance OSPF SET SURVIVES (co-existence — 6c
+# does NOT retire it; retirement is 6e) and ``areas`` stay ENTIRELY on that
+# surviving SET (6d's surface — never emitted, stripped or replayed here).
+# Parser-absence == model default for every migrated field EXCEPT
+# ``log_adjacency_changes`` (model default True, parser-absence False — the
+# 5c-A Finding-2 trap, Appendix O.1): that field is LINE-detected at emission
+# and KEPT (not reset) by the engine's ``_strip_native_ospf``.
+
+
+def ospf_redistribute_key(redist: Any) -> tuple[str, ...]:
+    """Identity segments for an OSPF ``redistribute`` member (family 6c).
+
+    ``("ospf_instances", pid, vrf, "redistribute", *ospf_redistribute_key(r))``
+    — identity ``(protocol, str(process_id) or "")``, the same key the legacy
+    ``_fieldlevel_list_rule("ospf_instances")`` uses for its keyed ``redistribute``
+    merge (merger.py:2350).  Codec-owned.
+    """
+    pid = getattr(redist, "process_id", None)
+    return (redist.protocol, str(pid) if pid is not None else "")
+
+
+def ospf_network_key(statement: Any) -> tuple[str, ...]:
+    """Identity segments for an OSPF ``network`` statement (family 6c).
+
+    ``network_statements`` is an ADDITIVE list (merger.py:2344 set-union) of
+    ``(IPv4Network, area_id)`` TUPLES — identity is ``(str(network), area_id)``,
+    the segments the ops-only ``no network A W area X`` LIST_REMOVE matches on.
+    CIDR and area-id tokens contain dots but never colons, so each is one path
+    segment.  Codec-owned.
+    """
+    return (str(statement[0]), statement[1])
+
+
+# OSPF instance-decomposition ``kind`` tokens carried at ``path[3]`` of a
+# ``("ospf_instances", pid, vrf, kind, *key)`` native SET (the EIGRP two-segment
+# keyed-member precedent).  NOTE: no ``area`` kind — areas stay on the surviving
+# derived whole-instance SET (Appendix O.0; 6d's surface).
+_OSPF_SET_KINDS: frozenset[str] = frozenset(
+    {
+        "scalar",
+        "network",
+        "passive_interface",
+        "non_passive_interface",
+        "redistribute",
+    }
+)
+
+# OSPF ops-only removal ``kind`` tokens carried at ``path[3]`` of an
+# ``("ospf_instance", pid, vrf, kind, <cidr>, <area>)`` LIST_REMOVE.  Only
+# ``network`` is emitted in 6c (the CONFIRMED withdrawal → adjacency capability);
+# the other reachable removals (redistribute / default-information originate)
+# are documented deferrals (Appendix O.4).
+_OSPF_REMOVAL_KINDS: frozenset[str] = frozenset({"network"})
+
+
+def _is_ospf_network_removal(path: tuple[str, ...]) -> bool:
+    """True for the family-6c ops-only ``no network A W area X`` removal path.
+
+    ``("ospf_instance", pid, vrf, "network", <cidr>, <area>)`` — a LIST_REMOVE
+    with NO legacy twin (``encode_legacy`` emits nothing; a ``no network``
+    under ``router ospf`` is silently dropped by every legacy parser today,
+    exactly like the 5b/6a/6b discipline).  The area id is one extra identity
+    segment vs EIGRP (the model member is the ``(network, area)`` tuple).
+    """
+    return (
+        len(path) == 6
+        and path[0] == "ospf_instance"
+        and path[3] in _OSPF_REMOVAL_KINDS
+    )
+
+
+def is_native_ospf_network_removal_op(op: "ChangeOp") -> bool:
+    """True iff *op* is the family-6c ops-only ``no network`` removal op.
+
+    Consumed by :func:`encode_legacy` to emit NOTHING (no legacy twin): a
+    ``no network A W area X`` under ``router ospf`` is silently dropped by
+    every legacy parser today (the positive walk is anchored and the merged
+    ``network_statements`` list is additive), so ops mode gains a
+    network-withdrawal capability legacy cannot see while legacy-mode
+    artifacts stay byte-identical.
+    """
+    return (
+        getattr(op, "origin", "derived") == "native"
+        and op.verb is Verb.LIST_REMOVE
+        and _is_ospf_network_removal(op.path)
+    )
+
+
+def _is_ospf_process_delete(path: tuple[str, ...]) -> bool:
+    """True for the whole-process ``no router ospf <pid>`` op path.
+
+    ``("process", "ospf", <pid>)`` — the byte-exact colon-split of the legacy
+    ``process:ospf:<pid>`` tombstone.  Emitted NATIVE + line-numbered (family
+    6c) so 6e can build ordered instance delete/recreate on it; in 6c it is
+    applied DELETE-WINS (VRF-blind, matching the legacy ``_del_process_ospf``
+    which compares ``str(process_id)`` only — Appendix O.3).
+    """
+    return len(path) == 3 and path[0] == "process" and path[1] == "ospf"
+
+
+def is_native_ospf_op(op: "ChangeOp") -> bool:
+    """True iff *op* is a parser-emitted family-6c OSPF op (CCR Appendix O).
+
+    Shapes (all ``origin == "native"``), on the PLURAL ``ospf_instances``
+    container for SETs (classifier-routed to OSPF by keyed-member existence) and
+    the SINGULAR ``ospf_instance`` / top-level ``process`` scope for deletions:
+
+    - ``SET ("ospf_instances", pid, vrf, "scalar", <field>)``  instance scalar —
+          state-derived positive-only for every non-default scalar EXCEPT
+          ``log_adjacency_changes``, which is LINE-detected (positive line →
+          True, ``no log-adjacency-changes`` → False; tri-state, Appendix O.1).
+    - ``SET ("ospf_instances", pid, vrf, "network", <cidr>, <area>)`` additive
+          ``(IPv4Network, area)`` tuple member.
+    - ``SET ("ospf_instances", pid, vrf, "passive_interface", <name>)`` additive.
+    - ``SET ("ospf_instances", pid, vrf, "non_passive_interface", <name>)`` "".
+    - ``SET ("ospf_instances", pid, vrf, "redistribute", <proto>, <pid>)`` keyed.
+    - ``OBJECT_DELETE ("process", "ospf", <pid>)``  whole-process removal
+          (``no router ospf`` — applied DELETE-WINS, VRF-blind, in 6c).
+    - ``LIST_REMOVE ("ospf_instance", pid, vrf, "network", <cidr>, <area>)``
+          ops-only ``no network`` withdrawal (SINGULAR scope, no legacy twin).
+
+    ``areas`` never appear here (Appendix O.0 — the derived whole-instance SET
+    carries them in both modes; 6d owns that surface).  Owned by the codec
+    module: the engine's ``_apply_native_ospf_ops`` pass and its
+    ``_proposal_from_ops`` skip MUST share this predicate.  Derived twins
+    (same path, ``origin="derived"``) return False (origin gate).
+    """
+    if getattr(op, "origin", "derived") != "native":
+        return False
+    path = op.path
+    if not path:
+        return False
+    if op.verb is Verb.SET:
+        return (
+            len(path) >= 5
+            and path[0] == "ospf_instances"
+            and path[3] in _OSPF_SET_KINDS
+        )
+    if op.verb is Verb.OBJECT_DELETE:
+        return _is_ospf_process_delete(path)
+    if op.verb is Verb.LIST_REMOVE:
+        return _is_ospf_network_removal(path)
+    return False
+
+
 def _static_nh_key(r: Any) -> str:
     """Stable NH identity segment for a static route (mirrors merger identity)."""
     nh = r.next_hop
@@ -1370,6 +1523,7 @@ def derive_ops(proposal: "ParsedConfig") -> ChangeSet:
         if not is_native_bgp_op(op)
         and not is_native_isis_op(op)
         and not is_native_eigrp_op(op)
+        and not is_native_ospf_op(op)
         for i in range(1, len(op.path))
     }
     # 5c-B.2 retirement (CCR Appendix L — the one authorized derive_ops touch):
@@ -1467,6 +1621,11 @@ def encode_legacy(ops: ChangeSet) -> LegacyArtifacts:
         # bare ``no network`` line is silently dropped by every legacy parser
         # today) — emit nothing so legacy-mode artifacts stay byte-identical.
         if is_native_eigrp_network_removal_op(op):
+            continue
+        # Family-6c ops-only ``no network A W area X`` (CCR Appendix O): NO
+        # legacy twin (the line is silently dropped by every legacy parser
+        # today) — emit nothing so legacy-mode artifacts stay byte-identical.
+        if is_native_ospf_network_removal_op(op):
             continue
         if op.path and op.path[0] == "bgp_instance":
             key = (op.path[1], op.path[2])
