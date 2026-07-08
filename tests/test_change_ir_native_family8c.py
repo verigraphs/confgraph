@@ -408,7 +408,18 @@ class TestCodec:
         assert singleton_line_detected_scalars("cdp") == frozenset(
             {"enabled", "advertise_v2"}
         )
-        assert singleton_line_detected_scalars("spanning_tree") == frozenset()
+        # PIN FLIPPED IN PLACE (WI-DB1-B3, CCR Appendix AC): the four
+        # spanning-tree default booleans join the line-detected family —
+        # their `no … default` resets land the model default (False), which
+        # the state walk (and the legacy rule's True-only arm) cannot see.
+        assert singleton_line_detected_scalars("spanning_tree") == frozenset(
+            {
+                "portfast_default",
+                "bpduguard_default",
+                "bpdufilter_default",
+                "loopguard_default",
+            }
+        )
         assert singleton_line_detected_scalars("vtp") == frozenset()
 
     def test_vlan_op_origin_gate(self):

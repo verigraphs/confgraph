@@ -288,23 +288,39 @@ class TestEmission:
 
 class TestNoTriState:
     def test_no_line_detected_scalars_registered(self):
+        # PIN FLIPPED IN PLACE (WI-DB1-B3, CCR Appendix AC): the U.2 "no
+        # tri-state in 8b" deferral is delivered for dhcp — its two global
+        # scalar resets are now line-detected; the other six 8b sections
+        # stay line-detection-free.
+        assert singleton_line_detected_scalars("dhcp") == frozenset(
+            {"snooping_enabled", "relay_information_option"}
+        )
         for sect in SECTIONS_8B:
+            if sect == "dhcp":
+                continue
             assert singleton_line_detected_scalars(sect) == frozenset()
 
-    def test_dhcp_negative_lines_parser_invisible_blind_both(self):
-        # `no ip dhcp snooping` / `no ip dhcp relay information option` never
-        # match the anchored ^ip\s+dhcp\s+ scan: no state effect, no
-        # tombstone, no native op — blind in BOTH modes (U.2, enumerated).
+    def test_dhcp_negative_lines_fold_and_emit(self):
+        # PIN FLIPPED IN PLACE (WI-DB1-B3, CCR Appendix AC.1): this pin
+        # previously asserted the U.6(2) blindness (`no ip dhcp snooping` /
+        # `no ip dhcp relay information option` parser-invisible).  The
+        # broadened `^(?:no\s+)?ip\s+dhcp\s+` scan now folds both anchored
+        # resets to post-line-state and the line-detected tri-state emits
+        # them at their true lines; scalar resets still produce NO
+        # tombstones (they are not removals).
         pc = _parse(
             "ip dhcp snooping\n"
             "no ip dhcp snooping\n"
             "no ip dhcp relay information option\n"
         )
-        assert pc.dhcp.snooping_enabled is True
-        assert pc.dhcp.relay_information_option is True
+        assert pc.dhcp.snooping_enabled is False  # last-line-winner
+        assert pc.dhcp.relay_information_option is False
         assert pc.no_commands == []
-        scalar_paths = {op.path for op in _native(pc)}
-        assert ("dhcp", "scalar", "relay_information_option") not in scalar_paths
+        by_path = {op.path: op for op in _native(pc)}
+        snoop = by_path[("dhcp", "scalar", "snooping_enabled")]
+        assert snoop.value is False and snoop.source_line == "no ip dhcp snooping"
+        relay = by_path[("dhcp", "scalar", "relay_information_option")]
+        assert relay.value is False
 
 
 # ---------------------------------------------------------------------------

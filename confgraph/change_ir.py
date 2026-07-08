@@ -266,7 +266,13 @@ _TOP_TOMBSTONE_VERBS: tuple[tuple[re.Pattern[str], Verb], ...] = (
     (re.compile(r"^field:syslog:host:"), Verb.LIST_REMOVE),
     (re.compile(r"^field:dns:(name_server|domain):"), Verb.LIST_REMOVE),
     (re.compile(r"^field:netflow:destination:"), Verb.LIST_REMOVE),
-    (re.compile(r"^field:dhcp:(pool|excluded):"), Verb.LIST_REMOVE),
+    # WI-DB1-B3 (CCR Appendix AC): ``snooping_vlan`` joins the dhcp entry
+    # shapes; the spanning_tree shapes cover the whole ``vlan_configs`` entry
+    # removal and the keyed attr-reset (``vlan_reset:<spec>:<field>`` — the
+    # AA.2 LIST_REMOVE-verbed attr-reset precedent, semantics in the
+    # accessor).  MUST precede the generic field-reset catch-all below.
+    (re.compile(r"^field:dhcp:(pool|excluded|snooping_vlan):"), Verb.LIST_REMOVE),
+    (re.compile(r"^field:spanning_tree:(vlan|vlan_reset):"), Verb.LIST_REMOVE),
     (re.compile(r"^field:vxlan:vni:"), Verb.LIST_REMOVE),
     (re.compile(r"^field:multicast:(rp|msdp):"), Verb.LIST_REMOVE),
     (re.compile(r"^field:bfd:template:"), Verb.LIST_REMOVE),
@@ -1951,6 +1957,26 @@ _SINGLETON_LINE_DETECTED_SCALARS: dict[str, frozenset[str]] = {
     # (absence == default True on every OS).
     "lldp": frozenset({"enabled"}),
     "cdp": frozenset({"enabled", "advertise_v2"}),
+    # WI-DB1-B3 (CCR Appendix AC.1/AC.2): global scalar resets whose
+    # post-line-state is invisible to the parsed state.
+    # ``dhcp.snooping_enabled`` — ``no ip dhcp snooping`` lands the model
+    # default (False); ``dhcp.relay_information_option`` — the positive
+    # ``ip dhcp relay information option`` re-assert lands the default
+    # (True), the ``no`` form is state-visible (the cdp.advertise_v2
+    # shape).  The four spanning-tree default booleans — the ``no …
+    # default`` resets land False == default (the legacy
+    # ``_spanning_tree_rule`` only ever sets True, so these are ops-only).
+    # All six: parser-absence == model default (no NX-OS-lldp-style
+    # unconditional anchor needed); last-line-winner both orders.
+    "dhcp": frozenset({"snooping_enabled", "relay_information_option"}),
+    "spanning_tree": frozenset(
+        {
+            "portfast_default",
+            "bpduguard_default",
+            "bpdufilter_default",
+            "loopguard_default",
+        }
+    ),
 }
 
 

@@ -277,6 +277,62 @@ _IOS_KNOWN_CHILD_PATTERNS: list[tuple[str, list[str]]] = [
 ]
 
 
+# --- WI-DB1-B3 (CCR Appendix AC) shared line predicates ---
+# ONE regex set drives BOTH the parse fold (post-line-state) and the
+# line-detected native emission in ``_native_singleton_ops`` — the Appendix-Z
+# shared-classifier discipline (parse and emission can never disagree).
+# All negation forms are ``$``-anchored: partial/suboption forms
+# (``no ip dhcp relay information option vpn``, ``no vtp``,
+# ``no spanning-tree`` bare, …) stay blind-disclosed (AC.3).
+_DHCP_SNOOP_POS_RE = re.compile(r"^ip\s+dhcp\s+snooping\s*$")
+_DHCP_SNOOP_NEG_RE = re.compile(r"^no\s+ip\s+dhcp\s+snooping\s*$")
+_DHCP_RELAY_OPT_POS_RE = re.compile(r"^ip\s+dhcp\s+relay\s+information\s+option\s*$")
+_DHCP_RELAY_OPT_NEG_RE = re.compile(r"^no\s+ip\s+dhcp\s+relay\s+information\s+option\s*$")
+# Section-scan predicates: positives + EXACTLY the fold-relevant anchored
+# negations.  Removal-only proposals (``no ip dhcp pool …``,
+# ``no spanning-tree vlan …``) must NOT create a section — their tombstones
+# apply to the merged BASELINE section (the 8b absent-section no-op
+# discipline, pinned in the engine suite).
+_DHCP_SECTION_SCAN = (
+    r"^ip\s+dhcp\s+"
+    r"|^no\s+ip\s+dhcp\s+(?:snooping\s*$|relay\s+information\s+option\s*$)"
+)
+_STP_SECTION_SCAN = (
+    r"^spanning-tree\s+"
+    r"|^no\s+spanning-tree\s+(?:mode(?:\s+\S+)?\s*$"
+    r"|portfast\s+(?:bpduguard\s+|bpdufilter\s+)?default\s*$"
+    r"|loopguard\s+default\s*$)"
+)
+_VTP_SECTION_SCAN = (
+    r"^vtp\s+"
+    r"|^no\s+vtp\s+(?:mode(?:\s+(?:server|client|transparent|off))?\s*$"
+    r"|version(?:\s+\d+)?\s*$)"
+)
+_VTP_MODE_NEG_RE = re.compile(
+    r"^no\s+vtp\s+mode(?:\s+(?:server|client|transparent|off))?\s*$"
+)
+_VTP_VERSION_NEG_RE = re.compile(r"^no\s+vtp\s+version(?:\s+\d+)?\s*$")
+_LACP_SYSPRI_NEG_RE = re.compile(r"^no\s+lacp\s+system-priority(?:\s+\d+)?\s*$")
+_STP_MODE_NEG_RE = re.compile(r"^no\s+spanning-tree\s+mode(?:\s+\S+)?\s*$")
+# The four global default-boolean resets (exact forms; device CLI).
+_STP_BOOL_NEG_RES: list[tuple[re.Pattern, str]] = [
+    (re.compile(r"^no\s+spanning-tree\s+portfast\s+bpduguard\s+default\s*$"),
+     "bpduguard_default"),
+    (re.compile(r"^no\s+spanning-tree\s+portfast\s+bpdufilter\s+default\s*$"),
+     "bpdufilter_default"),
+    (re.compile(r"^no\s+spanning-tree\s+portfast\s+default\s*$"),
+     "portfast_default"),
+    (re.compile(r"^no\s+spanning-tree\s+loopguard\s+default\s*$"),
+     "loopguard_default"),
+]
+# Device-default STP mode per OS — the ``no spanning-tree mode`` reset value
+# (post-line-state, AC.1).
+_STP_DEFAULT_MODE: dict[str, str] = {
+    "nxos": "rapid-pvst",
+    "eos": "mstp",
+}
+
+
 class IOSParser(BaseParser):
     """Parser for Cisco IOS and IOS-XE configurations.
 
@@ -2575,23 +2631,60 @@ class IOSParser(BaseParser):
             if winner is not None:
                 _emit_scalar("cdp", "advertise_v2", value, winner)
 
-        # --- family 8c: lacp_system_priority (Appendix V.1) ---
+        # --- WI-DB1-B3 line-detected tri-states (Appendix AC.1/AC.2) ---
+        # dhcp.snooping_enabled / dhcp.relay_information_option: the SAME
+        # anchored module regexes the parse_dhcp fold consumes (the Z
+        # single-source discipline) — last-line-winner, op only when a line
+        # exists; parser-absence == model default for both (no NX-OS-style
+        # unconditional anchor needed).
+        if getattr(pc, "dhcp", None) is not None:
+            dhcp_objs = parse.find_objects(r"^(?:no\s+)?ip\s+dhcp\s+")
+            for pos_re, neg_re, fname in (
+                (_DHCP_SNOOP_POS_RE, _DHCP_SNOOP_NEG_RE, "snooping_enabled"),
+                (
+                    _DHCP_RELAY_OPT_POS_RE,
+                    _DHCP_RELAY_OPT_NEG_RE,
+                    "relay_information_option",
+                ),
+            ):
+                neg = [o for o in dhcp_objs if neg_re.match(o.text.strip())]
+                pos = [o for o in dhcp_objs if pos_re.match(o.text.strip())]
+                winner, value = _tristate_winner(neg, pos)
+                if winner is not None:
+                    _emit_scalar("dhcp", fname, value, winner)
+        # spanning_tree default booleans: classified per line by the SHARED
+        # ``_stp_global_scalar_line_update`` (the parse_spanning_tree fold's
+        # classifier); only the line-detected quartet is emitted here —
+        # ``mode`` stays state-walk-emitted (state-visible, AC.1).
+        if getattr(pc, "spanning_tree", None) is not None:
+            stp_line_detected = singleton_line_detected_scalars("spanning_tree")
+            stp_last: dict[str, tuple] = {}
+            for o in parse.find_objects(r"^(?:no\s+)?spanning-tree\s+"):
+                upd = self._stp_global_scalar_line_update(o.text.strip())
+                if upd is not None and upd[0] in stp_line_detected:
+                    stp_last[upd[0]] = (o, upd[1])  # later lines overwrite
+            for fname, (o, value) in stp_last.items():
+                _emit_scalar("spanning_tree", fname, value, o)
+
+        # --- family 8c: lacp_system_priority (Appendix V.1 + AC.1) ---
         # A plain top-level ``int | None`` ParsedConfig scalar (no model) —
         # it cannot ride the section codec.  The native len-1 SET has the
         # SAME path as the derived op (exact-path dedupe retires the twin)
         # and deliberately flows the batched engine path (zero engine
-        # change, parity by construction).  parse_lacp_system_priority reads
-        # the FIRST matching line — provenance mirrors it.
+        # change, parity by construction).  Value AND anchor come from the
+        # shared ``_lacp_system_priority_line_state`` helper (WI-DB1-B3:
+        # a later ``no lacp system-priority`` wins → 32768 at that line).
         if getattr(pc, "lacp_system_priority", None) is not None:
-            objs = parse.find_objects(r"^lacp\s+system-priority\s+\d+")
-            first = objs[0] if objs else None
+            _lacp_value, _lacp_anchor = self._lacp_system_priority_line_state()
             ops.append(
                 ChangeOp(
                     verb=Verb.SET,
                     path=("lacp_system_priority",),
                     value=pc.lacp_system_priority,
-                    source_line=first.text.strip() if first is not None else "",
-                    line_no=first.linenum if first is not None else -1,
+                    source_line=(
+                        _lacp_anchor.text.strip() if _lacp_anchor is not None else ""
+                    ),
+                    line_no=_lacp_anchor.linenum if _lacp_anchor is not None else -1,
                     origin="native",
                 )
             )
@@ -7186,6 +7279,63 @@ class IOSParser(BaseParser):
                         f"field:dhcp:excluded:{m.group(1)}", obj
                     ).no_commands
                 )
+        # WI-DB1-B3 (CCR Appendix AC.1): ``no ip dhcp snooping vlan <spec>``
+        # removes the EXACT spec-string member (specs are opaque strings on
+        # this model surface — partial-range forms stay blind, AC.3).  The
+        # ``[\d,\-]+`` spec guard rejects grammar tokens in the spec
+        # position (the B2 validator-C2 lesson).  Bare ``no ip dhcp
+        # snooping`` is a line-detected scalar reset (parse_dhcp fold), NOT
+        # a tombstone.
+        for obj in parse.find_objects(r"^no\s+ip\s+dhcp\s+snooping\s+vlan\s+"):
+            m = re.match(
+                r"^no\s+ip\s+dhcp\s+snooping\s+vlan\s+([\d,\-]+)\s*$",
+                obj.text.strip(),
+            )
+            if m:
+                tombstones.extend(
+                    self._queue_native_singleton_removal(
+                        f"field:dhcp:snooping_vlan:{m.group(1)}", obj
+                    ).no_commands
+                )
+
+        # --- Spanning-tree vlan_configs tombstones (WI-DB1-B3, Appendix AC.1) ---
+        # Whole-entry removal (``no spanning-tree vlan <spec>``) and the
+        # keyed attr-resets (``… <spec> priority|hello-time|forward-time|
+        # max-age [v]`` → entry field None).  Keys are the EXACT spec
+        # strings (== the parse/merge identity); ``[\d,\-]+`` guards the
+        # spec position; ``no spanning-tree vlan <spec> root …`` and other
+        # param forms stay blind (positives unparsed — parity by absence,
+        # AC.3).  The merged-side accessors serve BOTH modes (legacy
+        # tombstone / ops pass B — delete-wins, both textual orders).
+        _stp_attr_field = {
+            "priority": "priority",
+            "hello-time": "hello_time",
+            "forward-time": "forward_time",
+            "max-age": "max_age",
+        }
+        for obj in parse.find_objects(r"^no\s+spanning-tree\s+vlan\s+"):
+            t = obj.text.strip()
+            m = re.match(
+                r"^no\s+spanning-tree\s+vlan\s+([\d,\-]+)\s+"
+                r"(priority|hello-time|forward-time|max-age)(?:\s+\d+)?\s*$",
+                t,
+            )
+            if m:
+                tombstones.extend(
+                    self._queue_native_singleton_removal(
+                        "field:spanning_tree:vlan_reset:"
+                        f"{m.group(1)}:{_stp_attr_field[m.group(2)]}",
+                        obj,
+                    ).no_commands
+                )
+                continue
+            m = re.match(r"^no\s+spanning-tree\s+vlan\s+([\d,\-]+)\s*$", t)
+            if m:
+                tombstones.extend(
+                    self._queue_native_singleton_removal(
+                        f"field:spanning_tree:vlan:{m.group(1)}", obj
+                    ).no_commands
+                )
 
         # --- NTP entry-level tombstones ---
         for obj in parse.find_objects(r"^no\s+ntp\s+"):
@@ -10356,9 +10506,20 @@ class IOSParser(BaseParser):
              lease 1
             ip dhcp snooping
             ip dhcp snooping vlan 10,20
+            ip dhcp relay information option
+            no ip dhcp snooping
+            no ip dhcp relay information option
+
+        WI-DB1-B3 (CCR Appendix AC.1): the scan admits EXACTLY the two
+        anchored scalar-reset no-lines (the parse_lldp precedent) so
+        negation-only proposals parse the section to post-line-state
+        instead of None; both FOLD through the shared regexes (the Z
+        discipline — last-line-wins by document order).  Removal no-lines
+        (pool / excluded / snooping-vlan) ride the deletion walk and never
+        create a section (the 8b absent-section no-op discipline).
         """
         parse = self._get_parse_obj()
-        dhcp_objs = parse.find_objects(r"^ip\s+dhcp\s+")
+        dhcp_objs = parse.find_objects(_DHCP_SECTION_SCAN)
         if not dhcp_objs:
             return None
 
@@ -10421,9 +10582,18 @@ class IOSParser(BaseParser):
                 vlan_str = self._extract_match(t, r"^ip\s+dhcp\s+snooping\s+vlan\s+(\S+)")
                 if vlan_str:
                     snooping_vlans.append(vlan_str)
-            elif re.match(r"^ip\s+dhcp\s+snooping\s*$", t):
+            elif _DHCP_SNOOP_POS_RE.match(t):
                 snooping_enabled = True
-            elif "no ip dhcp relay information option" in t:
+            # WI-DB1-B3 (AC.1): anchored tri-state folds.  The former
+            # substring negation branch was DEAD (the old ``^ip\s+dhcp``
+            # scan never yielded no-lines) and would over-trigger on
+            # ``… option vpn`` / ``… option-insert`` once reachable —
+            # anchored ``$`` forms only (AC.3).
+            elif _DHCP_SNOOP_NEG_RE.match(t):
+                snooping_enabled = False
+            elif _DHCP_RELAY_OPT_POS_RE.match(t):
+                relay_opt = True
+            elif _DHCP_RELAY_OPT_NEG_RE.match(t):
                 relay_opt = False
 
         return DHCPConfig(
@@ -10559,6 +10729,46 @@ class IOSParser(BaseParser):
     # Spanning Tree
     # -----------------------------------------------------------------------
 
+    def _stp_default_mode(self) -> str:
+        """Device-default STP mode for this OS (the ``no spanning-tree mode``
+        post-line-state — WI-DB1-B3, CCR Appendix AC.1)."""
+        os_val = getattr(self.os_type, "value", self.os_type)
+        return _STP_DEFAULT_MODE.get(os_val, "pvst")
+
+    def _stp_global_scalar_line_update(self, t: str) -> tuple[str, object] | None:
+        """Classify one stripped ``spanning-tree`` line into a GLOBAL scalar
+        update ``(field, value)`` — or None (vlan lines, unknown forms).
+
+        SHARED between the ``parse_spanning_tree`` fold and the line-detected
+        emission in ``_native_singleton_ops`` (WI-DB1-B3, CCR Appendix AC.1 —
+        the Appendix-Z single-classifier discipline).  Positive forms keep
+        the historical parse semantics EXACTLY (anchored mode regex; the
+        substring elif chain for the default booleans); negation forms are
+        ``$``-anchored resets to post-line-state (mode → the per-OS device
+        default; booleans → False).  Partial negations (``no spanning-tree``
+        bare, ``no spanning-tree portfast``, NX-OS ``port type edge`` forms)
+        return None — blind-disclosed (AC.3).
+        """
+        if t.startswith("no "):
+            if _STP_MODE_NEG_RE.match(t):
+                return ("mode", self._stp_default_mode())
+            for pattern, field in _STP_BOOL_NEG_RES:
+                if pattern.match(t):
+                    return (field, False)
+            return None
+        if re.match(r"^spanning-tree\s+mode\s+", t):
+            mode = self._extract_match(t, r"^spanning-tree\s+mode\s+(\S+)")
+            return ("mode", mode) if mode else None
+        if "portfast bpduguard default" in t:
+            return ("bpduguard_default", True)
+        if "portfast bpdufilter default" in t:
+            return ("bpdufilter_default", True)
+        if "portfast default" in t:
+            return ("portfast_default", True)
+        if "loopguard default" in t:
+            return ("loopguard_default", True)
+        return None
+
     def parse_spanning_tree(self) -> STPConfig | None:
         """Parse Spanning Tree Protocol global configuration.
 
@@ -10571,18 +10781,24 @@ class IOSParser(BaseParser):
             spanning-tree portfast bpduguard default
             spanning-tree portfast bpdufilter default
             spanning-tree loopguard default
+            no spanning-tree mode
+            no spanning-tree portfast [bpduguard|bpdufilter] default
+            no spanning-tree loopguard default
+
+        WI-DB1-B3 (CCR Appendix AC.1): the scan admits EXACTLY the anchored
+        global scalar-reset no-lines; they fold through the SHARED
+        ``_stp_global_scalar_line_update`` classifier (last-line-wins by
+        document order).  ``no spanning-tree vlan …`` forms ride the
+        deletion walk (tombstone twins) and never create a section (the 8b
+        absent-section no-op discipline).
         """
         parse = self._get_parse_obj()
-        stp_objs = parse.find_objects(r"^spanning-tree\s+")
+        stp_objs = parse.find_objects(_STP_SECTION_SCAN)
         if not stp_objs:
             return None
 
-        mode: str | None = None
+        scalars: dict[str, object] = {}
         vlan_configs: list[STPVlanConfig] = []
-        portfast_default = False
-        bpduguard_default = False
-        bpdufilter_default = False
-        loopguard_default = False
         raw_lines: list[str] = []
         line_numbers: list[int] = []
 
@@ -10591,9 +10807,7 @@ class IOSParser(BaseParser):
             line_numbers.append(obj.linenum)
             t = obj.text.strip()
 
-            if re.match(r"^spanning-tree\s+mode\s+", t):
-                mode = self._extract_match(t, r"^spanning-tree\s+mode\s+(\S+)")
-            elif re.match(r"^spanning-tree\s+vlan\s+", t):
+            if re.match(r"^spanning-tree\s+vlan\s+", t):
                 m = re.match(r"^spanning-tree\s+vlan\s+(\S+)\s+(\S+)\s+(\S+)", t)
                 if m:
                     vlan_id, param, value = m.group(1), m.group(2), m.group(3)
@@ -10610,37 +10824,60 @@ class IOSParser(BaseParser):
                         existing.forward_time = int(value)
                     elif param == "max-age":
                         existing.max_age = int(value)
-            elif "portfast bpduguard default" in t:
-                bpduguard_default = True
-            elif "portfast bpdufilter default" in t:
-                bpdufilter_default = True
-            elif "portfast default" in t:
-                portfast_default = True
-            elif "loopguard default" in t:
-                loopguard_default = True
+                continue
+            upd = self._stp_global_scalar_line_update(t)
+            if upd is not None:
+                scalars[upd[0]] = upd[1]
 
         return STPConfig(
             object_id="spanning_tree",
             raw_lines=raw_lines,
             source_os=self.os_type,
             line_numbers=line_numbers,
-            mode=mode,
+            mode=scalars.get("mode"),
             vlan_configs=vlan_configs,
-            portfast_default=portfast_default,
-            bpduguard_default=bpduguard_default,
-            bpdufilter_default=bpdufilter_default,
-            loopguard_default=loopguard_default,
+            portfast_default=scalars.get("portfast_default", False),
+            bpduguard_default=scalars.get("bpduguard_default", False),
+            bpdufilter_default=scalars.get("bpdufilter_default", False),
+            loopguard_default=scalars.get("loopguard_default", False),
         )
 
-    def parse_lacp_system_priority(self) -> int | None:
-        """Parse global ``lacp system-priority <N>``."""
+    def _lacp_system_priority_line_state(self):
+        """Resolve ``lacp system-priority`` line state → ``(value, anchor_obj)``.
+
+        SHARED between ``parse_lacp_system_priority`` and the native len-1
+        SET emission in ``_native_singleton_ops`` (WI-DB1-B3, CCR Appendix
+        AC.1 — the Z discipline).  Positives keep the pre-existing
+        FIRST-line-wins value quirk (V.1); a ``$``-anchored
+        ``no lacp system-priority [n]`` wins iff its LAST occurrence is
+        later than the value-determining positive line → post-line-state
+        32768 (the device default).  Both single-positive orders are
+        device-correct; ``no lacp`` bare and other forms stay blind (AC.3).
+        Returns ``(None, None)`` when no line matches.
+        """
         parse = self._get_parse_obj()
-        objs = parse.find_objects(r"^lacp\s+system-priority\s+\d+")
-        if objs:
-            m = re.search(r"lacp\s+system-priority\s+(\d+)", objs[0].text)
+        pos_objs = parse.find_objects(r"^lacp\s+system-priority\s+\d+")
+        value = anchor = None
+        if pos_objs:
+            m = re.search(r"lacp\s+system-priority\s+(\d+)", pos_objs[0].text)
             if m:
-                return int(m.group(1))
-        return None
+                value, anchor = int(m.group(1)), pos_objs[0]
+        neg_objs = [
+            o
+            for o in parse.find_objects(r"^no\s+lacp\s+system-priority")
+            if _LACP_SYSPRI_NEG_RE.match(o.text.strip())
+        ]
+        last_neg = max(neg_objs, key=lambda o: o.linenum, default=None)
+        if last_neg is not None and (
+            anchor is None or last_neg.linenum > anchor.linenum
+        ):
+            return 32768, last_neg
+        return value, anchor
+
+    def parse_lacp_system_priority(self) -> int | None:
+        """Parse global ``lacp system-priority <N>`` (and the WI-DB1-B3
+        ``no lacp system-priority`` reset → 32768, the device default)."""
+        return self._lacp_system_priority_line_state()[0]
 
     def parse_vtp(self):
         """Parse VTP configuration.
@@ -10650,11 +10887,24 @@ class IOSParser(BaseParser):
             vtp domain EXAMPLE
             vtp mode transparent
             vtp version 2
+            no vtp mode [server|client|transparent|off]
+            no vtp version [n]
+
+        WI-DB1-B3 (CCR Appendix AC.1): the scan admits EXACTLY the two
+        anchored reset no-lines.  ``no vtp mode [m]`` resets to "server"
+        (device semantics — any
+        stated mode operand still resets to server) and ``no vtp version
+        [n]`` resets to 1 (device default) — both state-VISIBLE post-line
+        states (≠ the None model default), so the legacy additive merge and
+        the state-walk emission carry them (last-line-wins by document
+        order).  ``no vtp`` bare / ``no vtp domain`` (device-questionable
+        on classic IOS) / ``no vtp password|pruning`` (no model surface)
+        stay blind-disclosed (AC.3).
         """
         from confgraph.models.vlan import VTPConfig
 
         parse = self._get_parse_obj()
-        vtp_objs = parse.find_objects(r"^vtp\s+")
+        vtp_objs = parse.find_objects(_VTP_SECTION_SCAN)
         if not vtp_objs:
             return None
 
@@ -10669,6 +10919,12 @@ class IOSParser(BaseParser):
             line_numbers.append(obj.linenum)
             t = obj.text.strip()
 
+            if t.startswith("no "):
+                if _VTP_MODE_NEG_RE.match(t):
+                    mode = "server"
+                elif _VTP_VERSION_NEG_RE.match(t):
+                    version = 1
+                continue
             dm = re.match(r"^vtp\s+domain\s+(\S+)", t)
             if dm:
                 domain = dm.group(1)
