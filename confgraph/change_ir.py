@@ -245,7 +245,14 @@ _TOP_TOMBSTONE_VERBS: tuple[tuple[re.Pattern[str], Verb], ...] = (
     (re.compile(r"^singleton:\w+$"), Verb.UNSET),              # whole-section null-out
     # --- "field:" families (merger._FIELD_PATH_ACCESSORS shapes) ---
     (re.compile(r"^field:bgp:\d+:af:\w+:redistribute:"), Verb.LIST_REMOVE),
-    (re.compile(r"^field:interface:[^:]+:(helper|nhrp_nhs):"), Verb.LIST_REMOVE),
+    (
+        re.compile(
+            r"^field:interface:[^:]+:(helper|nhrp_nhs|hsrp_groups|hsrp_vip"
+            r"|vrrp_groups|glbp_groups|secondary_ips|igmp_join_groups"
+            r"|igmp_static_groups):"
+        ),
+        Verb.LIST_REMOVE,
+    ),
     (re.compile(r"^field:ospf:[^:]+:area:[^:]+:(stub_reset|nssa_reset)$"), Verb.UNSET),
     (re.compile(r"^field:ntp:(server|peer|auth_key):"), Verb.LIST_REMOVE),
     (re.compile(r"^field:snmp:(community|host|view|group|user):"), Verb.LIST_REMOVE),
@@ -419,12 +426,28 @@ _IFACE_MEMBER_KEYS: dict[str, "Callable[[Any], str] | None"] = {
     "glbp_groups": lambda g: str(g.group_number),
 }
 
-# The two interface member-removal tombstone kinds (NESTED_DELETION_RULES
-# templates) and the model fields they target — the ONLY negation surface
-# in the family (X.0; every other collection negation is parser-blind).
+# Interface member-removal tombstone kinds (NESTED_DELETION_RULES
+# ``interface:`` templates) → the model fields they target.  The original
+# 8e pair (helper / nhrp_nhs) was the only negation surface in the family;
+# WI-DB1-B1 (CCR Appendix AA) wires the previously parser-blind
+# interface-child negations: FHRP whole-group removals (keyed by
+# group_number), the HSRP VIP attr-reset (kind ``hsrp_vip`` — the one kind
+# that is NOT a model field name; its accessor resets the group's
+# virtual_ip instead of removing a member), secondary-IP removals
+# (canonical CIDR keys) and IGMP group-membership removals.  Every kind
+# rides the same native LIST_REMOVE + byte-exact tombstone machinery and
+# the same engine replay (R.0 re-added-later rule keyed on
+# (interface, field, path[4])).
 IFACE_MEMBER_REMOVAL_FIELDS: dict[str, str] = {
     "helper": "helper_addresses",
     "nhrp_nhs": "nhrp_nhs",
+    "hsrp_groups": "hsrp_groups",
+    "hsrp_vip": "hsrp_groups",
+    "vrrp_groups": "vrrp_groups",
+    "glbp_groups": "glbp_groups",
+    "secondary_ips": "secondary_ips",
+    "igmp_join_groups": "igmp_join_groups",
+    "igmp_static_groups": "igmp_static_groups",
 }
 
 
@@ -462,12 +485,15 @@ def is_native_iface_member_op(op: "ChangeOp") -> bool:
       ``_proposal_from_ops`` (batched parity — the rebuilt list IS the
       parsed list); the derived whole-list ``("interface", <norm>,
       <field>)`` twin is retired by the generic container prefix-claim.
-    - ``LIST_REMOVE ("field", "interface", <as-written>, "helper"|"nhrp_nhs",
-      <ip>)`` — byte-exact colon-split of the legacy 5-segment tombstone
-      (regenerated via ``encode_legacy`` at the same walk position).
-      SKIPPED from the batched reconstruction and replayed by the engine
-      with the R.0 re-added-later rule (member-SET lines) — the helper/nhs
-      refresh capability; withdrawal applies == legacy.
+    - ``LIST_REMOVE ("field", "interface", <as-written>, <kind>, <key>)``
+      with kind in ``IFACE_MEMBER_REMOVAL_FIELDS`` (helper / nhrp_nhs from
+      8e; FHRP group removals, the ``hsrp_vip`` attr-reset, secondary-IP
+      and IGMP-group removals from WI-DB1-B1, CCR Appendix AA) — byte-exact
+      colon-split of the legacy 5-segment tombstone (regenerated via
+      ``encode_legacy`` at the same walk position).  SKIPPED from the
+      batched reconstruction and replayed by the engine with the R.0
+      re-added-later rule (member-SET lines) — the refresh capability;
+      withdrawal applies == legacy.
 
     Derived twins (same paths, ``origin="derived"``) return False (origin
     gate) and keep the batched legacy path so natives-less producers

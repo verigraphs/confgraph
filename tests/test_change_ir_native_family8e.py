@@ -112,9 +112,20 @@ class TestBoundary:
             "glbp_groups",
             "ospf_message_digest_keys",
         }
+        # Pin flipped in place by WI-DB1-B1 (CCR Appendix AA): the registry
+        # gained the previously parser-blind interface-child negation kinds
+        # (FHRP group removals, the hsrp_vip attr-reset, secondary-IP and
+        # IGMP-group removals) beside the original 8e pair.
         assert IFACE_MEMBER_REMOVAL_FIELDS == {
             "helper": "helper_addresses",
             "nhrp_nhs": "nhrp_nhs",
+            "hsrp_groups": "hsrp_groups",
+            "hsrp_vip": "hsrp_groups",
+            "vrrp_groups": "vrrp_groups",
+            "glbp_groups": "glbp_groups",
+            "secondary_ips": "secondary_ips",
+            "igmp_join_groups": "igmp_join_groups",
+            "igmp_static_groups": "igmp_static_groups",
         }
 
 

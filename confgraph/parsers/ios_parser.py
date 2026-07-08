@@ -1962,16 +1962,20 @@ class IOSParser(BaseParser):
 
     def _queue_native_iface_member_removal(self, tombstone: str, obj):
         """Build + queue a native family-8e interface member-removal op from
-        its 5-segment ``field:interface:<name>:helper|nhrp_nhs:<ip>``
-        tombstone (the two interface NESTED_DELETION_RULES templates),
-        returning its ``encode_legacy`` artifacts so the caller re-emits
-        the byte-exact legacy tombstone FROM the op (single source, CCR
-        Appendix X — the family-7a ``_queue_native_vrf_removal`` pattern).
+        its 5-segment ``field:interface:<name>:<kind>:<key>`` tombstone
+        (the ``interface:`` NESTED_DELETION_RULES templates — helper /
+        nhrp_nhs from 8e, plus the WI-DB1-B1 kinds: FHRP group removals,
+        the ``hsrp_vip`` attr-reset, secondary-IP and IGMP-group removals,
+        CCR Appendix AA), returning its ``encode_legacy`` artifacts so the
+        caller re-emits the byte-exact legacy tombstone FROM the op (single
+        source, CCR Appendix X — the family-7a
+        ``_queue_native_vrf_removal`` pattern).
 
         Path = the colon-split of the tombstone (identical to the deriver's
-        path — exact-path dedupe retires the derived twin); the child
-        patterns are IPv4-dotted-quad only, so the split is always 5
-        segments (no IPv6 colon exposure).  Emitted UNCONDITIONALLY at the
+        path — exact-path dedupe retires the derived twin); every kind's
+        key operand is colon-free (dotted-quads, canonical CIDR, group
+        numbers), so the split is always 5 segments (no IPv6 colon
+        exposure).  Emitted UNCONDITIONALLY at the
         negation's true line; the re-added-later refresh shape is resolved
         structurally by the engine replay against the positive member SETs'
         last-occurrence lines (R.0 — NOT emission suppression, so the
@@ -4006,6 +4010,38 @@ class IOSParser(BaseParser):
         mi_ch = intf_obj.find_child_objects(r"^\s+no\s+ip\s+ospf\s+mtu-ignore\s*$")
         if mi_ch:
             ops.append(_unset("ospf_mtu_ignore", mi_ch[-1]))
+
+        # WI-DB1-B1 (CCR Appendix AA.1) — four more F1-silent negations.
+        # Each positive parse is a positive-only regex, so the `no` form
+        # parses to the False default and is invisible to the merger without
+        # a tombstone.  NX-OS/EOS inherit via super() (same spellings).
+
+        # no spanning-tree guard root — stp_root_guard (default False).
+        rg_ch = intf_obj.find_child_objects(
+            r"^\s+no\s+spanning-tree\s+guard\s+root\s*$"
+        )
+        if rg_ch:
+            ops.append(_unset("stp_root_guard", rg_ch[-1]))
+
+        # no switchport port-security mac-address sticky — port_security_sticky.
+        # Disjoint from the bare `no switchport port-security` detection
+        # above ($-anchored).
+        st_ch = intf_obj.find_child_objects(
+            r"^\s+no\s+switchport\s+port-security\s+mac-address\s+sticky\s*$"
+        )
+        if st_ch:
+            ops.append(_unset("port_security_sticky", st_ch[-1]))
+
+        # no mab / no dot1x mab — dot1x_mab (positive parse is the bare
+        # `mab` form; both negation spellings reset the same field).
+        mab_ch = intf_obj.find_child_objects(r"^\s+no\s+(?:dot1x\s+)?mab\s*$")
+        if mab_ch:
+            ops.append(_unset("dot1x_mab", mab_ch[-1]))
+
+        # no ip pim bfd — pim_bfd (default False).
+        pb_ch = intf_obj.find_child_objects(r"^\s+no\s+ip\s+pim\s+bfd\s*$")
+        if pb_ch:
+            ops.append(_unset("pim_bfd", pb_ch[-1]))
 
         return ops
 
@@ -7185,6 +7221,16 @@ class IOSParser(BaseParser):
                         for i, name in enumerate(rule.child_groups)
                     }
                     ctx = {**parent_ctx, **child_ctx}
+                    # WI-DB1-B1 (CCR Appendix AA.2): optional per-rule
+                    # normalizer — computes canonical extra template keys
+                    # (e.g. secondary-ip dotted/CIDR → one str(IPv4Interface)
+                    # key); a None return skips the line (unparseable
+                    # operand stays blind, exactly as before the rule).
+                    if rule.derive is not None:
+                        extra = rule.derive(ctx)
+                        if extra is None:
+                            continue
+                        ctx.update(extra)
                     nested_tombstone = "field:" + rule.template.format(**ctx)
                     # Change-IR family 7a (CCR Appendix R): the VRF-shaped
                     # nested removals (route-target / rd — the WI-7 registry

@@ -35,7 +35,7 @@ Stored in: ``ParsedConfig.no_commands``
 Resolved in: ``merger._del_field`` → ``_access_bgp_af_redistribute``
 """
 
-from typing import NamedTuple
+from typing import Any, Callable, NamedTuple
 
 
 class NestedDeletionRule(NamedTuple):
@@ -52,6 +52,13 @@ class NestedDeletionRule(NamedTuple):
         template:       ``str.format``-style template whose keys are the union
             of *parent_groups* and *child_groups*.  Prefixed with ``field:``
             before being appended to ``ParsedConfig.no_commands``.
+        derive:         Optional normalizer (WI-DB1-B1, CCR Appendix AA.2):
+            called with the captured-groups dict, returns EXTRA template keys
+            (e.g. a canonical CIDR string computed from ip+mask captures so
+            the tombstone key byte-matches the positive member-op key), or
+            ``None`` to skip the matched line entirely (unparseable operand
+            stays blind — identical to today).  Default ``None`` — every
+            rule without a normalizer behaves exactly as before.
     """
 
     parent_pattern: str
@@ -59,6 +66,24 @@ class NestedDeletionRule(NamedTuple):
     child_pattern: str
     child_groups: list
     template: str
+    derive: "Callable[[dict], dict[str, Any] | None] | None" = None
+
+
+def _derive_secondary_cidr(ctx: dict) -> "dict[str, Any] | None":
+    """Canonical ``str(IPv4Interface)`` key for a secondary-IP removal.
+
+    Accepts either the IOS dotted form (``ip`` + ``mask`` captures) or the
+    NX-OS/EOS CIDR form (``addr`` capture).  Returns ``None`` when the
+    operand does not parse — the line stays blind, as today.
+    """
+    from ipaddress import IPv4Interface
+
+    try:
+        if ctx.get("addr"):
+            return {"cidr": str(IPv4Interface(ctx["addr"]))}
+        return {"cidr": str(IPv4Interface(f"{ctx['ip']}/{ctx['mask']}"))}
+    except (KeyError, ValueError):
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -166,5 +191,99 @@ NESTED_DELETION_RULES: list[NestedDeletionRule] = [
         child_pattern=r"^no\s+rd(?:\s+(\S+))?\s*$",
         child_groups=["rd"],
         template="vrfs:{name}:rd",
+    ),
+    # ------------------------------------------------------------------
+    # WI-DB1-B1 (CCR Appendix AA.2) — interface container removals.
+    # All templates start ``interface:`` so the shared walk queues a native
+    # line-numbered LIST_REMOVE (family-8e member machinery) and regenerates
+    # the byte-exact tombstone FROM the op.  Kind tokens are the model field
+    # names (classifier attribution via _tombstone_area for free); the one
+    # exception is ``hsrp_vip`` (attr-reset, no model-field twin).
+    # Child patterns are $-anchored: FHRP attr-reset grammar beyond the HSRP
+    # VIP (priority/preempt/timers/track/authentication/…) deliberately does
+    # NOT match — left blind and disclosed (AA.3).
+    # ------------------------------------------------------------------
+    # Whole HSRP group removal — ``no standby 10`` (IOS) / ``no hsrp 10``
+    # (NX-OS sub-block header negation, a direct interface child).
+    # Tombstone: ``field:interface:Vlan100:hsrp_groups:10``
+    NestedDeletionRule(
+        parent_pattern=r"^interface\s+(\S+)\s*$",
+        parent_groups=["name"],
+        child_pattern=r"^no\s+standby\s+(\d+)\s*$",
+        child_groups=["group"],
+        template="interface:{name}:hsrp_groups:{group}",
+    ),
+    NestedDeletionRule(
+        parent_pattern=r"^interface\s+(\S+)\s*$",
+        parent_groups=["name"],
+        child_pattern=r"^no\s+hsrp\s+(\d+)\s*$",
+        child_groups=["group"],
+        template="interface:{name}:hsrp_groups:{group}",
+    ),
+    # HSRP VIP attr-reset — ``no standby 1 ip [10.40.1.254]``: resets the
+    # group's virtual_ip to None (the group itself survives).  The stated
+    # address is not baseline-checked (the device errors on a mismatch; a
+    # parse cannot).  Tombstone: ``field:interface:Vlan100:hsrp_vip:1``
+    NestedDeletionRule(
+        parent_pattern=r"^interface\s+(\S+)\s*$",
+        parent_groups=["name"],
+        child_pattern=r"^no\s+standby\s+(\d+)\s+ip(?:\s+\d+\.\d+\.\d+\.\d+)?\s*$",
+        child_groups=["group"],
+        template="interface:{name}:hsrp_vip:{group}",
+    ),
+    # Whole VRRP / GLBP group removals — ``no vrrp 20`` / ``no glbp 30``.
+    NestedDeletionRule(
+        parent_pattern=r"^interface\s+(\S+)\s*$",
+        parent_groups=["name"],
+        child_pattern=r"^no\s+vrrp\s+(\d+)\s*$",
+        child_groups=["group"],
+        template="interface:{name}:vrrp_groups:{group}",
+    ),
+    NestedDeletionRule(
+        parent_pattern=r"^interface\s+(\S+)\s*$",
+        parent_groups=["name"],
+        child_pattern=r"^no\s+glbp\s+(\d+)\s*$",
+        child_groups=["group"],
+        template="interface:{name}:glbp_groups:{group}",
+    ),
+    # Secondary-address removal — IOS dotted-mask and NX-OS/EOS CIDR forms.
+    # ``derive`` computes ONE canonical ``str(IPv4Interface)`` key so the
+    # tombstone byte-matches the positive member-SET key (the R.0 basis).
+    # Tombstone: ``field:interface:Gi0/1:secondary_ips:10.0.1.5/24``
+    NestedDeletionRule(
+        parent_pattern=r"^interface\s+(\S+)\s*$",
+        parent_groups=["name"],
+        child_pattern=(
+            r"^no\s+ip\s+address\s+(\d+\.\d+\.\d+\.\d+)"
+            r"\s+(\d+\.\d+\.\d+\.\d+)\s+secondary\s*$"
+        ),
+        child_groups=["ip", "mask"],
+        template="interface:{name}:secondary_ips:{cidr}",
+        derive=_derive_secondary_cidr,
+    ),
+    NestedDeletionRule(
+        parent_pattern=r"^interface\s+(\S+)\s*$",
+        parent_groups=["name"],
+        child_pattern=r"^no\s+ip\s+address\s+(\d+\.\d+\.\d+\.\d+/\d+)\s+secondary\s*$",
+        child_groups=["addr"],
+        template="interface:{name}:secondary_ips:{cidr}",
+        derive=_derive_secondary_cidr,
+    ),
+    # IGMP group-membership removals — dotted-quad operands only (SSM
+    # ``… source S`` and non-address operands stay blind, disclosed).
+    # Tombstone: ``field:interface:Gi0/1:igmp_join_groups:239.1.1.1``
+    NestedDeletionRule(
+        parent_pattern=r"^interface\s+(\S+)\s*$",
+        parent_groups=["name"],
+        child_pattern=r"^no\s+ip\s+igmp\s+join-group\s+(\d+\.\d+\.\d+\.\d+)\s*$",
+        child_groups=["group"],
+        template="interface:{name}:igmp_join_groups:{group}",
+    ),
+    NestedDeletionRule(
+        parent_pattern=r"^interface\s+(\S+)\s*$",
+        parent_groups=["name"],
+        child_pattern=r"^no\s+ip\s+igmp\s+static-group\s+(\d+\.\d+\.\d+\.\d+)\s*$",
+        child_groups=["group"],
+        template="interface:{name}:igmp_static_groups:{group}",
     ),
 ]
