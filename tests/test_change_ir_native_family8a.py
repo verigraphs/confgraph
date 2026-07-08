@@ -303,15 +303,26 @@ class TestRetirement:
             ), sect
 
     def test_unmigrated_singletons_still_derived(self):
-        # Pin flipped by WI-8c (CCR Appendix V): the original control was
-        # ``vtp`` — migrated in family 8c, so the still-unmigrated control is
-        # now ``nat`` (custom ``_nat_rule``, no native emission).
-        pc = _parse(
-            "ip nat pool POOL1 10.1.1.1 10.1.1.10 netmask 255.255.255.0\n"
-            "ntp server 10.0.0.1\n"
+        # Pin flipped by WI-8c (control was ``vtp``) and AGAIN by WI-8d (CCR
+        # Appendix W: ``nat``/``crypto`` — the last un-migrated singletons —
+        # are now native).  The singleton universe is FULLY migrated, so the
+        # control becomes the NATIVES-LESS PRODUCER (a hand-built
+        # ParsedConfig — JunOS/PAN-OS/hand-built shape): with no native ops,
+        # the derived whole-singleton SET must SURVIVE composition — the
+        # graceful-degradation guarantee this pin always protected.
+        from confgraph.models.ntp import NTPConfig, NTPServer
+        from confgraph.models.parsed_config import ParsedConfig
+
+        pc = ParsedConfig(
+            source_os="ios",
+            ntp=NTPConfig(
+                object_id="ntp",
+                source_os="ios",
+                servers=[NTPServer(address="10.0.0.1")],
+            ),
         )
         ops = derive_ops(pc)
-        assert any(op.path == ("nat",) and op.origin == "derived" for op in ops)
+        assert any(op.path == ("ntp",) and op.origin == "derived" for op in ops)
 
     def test_anti_rot_family8a_never_derived(self):
         pc = _parse(KITCHEN_SINK + "no snmp-server\nno ip domain-lookup\n")

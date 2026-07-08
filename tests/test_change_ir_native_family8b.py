@@ -328,18 +328,39 @@ class TestRetirement:
             assert sum(1 for op in ops if op.path == (sect, "instance")) == 1, sect
 
     def test_unmigrated_singletons_still_derived(self):
-        # Pin flipped by WI-8c (CCR Appendix V): the original controls were
-        # ``vtp``/``cdp`` — both migrated in family 8c.  The still-unmigrated
-        # controls are now ``nat`` (custom ``_nat_rule``) and ``crypto``
-        # (``_singleton_rule``), neither of which has native emission.
-        pc = _parse(
-            "ip nat pool POOL1 10.1.1.1 10.1.1.10 netmask 255.255.255.0\n"
-            "crypto isakmp policy 10\n encryption aes\n"
-            "ip dhcp snooping\n"
+        # Pin flipped by WI-8c (controls were ``vtp``/``cdp``) and AGAIN by
+        # WI-8d (CCR Appendix W: ``nat``/``crypto`` — the last un-migrated
+        # singletons — are now native).  The singleton universe is FULLY
+        # migrated, so the control becomes the NATIVES-LESS PRODUCER (a
+        # hand-built ParsedConfig — JunOS/PAN-OS/hand-built shape): with no
+        # native ops, the derived whole-singleton SETs must SURVIVE
+        # composition — the graceful-degradation guarantee this pin always
+        # protected.
+        from confgraph.models.dhcp import DHCPConfig
+        from confgraph.models.nat import NATConfig, NATPool
+        from confgraph.models.parsed_config import ParsedConfig
+
+        pc = ParsedConfig(
+            source_os="ios",
+            nat=NATConfig(
+                object_id="nat",
+                source_os="ios",
+                pools=[
+                    NATPool(
+                        name="POOL1",
+                        start_address="10.1.1.1",
+                        end_address="10.1.1.10",
+                        netmask="255.255.255.0",
+                    )
+                ],
+            ),
+            dhcp=DHCPConfig(
+                object_id="dhcp", source_os="ios", snooping_enabled=True
+            ),
         )
         ops = derive_ops(pc)
         assert any(op.path == ("nat",) and op.origin == "derived" for op in ops)
-        assert any(op.path == ("crypto",) and op.origin == "derived" for op in ops)
+        assert any(op.path == ("dhcp",) and op.origin == "derived" for op in ops)
 
     def test_anti_rot_family8b_never_derived(self):
         pc = _parse(KITCHEN_SINK + "no ip multicast-routing\nno ip flow-export\n")

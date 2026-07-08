@@ -1688,6 +1688,7 @@ class IOSParser(BaseParser):
         ops.extend(self._native_vrf_ops(pc))
         ops.extend(self._native_singleton_section_ops(pc))
         ops.extend(self._native_vlan_ops(pc))
+        ops.extend(self._native_simple_keyed_list_ops(pc))
         pc.native_change_ops = ops
 
     def _queue_native_static_delete(self, tombstone: str, obj):
@@ -1899,6 +1900,52 @@ class IOSParser(BaseParser):
         ops.sort(key=lambda op: op.line_no)
         return ops
 
+    def _native_simple_keyed_list_ops(self, pc) -> list:
+        """Native family-8d shape-1 ops (CCR Appendix W): per-entry keyed
+        SETs for the remaining simple keyed collections (``lines`` /
+        ``class_maps`` / ``policy_maps`` / ``rip_instances``).
+
+        A parser-agnostic STATE WALK over the FINAL parsed lists (covers the
+        inherited NX-OS/EOS/IOS-XR parses uniformly — runs at parse
+        finalization via ``_attach_native_change_ops``).  Each entry emits
+        ``SET (<field>, *simple_keyed_list_key(...))`` — the EXACT derived
+        path, so the exact-path dedupe in ``derive_ops`` retires the derived
+        twin — carrying the entry's OWN block-head provenance (all four
+        models extend BaseConfigObject) in parse order (== the legacy
+        proposal list order, so duplicate-key entries keep their last-wins
+        outcome).  ZERO negation surface exists for these collections
+        (W.0), so no ordering ever rests on these lines and the ops
+        deliberately flow the BATCHED engine path (no ``is_native_*``
+        predicate — the 8c ``lacp_system_priority`` posture): zero engine
+        change, parity by construction.  IOS-XR emits them harmlessly
+        (path-identical keyed-replace parity — the 8c vlan posture);
+        JunOS/PAN-OS are natives-less, so ``zones`` (PAN-OS-only) stays
+        derived by construction.
+        """
+        from confgraph.change_ir import (
+            ChangeOp,
+            Verb,
+            simple_keyed_list_fields,
+            simple_keyed_list_key,
+        )
+
+        ops: list = []
+        for field in sorted(simple_keyed_list_fields()):
+            for item in getattr(pc, field, None) or []:
+                raw_lines = getattr(item, "raw_lines", None) or []
+                line_numbers = getattr(item, "line_numbers", None) or []
+                ops.append(
+                    ChangeOp(
+                        verb=Verb.SET,
+                        path=(field, *simple_keyed_list_key(field, item)),
+                        value=item,
+                        source_line=raw_lines[0].strip() if raw_lines else "",
+                        line_no=line_numbers[0] if line_numbers else -1,
+                        origin="native",
+                    )
+                )
+        return ops
+
     def _singleton_section_gated(self) -> bool:
         """Family-8a per-OS gate (CCR Appendix T.0): True iff this parser's
         comms-singleton surface must stay fully DERIVED (no native ops, the
@@ -1962,6 +2009,7 @@ class IOSParser(BaseParser):
         from confgraph.change_ir import (
             ChangeOp,
             Verb,
+            singleton_create_mode,
             singleton_line_detected_scalars,
             singleton_member_key,
             singleton_member_kinds,
@@ -1993,15 +2041,26 @@ class IOSParser(BaseParser):
 
             _emit((sect, "instance"), obj)
 
+            # Family 8d create-mode dispatch (CCR Appendix W.1): "replace"
+            # sections (crypto — legacy atomic ``_singleton_rule``) emit the
+            # create op ONLY (the value IS the op); "adopt" sections (nat —
+            # legacy ``_nat_rule``) emit NO scalar ops (scalars ride the
+            # create value on adoption and stay legacy-blind on an existing
+            # baseline in BOTH modes) but keep the member walk.
+            mode = singleton_create_mode(sect)
+            if mode == "replace":
+                continue
+
             model_fields = type(obj).model_fields
-            scalar_family = singleton_scalar_fields(sect)
-            line_detected = singleton_line_detected_scalars(sect)
-            for fname in (f for f in model_fields if f in scalar_family):
-                if fname in line_detected:
-                    continue  # T.2 — emitted by the line scans below
-                value = getattr(obj, fname)
-                if value != model_fields[fname].default:
-                    _emit((sect, "scalar", fname), value)
+            if mode != "adopt":
+                scalar_family = singleton_scalar_fields(sect)
+                line_detected = singleton_line_detected_scalars(sect)
+                for fname in (f for f in model_fields if f in scalar_family):
+                    if fname in line_detected:
+                        continue  # T.2 — emitted by the line scans below
+                    value = getattr(obj, fname)
+                    if value != model_fields[fname].default:
+                        _emit((sect, "scalar", fname), value)
 
             member_kinds = singleton_member_kinds(sect)
             for lf in (f for f in model_fields if f in member_kinds):

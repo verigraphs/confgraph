@@ -148,9 +148,12 @@ __all__ = [
     "singleton_member_key",
     "singleton_scalar_fields",
     "singleton_line_detected_scalars",
+    "singleton_create_mode",
     "is_native_singleton_section_op",
     "is_native_singleton_instance_create_op",
     "is_native_vlan_op",
+    "simple_keyed_list_fields",
+    "simple_keyed_list_key",
 ]
 
 
@@ -1682,7 +1685,62 @@ _SINGLETON_MEMBER_KEYS: dict[str, dict[str, Callable[[Any], tuple[str, ...]]]] =
         "vlan_configs": lambda v: (str(v.vlan_id),),
     },
     "vtp": {},
+    # Family 8d (CCR Appendix W) — the two non-additive singletons.  ``nat``
+    # is create-mode "adopt" (legacy ``_nat_rule``): member kinds mirror the
+    # rule's keyed dict-merges EXACTLY (pools by name, dynamic entries by
+    # ACL, static entries by (local_ip, local_port) — ``None`` port uses the
+    # ``or ""`` idiom); NO scalar ops are ever emitted (scalars ride the
+    # create op value on adoption and are legacy-blind on an existing
+    # baseline in BOTH modes — W.2).  ``crypto`` is create-mode "replace"
+    # (legacy ``_singleton_rule`` atomic overwrite): create-op-only, no
+    # member kinds.
+    "nat": {
+        "pools": lambda p: (p.name,),
+        "dynamic_entries": lambda e: (e.acl,),
+        "static_entries": lambda e: (
+            str(e.local_ip),
+            str(e.local_port) if e.local_port is not None else "",
+        ),
+    },
+    "crypto": {},
 }
+
+# Family 8d (CCR Appendix W): per-section CREATE-MODE — how the engine's
+# creation pre-pass consumes the ``SET (<sect>, "instance")`` op, mirroring
+# the section's LEGACY merge rule exactly:
+#
+# - "seed" (default, 8a/8b/8c): seed an ABSENT section via the generic
+#   reset-to-default seed; existing sections NO-OP (the retired SET was
+#   inert — scalars and members are natively rebuilt).
+# - "adopt" (legacy ``_nat_rule``): an ABSENT section adopts the create op's
+#   value WHOLESALE (scalars/nested sub-objects the walk cannot rebuild —
+#   nat.timeouts et al. — ride the value, exactly the legacy deepcopy-adopt
+#   arm); an existing section NO-OPs and ONLY the member ops merge onto it
+#   (the legacy keyed dict-merges; scalars stay legacy-blind in both modes).
+#   The parser emits NO scalar ops for adopt sections.
+# - "replace" (legacy ``_singleton_rule``): the create op's value replaces
+#   the section UNCONDITIONALLY (atomic overwrite).  The parser emits the
+#   create op ONLY (no scalar/member decomposition — the value IS the op).
+#
+# Adopt/replace sections are SEED-IMMUNE by construction: every model field
+# rides the create value, so a future model field can never be silently
+# dropped (the T.3 completeness partition is unnecessary for them; the
+# anti-rot pins assert the mode registrations and the no-scalar-op rule
+# instead).
+_SINGLETON_CREATE_MODES: dict[str, str] = {
+    "nat": "adopt",
+    "crypto": "replace",
+}
+
+
+def singleton_create_mode(section: str) -> str:
+    """Create-mode for a migrated singleton section (CCR Appendix W).
+
+    ``"seed"`` / ``"adopt"`` / ``"replace"`` — codec-owned; the parser's
+    emission walk and the engine's creation pre-pass MUST share this
+    registry, never re-implement the mode split.
+    """
+    return _SINGLETON_CREATE_MODES.get(section, "seed")
 
 # Scalars whose native op is LINE-DETECTED (tri-state), not state-derived —
 # the two True-default booleans whose positive re-assert/refresh is invisible
@@ -1764,12 +1822,14 @@ def singleton_scalar_fields(section: str) -> frozenset[str]:
     from confgraph.models.aaa import AAAConfig
     from confgraph.models.bfd import BFDConfig
     from confgraph.models.cdp import CDPConfig
+    from confgraph.models.crypto import CryptoConfig
     from confgraph.models.dhcp import DHCPConfig
     from confgraph.models.dns import DNSConfig
     from confgraph.models.lldp import LLDPConfig
     from confgraph.models.logging_config import SyslogConfig
     from confgraph.models.mpls import MPLSConfig
     from confgraph.models.multicast import MulticastConfig
+    from confgraph.models.nat import NATConfig
     from confgraph.models.netflow import NetFlowConfig
     from confgraph.models.ntp import NTPConfig
     from confgraph.models.snmp import SNMPConfig
@@ -1795,6 +1855,11 @@ def singleton_scalar_fields(section: str) -> frozenset[str]:
         "cdp": CDPConfig,
         "spanning_tree": STPConfig,
         "vtp": VTPConfig,
+        # Family 8d (CCR Appendix W) — registered for completeness pins only:
+        # the parser NEVER emits scalar ops for adopt/replace sections (their
+        # scalars ride the create op value — W.1/W.2).
+        "nat": NATConfig,
+        "crypto": CryptoConfig,
     }
     fields: set[str] = set()
     for name, info in models[section].model_fields.items():
@@ -1924,6 +1989,39 @@ def is_native_vlan_op(op: "ChangeOp") -> bool:
     if op.verb is Verb.OBJECT_DELETE:
         return path[0] == "vlan"
     return False
+
+
+@_lru_cache(maxsize=1)
+def simple_keyed_list_fields() -> frozenset[str]:
+    """Family-8d boundary, shape 1 (CCR Appendix W): the remaining simple
+    keyed top-level collections migrated to native emission.
+
+    ``lines`` / ``class_maps`` / ``policy_maps`` / ``rip_instances`` — all
+    ``_SIMPLE_LIST_FIELDS`` keyed-replace collections with ZERO negation
+    surface (no deletion-walk shape or merger accessor targets them, W.0),
+    populated only by the IOS-family parsers.  The native op is a per-entry
+    ``SET (<field>, *simple_keyed_list_key(...))`` at the EXACT derived
+    path, so the exact-path dedupe in :func:`derive_ops` retires the
+    derived twin; the op deliberately flows the BATCHED engine path
+    (no ``is_native_*`` predicate — the 8c ``lacp_system_priority``
+    posture): zero engine change, parity by construction.
+
+    ``zones`` is deliberately NOT here: only PAN-OS populates it and
+    PANOSParser is a natives-less BaseParser subclass (Phase-5 gate) — its
+    derived keyed SETs keep exact legacy behavior, pinned.
+    """
+    return frozenset({"lines", "class_maps", "policy_maps", "rip_instances"})
+
+
+def simple_keyed_list_key(field_name: str, item: Any) -> tuple[str, ...]:
+    """Identity path segments for a family-8d shape-1 entry.
+
+    Delegates to the deriver's ``_TOP_LIST_KEYS`` so native paths are
+    identical to the derived SET paths by construction (the exact-path
+    dedupe relies on this).  Codec-owned; the parser must not re-implement
+    the keys.
+    """
+    return _TOP_LIST_KEYS[field_name](item)
 
 
 def _static_nh_key(r: Any) -> str:
