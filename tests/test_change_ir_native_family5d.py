@@ -20,8 +20,10 @@ the derived whole-instance ``SET ("bgp_instances", asn, vrf)`` STILL SURVIVES
   removal encodes to NOTHING; the derived whole-instance SET survives; anti-rot
   (no 5c-B.1 AF form derived); NX-OS VRF instances carry no AFs (no-op).
 
-The three UNPARSED AF scalars (default_information_originate / auto_summary /
-synchronization) are never set by the AF parser → nothing emitted (task #22).
+The three AF scalars (default_information_originate / auto_summary /
+synchronization) were unparsed at 5c-B.1 time; task #22 (WI-DB3, Appendix Z)
+delivered their parse + native emission — see ``test_af_flag_scalars_now_native``
+below and ``test_change_ir_bgp_scalars.py`` for the full pins.
 """
 
 from __future__ import annotations
@@ -143,15 +145,28 @@ def test_prefix_validate_tristate_permissive_and_absent():
     assert not [o for o in _af_ops(absent) if o.path[-1] == "prefix_validate_allow_invalid"]
 
 
-def test_unparsed_af_scalars_emit_nothing():
-    # default_information_originate / auto_summary / synchronization are never
-    # parsed for BGP AF (task #22) — no native op regardless of the lines.
+def test_af_flag_scalars_now_native():
+    # PIN FLIPPED (WI-DB3, CCR Appendix Z): this test previously asserted the
+    # task-#22 DEFERRAL (default_information_originate / auto_summary /
+    # synchronization never parsed → no native op).  Task #22 delivers the
+    # parser support, so the three AF flag lines now emit line-detected
+    # AF-scalar SETs (True at their lines).
     pc = _parse(
         "router bgp 65000\n address-family ipv4\n"
         "  default-information originate\n  auto-summary\n  synchronization\n"
     )
     scal = [o for o in _af_ops(pc) if len(o.path) > 7 and o.path[7] == "scalar"]
-    assert scal == []
+    assert {(o.path[8], o.value) for o in scal} == {
+        ("default_information_originate", True),
+        ("auto_summary", True),
+        ("synchronization", True),
+    }
+    af = _parse("router bgp 65000\n address-family ipv4\n").bgp_instances[0].address_families[0]
+    assert (
+        af.default_information_originate,
+        af.auto_summary,
+        af.synchronization,
+    ) == (False, False, False)  # absence == model default (Z.0)
 
 
 def test_ipv6_af_and_multi_af():

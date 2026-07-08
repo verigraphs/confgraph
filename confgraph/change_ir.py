@@ -896,9 +896,14 @@ def is_native_bgp_op(op: "ChangeOp") -> bool:
 
     - ``SET ("bgp_instances", asn, vrf, "scalar", <field>)``
           instance scalar (router_id / cluster_id / confederation_id /
-          confederation_peers / rpki_server — parity scalars; and the
+          confederation_peers / rpki_server — parity scalars; the
           new-capability ``log_neighbor_changes`` tri-state True-default +
-          ``default_local_preference`` anchored default).  value = the scalar.
+          ``default_local_preference`` anchored default; and the task-#22
+          formerly-unparsed scalars — ``graceful_restart`` (+2 timers),
+          ``enforce_first_as`` / ``fast_external_fallover`` (tri-state
+          True-defaults), ``deterministic_med``, ``dampening``,
+          ``default_metric`` — line-detected SET-to-post-line-state, CCR
+          Appendix Z).  value = the scalar.
     - ``SET ("bgp_instances", asn, vrf, "bestpath", <option_field>)``
           one ``bgp bestpath …`` option → the ``bestpath_options`` sub-object.
     - ``SET ("bgp_instances", asn, vrf, "redistribute", <proto>, <pid>)``
@@ -928,7 +933,10 @@ def is_native_bgp_op(op: "ChangeOp") -> bool:
           AF ``aggregate-address`` positive member.
     - ``SET (…, "af", afi, safi, afvrf, "scalar", <field>)``
           AF scalar (``maximum_paths`` / ``maximum_paths_ibgp`` — positive-only;
-          tri-state None-default ``prefix_validate_allow_invalid``).
+          tri-state None-default ``prefix_validate_allow_invalid``; and the
+          task-#22 line-detected False-default flags
+          ``default_information_originate`` / ``auto_summary`` /
+          ``synchronization`` — CCR Appendix Z).
     - ``LIST_REMOVE ("bgp_instance", asn, vrf, "af", afi, safi, afvrf,
           "aggregate", <prefix>)`` — ops-only AF ``no aggregate-address``
           withdrawal (SINGULAR scope prefix, no legacy twin — encode_legacy

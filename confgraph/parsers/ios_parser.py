@@ -142,6 +142,8 @@ _IOS_KNOWN_CHILD_PATTERNS: list[tuple[str, list[str]]] = [
         r"^bestpath\b",             # NX-OS bare form
         r"^confederation\b",        # NX-OS bare form
         r"^graceful-restart\b",
+        r"^enforce-first-as\b",     # NX-OS bare form (task #22)
+        r"^fast-external-fallover\b",  # NX-OS bare form (task #22)
         r"^event-history\b",        # NX-OS cosmetic
     ]),
     (r"^router\s+isis\b", [
@@ -3242,6 +3244,101 @@ class IOSParser(BaseParser):
         os_val = getattr(self.os_type, "value", self.os_type)
         return os_val == "nxos" and bgp.vrf is not None
 
+    # ------------------------------------------------------------------ #
+    # Task #22 (CCR Appendix Z): line classifiers for the formerly-unparsed
+    # BGP scalars.  SINGLE SOURCE for both the state parse (parse_bgp /
+    # _parse_bgp_address_families FOLD the updates in line order —
+    # last-line-wins) and the native op emission (_native_bgp_ops emits one
+    # line-detected SET per update at the line), so parse and emission can
+    # never disagree.  Parser-absence == the model default for EVERY field
+    # (tri-state discipline for the True-default enforce_first_as /
+    # fast_external_fallover — the Appendix T pattern, NEVER the
+    # log_neighbor_changes trap).
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _bgp_instance_scalar22_updates(text: str) -> list[tuple[str, object]]:
+        """Field updates implied by ONE direct ``router bgp`` child line.
+
+        Spellings (Appendix Z.2 audit): IOS ``bgp graceful-restart
+        [restart-time N] [stalepath-time N]`` / ``bgp enforce-first-as`` /
+        ``bgp fast-external-fallover`` / ``bgp deterministic-med`` /
+        ``bgp dampening [params…]`` (flag only — params UNPARSED) /
+        ``default-metric N`` (classic direct-child form — NOT ``bgp
+        default-metric``), plus the NX-OS bare spellings of the first three
+        via the optional ``bgp`` prefix.  All ``no`` forms handled; a bare
+        ``no [bgp] graceful-restart`` resets the flag AND both timers
+        (device semantics — the timers are options of the same command).
+        Returns ``[]`` for every non-matching line.
+        """
+        t = text.strip()
+        m = re.match(r"^(?:bgp\s+)?graceful-restart(\s+.*)?$", t)
+        if m:
+            updates: list[tuple[str, object]] = [("graceful_restart", True)]
+            rest = m.group(1) or ""
+            rt = re.search(r"\brestart-time\s+(\d+)\b", rest)
+            if rt:
+                updates.append(
+                    ("graceful_restart_restart_time", int(rt.group(1)))
+                )
+            st = re.search(r"\bstalepath-time\s+(\d+)\b", rest)
+            if st:
+                updates.append(
+                    ("graceful_restart_stalepath_time", int(st.group(1)))
+                )
+            return updates
+        if re.match(r"^no\s+(?:bgp\s+)?graceful-restart\s*$", t):
+            return [
+                ("graceful_restart", False),
+                ("graceful_restart_restart_time", None),
+                ("graceful_restart_stalepath_time", None),
+            ]
+        if re.match(r"^no\s+(?:bgp\s+)?graceful-restart\s+restart-time(\s+\d+)?\s*$", t):
+            return [("graceful_restart_restart_time", None)]
+        if re.match(r"^no\s+(?:bgp\s+)?graceful-restart\s+stalepath-time(\s+\d+)?\s*$", t):
+            return [("graceful_restart_stalepath_time", None)]
+        if re.match(r"^(?:bgp\s+)?enforce-first-as\s*$", t):
+            return [("enforce_first_as", True)]
+        if re.match(r"^no\s+(?:bgp\s+)?enforce-first-as\s*$", t):
+            return [("enforce_first_as", False)]
+        if re.match(r"^(?:bgp\s+)?fast-external-fallover\s*$", t):
+            return [("fast_external_fallover", True)]
+        if re.match(r"^no\s+(?:bgp\s+)?fast-external-fallover\s*$", t):
+            return [("fast_external_fallover", False)]
+        if re.match(r"^bgp\s+deterministic-med\s*$", t):
+            return [("deterministic_med", True)]
+        if re.match(r"^no\s+bgp\s+deterministic-med\s*$", t):
+            return [("deterministic_med", False)]
+        if re.match(r"^bgp\s+dampening(\s+.*)?$", t):
+            return [("dampening", True)]
+        if re.match(r"^no\s+bgp\s+dampening(\s+.*)?$", t):
+            return [("dampening", False)]
+        m = re.match(r"^default-metric\s+(\d+)\s*$", t)
+        if m:
+            return [("default_metric", int(m.group(1)))]
+        if re.match(r"^no\s+default-metric(\s+\d+)?\s*$", t):
+            return [("default_metric", None)]
+        return []
+
+    @staticmethod
+    def _bgp_af_flag22_updates(text: str) -> list[tuple[str, object]]:
+        """Field updates implied by ONE ``address-family`` child line
+        (task #22 AF flags — False-default booleans, ``no`` form → False)."""
+        t = text.strip()
+        if re.match(r"^default-information\s+originate\s*$", t):
+            return [("default_information_originate", True)]
+        if re.match(r"^no\s+default-information\s+originate\s*$", t):
+            return [("default_information_originate", False)]
+        if re.match(r"^auto-summary\s*$", t):
+            return [("auto_summary", True)]
+        if re.match(r"^no\s+auto-summary\s*$", t):
+            return [("auto_summary", False)]
+        if re.match(r"^synchronization\s*$", t):
+            return [("synchronization", True)]
+        if re.match(r"^no\s+synchronization\s*$", t):
+            return [("synchronization", False)]
+        return []
+
     def _native_bgp_ops(self, pc) -> list:
         """Native family-5a BGP-neighbor ops (CCR Appendix H) in script order.
 
@@ -3485,6 +3582,20 @@ class IOSParser(BaseParser):
                         "default_local_preference", 100, c.text.strip(), c.linenum
                     )
 
+            # Task #22 (CCR Appendix Z): the formerly-unparsed instance
+            # scalars — line-detected (one SET per update at that line, value
+            # = the post-line state from the SHARED classifier used by
+            # parse_bgp, so parse and emission cannot disagree); ChangeSet-
+            # ordered replay makes last-line-wins device-correct.  GLOBAL
+            # instances only: the VRF scopes (IOS ``address-family ipv4 vrf
+            # N``, NX-OS ``vrf N``) do not parse these fields
+            # (_parse_bgp_vrf_instances — Z.4 follow-up), so emitting there
+            # would desync parse and replay.
+            if bgp.vrf is None:
+                for c in candidates:
+                    for fld, val in self._bgp_instance_scalar22_updates(c.text):
+                        _emit_scalar(fld, val, c.text.strip(), c.linenum)
+
             # Best-path options (nested sub-object) — state-derived (each option
             # defaults False; True ⇒ the ``bgp bestpath …`` line was written).
             bp = bgp.bestpath_options
@@ -3687,6 +3798,27 @@ class IOSParser(BaseParser):
                             origin="native",
                         )
                     )
+                # Task #22 (CCR Appendix Z): AF-level flags
+                # (default_information_originate / auto_summary /
+                # synchronization) — line-detected False-default booleans
+                # (positive → SET True, negation → SET False) via the SHARED
+                # classifier used by _parse_bgp_address_families.  Skipped for
+                # IOS-XR: its _parse_bgp_address_families override does not
+                # fold the flags (Phase-5 surface), so emitting here would
+                # desync parse and replay.
+                if getattr(self.os_type, "value", self.os_type) != "ios_xr":
+                    for c in af_children:
+                        for fld, val in self._bgp_af_flag22_updates(c.text):
+                            ops.append(
+                                ChangeOp(
+                                    verb=Verb.SET,
+                                    path=af_prefix + ("scalar", fld),
+                                    value=val,
+                                    source_line=c.text.strip(),
+                                    line_no=c.linenum,
+                                    origin="native",
+                                )
+                            )
                 # ops-only AF `no aggregate-address` (no legacy twin) —
                 # line-detected so delete/re-add of an aggregate is order-correct
                 # (both sides native, ChangeSet-ordered).
@@ -3991,6 +4123,27 @@ class IOSParser(BaseParser):
                 if dlp_m:
                     default_local_preference = int(dlp_m.group(1))
 
+            # Task #22 (CCR Appendix Z): the formerly-unparsed instance
+            # scalars — fold the SHARED line classifier over the DIRECT
+            # children in line order (last-line-wins on exact spellings).
+            # Parser-absence == the model default for EVERY field: the
+            # True-default tri-states (enforce_first_as /
+            # fast_external_fallover) stay True when no line matches
+            # (Appendix T discipline — never the log_neighbor_changes trap).
+            scalar22: dict[str, object] = {
+                "graceful_restart": False,
+                "graceful_restart_restart_time": None,
+                "graceful_restart_stalepath_time": None,
+                "enforce_first_as": True,
+                "fast_external_fallover": True,
+                "deterministic_med": False,
+                "dampening": False,
+                "default_metric": None,
+            }
+            for child in bgp_obj.children:
+                for fld, val in self._bgp_instance_scalar22_updates(child.text):
+                    scalar22[fld] = val
+
             # Best-path options
             bestpath_options = self._parse_bgp_bestpath_options(bgp_obj)
 
@@ -4040,6 +4193,7 @@ class IOSParser(BaseParser):
                     redistribute=redistribute,
                     no_commands=bgp_no_commands,
                     default_local_preference=default_local_preference,
+                    **scalar22,
                 )
             )
 
@@ -5790,6 +5944,18 @@ class IOSParser(BaseParser):
             ):
                 prefix_validate_allow_invalid = True
 
+            # Task #22 (CCR Appendix Z): AF-level flags — fold the SHARED
+            # line classifier in line order (last-line-wins); absence == the
+            # model default False for all three.
+            af_flags: dict[str, object] = {
+                "default_information_originate": False,
+                "auto_summary": False,
+                "synchronization": False,
+            }
+            for c in af_child.children:
+                for fld, val in self._bgp_af_flag22_updates(c.text):
+                    af_flags[fld] = val
+
             address_families.append(
                 BGPAddressFamily(
                     afi=afi,
@@ -5801,6 +5967,7 @@ class IOSParser(BaseParser):
                     maximum_paths=maximum_paths,
                     maximum_paths_ibgp=maximum_paths_ibgp,
                     prefix_validate_allow_invalid=prefix_validate_allow_invalid,
+                    **af_flags,
                 )
             )
 
