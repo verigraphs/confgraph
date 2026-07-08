@@ -5738,7 +5738,13 @@ class IOSParser(BaseParser):
             if m:
                 tombstones.append(f"field:dns:domain:{m.group(1)}")
         if parse.find_objects(r"^no\s+ip\s+domain.lookup\s*$"):
-            tombstones.append("singleton:dns")
+            # Targeted action tombstone — disables lookups ONLY.  The former
+            # ``singleton:dns`` emission wiped the whole DNS section (name
+            # servers, domain name) for a command that merely turns lookups
+            # off (WI-8-pre bug 3, CCR legacy_singleton_merge_bugs.md).  The
+            # merger accessor sets ``dns.lookup_enabled = False`` — an action
+            # value, not the model default (True).
+            tombstones.append("field:dns:lookup_disable")
 
         # --- NetFlow entry-level tombstones ---
         for obj in parse.find_objects(r"^no\s+ip\s+flow-export\s+destination\s+"):
