@@ -1685,6 +1685,7 @@ class IOSParser(BaseParser):
         ops.extend(self._native_isis_ops(pc))
         ops.extend(self._native_eigrp_ops(pc))
         ops.extend(self._native_ospf_ops(pc))
+        ops.extend(self._native_vrf_ops(pc))
         pc.native_change_ops = ops
 
     def _queue_native_static_delete(self, tombstone: str, obj):
@@ -1711,6 +1712,190 @@ class IOSParser(BaseParser):
         )
         self._pending_native_static_ops.append(op)
         return encode_legacy([op])
+
+    def _queue_native_vrf_removal(self, tombstone: str, obj):
+        """Build + queue a native family-7a VRF member-removal op from a
+        nested ``field:vrfs:…`` tombstone (``no route-target …`` /
+        ``no rd`` — the WI-7 registry shapes), returning its
+        ``encode_legacy`` artifacts so the caller re-emits the byte-exact
+        legacy tombstone FROM the op (single source, CCR Appendix R — the
+        family-4 ``_queue_native_static_delete`` pattern).
+
+        The op path is the colon-split of the tombstone (identical to the
+        deriver's path, so exact-path dedupe retires the derived twin), and
+        ``encode_legacy``'s ``":".join`` reproduces the string byte-for-byte
+        — including the RT value's own embedded colon (R.0 design item 2).
+        Emitted UNCONDITIONALLY at the negation's true line; the
+        re-added-later refresh shape is resolved structurally by the engine
+        replay against the positive member SETs' last-occurrence lines
+        (R.0 design item 1 — NOT emission suppression, so the legacy twin
+        keeps flowing and the round-trip pin holds).
+        """
+        from confgraph.change_ir import ChangeOp, Verb, encode_legacy
+
+        path = tuple(tombstone.split(":"))
+        verb = Verb.UNSET if path[3:] == ("rd",) else Verb.LIST_REMOVE
+        op = ChangeOp(
+            verb=verb,
+            path=path,
+            value=None,
+            source_line=obj.text.strip(),
+            line_no=obj.linenum,
+            origin="native",
+        )
+        self._pending_native_vrf_ops.append(op)
+        return encode_legacy([op])
+
+    def _queue_native_vrf_delete(self, tombstone: str, obj):
+        """Build + queue the native family-7a whole-VRF OBJECT_DELETE from a
+        top-level ``field:vrfs:<name>`` tombstone (``no vrf definition <name>``;
+        reused by the NX-OS ``no vrf context`` override), returning its
+        ``encode_legacy`` artifacts (byte-exact tombstone re-emitted from the
+        op — single source).  Line-numbered for 7b; applied DELETE-WINS-last
+        in 7a (CCR Appendix R.1).
+        """
+        from confgraph.change_ir import ChangeOp, Verb, encode_legacy
+
+        op = ChangeOp(
+            verb=Verb.OBJECT_DELETE,
+            path=tuple(tombstone.split(":")),
+            value=None,
+            source_line=obj.text.strip(),
+            line_no=obj.linenum,
+            origin="native",
+        )
+        self._pending_native_vrf_ops.append(op)
+        return encode_legacy([op])
+
+    def _native_vrf_ops(self, pc) -> list:
+        """Native family-7a VRF ops (CCR Appendix R) — positives + queued removals.
+
+        Positive side: a parser-agnostic STATE WALK over the FINAL ``pc.vrfs``
+        (covers IOS/NX-OS/EOS/IOS-XR instances uniformly — runs at parse
+        finalization via ``_attach_native_change_ops``, so no per-parser
+        pending resets are needed):
+
+        - ``SET ("vrfs", name, "scalar", <field>)`` per non-default scalar
+          (rd / route_map_import / route_map_export / description / vpnid —
+          the last two are unparsed everywhere today, emitted-if-non-default
+          for symmetry with the engine strip).
+        - ``SET ("vrfs", name, <rt_kind>, <rt>)`` per additive RT member,
+          carrying the member's LAST-occurrence line in the block (backward
+          ``raw_lines`` scan) — the R.0 re-added-later ordering basis for the
+          engine replay's refresh resolution.
+        - ``SET ("vrfs", name, "interface", <ifname>)`` per member (IOS-family
+          parsers never populate ``VRFConfig.interfaces`` — JunOS/PAN-OS do,
+          but they are natives-less BaseParser subclasses).
+
+        Delete side: the pending ops queued by ``_queue_native_vrf_removal`` /
+        ``_queue_native_vrf_delete`` at their true negation lines.
+
+        The derived whole-VRF ``SET ("vrfs", name)`` SURVIVES composition
+        (H.3 exclusion in ``derive_ops``) — the engine strips the natively
+        rebuilt fields from it (``_strip_native_vrf``) and this family's ops
+        are the sole appliers of that content in ops mode.  Retirement is 7b.
+        """
+        from confgraph.change_ir import ChangeOp, Verb
+
+        member_lines = self._vrf_member_last_lines()
+        ops: list = []
+        for vrf in getattr(pc, "vrfs", None) or []:
+            raw_lines = vrf.raw_lines or []
+            line_numbers = vrf.line_numbers or []
+            block_line = (
+                (raw_lines[0].strip() if raw_lines else ""),
+                (line_numbers[0] if line_numbers else -1),
+            )
+
+            def _emit(kind, key, value, _vrf=vrf, _blk=block_line):
+                # LAST-occurrence provenance from the parse-object scan (the
+                # R.0 re-added-later ordering basis — a re-added member
+                # carries the re-add line); block first line as fallback.
+                source_line, line_no = member_lines.get(
+                    (_vrf.name, kind, key), _blk
+                )
+                ops.append(
+                    ChangeOp(
+                        verb=Verb.SET,
+                        path=("vrfs", _vrf.name, kind, key),
+                        value=value,
+                        source_line=source_line,
+                        line_no=line_no,
+                        origin="native",
+                    )
+                )
+
+            if vrf.rd is not None:
+                _emit("scalar", "rd", vrf.rd)
+            if vrf.route_map_import is not None:
+                _emit("scalar", "route_map_import", vrf.route_map_import)
+            if vrf.route_map_export is not None:
+                _emit("scalar", "route_map_export", vrf.route_map_export)
+            if vrf.description is not None:
+                _emit("scalar", "description", vrf.description)
+            if vrf.vpnid is not None:
+                _emit("scalar", "vpnid", vrf.vpnid)
+            for kind in (
+                "route_target_import",
+                "route_target_export",
+                "route_target_both",
+            ):
+                for rt in getattr(vrf, kind):
+                    _emit(kind, rt, rt)
+            for ifname in vrf.interfaces:
+                _emit("interface", ifname, ifname)
+
+        ops.extend(getattr(self, "_pending_native_vrf_ops", None) or [])
+        return ops
+
+    def _vrf_member_last_lines(self) -> dict:
+        """Map ``(vrf_name, kind, key)`` → ``(source_line, linenum)`` for VRF
+        member/scalar lines, LAST occurrence winning (family 7a, CCR Appendix
+        R.0 — the re-added-later ordering basis for the engine replay).
+
+        One parse-object scan over every VRF block spelling the IOS-family
+        parsers share (IOS ``vrf definition`` / NX-OS ``vrf context`` /
+        EOS ``vrf instance`` / IOS-XR bare ``vrf NAME``), walking
+        ``all_children`` so route-target lines nested under
+        ``address-family`` are found (the NX-OS base-helper ``raw_lines``
+        do NOT include them — this scan is the reliable line source).
+        The IOS-XR bare-value RT stanza form is not matched (no keyed line
+        to attribute) — XR members fall back to the block first line, and
+        XR emits no VRF removals, so no ordering rests on it.
+        """
+        lines: dict = {}
+        parse = self._get_parse_obj()
+        for obj in parse.find_objects(r"^vrf\s+\S+"):
+            m = re.match(
+                r"^vrf\s+(?:(?:definition|context|instance)\s+)?(\S+)\s*$",
+                obj.text,
+            )
+            if not m:
+                continue
+            name = m.group(1)
+            for child in obj.all_children:
+                text = child.text.strip()
+                rt = re.match(
+                    r"^route-target\s+(import|export|both)\s+(?:evpn\s+)?(\S+)\s*$",
+                    text,
+                )
+                if rt:
+                    lines[(name, f"route_target_{rt.group(1)}", rt.group(2))] = (
+                        text,
+                        child.linenum,
+                    )
+                    continue
+                rd = re.match(r"^rd\s+(\S+)\s*$", text)
+                if rd:
+                    lines[(name, "scalar", "rd")] = (text, child.linenum)
+                    continue
+                rm = re.match(r"^route-map\s+(\S+)\s+(import|export)\s*$", text)
+                if rm:
+                    lines[(name, "scalar", f"route_map_{rm.group(2)}")] = (
+                        text,
+                        child.linenum,
+                    )
+        return lines
 
     def _native_static_ops(self, pc) -> list:
         """Native family-4 static-route ops (CCR Appendix G) in script order.
@@ -5294,6 +5479,12 @@ class IOSParser(BaseParser):
         # attached at finalization, interleaved with the route (re)creation
         # SET ops by line order.  Re-initialized per call.
         self._pending_native_static_ops: list = []
+        # Change-IR Phase 3 family 7a (CCR Appendix R): native VRF removal ops
+        # (nested ``no route-target``/``no rd`` + whole-VRF deletes) queued
+        # UNCONDITIONALLY at their true lines; the byte-exact ``field:vrfs:…``
+        # tombstones are regenerated FROM them (single source).  Re-initialized
+        # per call.
+        self._pending_native_vrf_ops: list = []
 
         # --- static route deletions ---
         # Tombstone format: "static:<vrf>:<dest/plen>[:<nh_spec>]" where vrf=""
@@ -5705,7 +5896,14 @@ class IOSParser(BaseParser):
         for obj in parse.find_objects(r"^no\s+vrf\s+definition\s+"):
             m = re.search(r"^no\s+vrf\s+definition\s+(\S+)", obj.text)
             if m:
-                tombstones.append(f"field:vrfs:{m.group(1)}")
+                # Change-IR family 7a (CCR Appendix R): queue the native
+                # line-numbered OBJECT_DELETE and regenerate the tombstone
+                # FROM it (single source, byte-exact).
+                tombstones.extend(
+                    self._queue_native_vrf_delete(
+                        f"field:vrfs:{m.group(1)}", obj
+                    ).no_commands
+                )
 
         # --- interface deletions ---
         # ``no interface Loopback0`` → ``interface:Loopback0``
@@ -5758,7 +5956,21 @@ class IOSParser(BaseParser):
                         for i, name in enumerate(rule.child_groups)
                     }
                     ctx = {**parent_ctx, **child_ctx}
-                    tombstones.append("field:" + rule.template.format(**ctx))
+                    nested_tombstone = "field:" + rule.template.format(**ctx)
+                    # Change-IR family 7a (CCR Appendix R): the VRF-shaped
+                    # nested removals (route-target / rd — the WI-7 registry
+                    # entries) are queued as NATIVE line-numbered ops and the
+                    # byte-exact tombstone is regenerated FROM the op at this
+                    # same position (single source, the family-4 pattern).
+                    # Non-VRF templates are unchanged.
+                    if rule.template.startswith("vrfs:"):
+                        tombstones.extend(
+                            self._queue_native_vrf_removal(
+                                nested_tombstone, child
+                            ).no_commands
+                        )
+                    else:
+                        tombstones.append(nested_tombstone)
 
         return tombstones
 

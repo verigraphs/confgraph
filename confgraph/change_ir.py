@@ -140,6 +140,8 @@ __all__ = [
     "is_native_ospf_network_removal_op",
     "is_native_ospf_area_range_removal_op",
     "is_native_ospf_instance_create_op",
+    "is_native_vrf_op",
+    "is_native_vrf_delete_op",
 ]
 
 
@@ -1432,6 +1434,130 @@ def is_native_ospf_op(op: "ChangeOp") -> bool:
     return False
 
 
+# VRF decomposition ``kind`` tokens carried at ``path[2]`` of a
+# ``("vrfs", name, kind, *key)`` native SET (family 7a, CCR Appendix R).  The
+# VRF identity is the single-segment ``name`` (``_TOP_LIST_KEYS["vrfs"]``).
+_VRF_SET_KINDS: frozenset[str] = frozenset(
+    {
+        "scalar",
+        "route_target_import",
+        "route_target_export",
+        "route_target_both",
+        "interface",
+    }
+)
+
+_VRF_RT_KINDS: frozenset[str] = frozenset(
+    {"route_target_import", "route_target_export", "route_target_both"}
+)
+
+
+def _is_vrf_member_removal(path: tuple[str, ...]) -> bool:
+    """True for the family-7a native RT-removal op path.
+
+    ``("field", "vrfs", <name>, "route_target_<kind>", *rt_segments)`` — the
+    byte-exact colon-split of the WI-7 legacy tombstone
+    ``field:vrfs:<name>:route_target_<kind>:<rt>`` (the RT value's embedded
+    colon splits into ≥2 segments; ``encode_legacy``'s ``":".join`` rejoins it
+    byte-exactly — CCR Appendix R.0 design item 2).
+    """
+    return (
+        len(path) >= 5
+        and path[0] == "field"
+        and path[1] == "vrfs"
+        and path[3] in _VRF_RT_KINDS
+    )
+
+
+def _is_vrf_rd_reset(path: tuple[str, ...]) -> bool:
+    """True for the family-7a native rd-reset op path.
+
+    ``("field", "vrfs", <name>, "rd")`` — byte-exact colon-split of the WI-7
+    ``field:vrfs:<name>:rd`` tombstone (``no rd [<rd>]`` inside a VRF block).
+    """
+    return (
+        len(path) == 4
+        and path[0] == "field"
+        and path[1] == "vrfs"
+        and path[3] == "rd"
+    )
+
+
+def _is_vrf_delete(path: tuple[str, ...]) -> bool:
+    """True for the family-7a native whole-VRF removal op path.
+
+    ``("field", "vrfs", <name>)`` — byte-exact colon-split of the WI-7
+    ``field:vrfs:<name>`` tombstone (``no vrf definition|context <name>``).
+    Emitted NATIVE + line-numbered (7b builds on it); in 7a it is applied
+    DELETE-WINS-last (delete-then-recreate both orders → ABSENT == legacy;
+    the ordering capability stays deferred, the L.7 posture).  The IOS-XR
+    ``vrf:<name>`` shape is NOT matched — it stays on the D1 fix-forward
+    path (``_OPS_OBJECT_DELETE_FIX_FORWARD``), regression-pinned.
+    """
+    return len(path) == 3 and path[0] == "field" and path[1] == "vrfs"
+
+
+def is_native_vrf_delete_op(op: "ChangeOp") -> bool:
+    """True iff *op* is the family-7a native whole-VRF OBJECT_DELETE."""
+    return (
+        getattr(op, "origin", "derived") == "native"
+        and op.verb is Verb.OBJECT_DELETE
+        and _is_vrf_delete(op.path)
+    )
+
+
+def is_native_vrf_op(op: "ChangeOp") -> bool:
+    """True iff *op* is a parser-emitted family-7a VRF op (CCR Appendix R).
+
+    Shapes (all ``origin == "native"``), on the PLURAL ``vrfs`` container for
+    SETs (classifier-routed to VRF by keyed-member existence via
+    ``_TOP_FIELD_AREA["vrfs"]``) and the byte-exact ``("field", "vrfs", …)``
+    tombstone shapes for removals (classifier rejoins them to the legacy
+    tombstone → ``_tombstone_area`` → VRF, the WI-7 routing — zero classifier
+    change):
+
+    - ``SET ("vrfs", name, "scalar", <field>)``  rd / route_map_import /
+          route_map_export / description / vpnid — state-derived,
+          positive-only (non-default).
+    - ``SET ("vrfs", name, "route_target_import"|"route_target_export"|
+          "route_target_both", <rt>)``  additive RT member (the RT is ONE
+          segment here — SET paths never colon-join), carrying the member's
+          LAST-occurrence line (the R.0 re-added-later ordering basis).
+    - ``SET ("vrfs", name, "interface", <ifname>)``  additive member (IOS-family
+          parsers never populate ``VRFConfig.interfaces``; emitted for
+          completeness/symmetry with the strip).
+    - ``LIST_REMOVE ("field", "vrfs", name, "route_target_<kind>", *rt)``
+          ``no route-target …`` (byte-exact WI-7 twin regenerated via
+          ``encode_legacy``; unconditional — refresh is resolved structurally
+          in the engine replay, R.0 design item 1).
+    - ``UNSET ("field", "vrfs", name, "rd")``  ``no rd``.
+    - ``OBJECT_DELETE ("field", "vrfs", name)``  whole-VRF removal,
+          applied DELETE-WINS-last.
+
+    The derived whole-VRF ``SET ("vrfs", name)`` (len 2) is NOT matched — it
+    survives composition (7a co-existence; retirement is 7b).  Owned by the
+    codec module: the engine's ``_apply_native_vrf_ops`` pass and its
+    ``_proposal_from_ops`` skip MUST share this predicate.  Derived twins
+    (same path, ``origin="derived"``) return False (origin gate) and keep
+    flowing through the batched legacy apply path so natives-less producers
+    (JunOS/PAN-OS) retain exact legacy parity.
+    """
+    if getattr(op, "origin", "derived") != "native":
+        return False
+    path = op.path
+    if not path:
+        return False
+    if op.verb is Verb.SET:
+        return len(path) == 4 and path[0] == "vrfs" and path[2] in _VRF_SET_KINDS
+    if op.verb is Verb.LIST_REMOVE:
+        return _is_vrf_member_removal(path)
+    if op.verb is Verb.UNSET:
+        return _is_vrf_rd_reset(path)
+    if op.verb is Verb.OBJECT_DELETE:
+        return _is_vrf_delete(path)
+    return False
+
+
 def _static_nh_key(r: Any) -> str:
     """Stable NH identity segment for a static route (mirrors merger identity)."""
     nh = r.next_hop
@@ -1684,8 +1810,11 @@ def derive_ops(proposal: "ParsedConfig") -> ChangeSet:
     # ``("bgp_instances", asn, vrf)`` / ``("isis_instances", tag)`` prefix on its
     # own, so the co-existing derived whole-instance SET SURVIVES (6a does NOT
     # retire it; BGP retirement is the create-op narrowing below, IS-IS
-    # retirement is 6e).  Family 1-4 ops are not BGP/IS-IS ops, so their
-    # container-claim semantics are unchanged.
+    # retirement is 6e).  Family 7a (CCR Appendix R) extends the same
+    # exclusion to VRF ops: a native ``("vrfs", name, kind, *key)`` member SET
+    # must not claim its ``("vrfs", name)`` prefix — the derived whole-VRF SET
+    # survives (retirement is 7b).  Family 1-4 ops are not BGP/IS-IS/VRF ops,
+    # so their container-claim semantics are unchanged.
     native_prefix_claims = {
         op.path[:i]
         for op in natives
@@ -1693,6 +1822,7 @@ def derive_ops(proposal: "ParsedConfig") -> ChangeSet:
         and not is_native_isis_op(op)
         and not is_native_eigrp_op(op)
         and not is_native_ospf_op(op)
+        and not is_native_vrf_op(op)
         for i in range(1, len(op.path))
     }
     # 5c-B.2 retirement (CCR Appendix L — the one authorized derive_ops touch),

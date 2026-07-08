@@ -1207,7 +1207,16 @@ class NXOSParser(IOSParser):
         for obj in parse.find_objects(r"^no\s+vrf\s+context\s+"):
             m = re.match(r"^no\s+vrf\s+context\s+(\S+)", obj.text.strip())
             if m:
-                tombstones.append(f"field:vrfs:{m.group(1)}")
+                # Change-IR family 7a (CCR Appendix R): queue the native
+                # line-numbered OBJECT_DELETE via the shared IOS helper and
+                # regenerate the tombstone FROM it (single source, byte-exact).
+                # super().parse_deletion_commands() already initialised
+                # _pending_native_vrf_ops.
+                tombstones.extend(
+                    self._queue_native_vrf_delete(
+                        f"field:vrfs:{m.group(1)}", obj
+                    ).no_commands
+                )
 
         # --- VRF static route deletions (nested under vrf context NAME) ---
         for vrf_obj in parse.find_objects(r"^vrf\s+context\s+(\S+)"):
