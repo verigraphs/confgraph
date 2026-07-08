@@ -1504,25 +1504,41 @@ class EOSParser(IOSParser):
         parse = self._get_parse_obj()
 
         # --- VXLAN VNI removal (nested under interface Vxlan1) ---
+        # Change-IR family 8b (CCR Appendix U): tombstones regenerated FROM the
+        # native removal ops via the shared IOS queue helper (byte-exact, same
+        # walk positions).  super().parse_deletion_commands() already
+        # initialised _pending_native_singleton_ops.
         for vxlan_obj in parse.find_objects(r"^interface\s+Vxlan1\b"):
             for child in vxlan_obj.children:
                 t = child.text.strip()
                 # "no vxlan vlan <vlan_id> vni <vni_id>"
                 m = re.match(r"no\s+vxlan\s+vlan\s+\d+\s+vni\s+(\d+)", t)
                 if m:
-                    tombstones.append(f"field:vxlan:vni:{m.group(1)}")
+                    tombstones.extend(
+                        self._queue_native_singleton_removal(
+                            f"field:vxlan:vni:{m.group(1)}", child
+                        ).no_commands
+                    )
                     continue
                 # "no vxlan vrf <name> vni <vni_id>"
                 m = re.match(r"no\s+vxlan\s+vrf\s+\S+\s+vni\s+(\d+)", t)
                 if m:
-                    tombstones.append(f"field:vxlan:vni:{m.group(1)}")
+                    tombstones.extend(
+                        self._queue_native_singleton_removal(
+                            f"field:vxlan:vni:{m.group(1)}", child
+                        ).no_commands
+                    )
 
         # --- MLAG peer-address removal (nested under mlag configuration) ---
         for mlag_obj in parse.find_objects(r"^mlag\s+configuration"):
             for child in mlag_obj.children:
                 t = child.text.strip()
                 if re.match(r"no\s+peer-address\b", t):
-                    tombstones.append("field:vpc:peer_keepalive_destination")
+                    tombstones.extend(
+                        self._queue_native_singleton_removal(
+                            "field:vpc:peer_keepalive_destination", child
+                        ).no_commands
+                    )
 
         return tombstones
 

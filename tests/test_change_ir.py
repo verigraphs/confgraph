@@ -58,7 +58,10 @@ def _is_reordered_native_tombstone(t: str) -> bool:
     CCR Appendix O) + family 7a (``field:vrfs:`` RT/rd removals and whole-VRF
     deletes, CCR Appendix R) + family 8a (the five comms-singleton sections'
     entry removals, the ``field:dns:lookup_disable`` action, and the
-    ``singleton:snmp`` / ``singleton:aaa`` null-outs, CCR Appendix T) — each
+    ``singleton:snmp`` / ``singleton:aaa`` null-outs, CCR Appendix T) +
+    family 8b (the seven infra-singleton sections' entry removals /
+    scalar resets and the ``singleton:netflow`` / ``singleton:multicast``
+    null-outs, CCR Appendix U) — each
     encodes byte-exactly but no longer at its legacy walk-group position in
     ``no_commands``.  Non-weakening: order among these and other families is
     semantically inert — each dispatches to an independent
@@ -66,7 +69,10 @@ def _is_reordered_native_tombstone(t: str) -> bool:
     fields (the Appendix F deviation precedent).  (``process:bgp:`` stays
     derived until 5a-retirement; the IOS-XR ``singleton:ntp`` /
     ``singleton:dns`` stay DERIVED — the family-8a XR gate — and keep their
-    exact sequence position.)
+    exact sequence position.  The IOS-XR DERIVED ``singleton:multicast``
+    shares its string with the now-native IOS one, so it joins the
+    order-exempt multiset — order among singleton null-outs is inert, the
+    same F-precedent argument.)
     """
     return (
         t.startswith(_FAMILY3_TOMBSTONE_PREFIXES)
@@ -78,7 +84,18 @@ def _is_reordered_native_tombstone(t: str) -> bool:
         or t.startswith(
             ("field:ntp:", "field:snmp:", "field:syslog:", "field:dns:", "field:aaa:")
         )
-        or t in ("singleton:snmp", "singleton:aaa")
+        or t.startswith(
+            (
+                "field:dhcp:",
+                "field:netflow:",
+                "field:multicast:",
+                "field:bfd:",
+                "field:vxlan:",
+                "field:vpc:",
+                "field:mpls:",
+            )
+        )
+        or t in ("singleton:snmp", "singleton:aaa", "singleton:netflow", "singleton:multicast")
     )
 
 
@@ -601,11 +618,11 @@ class TestSetDerivation:
         )
         ops = derive_ops(cfg)
         set_paths = [op.path for op in _ops_with_verb(ops, Verb.SET)]
-        # Family 8a (CCR Appendix T) retired the derived whole-singleton
-        # ``SET ("ntp",)`` for native-emitting parsers: the native
-        # whole-section CREATE op claims its prefix (pin flipped in place —
-        # the L.4/Q.4 pattern).  Un-migrated singletons (e.g. mpls) and
-        # natives-less parsers still derive whole-section SETs.
+        # Families 8a/8b (CCR Appendices T/U) retired the derived
+        # whole-singleton ``SET ("ntp",)`` for native-emitting parsers: the
+        # native whole-section CREATE op claims its prefix (pin flipped in
+        # place — the L.4/Q.4 pattern).  Un-migrated singletons (e.g. vtp,
+        # cdp, lldp) and natives-less parsers still derive whole-section SETs.
         assert ("ntp",) not in set_paths
         assert ("ntp", "instance") in set_paths
         assert ("ntp", "servers", "10.0.0.1") in set_paths

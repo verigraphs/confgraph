@@ -1240,23 +1240,45 @@ class NXOSParser(IOSParser):
                     )
 
         # --- VXLAN nested deletions (under interface nve) ---
+        # Change-IR family 8b (CCR Appendix U): tombstones regenerated FROM the
+        # native removal ops via the shared IOS queue helper (byte-exact, same
+        # walk positions).  super().parse_deletion_commands() already
+        # initialised _pending_native_singleton_ops.
         for nve_obj in parse.find_objects(r"^interface\s+nve\d+"):
             for child in nve_obj.children:
                 t = child.text.strip()
                 m = re.match(r"no\s+member\s+vni\s+(\d+)", t)
                 if m:
-                    tombstones.append(f"field:vxlan:vni:{m.group(1)}")
+                    tombstones.extend(
+                        self._queue_native_singleton_removal(
+                            f"field:vxlan:vni:{m.group(1)}", child
+                        ).no_commands
+                    )
                 if re.match(r"no\s+host-reachability\s+protocol\b", t):
-                    tombstones.append("field:vxlan:host_reachability")
+                    tombstones.extend(
+                        self._queue_native_singleton_removal(
+                            "field:vxlan:host_reachability", child
+                        ).no_commands
+                    )
 
         # --- vPC peer-keepalive removal (nested under vpc domain) ---
+        # ONE ``no peer-keepalive`` line fans out to THREE scalar-reset
+        # tombstones — three native UNSETs queued at the same line, twins
+        # regenerated in the same order (family 8b).
         for vpc_obj in parse.find_objects(r"^vpc\s+domain\s+\d+"):
             for child in vpc_obj.children:
                 t = child.text.strip()
                 if re.match(r"no\s+peer-keepalive\b", t):
-                    tombstones.append("field:vpc:peer_keepalive_destination")
-                    tombstones.append("field:vpc:peer_keepalive_source")
-                    tombstones.append("field:vpc:peer_keepalive_vrf")
+                    for _vpc_ts in (
+                        "field:vpc:peer_keepalive_destination",
+                        "field:vpc:peer_keepalive_source",
+                        "field:vpc:peer_keepalive_vrf",
+                    ):
+                        tombstones.extend(
+                            self._queue_native_singleton_removal(
+                                _vpc_ts, child
+                            ).no_commands
+                        )
 
         return tombstones
 

@@ -1593,11 +1593,12 @@ def is_native_vrf_op(op: "ChangeOp") -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Family 8a — comms/service singleton sections (CCR Appendix T)
+# Families 8a/8b — singleton sections (CCR Appendices T + U)
 # ---------------------------------------------------------------------------
-# The five singleton ParsedConfig sections migrated by WI-8a: ntp / snmp /
-# syslog / dns / aaa.  Family 8b extends the SAME registries (dhcp, netflow,
-# multicast, bfd, mpls, vxlan, vpc) — one entry per section, no new mechanism.
+# The five comms/service sections migrated by WI-8a (ntp / snmp / syslog /
+# dns / aaa) plus the seven infra sections migrated by WI-8b (dhcp, netflow,
+# multicast, bfd, mpls, vxlan, vpc) — one registry entry per section, no new
+# mechanism (Appendix U).
 #
 # Member kinds are the MODEL LIST-FIELD NAMES (path[1] of a member SET); the
 # key functions mirror the engine merger's ``list_keys`` identity functions
@@ -1635,6 +1636,34 @@ _SINGLETON_MEMBER_KEYS: dict[str, dict[str, Callable[[Any], tuple[str, ...]]]] =
         "tacacs_servers": lambda s: (s.address,),
         "radius_servers": lambda s: (s.address,),
     },
+    # Family 8b (CCR Appendix U) — infra singletons.  Same discipline: keys
+    # mirror the merger ``_SINGLETON_SECTION_LIST_KEYS`` identities exactly
+    # (stringified; ``None``-able key parts use the ``or ""`` idiom of
+    # ``_TOP_LIST_KEYS``).  ``mpls`` / ``vpc`` are scalar-only sections —
+    # registered with no member kinds.
+    "dhcp": {
+        "pools": lambda p: (p.name,),
+        "excluded_ranges": lambda r: (r.low,),
+        "snooping_vlans": lambda v: (str(v),),
+    },
+    "netflow": {
+        "destinations": lambda d: (str(d.address), str(d.port)),
+    },
+    "multicast": {
+        "pim_rp_addresses": lambda r: (str(r.rp_address), r.acl or ""),
+        "msdp_peers": lambda p: (str(p.peer_address),),
+        "multicast_routing_vrfs": lambda v: (str(v),),
+    },
+    "bfd": {
+        "templates": lambda t: (t.name,),
+        "maps": lambda m: (m.afi, str(m.destination), str(m.source)),
+    },
+    "mpls": {},
+    "vxlan": {
+        "vni_mappings": lambda v: (str(v.vni),),
+        "flood_vtep_list": lambda f: (str(f),),
+    },
+    "vpc": {},
 }
 
 # Scalars whose native op is LINE-DETECTED (tri-state), not state-derived —
@@ -1684,24 +1713,38 @@ def singleton_line_detected_scalars(section: str) -> frozenset[str]:
 
 @_lru_cache(maxsize=None)
 def singleton_scalar_fields(section: str) -> frozenset[str]:
-    """Structural walk of a migrated section's scalar fields (family 8a).
+    """Structural walk of a migrated section's scalar fields (families 8a/8b).
 
     Same discipline as :func:`banner_scalar_fields`: declared Pydantic
     default, no ``default_factory``, provenance/identity excluded — a future
     scalar model field automatically joins the family.  Together with
     :func:`singleton_member_kinds` this partitions the section's model
-    fields completely (anti-rot completeness pin in the family-8a tests):
+    fields completely (anti-rot completeness pin in the family-8a/8b tests):
     every field is provenance, a structural scalar, or a registered member
     kind — so the engine's generic creation seed (reset-everything-to-
     default) can never silently drop content.
-    """
-    from pydantic_core import PydanticUndefined
 
+    REQUIRED business fields (``default is PydanticUndefined``, no factory —
+    today exactly ``vpc.domain_id``) are structural scalars too (family 8b,
+    CCR Appendix U.1): the state walk's non-default test is vacuously true
+    for them, so their SET is ALWAYS emitted — mirroring the legacy
+    ``_merge_singleton_additive`` arm that overrides required fields from
+    the proposal unconditionally.  The engine's creation seed keeps the
+    parsed value for required fields (it cannot reset them).  No 8a section
+    has a required field, so this is behavior-neutral for 8a.
+    """
     from confgraph.models.aaa import AAAConfig
+    from confgraph.models.bfd import BFDConfig
+    from confgraph.models.dhcp import DHCPConfig
     from confgraph.models.dns import DNSConfig
     from confgraph.models.logging_config import SyslogConfig
+    from confgraph.models.mpls import MPLSConfig
+    from confgraph.models.multicast import MulticastConfig
+    from confgraph.models.netflow import NetFlowConfig
     from confgraph.models.ntp import NTPConfig
     from confgraph.models.snmp import SNMPConfig
+    from confgraph.models.vpc import VPCConfig
+    from confgraph.models.vxlan import VXLANConfig
 
     models = {
         "ntp": NTPConfig,
@@ -1709,14 +1752,19 @@ def singleton_scalar_fields(section: str) -> frozenset[str]:
         "syslog": SyslogConfig,
         "dns": DNSConfig,
         "aaa": AAAConfig,
+        "dhcp": DHCPConfig,
+        "netflow": NetFlowConfig,
+        "multicast": MulticastConfig,
+        "bfd": BFDConfig,
+        "mpls": MPLSConfig,
+        "vxlan": VXLANConfig,
+        "vpc": VPCConfig,
     }
     fields: set[str] = set()
     for name, info in models[section].model_fields.items():
         if name in _PROVENANCE_FIELDS:
             continue
         if info.default_factory is not None:
-            continue
-        if info.default is PydanticUndefined:
             continue
         fields.add(name)
     return frozenset(fields)

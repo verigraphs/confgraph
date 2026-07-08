@@ -1769,10 +1769,12 @@ class IOSParser(BaseParser):
         return encode_legacy([op])
 
     def _queue_native_singleton_removal(self, tombstone: str, obj):
-        """Build + queue a native family-8a singleton-section removal op from
-        its legacy tombstone (entry-level ``field:<sect>:…`` shapes, the
+        """Build + queue a native family-8a/8b singleton-section removal op
+        from its legacy tombstone (entry-level ``field:<sect>:…`` shapes,
+        scalar-reset ``field:<sect>:<field>`` shapes, the
         ``field:dns:lookup_disable`` action, and the whole-section
-        ``singleton:snmp`` / ``singleton:aaa`` null-outs), returning its
+        ``singleton:snmp`` / ``singleton:aaa`` / ``singleton:netflow`` /
+        ``singleton:multicast`` null-outs), returning its
         ``encode_legacy`` artifacts so the caller re-emits the byte-exact
         legacy tombstone FROM the op (single source, CCR Appendix T — the
         family-4/7a ``_queue_native_*`` pattern).
@@ -5904,8 +5906,19 @@ class IOSParser(BaseParser):
                 tombstones.append(f"prefix-list:{m.group(1)}:seq:{m.group(2)}")
 
         # --- singleton protocol removals (whole-section) ---
-        if parse.find_objects(r"^no\s+ip\s+multicast-routing"):
-            tombstones.append("singleton:multicast")
+        # Change-IR family 8b (CCR Appendix U): the whole-section multicast
+        # null-out is a NATIVE UNSET like the 8a aaa/snmp ones; the byte-exact
+        # ``singleton:multicast`` tombstone is regenerated FROM it (single
+        # source).  The engine replay applies it LAST, origin-blind (pass C).
+        # NOTE: the IOS-XR override emits its own DERIVED ``singleton:multicast``
+        # (no super(); XR is gated) — untouched.
+        _mcast_null_objs = parse.find_objects(r"^no\s+ip\s+multicast-routing")
+        if _mcast_null_objs:
+            tombstones.extend(
+                self._queue_native_singleton_removal(
+                    "singleton:multicast", _mcast_null_objs[0]
+                ).no_commands
+            )
         # Change-IR family 8a (CCR Appendix T): the whole-section AAA null-out
         # is a NATIVE UNSET; the byte-exact ``singleton:aaa`` tombstone is
         # regenerated FROM it (single source).  The engine replay applies it
@@ -5920,20 +5933,37 @@ class IOSParser(BaseParser):
             )
 
         # --- Multicast entry-level tombstones ---
+        # Change-IR family 8b (CCR Appendix U): every entry-level tombstone in
+        # the infra-singleton walks (multicast/bfd/netflow/dhcp here) is now
+        # generated FROM its native removal op via
+        # _queue_native_singleton_removal (byte-exact string, same walk
+        # position — the 8a pattern).  Entry removals stay DELETE-WINS.
         for obj in parse.find_objects(r"^no\s+ip\s+pim\s+rp-address\s+"):
             m = re.match(r"^no\s+ip\s+pim\s+rp-address\s+(\S+)", obj.text.strip())
             if m:
-                tombstones.append(f"field:multicast:rp:{m.group(1)}")
+                tombstones.extend(
+                    self._queue_native_singleton_removal(
+                        f"field:multicast:rp:{m.group(1)}", obj
+                    ).no_commands
+                )
         for obj in parse.find_objects(r"^no\s+ip\s+msdp\s+peer\s+"):
             m = re.match(r"^no\s+ip\s+msdp\s+peer\s+(\S+)", obj.text.strip())
             if m:
-                tombstones.append(f"field:multicast:msdp:{m.group(1)}")
+                tombstones.extend(
+                    self._queue_native_singleton_removal(
+                        f"field:multicast:msdp:{m.group(1)}", obj
+                    ).no_commands
+                )
 
         # --- BFD entry-level tombstones ---
         for obj in parse.find_objects(r"^no\s+bfd-template\s+"):
             m = re.match(r"^no\s+bfd-template\s+(?:single-hop|multi-hop)\s+(\S+)", obj.text.strip())
             if m:
-                tombstones.append(f"field:bfd:template:{m.group(1)}")
+                tombstones.extend(
+                    self._queue_native_singleton_removal(
+                        f"field:bfd:template:{m.group(1)}", obj
+                    ).no_commands
+                )
             # Untyped "no bfd-template <name>" or bare "no bfd ..." (slow-timers
             # etc.) are attribute removals, not service removal — no tombstone.
         # --- Syslog entry-level tombstones ---
@@ -5992,19 +6022,38 @@ class IOSParser(BaseParser):
         for obj in parse.find_objects(r"^no\s+ip\s+flow-export\s+destination\s+"):
             m = re.match(r"^no\s+ip\s+flow-export\s+destination\s+(\S+)\s+(\d+)", obj.text.strip())
             if m:
-                tombstones.append(f"field:netflow:destination:{m.group(1)}:{m.group(2)}")
-        if parse.find_objects(r"^no\s+ip\s+flow-export\s*$"):
-            tombstones.append("singleton:netflow")
+                tombstones.extend(
+                    self._queue_native_singleton_removal(
+                        f"field:netflow:destination:{m.group(1)}:{m.group(2)}", obj
+                    ).no_commands
+                )
+        # Bare "no ip flow-export" → whole-section removal.  Family 8b: NATIVE
+        # UNSET (pass C, origin-blind — delete-wins, both textual orders).
+        _netflow_null_objs = parse.find_objects(r"^no\s+ip\s+flow-export\s*$")
+        if _netflow_null_objs:
+            tombstones.extend(
+                self._queue_native_singleton_removal(
+                    "singleton:netflow", _netflow_null_objs[0]
+                ).no_commands
+            )
 
         # --- DHCP entry-level tombstones ---
         for obj in parse.find_objects(r"^no\s+ip\s+dhcp\s+pool\s+"):
             m = re.match(r"^no\s+ip\s+dhcp\s+pool\s+(\S+)", obj.text.strip())
             if m:
-                tombstones.append(f"field:dhcp:pool:{m.group(1)}")
+                tombstones.extend(
+                    self._queue_native_singleton_removal(
+                        f"field:dhcp:pool:{m.group(1)}", obj
+                    ).no_commands
+                )
         for obj in parse.find_objects(r"^no\s+ip\s+dhcp\s+excluded-address\s+"):
             m = re.match(r"^no\s+ip\s+dhcp\s+excluded-address\s+(\S+)", obj.text.strip())
             if m:
-                tombstones.append(f"field:dhcp:excluded:{m.group(1)}")
+                tombstones.extend(
+                    self._queue_native_singleton_removal(
+                        f"field:dhcp:excluded:{m.group(1)}", obj
+                    ).no_commands
+                )
 
         # --- NTP entry-level tombstones ---
         for obj in parse.find_objects(r"^no\s+ntp\s+"):
