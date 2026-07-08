@@ -235,7 +235,7 @@ _TOP_TOMBSTONE_VERBS: tuple[tuple[re.Pattern[str], Verb], ...] = (
     (re.compile(r"^static:"), Verb.LIST_REMOVE),               # static route(s) by (vrf, dest[, nh])
     (re.compile(r"^vlan:"), Verb.OBJECT_DELETE),               # VLAN database entry
     (re.compile(r"^vrf:"), Verb.OBJECT_DELETE),                # IOS-XR whole-VRF removal
-    (re.compile(r"^process:(ospf|bgp|isis|eigrp):"), Verb.OBJECT_DELETE),
+    (re.compile(r"^process:(ospf|bgp|isis|eigrp|rip):"), Verb.OBJECT_DELETE),
     (re.compile(r"^acl-seq:"), Verb.LIST_REMOVE),              # single ACE
     (re.compile(r"^acl:"), Verb.OBJECT_DELETE),                # whole named ACL
     (re.compile(r"^route-map:.+:seq:\d+$"), Verb.LIST_REMOVE),
@@ -279,6 +279,24 @@ _TOP_TOMBSTONE_VERBS: tuple[tuple[re.Pattern[str], Verb], ...] = (
     (re.compile(r"^field:ip_sla_operations:\d+$"), Verb.OBJECT_DELETE),
     (re.compile(r"^field:object_tracks:\d+$"), Verb.OBJECT_DELETE),
     (re.compile(r"^field:eem_applets:[^:]+$"), Verb.OBJECT_DELETE),
+    # WI-DB1-B2 (CCR Appendix AB) — nat/crypto keyed-entry removals (the
+    # 8b field:dhcp:pool vocabulary) and keyed whole-object deletes on
+    # top-level collections (the service-entity vocabulary + the owner's
+    # ``no line`` OBJECT_DELETE decision).  MUST precede the generic
+    # field-reset catch-all below.
+    (re.compile(r"^field:nat:(pool|dynamic|static):"), Verb.LIST_REMOVE),
+    (
+        re.compile(r"^field:crypto:(crypto_map|isakmp_policy|transform_set):"),
+        Verb.LIST_REMOVE,
+    ),
+    (
+        re.compile(r"^field:lines:(console|vty|aux|tty):\d+(:\d+)?$"),
+        Verb.OBJECT_DELETE,
+    ),
+    (re.compile(r"^field:class_maps:[^:]+$"), Verb.OBJECT_DELETE),
+    (re.compile(r"^field:policy_maps:[^:]+$"), Verb.OBJECT_DELETE),
+    (re.compile(r"^field:community_lists:[^:]+$"), Verb.OBJECT_DELETE),
+    (re.compile(r"^field:as_path_lists:[^:]+$"), Verb.OBJECT_DELETE),
     # Generic scalar-field reset — MUST BE LAST among field: shapes.  Serves
     # field:banners:<field>, field:vpc:<field>, field:vxlan:host_reachability, …
     (re.compile(r"^field:\w+:\w+$"), Verb.UNSET),

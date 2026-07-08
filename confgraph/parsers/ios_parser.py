@@ -1763,6 +1763,12 @@ class IOSParser(BaseParser):
         ops.extend(self._native_vlan_ops(pc))
         ops.extend(self._native_simple_keyed_list_ops(pc))
         ops.extend(self._native_policy_object_ops(pc))
+        # WI-DB1-B2 (CCR Appendix AB): keyed-removal ops queued by
+        # parse_deletion_commands (``no router rip`` + lines / QoS-map /
+        # community-list / as-path whole-object deletes).  Appended in walk
+        # order; they match no native-family predicate, so both modes apply
+        # them through the batched tombstone path (delete-wins).
+        ops.extend(getattr(self, "_pending_native_keyed_removal_ops", None) or [])
         # Family 8e (CCR Appendix X): interface member removals + whole-
         # interface deletes queued by parse_deletion_commands.  Appended in
         # walk order; replay semantics rest on the ops' LINE NUMBERS (the
@@ -1931,6 +1937,48 @@ class IOSParser(BaseParser):
             origin="native",
         )
         self._pending_native_policy_ops.append(op)
+        return encode_legacy([op])
+
+    def _queue_native_keyed_removal(self, tombstone: str, obj):
+        """Build + queue a native WI-DB1-B2 keyed-removal op from its legacy
+        tombstone (CCR change_ir_proposal_operations.md Appendix AB):
+        the ``process:rip:`` whole-process delete and the keyed
+        whole-object deletes on top-level collections
+        (``field:lines:…`` / ``field:class_maps:…`` /
+        ``field:policy_maps:…`` / ``field:community_lists:…`` /
+        ``field:as_path_lists:…``), returning the ``encode_legacy``
+        artifacts so the caller re-emits the byte-exact legacy tombstone
+        FROM the op (single source — the family-4/7a/8a/8f
+        ``_queue_native_*`` pattern).
+
+        The op path is the colon-split of the tombstone (identical to the
+        derived twin's path, so exact-path dedupe retires it) and the VERB
+        comes from the codec's tombstone→verb registry.  These ops match
+        NO native-family predicate: in ops mode ``_proposal_from_ops``
+        falls them through to the reconstructed proposal's
+        ``no_commands`` (byte-exact), so BOTH modes apply them through
+        the same ``_DELETION_RULES`` / ``_FIELD_PATH_ACCESSORS`` handlers
+        (delete-wins, both textual orders — the mandated batch posture;
+        the ordering capability stays deferred, the L.7 class).
+        NX-OS/EOS share these walk sites via
+        ``super().parse_deletion_commands()``; IOS-XR overrides without
+        ``super()`` and never emits these shapes (Phase 5).
+        """
+        from confgraph.change_ir import (
+            ChangeOp,
+            _verb_for_top_tombstone,
+            encode_legacy,
+        )
+
+        op = ChangeOp(
+            verb=_verb_for_top_tombstone(tombstone),
+            path=tuple(tombstone.split(":")),
+            value=None,
+            source_line=obj.text.strip(),
+            line_no=obj.linenum,
+            origin="native",
+        )
+        self._pending_native_keyed_removal_ops.append(op)
         return encode_legacy([op])
 
     def _queue_native_vlan_delete(self, vid: str, obj) -> list:
@@ -6537,6 +6585,13 @@ class IOSParser(BaseParser):
         # tombstones are regenerated FROM them (single source).
         # Re-initialized per call.
         self._pending_native_policy_ops: list = []
+        # Change-IR WI-DB1-B2 (CCR Appendix AB): native keyed-removal ops
+        # (``no router rip`` + lines / class-map / policy-map /
+        # community-list / as-path whole-object deletes) queued
+        # UNCONDITIONALLY at their true lines; the byte-exact tombstones
+        # are regenerated FROM them (single source).  Re-initialized per
+        # call.
+        self._pending_native_keyed_removal_ops: list = []
 
         # --- static route deletions ---
         # Tombstone format: "static:<vrf>:<dest/plen>[:<nh_spec>]" where vrf=""
@@ -6694,6 +6749,22 @@ class IOSParser(BaseParser):
                 self._pending_native_eigrp_ops.append(op)
                 tombstones.extend(encode_legacy([op]).no_commands)
 
+        # Change-IR WI-DB1-B2 (CCR Appendix AB): the whole-process
+        # ``no router rip`` delete — a NATIVE, line-numbered OBJECT_DELETE
+        # ``("process","rip","")``; the byte-exact ``process:rip:`` tombstone
+        # is regenerated FROM the op (single source).  The key segment is the
+        # rip_instances identity (vrf, "" = global) — parse_rip only ever
+        # emits the global instance (``^router\s+rip$``), and IOS ``no router
+        # rip`` has no VRF operand.  The NX-OS tagged form (``no router rip
+        # <tag>``) does NOT match — its positives are equally unparsed
+        # (parity by absence, disclosed).  Applied via the new
+        # ``_DELETION_RULES["process:rip:"]`` handler in BOTH modes
+        # (delete-wins, both textual orders — the 6a-6c posture).
+        for obj in parse.find_objects(r"^no\s+router\s+rip\s*$"):
+            tombstones.extend(
+                self._queue_native_keyed_removal("process:rip:", obj).no_commands
+            )
+
         # Change-IR family 8f (CCR Appendix Y): the whole-ACL delete is a
         # NATIVE line-numbered OBJECT_DELETE; the byte-exact ``acl:<name>``
         # tombstone is regenerated FROM it (single source).  The engine
@@ -6724,6 +6795,24 @@ class IOSParser(BaseParser):
                         f"route-map:{m.group(1)}:seq:{m.group(2)}", obj
                     ).no_commands
                 )
+                continue
+            # WI-DB1-B2 (CCR Appendix AB): seq-less whole-object
+            # ``no route-map <name>`` — a NATIVE, line-numbered
+            # OBJECT_DELETE ``("route-map", <name>)`` whose byte-exact
+            # ``route-map:<name>`` tombstone is the IOS-XR D1 spelling.
+            # LEGACY stays blind BY DESIGN (``_del_route_map_seq``
+            # guard-returns without ``:seq:`` — disclosed; no new legacy
+            # handler, owner constraint); ops mode honors it through the
+            # pre-existing ``_OPS_OBJECT_DELETE_FIX_FORWARD`` (net-ABSENT
+            # on delete+recreate — the pinned D1 posture).  ``$``-anchored:
+            # ``no route-map RM permit`` (action-scoped) stays blind.
+            m = re.search(r"^no\s+route-map\s+(\S+)\s*$", obj.text)
+            if m:
+                tombstones.extend(
+                    self._queue_native_policy_removal(
+                        f"route-map:{m.group(1)}", obj
+                    ).no_commands
+                )
 
         # --- prefix-list sequence deletion ---
         # Family 8f: native LIST_REMOVE (same posture as route-map seqs).
@@ -6735,6 +6824,216 @@ class IOSParser(BaseParser):
                 tombstones.extend(
                     self._queue_native_policy_removal(
                         f"prefix-list:{m.group(1)}:seq:{m.group(2)}", obj
+                    ).no_commands
+                )
+                continue
+            # WI-DB1-B2 (CCR Appendix AB): seq-less whole-object
+            # ``no ip prefix-list <name>`` — same D1-class mechanism as the
+            # route-map form above (``prefix-list:<name>`` tombstone,
+            # legacy blind-disclosed, ops fix-forward).  ``$``-anchored:
+            # ``no ip prefix-list <n> description|permit …`` stay blind.
+            m = re.search(r"^no\s+ip\s+prefix-list\s+(\S+)\s*$", obj.text)
+            if m:
+                tombstones.extend(
+                    self._queue_native_policy_removal(
+                        f"prefix-list:{m.group(1)}", obj
+                    ).no_commands
+                )
+
+        # --- WI-DB1-B2 (CCR Appendix AB): policy-list whole-object deletes ---
+        # Owner decision: WHOLE-OBJECT only (entry-level ``… permit <val>``
+        # forms are a recorded follow-up — ``$``-anchored regexes leave them
+        # blind).  Legacy CAN express these (``_del_field`` accessors) →
+        # twinned: applied in BOTH modes, delete-wins.
+        for obj in parse.find_objects(r"^no\s+ip\s+community-list\s+"):
+            m = re.search(
+                r"^no\s+ip\s+community-list\s+(?:(?:standard|expanded)\s+)?(\S+)\s*$",
+                obj.text,
+            )
+            # Incomplete-CLI guard (validator C2, Appendix AB.3): keyword-only
+            # (``no ip community-list standard|expanded``) and keyword+action
+            # (``… standard permit``) lines are DEVICE-REJECTED ("% Incomplete
+            # command"), but the optional keyword group backtracks and would
+            # bind the keyword / action word as the list NAME — silently
+            # deleting a baseline object.  Reject grammar tokens in the name
+            # position (the nameless nat-pool / bare class-map posture).
+            # Trade-off (disclosed, AB.3): a list literally named
+            # ``standard|expanded|permit|deny`` becomes undeletable by
+            # negation — left blind, never wrongly deleted.
+            if m and m.group(1) not in ("standard", "expanded", "permit", "deny"):
+                tombstones.extend(
+                    self._queue_native_keyed_removal(
+                        f"field:community_lists:{m.group(1)}", obj
+                    ).no_commands
+                )
+        for obj in parse.find_objects(r"^no\s+ip\s+as-path\s+access-list\s+"):
+            m = re.search(
+                r"^no\s+ip\s+as-path\s+access-list\s+(\S+)\s*$", obj.text
+            )
+            # Same guard class for the as-path walk: the nameless form is
+            # already unmatched (``\s+(\S+)`` needs a token), but an
+            # action-in-name-position line (``no ip as-path access-list
+            # permit``) would bind ``permit`` as the name.  Real IOS as-path
+            # list names are numeric (1–500), so only the action words can
+            # arrive here via incomplete CLI — reject them.
+            if m and m.group(1) not in ("permit", "deny"):
+                tombstones.extend(
+                    self._queue_native_keyed_removal(
+                        f"field:as_path_lists:{m.group(1)}", obj
+                    ).no_commands
+                )
+
+        # --- WI-DB1-B2 (CCR Appendix AB): NAT keyed-entry removals ---
+        # The 8b ``field:dhcp:pool:`` shape — native LIST_REMOVE +
+        # byte-exact tombstone via _queue_native_singleton_removal; ops mode
+        # replays them in _apply_native_singleton_ops pass B (AFTER the 8d
+        # create-mode pass 0 "adopt" + member pass A → delete-wins composes
+        # with creation, both orders); legacy applies the same accessors via
+        # _apply_deletions.  Keys mirror the _nat_rule merge identities
+        # EXACTLY (pools by name, dynamic by acl, static by
+        # (local_ip, local_port)).
+        for obj in parse.find_objects(r"^no\s+ip\s+nat\s+"):
+            t = obj.text.strip()
+            m = re.match(r"^no\s+ip\s+nat\s+pool\s+(\S+)", t)
+            if m:
+                tombstones.extend(
+                    self._queue_native_singleton_removal(
+                        f"field:nat:pool:{m.group(1)}", obj
+                    ).no_commands
+                )
+                continue
+            m = re.match(
+                r"^no\s+ip\s+nat\s+(?:inside|outside)\s+source\s+list\s+(\S+)\s+"
+                r"(?:pool\s+\S+|interface\s+\S+)",
+                t,
+            )
+            if m:
+                tombstones.extend(
+                    self._queue_native_singleton_removal(
+                        f"field:nat:dynamic:{m.group(1)}", obj
+                    ).no_commands
+                )
+                continue
+            m = re.match(
+                r"^no\s+ip\s+nat\s+inside\s+source\s+static\s+"
+                r"(?:(?:tcp|udp)\s+)?(\S+)(?:\s+(\d+))?\s+\S+",
+                t,
+            )
+            if m:
+                # Validate the local address like the positive parse does —
+                # an unparseable operand stays blind (== today).
+                from ipaddress import IPv4Address as _IPv4A
+                try:
+                    _IPv4A(m.group(1))
+                except ValueError:
+                    continue
+                key = f"{m.group(1)}:{m.group(2)}" if m.group(2) else m.group(1)
+                tombstones.extend(
+                    self._queue_native_singleton_removal(
+                        f"field:nat:static:{key}", obj
+                    ).no_commands
+                )
+            # Bare/incomplete forms (``no ip nat inside``, list form without
+            # pool|interface) and scalar resets (``no ip nat translation …``)
+            # stay blind — enumerated in Appendix AB.3.
+
+        # --- WI-DB1-B2 (CCR Appendix AB): crypto keyed-entry removals ---
+        # Same 8b shape; ops-mode pass-B replay runs AFTER the 8d "replace"
+        # create-mode pass 0, so removals compose with a coexisting positive
+        # crypto section (delete-wins) in both modes.  ``$``-anchored:
+        # attr forms (``no crypto map M 10 set peer …``) stay blind;
+        # interface-child ``no crypto map M`` is indented and never matches
+        # the column-0 walk.
+        for obj in parse.find_objects(r"^no\s+crypto\s+map\s+"):
+            m = re.match(
+                r"^no\s+crypto\s+map\s+(\S+)\s+(\d+)"
+                r"(?:\s+(?:ipsec-isakmp|ipsec-manual|gdoi))?\s*$",
+                obj.text.strip(),
+            )
+            if m:
+                tombstones.extend(
+                    self._queue_native_singleton_removal(
+                        f"field:crypto:crypto_map:{m.group(1)}:{m.group(2)}", obj
+                    ).no_commands
+                )
+                continue
+            m = re.match(r"^no\s+crypto\s+map\s+(\S+)\s*$", obj.text.strip())
+            if m:
+                tombstones.extend(
+                    self._queue_native_singleton_removal(
+                        f"field:crypto:crypto_map:{m.group(1)}", obj
+                    ).no_commands
+                )
+        for obj in parse.find_objects(r"^no\s+crypto\s+isakmp\s+policy\s+"):
+            m = re.match(
+                r"^no\s+crypto\s+isakmp\s+policy\s+(\d+)\s*$", obj.text.strip()
+            )
+            if m:
+                tombstones.extend(
+                    self._queue_native_singleton_removal(
+                        f"field:crypto:isakmp_policy:{m.group(1)}", obj
+                    ).no_commands
+                )
+        for obj in parse.find_objects(r"^no\s+crypto\s+ipsec\s+transform-set\s+"):
+            m = re.match(
+                r"^no\s+crypto\s+ipsec\s+transform-set\s+(\S+)", obj.text.strip()
+            )
+            if m:
+                # Trailing transform tokens are allowed — the device accepts
+                # the full-line form and removal is whole-object either way.
+                tombstones.extend(
+                    self._queue_native_singleton_removal(
+                        f"field:crypto:transform_set:{m.group(1)}", obj
+                    ).no_commands
+                )
+
+        # --- WI-DB1-B2 (CCR Appendix AB): lines / class-map / policy-map ---
+        # Keyed whole-object deletes on _SIMPLE_LIST_FIELDS collections
+        # (the service-entity ``field:ip_sla_operations:<id>`` vocabulary).
+        # Owner decision: ``no line …`` is OBJECT_DELETE with a contract
+        # honesty note (real IOS RESETS default lines rather than deleting
+        # them); the accessor matches the merge identity
+        # (line_type, first_line) — <last> is carried for fidelity only.
+        for obj in parse.find_objects(r"^no\s+line\s+"):
+            m = re.match(
+                r"^no\s+line\s+(con(?:sole)?|vty|aux|tty)\s+(\d+)(?:\s+(\d+))?\s*$",
+                obj.text.strip(),
+            )
+            if m:
+                raw_type = m.group(1)
+                if raw_type.startswith("con"):
+                    line_type = "console"
+                else:
+                    line_type = raw_type
+                key = f"{line_type}:{m.group(2)}"
+                if m.group(3):
+                    key = f"{key}:{m.group(3)}"
+                tombstones.extend(
+                    self._queue_native_keyed_removal(
+                        f"field:lines:{key}", obj
+                    ).no_commands
+                )
+        for obj in parse.find_objects(r"^no\s+class-map\s+"):
+            # Name extraction mirrors parse_class_maps exactly; the bare
+            # ``no class-map match-any|match-all`` (no name — incomplete
+            # CLI) is skipped; typed forms (``no class-map type …``) stay
+            # blind ($-anchor), matching the positive-parse boundary.
+            m = re.match(
+                r"^no\s+class-map\s+(?:(?:match-any|match-all)\s+)?(\S+)\s*$",
+                obj.text.strip(),
+            )
+            if m and m.group(1) not in ("match-any", "match-all"):
+                tombstones.extend(
+                    self._queue_native_keyed_removal(
+                        f"field:class_maps:{m.group(1)}", obj
+                    ).no_commands
+                )
+        for obj in parse.find_objects(r"^no\s+policy-map\s+"):
+            m = re.match(r"^no\s+policy-map\s+(\S+)\s*$", obj.text.strip())
+            if m:
+                tombstones.extend(
+                    self._queue_native_keyed_removal(
+                        f"field:policy_maps:{m.group(1)}", obj
                     ).no_commands
                 )
 
