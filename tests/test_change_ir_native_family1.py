@@ -274,10 +274,14 @@ class TestHybridComposition:
         # composition control flips from derived to native.
         assert any(op.verb is Verb.LIST_REMOVE and op.path[0] == "static"
                    for op in natives)
-        # Non-migrated family still derived (control): top-level SET (ntp).
+        # Family 8a (CCR Appendix T) migrated ntp: the derived whole-section
+        # SET is retired (create-op prefix claim) — the control flips to the
+        # native ``("ntp", "instance")`` create op (pin updated in place,
+        # the L.4/Q.4 pattern).
         derived = ops[n_native:]
         assert not any("trunk_allowed_vlans" in op.path for op in derived)
-        assert any(op.path == ("ntp",) for op in derived)
+        assert not any(op.path == ("ntp",) for op in derived)
+        assert any(op.path == ("ntp", "instance") for op in natives)
         assert not any(op.path and op.path[0] in ("static", "static_routes")
                        for op in derived)
 

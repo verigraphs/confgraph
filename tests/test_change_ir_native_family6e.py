@@ -196,8 +196,11 @@ def test_claim_is_instance_scoped_no_cross_instance_overclaim():
 
 
 def test_families_1_5_dedupe_unchanged():
-    # The claim is create-op-scoped: interface (F1), static (F4), vlan and
-    # ntp derived SETs are untouched by the 6e claims.
+    # The claim is create-op-scoped: interface (F1), static (F4) and vlan
+    # derived SETs are untouched by the 6e claims.  Family 8a (CCR Appendix
+    # T) later retired the derived ntp whole-section SET too — that leg of
+    # the pin flipped in place to the native create op (the L.4/Q.4
+    # pattern); the un-migrated vlan SET is the surviving derived control.
     pc = _parse(
         "interface GigabitEthernet0/1\n mtu 9000\n"
         "ip route 10.50.0.0 255.255.0.0 10.1.1.253\n"
@@ -208,7 +211,8 @@ def test_families_1_5_dedupe_unchanged():
     ops = derive_ops(pc)
     paths = {op.path for op in ops}
     assert ("interface", "GigabitEthernet0/1", "mtu") in paths
-    assert ("ntp",) in paths
+    assert ("ntp",) not in paths
+    assert ("ntp", "instance") in paths
     assert ("vlans", "400") in paths
     assert any(p[0] == "static_routes" for p in paths)
 

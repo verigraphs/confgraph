@@ -56,9 +56,17 @@ def _is_reordered_native_tombstone(t: str) -> bool:
     CCR Appendix M) + family 6b (``process:eigrp:`` whole-process removal,
     CCR Appendix N) + family 6c (``process:ospf:`` whole-process removal,
     CCR Appendix O) + family 7a (``field:vrfs:`` RT/rd removals and whole-VRF
-    deletes, CCR Appendix R) — each encodes byte-exactly but no longer at its
-    legacy walk-group position in ``no_commands``.  (``process:bgp:`` stays
-    derived until 5a-retirement.)
+    deletes, CCR Appendix R) + family 8a (the five comms-singleton sections'
+    entry removals, the ``field:dns:lookup_disable`` action, and the
+    ``singleton:snmp`` / ``singleton:aaa`` null-outs, CCR Appendix T) — each
+    encodes byte-exactly but no longer at its legacy walk-group position in
+    ``no_commands``.  Non-weakening: order among these and other families is
+    semantically inert — each dispatches to an independent
+    ``_FIELD_PATH_ACCESSORS`` / ``_DELETION_RULES`` handler over disjoint
+    fields (the Appendix F deviation precedent).  (``process:bgp:`` stays
+    derived until 5a-retirement; the IOS-XR ``singleton:ntp`` /
+    ``singleton:dns`` stay DERIVED — the family-8a XR gate — and keep their
+    exact sequence position.)
     """
     return (
         t.startswith(_FAMILY3_TOMBSTONE_PREFIXES)
@@ -67,6 +75,10 @@ def _is_reordered_native_tombstone(t: str) -> bool:
         or t.startswith("process:eigrp:")
         or t.startswith("process:ospf:")
         or t.startswith("field:vrfs:")
+        or t.startswith(
+            ("field:ntp:", "field:snmp:", "field:syslog:", "field:dns:", "field:aaa:")
+        )
+        or t in ("singleton:snmp", "singleton:aaa")
     )
 
 
@@ -589,7 +601,14 @@ class TestSetDerivation:
         )
         ops = derive_ops(cfg)
         set_paths = [op.path for op in _ops_with_verb(ops, Verb.SET)]
-        assert ("ntp",) in set_paths
+        # Family 8a (CCR Appendix T) retired the derived whole-singleton
+        # ``SET ("ntp",)`` for native-emitting parsers: the native
+        # whole-section CREATE op claims its prefix (pin flipped in place —
+        # the L.4/Q.4 pattern).  Un-migrated singletons (e.g. mpls) and
+        # natives-less parsers still derive whole-section SETs.
+        assert ("ntp",) not in set_paths
+        assert ("ntp", "instance") in set_paths
+        assert ("ntp", "servers", "10.0.0.1") in set_paths
         assert ("vlans", "100") in set_paths
         assert any(p[0] == "static_routes" and p[1] == "" for p in set_paths)
 

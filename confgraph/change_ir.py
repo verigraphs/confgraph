@@ -143,6 +143,13 @@ __all__ = [
     "is_native_vrf_op",
     "is_native_vrf_delete_op",
     "is_native_vrf_instance_create_op",
+    "singleton_section_fields",
+    "singleton_member_kinds",
+    "singleton_member_key",
+    "singleton_scalar_fields",
+    "singleton_line_detected_scalars",
+    "is_native_singleton_section_op",
+    "is_native_singleton_instance_create_op",
 ]
 
 
@@ -1585,6 +1592,216 @@ def is_native_vrf_op(op: "ChangeOp") -> bool:
     return False
 
 
+# ---------------------------------------------------------------------------
+# Family 8a — comms/service singleton sections (CCR Appendix T)
+# ---------------------------------------------------------------------------
+# The five singleton ParsedConfig sections migrated by WI-8a: ntp / snmp /
+# syslog / dns / aaa.  Family 8b extends the SAME registries (dhcp, netflow,
+# multicast, bfd, mpls, vxlan, vpc) — one entry per section, no new mechanism.
+#
+# Member kinds are the MODEL LIST-FIELD NAMES (path[1] of a member SET); the
+# key functions mirror the engine merger's ``list_keys`` identity functions
+# EXACTLY (``_SINGLETON_SECTION_LIST_KEYS`` in confgraph-entrp merger.py) so
+# native member paths and the replay's keyed merges can never drift.  Keys
+# are stringified for path segments; values that contain colons (IPv6 hosts)
+# stay ONE segment — SET paths never colon-join.
+
+_SINGLETON_MEMBER_KEYS: dict[str, dict[str, Callable[[Any], tuple[str, ...]]]] = {
+    "ntp": {
+        "servers": lambda s: (str(s.address),),
+        "peers": lambda s: (str(s.address),),
+        "authentication_keys": lambda k: (str(k.key_id),),
+        "trusted_keys": lambda k: (str(k),),
+    },
+    "snmp": {
+        "communities": lambda c: (c.community_string,),
+        "hosts": lambda h: (str(h.address), h.version),
+        "views": lambda v: (v.name,),
+        "groups": lambda g: (g.name, g.version),
+        "users": lambda u: (u.username, u.group),
+        "enable_traps": lambda t: (str(t),),
+    },
+    "syslog": {
+        "hosts": lambda h: (str(h.address),),
+    },
+    "dns": {
+        "domain_list": lambda d: (str(d),),
+        "name_servers": lambda n: (str(n),),
+    },
+    "aaa": {
+        "authentication_lists": lambda a: (a.service, a.name),
+        "authorization_lists": lambda a: (a.service, a.name),
+        "accounting_lists": lambda a: (a.service, a.name),
+        "tacacs_servers": lambda s: (s.address,),
+        "radius_servers": lambda s: (s.address,),
+    },
+}
+
+# Scalars whose native op is LINE-DETECTED (tri-state), not state-derived —
+# the two True-default booleans whose positive re-assert/refresh is invisible
+# to the parsed state (CCR Appendix T.2).  The parser's structural scalar
+# walk skips them; dedicated line scans emit them at their true lines.
+_SINGLETON_LINE_DETECTED_SCALARS: dict[str, frozenset[str]] = {
+    "syslog": frozenset({"enabled"}),
+    "dns": frozenset({"lookup_enabled"}),
+}
+
+
+@_lru_cache(maxsize=1)
+def singleton_section_fields() -> frozenset[str]:
+    """Family-8a boundary: the migrated singleton ParsedConfig sections.
+
+    Each flows as native ops (whole-section CREATE + per-scalar SETs +
+    keyed/scalar member SETs + byte-exact removal twins) and its derived
+    whole-singleton ``SET (<field>,)`` is RETIRED (inline — the Appendix F
+    banners precedent): the CREATE op claims the ``(<field>,)`` prefix in
+    :func:`derive_ops`.  Gated producers (IOS-XR) and natives-less parsers
+    (JunOS/PAN-OS) emit no family-8a ops → their derived SET survives →
+    exact legacy parity.
+    """
+    return frozenset(_SINGLETON_MEMBER_KEYS)
+
+
+def singleton_member_kinds(section: str) -> frozenset[str]:
+    """Member-kind tokens (model list-field names) for a migrated section."""
+    return frozenset(_SINGLETON_MEMBER_KEYS[section])
+
+
+def singleton_member_key(section: str, list_field: str, item: Any) -> tuple[str, ...]:
+    """Identity path segments for a singleton-section list member.
+
+    ``(<section>, <list_field>, *singleton_member_key(...))`` is the native
+    member-SET path.  Codec-owned — the parser and the engine replay must
+    not re-implement the keys (they mirror the merger ``list_keys`` exactly).
+    """
+    return _SINGLETON_MEMBER_KEYS[section][list_field](item)
+
+
+def singleton_line_detected_scalars(section: str) -> frozenset[str]:
+    """Scalars excluded from the state-derived walk (line-detected, T.2)."""
+    return _SINGLETON_LINE_DETECTED_SCALARS.get(section, frozenset())
+
+
+@_lru_cache(maxsize=None)
+def singleton_scalar_fields(section: str) -> frozenset[str]:
+    """Structural walk of a migrated section's scalar fields (family 8a).
+
+    Same discipline as :func:`banner_scalar_fields`: declared Pydantic
+    default, no ``default_factory``, provenance/identity excluded — a future
+    scalar model field automatically joins the family.  Together with
+    :func:`singleton_member_kinds` this partitions the section's model
+    fields completely (anti-rot completeness pin in the family-8a tests):
+    every field is provenance, a structural scalar, or a registered member
+    kind — so the engine's generic creation seed (reset-everything-to-
+    default) can never silently drop content.
+    """
+    from pydantic_core import PydanticUndefined
+
+    from confgraph.models.aaa import AAAConfig
+    from confgraph.models.dns import DNSConfig
+    from confgraph.models.logging_config import SyslogConfig
+    from confgraph.models.ntp import NTPConfig
+    from confgraph.models.snmp import SNMPConfig
+
+    models = {
+        "ntp": NTPConfig,
+        "snmp": SNMPConfig,
+        "syslog": SyslogConfig,
+        "dns": DNSConfig,
+        "aaa": AAAConfig,
+    }
+    fields: set[str] = set()
+    for name, info in models[section].model_fields.items():
+        if name in _PROVENANCE_FIELDS:
+            continue
+        if info.default_factory is not None:
+            continue
+        if info.default is PydanticUndefined:
+            continue
+        fields.add(name)
+    return frozenset(fields)
+
+
+def is_native_singleton_instance_create_op(op: "ChangeOp") -> bool:
+    """True iff *op* is the family-8a whole-section CREATE op.
+
+    ``SET (<section>, "instance")`` (2-seg — singletons carry no identity
+    key) — emitted by the parser for every parsed, ungated section.  value =
+    the parsed section object (the engine seeds an absent section from it
+    via ``_singleton_creation_seed`` — parser-absence == model default for
+    every migrated field, CCR Appendix T.2; an EXISTING section is a NO-OP,
+    the retired SET was fully inert).  Claims its ``(<section>,)`` prefix in
+    :func:`derive_ops` → the derived whole-singleton SET is RETIRED (the
+    Appendix L/Q/S pattern, inline per Appendix F).
+    """
+    path = op.path
+    return (
+        getattr(op, "origin", "derived") == "native"
+        and op.verb is Verb.SET
+        and len(path) == 2
+        and path[0] in _SINGLETON_MEMBER_KEYS
+        and path[1] == "instance"
+    )
+
+
+def is_native_singleton_section_op(op: "ChangeOp") -> bool:
+    """True iff *op* is a parser-emitted family-8a singleton-section op.
+
+    Shapes (all ``origin == "native"`` — CCR Appendix T.1):
+
+    - ``SET (<sect>, "instance")``                 whole-section CREATE op.
+    - ``SET (<sect>, "scalar", <field>)``          per-scalar (state-derived
+          non-default; ``dns.lookup_enabled`` / ``syslog.enabled`` are
+          line-detected tri-state — T.2).
+    - ``SET (<sect>, <list_field>, *key)``         keyed/scalar list member.
+    - ``LIST_REMOVE ("field", <sect>, …)``         entry removal — byte-exact
+          colon-split of the legacy tombstone (regenerated via
+          ``encode_legacy`` at the same walk position).
+    - ``UNSET ("field", <sect>, <action>)``        today exactly
+          ``field:dns:lookup_disable`` (the WI-8-pre action tombstone).
+    - ``UNSET ("singleton", <sect>)``              whole-section null-out
+          (IOS ``singleton:snmp`` / ``singleton:aaa``; the IOS-XR
+          ``singleton:ntp`` / ``singleton:dns`` stay DERIVED — XR is gated).
+
+    Owned by the codec module: the engine's ``_apply_native_singleton_ops``
+    pass and its ``_proposal_from_ops`` skip MUST share this predicate.
+    Derived twins (same path, ``origin="derived"``) return False (origin
+    gate) and keep flowing through the batched legacy apply path so
+    natives-less producers retain exact legacy parity.
+    """
+    if getattr(op, "origin", "derived") != "native":
+        return False
+    path = op.path
+    if not path:
+        return False
+    if op.verb is Verb.SET:
+        if len(path) == 2:
+            return path[0] in _SINGLETON_MEMBER_KEYS and path[1] == "instance"
+        return (
+            len(path) >= 3
+            and path[0] in _SINGLETON_MEMBER_KEYS
+            and (
+                path[1] == "scalar"
+                or path[1] in _SINGLETON_MEMBER_KEYS[path[0]]
+            )
+        )
+    if op.verb is Verb.LIST_REMOVE:
+        return (
+            len(path) >= 3
+            and path[0] == "field"
+            and path[1] in _SINGLETON_MEMBER_KEYS
+        )
+    if op.verb is Verb.UNSET:
+        if len(path) == 2 and path[0] == "singleton":
+            return path[1] in _SINGLETON_MEMBER_KEYS
+        return (
+            len(path) == 3
+            and path[0] == "field"
+            and path[1] in _SINGLETON_MEMBER_KEYS
+        )
+    return False
+
+
 def _static_nh_key(r: Any) -> str:
     """Stable NH identity segment for a static route (mirrors merger identity)."""
     nh = r.next_hop
@@ -1850,6 +2067,7 @@ def derive_ops(proposal: "ParsedConfig") -> ChangeSet:
         and not is_native_eigrp_op(op)
         and not is_native_ospf_op(op)
         and not is_native_vrf_op(op)
+        and not is_native_singleton_section_op(op)
         for i in range(1, len(op.path))
     }
     # 5c-B.2 retirement (CCR Appendix L — the one authorized derive_ops touch),
@@ -1880,6 +2098,17 @@ def derive_ops(proposal: "ParsedConfig") -> ChangeSet:
         for op in natives
         if is_native_isis_instance_create_op(op)
         or is_native_vrf_instance_create_op(op)
+    }
+    # Family 8a (CCR Appendix T): the whole-SECTION create op claims its
+    # ``(<section>,)`` len-1 prefix — exactly the derived whole-singleton
+    # SET's path — so the SET is RETIRED inline for native-emitting parsers
+    # (the Appendix F banners precedent, via the L/Q/S create-op mechanism).
+    # Gated (IOS-XR) / natives-less (JunOS, PAN-OS) producers emit no create
+    # op → their derived whole-section SET survives (exact legacy parity).
+    native_prefix_claims |= {
+        op.path[:1]
+        for op in natives
+        if is_native_singleton_instance_create_op(op)
     }
     return natives + [
         op

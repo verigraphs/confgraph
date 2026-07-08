@@ -1686,6 +1686,7 @@ class IOSParser(BaseParser):
         ops.extend(self._native_eigrp_ops(pc))
         ops.extend(self._native_ospf_ops(pc))
         ops.extend(self._native_vrf_ops(pc))
+        ops.extend(self._native_singleton_section_ops(pc))
         pc.native_change_ops = ops
 
     def _queue_native_static_delete(self, tombstone: str, obj):
@@ -1766,6 +1767,203 @@ class IOSParser(BaseParser):
         )
         self._pending_native_vrf_ops.append(op)
         return encode_legacy([op])
+
+    def _queue_native_singleton_removal(self, tombstone: str, obj):
+        """Build + queue a native family-8a singleton-section removal op from
+        its legacy tombstone (entry-level ``field:<sect>:…`` shapes, the
+        ``field:dns:lookup_disable`` action, and the whole-section
+        ``singleton:snmp`` / ``singleton:aaa`` null-outs), returning its
+        ``encode_legacy`` artifacts so the caller re-emits the byte-exact
+        legacy tombstone FROM the op (single source, CCR Appendix T — the
+        family-4/7a ``_queue_native_*`` pattern).
+
+        The op path is the colon-split of the tombstone (identical to the
+        deriver's path, so exact-path dedupe retires the derived twin) and
+        the VERB comes from the codec's own tombstone→verb registry
+        (``_verb_for_top_tombstone`` — LIST_REMOVE for entry shapes, UNSET
+        for ``singleton:``/action shapes; single source, never
+        re-implemented here).  ``encode_legacy``'s ``":".join`` reproduces
+        the string byte-for-byte, including entry values with embedded
+        colons (IPv6 hosts).  Emitted UNCONDITIONALLY at the negation's true
+        line — the engine replay applies entry removals DELETE-WINS
+        (== legacy, the mandated family-8a refresh posture) and resolves the
+        ``lookup_disable`` refresh against the line-detected positive
+        (Appendix T.2).  NX-OS/EOS share these walk sites via
+        ``super().parse_deletion_commands()``; IOS-XR overrides the method
+        without ``super()`` and stays fully derived (gated).
+        """
+        from confgraph.change_ir import (
+            ChangeOp,
+            _verb_for_top_tombstone,
+            encode_legacy,
+        )
+
+        op = ChangeOp(
+            verb=_verb_for_top_tombstone(tombstone),
+            path=tuple(tombstone.split(":")),
+            value=None,
+            source_line=obj.text.strip(),
+            line_no=obj.linenum,
+            origin="native",
+        )
+        self._pending_native_singleton_ops.append(op)
+        return encode_legacy([op])
+
+    def _singleton_section_gated(self) -> bool:
+        """Family-8a per-OS gate (CCR Appendix T.0): True iff this parser's
+        comms-singleton surface must stay fully DERIVED (no native ops, the
+        derived whole-section SETs survive → exact legacy parity).
+
+        Today exactly **IOS-XR**: its own ``parse_deletion_commands``
+        (iosxr_parser.py, no ``super()``) emits the DERIVED ``singleton:ntp``
+        / ``singleton:dns`` null-outs with no native twin — Phase-5 surface.
+        NX-OS/EOS are UNGATED: their section parses feed the same
+        parser-agnostic state walk (no per-parse ``_pending`` channel to
+        miss — the S.2 argument) and they inherit the IOS deletion walk via
+        ``super().parse_deletion_commands()``.  JunOS/PAN-OS subclass
+        BaseParser and emit no native ops at all (natives-less).
+        """
+        os_val = getattr(self.os_type, "value", self.os_type)
+        return os_val == "ios_xr"
+
+    def _native_singleton_section_ops(self, pc) -> list:
+        """Native family-8a comms-singleton ops (CCR Appendix T).
+
+        Positive side — a parser-agnostic STATE WALK over the FINAL parsed
+        sections (``pc.ntp`` / ``pc.snmp`` / ``pc.syslog`` / ``pc.dns`` /
+        ``pc.aaa`` — covers the NX-OS/EOS own-parse overrides uniformly;
+        runs at parse finalization via ``_attach_native_change_ops``):
+
+        - ``SET (<sect>, "instance")`` — whole-section CREATE op (value =
+          the parsed section; claims the derived whole-singleton SET's
+          prefix in ``derive_ops`` → inline retirement, Appendix T.1).
+        - ``SET (<sect>, "scalar", <field>)`` per non-default structural
+          scalar (``singleton_scalar_fields`` — declared default, no
+          factory), EXCLUDING the two line-detected tri-state booleans.
+        - ``SET (<sect>, <list_field>, *key)`` per list member
+          (``singleton_member_key`` — the exact merger ``list_keys``
+          identities).
+
+        Line-detected tri-state (Appendix T.2 — the capability surface):
+
+        - ``syslog.enabled``: ONE op, value = last-line-winner among
+          ``no logging on`` / ``logging off`` (False) and ``logging on``
+          (True), at the winning line.  Parsed state (and therefore legacy
+          artifacts) untouched.
+        - ``dns.lookup_enabled``: a positive bare ``ip domain lookup`` /
+          ``ip domain-lookup`` line emits ``SET ("dns","scalar",
+          "lookup_enabled") = True`` at its LAST line; the negative intent
+          rides the native ``field:dns:lookup_disable`` UNSET queued by the
+          deletion walk (parse_dns guarantees ``lookup_enabled=False`` iff
+          that line exists).  The engine replay skips the lookup_disable op
+          iff the positive carries a LATER line (refresh → device truth).
+
+        Delete side: the pending ops queued by
+        ``_queue_native_singleton_removal`` at their true negation lines.
+        Everything stable-sorted by line (unknown positions last).  GATED
+        parsers (IOS-XR) return no ops — their sections stay fully derived.
+        Member/scalar provenance is the section block's first recorded line
+        (coarse — sufficient: entry removals are DELETE-WINS by mandate, so
+        no ordering rests on member lines).
+        """
+        if self._singleton_section_gated():
+            return []
+
+        from confgraph.change_ir import (
+            ChangeOp,
+            Verb,
+            singleton_line_detected_scalars,
+            singleton_member_key,
+            singleton_member_kinds,
+            singleton_scalar_fields,
+            singleton_section_fields,
+        )
+
+        ops: list = []
+        for sect in sorted(singleton_section_fields()):
+            obj = getattr(pc, sect, None)
+            if obj is None:
+                continue
+            raw_lines = obj.raw_lines or []
+            line_numbers = obj.line_numbers or []
+            blk_source = raw_lines[0].strip() if raw_lines else ""
+            blk_no = line_numbers[0] if line_numbers else -1
+
+            def _emit(path, value, source_line=None, line_no=None):
+                ops.append(
+                    ChangeOp(
+                        verb=Verb.SET,
+                        path=path,
+                        value=value,
+                        source_line=blk_source if source_line is None else source_line,
+                        line_no=blk_no if line_no is None else line_no,
+                        origin="native",
+                    )
+                )
+
+            _emit((sect, "instance"), obj)
+
+            model_fields = type(obj).model_fields
+            scalar_family = singleton_scalar_fields(sect)
+            line_detected = singleton_line_detected_scalars(sect)
+            for fname in (f for f in model_fields if f in scalar_family):
+                if fname in line_detected:
+                    continue  # T.2 — emitted by the line scans below
+                value = getattr(obj, fname)
+                if value != model_fields[fname].default:
+                    _emit((sect, "scalar", fname), value)
+
+            member_kinds = singleton_member_kinds(sect)
+            for lf in (f for f in model_fields if f in member_kinds):
+                for item in getattr(obj, lf) or []:
+                    key = singleton_member_key(sect, lf, item)
+                    _emit((sect, lf, *key), item)
+
+        # --- line-detected tri-state booleans (Appendix T.2) ---
+        parse = self._get_parse_obj()
+        if getattr(pc, "syslog", None) is not None:
+            neg = parse.find_objects(r"^no\s+logging\s+on\s*$") + parse.find_objects(
+                r"^logging\s+off\s*$"
+            )
+            pos = parse.find_objects(r"^logging\s+on\s*$")
+            last_neg = max(neg, key=lambda o: o.linenum, default=None)
+            last_pos = max(pos, key=lambda o: o.linenum, default=None)
+            winner = None
+            if last_pos is not None and (
+                last_neg is None or last_pos.linenum > last_neg.linenum
+            ):
+                winner, value = last_pos, True
+            elif last_neg is not None:
+                winner, value = last_neg, False
+            if winner is not None:
+                ops.append(
+                    ChangeOp(
+                        verb=Verb.SET,
+                        path=("syslog", "scalar", "enabled"),
+                        value=value,
+                        source_line=winner.text.strip(),
+                        line_no=winner.linenum,
+                        origin="native",
+                    )
+                )
+        if getattr(pc, "dns", None) is not None:
+            pos = parse.find_objects(r"^ip\s+domain(?:-|\s+)lookup\s*$")
+            if pos:
+                last = max(pos, key=lambda o: o.linenum)
+                ops.append(
+                    ChangeOp(
+                        verb=Verb.SET,
+                        path=("dns", "scalar", "lookup_enabled"),
+                        value=True,
+                        source_line=last.text.strip(),
+                        line_no=last.linenum,
+                        origin="native",
+                    )
+                )
+
+        ops.extend(getattr(self, "_pending_native_singleton_ops", None) or [])
+        ops.sort(key=lambda op: op.line_no if op.line_no >= 0 else float("inf"))
+        return ops
 
     def _native_vrf_ops(self, pc) -> list:
         """Native family-7a VRF ops (CCR Appendix R) — positives + queued removals.
@@ -5530,6 +5728,13 @@ class IOSParser(BaseParser):
         # tombstones are regenerated FROM them (single source).  Re-initialized
         # per call.
         self._pending_native_vrf_ops: list = []
+        # Change-IR Phase 3 family 8a (CCR Appendix T): native comms-singleton
+        # removal ops (ntp/snmp/syslog/dns/aaa entry walks, the dns
+        # lookup_disable action, and the singleton:snmp/singleton:aaa
+        # null-outs) queued UNCONDITIONALLY at their true lines; the
+        # byte-exact tombstones are regenerated FROM them (single source).
+        # Re-initialized per call.
+        self._pending_native_singleton_ops: list = []
 
         # --- static route deletions ---
         # Tombstone format: "static:<vrf>:<dest/plen>[:<nh_spec>]" where vrf=""
@@ -5701,8 +5906,18 @@ class IOSParser(BaseParser):
         # --- singleton protocol removals (whole-section) ---
         if parse.find_objects(r"^no\s+ip\s+multicast-routing"):
             tombstones.append("singleton:multicast")
-        if parse.find_objects(r"^no\s+aaa\s+new-model"):
-            tombstones.append("singleton:aaa")
+        # Change-IR family 8a (CCR Appendix T): the whole-section AAA null-out
+        # is a NATIVE UNSET; the byte-exact ``singleton:aaa`` tombstone is
+        # regenerated FROM it (single source).  The engine replay applies it
+        # LAST, origin-blind (delete-wins — same net as legacy's
+        # additive-then-deletion order for delete+recreate scripts).
+        _aaa_null_objs = parse.find_objects(r"^no\s+aaa\s+new-model")
+        if _aaa_null_objs:
+            tombstones.extend(
+                self._queue_native_singleton_removal(
+                    "singleton:aaa", _aaa_null_objs[0]
+                ).no_commands
+            )
 
         # --- Multicast entry-level tombstones ---
         for obj in parse.find_objects(r"^no\s+ip\s+pim\s+rp-address\s+"):
@@ -5722,29 +5937,56 @@ class IOSParser(BaseParser):
             # Untyped "no bfd-template <name>" or bare "no bfd ..." (slow-timers
             # etc.) are attribute removals, not service removal — no tombstone.
         # --- Syslog entry-level tombstones ---
+        # Change-IR family 8a (CCR Appendix T): every entry-level tombstone in
+        # the five comms-singleton walks (syslog/dns/ntp/snmp/aaa below) is now
+        # generated FROM its native removal op via
+        # _queue_native_singleton_removal (byte-exact string, same walk
+        # position — single source).  The engine replay applies entry removals
+        # DELETE-WINS (== legacy, the mandated refresh posture).
         for obj in parse.find_objects(r"^no\s+logging\s+"):
             t = obj.text.strip()
             m = re.match(r"^no\s+logging\s+host\s+(\S+)", t)
             if m:
-                tombstones.append(f"field:syslog:host:{m.group(1)}")
+                tombstones.extend(
+                    self._queue_native_singleton_removal(
+                        f"field:syslog:host:{m.group(1)}", obj
+                    ).no_commands
+                )
 
         # --- DNS entry-level tombstones ---
         for obj in parse.find_objects(r"^no\s+ip\s+name-server\s+"):
             m = re.match(r"^no\s+ip\s+name-server\s+(\S+)", obj.text.strip())
             if m:
-                tombstones.append(f"field:dns:name_server:{m.group(1)}")
+                tombstones.extend(
+                    self._queue_native_singleton_removal(
+                        f"field:dns:name_server:{m.group(1)}", obj
+                    ).no_commands
+                )
         for obj in parse.find_objects(r"^no\s+ip\s+domain.list\s+"):
             m = re.match(r"^no\s+ip\s+domain.list\s+(\S+)", obj.text.strip())
             if m:
-                tombstones.append(f"field:dns:domain:{m.group(1)}")
-        if parse.find_objects(r"^no\s+ip\s+domain.lookup\s*$"):
+                tombstones.extend(
+                    self._queue_native_singleton_removal(
+                        f"field:dns:domain:{m.group(1)}", obj
+                    ).no_commands
+                )
+        _lookup_null_objs = parse.find_objects(r"^no\s+ip\s+domain.lookup\s*$")
+        if _lookup_null_objs:
             # Targeted action tombstone — disables lookups ONLY.  The former
             # ``singleton:dns`` emission wiped the whole DNS section (name
             # servers, domain name) for a command that merely turns lookups
             # off (WI-8-pre bug 3, CCR legacy_singleton_merge_bugs.md).  The
             # merger accessor sets ``dns.lookup_enabled = False`` — an action
-            # value, not the model default (True).
-            tombstones.append("field:dns:lookup_disable")
+            # value, not the model default (True).  Family 8a: NATIVE UNSET at
+            # the LAST negation line (the T.2 refresh-ordering basis — the
+            # engine replay skips it iff the line-detected positive
+            # ``ip domain lookup`` op carries a later line); tombstone
+            # regenerated byte-exact from the op.
+            tombstones.extend(
+                self._queue_native_singleton_removal(
+                    "field:dns:lookup_disable", _lookup_null_objs[-1]
+                ).no_commands
+            )
 
         # --- NetFlow entry-level tombstones ---
         for obj in parse.find_objects(r"^no\s+ip\s+flow-export\s+destination\s+"):
@@ -5769,71 +6011,140 @@ class IOSParser(BaseParser):
             t = obj.text.strip()
             m = re.match(r"^no\s+ntp\s+server\s+(\S+)", t)
             if m:
-                tombstones.append(f"field:ntp:server:{m.group(1)}")
+                tombstones.extend(
+                    self._queue_native_singleton_removal(
+                        f"field:ntp:server:{m.group(1)}", obj
+                    ).no_commands
+                )
                 continue
             m = re.match(r"^no\s+ntp\s+peer\s+(\S+)", t)
             if m:
-                tombstones.append(f"field:ntp:peer:{m.group(1)}")
+                tombstones.extend(
+                    self._queue_native_singleton_removal(
+                        f"field:ntp:peer:{m.group(1)}", obj
+                    ).no_commands
+                )
                 continue
             m = re.match(r"^no\s+ntp\s+authentication-key\s+(\d+)", t)
             if m:
-                tombstones.append(f"field:ntp:auth_key:{m.group(1)}")
+                tombstones.extend(
+                    self._queue_native_singleton_removal(
+                        f"field:ntp:auth_key:{m.group(1)}", obj
+                    ).no_commands
+                )
 
         # --- SNMP entry-level tombstones ---
-        # Bare "no snmp-server" (no sub-command) → whole-section removal
-        if parse.find_objects(r"^no\s+snmp-server\s*$"):
-            tombstones.append("singleton:snmp")
+        # Bare "no snmp-server" (no sub-command) → whole-section removal.
+        # Family 8a: NATIVE UNSET (applied LAST + origin-blind by the engine
+        # replay — delete-wins, matching legacy's additive-then-deletion
+        # order for ``no snmp-server`` + re-add scripts); tombstone
+        # regenerated byte-exact from the op.
+        _snmp_null_objs = parse.find_objects(r"^no\s+snmp-server\s*$")
+        if _snmp_null_objs:
+            tombstones.extend(
+                self._queue_native_singleton_removal(
+                    "singleton:snmp", _snmp_null_objs[0]
+                ).no_commands
+            )
         for obj in parse.find_objects(r"^no\s+snmp-server\s+"):
             t = obj.text.strip()
             m = re.match(r"^no\s+snmp-server\s+community\s+(\S+)", t)
             if m:
-                tombstones.append(f"field:snmp:community:{m.group(1)}")
+                tombstones.extend(
+                    self._queue_native_singleton_removal(
+                        f"field:snmp:community:{m.group(1)}", obj
+                    ).no_commands
+                )
                 continue
             m = re.match(r"^no\s+snmp-server\s+host\s+(\S+)", t)
             if m:
-                tombstones.append(f"field:snmp:host:{m.group(1)}")
+                tombstones.extend(
+                    self._queue_native_singleton_removal(
+                        f"field:snmp:host:{m.group(1)}", obj
+                    ).no_commands
+                )
                 continue
             m = re.match(r"^no\s+snmp-server\s+view\s+(\S+)", t)
             if m:
-                tombstones.append(f"field:snmp:view:{m.group(1)}")
+                tombstones.extend(
+                    self._queue_native_singleton_removal(
+                        f"field:snmp:view:{m.group(1)}", obj
+                    ).no_commands
+                )
                 continue
             m = re.match(r"^no\s+snmp-server\s+group\s+(\S+)", t)
             if m:
-                tombstones.append(f"field:snmp:group:{m.group(1)}")
+                tombstones.extend(
+                    self._queue_native_singleton_removal(
+                        f"field:snmp:group:{m.group(1)}", obj
+                    ).no_commands
+                )
                 continue
             m = re.match(r"^no\s+snmp-server\s+user\s+(\S+)", t)
             if m:
-                tombstones.append(f"field:snmp:user:{m.group(1)}")
+                tombstones.extend(
+                    self._queue_native_singleton_removal(
+                        f"field:snmp:user:{m.group(1)}", obj
+                    ).no_commands
+                )
 
         # --- AAA entry-level tombstones ---
         for obj in parse.find_objects(r"^no\s+aaa\s+authentication\s+"):
             m = re.match(r"^no\s+aaa\s+authentication\s+(\S+)\s+(\S+)", obj.text.strip())
             if m:
-                tombstones.append(f"field:aaa:authentication:{m.group(1)}:{m.group(2)}")
+                tombstones.extend(
+                    self._queue_native_singleton_removal(
+                        f"field:aaa:authentication:{m.group(1)}:{m.group(2)}", obj
+                    ).no_commands
+                )
         for obj in parse.find_objects(r"^no\s+aaa\s+authorization\s+"):
             m = re.match(r"^no\s+aaa\s+authorization\s+(\S+)\s+(\S+)", obj.text.strip())
             if m:
-                tombstones.append(f"field:aaa:authorization:{m.group(1)}:{m.group(2)}")
+                tombstones.extend(
+                    self._queue_native_singleton_removal(
+                        f"field:aaa:authorization:{m.group(1)}:{m.group(2)}", obj
+                    ).no_commands
+                )
         for obj in parse.find_objects(r"^no\s+aaa\s+accounting\s+"):
             m = re.match(r"^no\s+aaa\s+accounting\s+(\S+)\s+(\S+)", obj.text.strip())
             if m:
-                tombstones.append(f"field:aaa:accounting:{m.group(1)}:{m.group(2)}")
+                tombstones.extend(
+                    self._queue_native_singleton_removal(
+                        f"field:aaa:accounting:{m.group(1)}:{m.group(2)}", obj
+                    ).no_commands
+                )
         for obj in parse.find_objects(r"^no\s+tacacs\s+server\s+"):
             m = re.match(r"^no\s+tacacs\s+server\s+(\S+)", obj.text.strip())
             if m:
-                tombstones.append(f"field:aaa:tacacs_named:{m.group(1)}")
+                tombstones.extend(
+                    self._queue_native_singleton_removal(
+                        f"field:aaa:tacacs_named:{m.group(1)}", obj
+                    ).no_commands
+                )
         for obj in parse.find_objects(r"^no\s+tacacs-server\s+host\s+"):
             m = re.match(r"^no\s+tacacs-server\s+host\s+(\S+)", obj.text.strip())
             if m:
-                tombstones.append(f"field:aaa:tacacs:{m.group(1)}")
+                tombstones.extend(
+                    self._queue_native_singleton_removal(
+                        f"field:aaa:tacacs:{m.group(1)}", obj
+                    ).no_commands
+                )
         for obj in parse.find_objects(r"^no\s+radius\s+server\s+"):
             m = re.match(r"^no\s+radius\s+server\s+(\S+)", obj.text.strip())
             if m:
-                tombstones.append(f"field:aaa:radius_named:{m.group(1)}")
+                tombstones.extend(
+                    self._queue_native_singleton_removal(
+                        f"field:aaa:radius_named:{m.group(1)}", obj
+                    ).no_commands
+                )
         for obj in parse.find_objects(r"^no\s+radius-server\s+host\s+"):
             m = re.match(r"^no\s+radius-server\s+host\s+(\S+)", obj.text.strip())
             if m:
-                tombstones.append(f"field:aaa:radius:{m.group(1)}")
+                tombstones.extend(
+                    self._queue_native_singleton_removal(
+                        f"field:aaa:radius:{m.group(1)}", obj
+                    ).no_commands
+                )
 
         # --- LLDP entry-level tombstones ---
         for obj in parse.find_objects(r"^no\s+lldp\s+tlv-select\s+"):
