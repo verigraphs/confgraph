@@ -97,6 +97,15 @@ def _is_reordered_native_tombstone(t: str) -> bool:
             )
         )
         or t.startswith(("field:lldp:", "vlan:"))
+        # Family 8e (CCR Appendix X): interface member removals
+        # (helper / nhrp_nhs — the only two ``field:interface:…`` 5-segment
+        # shapes) and whole-interface deletes.  Non-weakening: the member
+        # removals dispatch to the two dedicated _FIELD_PATH_ACCESSORS
+        # accessors (disjoint from every other family's fields), and
+        # ``interface:`` deletes dispatch to _del_interface — order among
+        # these and other families' tombstones is semantically inert (the
+        # same F-precedent argument as above).
+        or t.startswith(("field:interface:", "interface:"))
         or t in ("singleton:snmp", "singleton:aaa", "singleton:netflow", "singleton:multicast")
     )
 
@@ -230,13 +239,19 @@ class TestIRTypes:
 
 class TestTopLevelTombstoneFamilies:
     def test_interface_delete(self):
+        # Pin updated for family 8e (CCR Appendix X): the whole-interface
+        # delete is NATIVE — line-numbered at the ``no interface`` walk with
+        # the verbatim source line (was: derived from the tombstone with
+        # line_no == -1).  Path/verb/tombstone are unchanged (byte-exact).
         cfg = _parse_ios("no interface Loopback0\n")
         assert "interface:Loopback0" in cfg.no_commands
         ops, _ = _roundtrip(cfg)
         op = _op_for_tombstone(ops, "interface:Loopback0")
         assert op.verb is Verb.OBJECT_DELETE
         assert op.path == ("interface", "Loopback0")
-        assert op.line_no == -1
+        assert op.origin == "native"
+        assert op.line_no == 0
+        assert op.source_line == "no interface Loopback0"
 
     def test_static_route_removal_with_next_hop(self):
         cfg = _parse_ios("no ip route 10.0.0.0 255.0.0.0 10.1.1.1\n")

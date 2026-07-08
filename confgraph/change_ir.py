@@ -101,6 +101,11 @@ __all__ = [
     "is_interface_scoped_path",
     "interface_scalar_fields",
     "interface_list_replace_fields",
+    "interface_member_fields",
+    "interface_member_key",
+    "IFACE_MEMBER_REMOVAL_FIELDS",
+    "is_native_iface_member_op",
+    "is_native_interface_delete_op",
     "service_entity_list_fields",
     "service_entity_singleton_fields",
     "banner_scalar_fields",
@@ -375,6 +380,133 @@ def interface_list_replace_fields() -> frozenset[str]:
     families.
     """
     return frozenset({"trunk_allowed_vlans"})
+
+
+# ---------------------------------------------------------------------------
+# Family 8e — interface collection members (CCR Appendix X)
+# ---------------------------------------------------------------------------
+# InterfaceConfig collection fields migrated to per-MEMBER native SET ops
+# ``("interface", <norm>, <field>, <key>)``.  Key functions mirror the
+# engine's ``_IFACE_INCREMENTAL_LISTS`` identities:
+#   None      — value-identity union lists (the member IS its key:
+#               ``str(item)`` — dotted-quad / CIDR / group string).
+#   Callable  — keyed-object lists (FHRP groups by ``group_number``).
+# ``glbp_groups`` is keyed here for op identity even though its legacy
+# merge is the generic ATOMIC replace (it is absent from
+# ``_IFACE_INCREMENTAL_LISTS`` — pre-existing asymmetry vs hsrp/vrrp,
+# preserved: the batched reconstruction rebuilds the FULL list, so the
+# atomic arm sees exactly the legacy proposal list).
+# ``ospf_message_digest_keys`` (dict[int, str]) is handled beside this
+# registry — key = ``str(key_id)``, value = the md5 string.
+_IFACE_MEMBER_KEYS: dict[str, "Callable[[Any], str] | None"] = {
+    "secondary_ips": None,
+    "ipv6_addresses": None,
+    "helper_addresses": None,
+    "nhrp_nhs": None,
+    "nhrp_map": None,
+    "igmp_join_groups": None,
+    "igmp_static_groups": None,
+    "hsrp_groups": lambda g: str(g.group_number),
+    "vrrp_groups": lambda g: str(g.group_number),
+    "glbp_groups": lambda g: str(g.group_number),
+}
+
+# The two interface member-removal tombstone kinds (NESTED_DELETION_RULES
+# templates) and the model fields they target — the ONLY negation surface
+# in the family (X.0; every other collection negation is parser-blind).
+IFACE_MEMBER_REMOVAL_FIELDS: dict[str, str] = {
+    "helper": "helper_addresses",
+    "nhrp_nhs": "nhrp_nhs",
+}
+
+
+@_lru_cache(maxsize=1)
+def interface_member_fields() -> frozenset[str]:
+    """Family-8e boundary: InterfaceConfig collection fields with per-member
+    native SET ops (CCR Appendix X) — the 10 ``_IFACE_MEMBER_KEYS`` lists
+    plus the ``ospf_message_digest_keys`` dict.  Together with families 1
+    and 2 this completes the interface container: every non-provenance
+    InterfaceConfig field is native-emitting on the IOS-family parsers.
+    """
+    return frozenset(_IFACE_MEMBER_KEYS) | {"ospf_message_digest_keys"}
+
+
+def interface_member_key(field_name: str, item: Any) -> str:
+    """Identity path segment for one family-8e list member.
+
+    Codec-owned (the parser and the engine replay must share it): the
+    member key is what the removal replay and the derived-twin claim
+    reason over.  For the dict field the caller passes the dict KEY, not
+    this function.
+    """
+    key_fn = _IFACE_MEMBER_KEYS[field_name]
+    return key_fn(item) if key_fn is not None else str(item)
+
+
+def is_native_iface_member_op(op: "ChangeOp") -> bool:
+    """True iff *op* is a parser-emitted family-8e interface member op.
+
+    Two shapes (both ``origin == "native"`` — CCR Appendix X.1):
+
+    - ``SET ("interface", <norm>, <field>, <key>)`` — one collection member
+      (whole parsed item as value; md-key dict entries carry the md5
+      string).  Routed INTO the reconstructed proposal interface by
+      ``_proposal_from_ops`` (batched parity — the rebuilt list IS the
+      parsed list); the derived whole-list ``("interface", <norm>,
+      <field>)`` twin is retired by the generic container prefix-claim.
+    - ``LIST_REMOVE ("field", "interface", <as-written>, "helper"|"nhrp_nhs",
+      <ip>)`` — byte-exact colon-split of the legacy 5-segment tombstone
+      (regenerated via ``encode_legacy`` at the same walk position).
+      SKIPPED from the batched reconstruction and replayed by the engine
+      with the R.0 re-added-later rule (member-SET lines) — the helper/nhs
+      refresh capability; withdrawal applies == legacy.
+
+    Derived twins (same paths, ``origin="derived"``) return False (origin
+    gate) and keep the batched legacy path so natives-less producers
+    (JunOS/PAN-OS; XR for the removal half) retain exact parity.
+    """
+    if getattr(op, "origin", "derived") != "native":
+        return False
+    path = op.path
+    if op.verb is Verb.SET:
+        return (
+            len(path) == 4
+            and path[0] == "interface"
+            and path[2] in interface_member_fields()
+        )
+    if op.verb is Verb.LIST_REMOVE:
+        return (
+            len(path) == 5
+            and path[0] == "field"
+            and path[1] == "interface"
+            and path[3] in IFACE_MEMBER_REMOVAL_FIELDS
+        )
+    return False
+
+
+def is_native_interface_delete_op(op: "ChangeOp") -> bool:
+    """True iff *op* is the parser-emitted family-8e whole-interface delete.
+
+    ``OBJECT_DELETE ("interface", <norm>)`` at the ``no interface <name>``
+    line — byte-exact colon-split of the legacy ``interface:<norm>``
+    tombstone (implicit sub-interface fan-out stays a CONSUMER semantic,
+    ``_del_interface``).  SKIPPED from the batched reconstruction and
+    replayed by ``_apply_native_interface_ops``: delete-wins == legacy,
+    EXCEPT an interface re-created later in the script (any native
+    interface SET with a later line), which is rebuilt FRESH from the
+    post-delete ops — the ordered delete+recreate capability (the 8c vlan
+    class).  Emitting natively also closes the latent ops-mode claim bug
+    (X.0): the derived delete twin was dropped by the generic prefix-claim
+    whenever the same proposal carried any field SET for that interface.
+
+    Derived twins return False (origin gate) and keep the batched path.
+    """
+    return (
+        getattr(op, "origin", "derived") == "native"
+        and op.verb is Verb.OBJECT_DELETE
+        and len(op.path) == 2
+        and op.path[0] == "interface"
+    )
 
 
 @_lru_cache(maxsize=1)

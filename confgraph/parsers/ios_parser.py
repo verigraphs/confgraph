@@ -1522,6 +1522,41 @@ class IOSParser(BaseParser):
         "cdp_enabled": r"^\s+cdp\s+enable\s*$",
     }
 
+    # Family 8e (CCR Appendix X): per-MEMBER command-line locators for the
+    # interface collection fields.  Each builder receives the parsed member
+    # (or the md-key id) and returns a regex matched against the interface
+    # block's raw_lines (LAST occurrence wins — the 7a keyed-member
+    # posture); misses fall back to the block header.  Provenance quality
+    # only affects the two ORDERED consumers (helper/nhs re-added-later and
+    # the delete+recreate rebuild) and both degrade to exact legacy parity
+    # on a block-head fallback (head line < any nested negation line;
+    # head line > any earlier ``no interface`` line).
+    _IFACE_MEMBER_LINE_BUILDERS: dict = {
+        "secondary_ips": lambda v: (
+            rf"^\s+ip\s+address\s+{re.escape(str(v.ip))}(?:/\d+|\s+\S+)\s+secondary\b"
+        ),
+        "ipv6_addresses": lambda v: (
+            rf"(?i)^\s+ipv6\s+address\s+{re.escape(str(v))}\s*$"
+        ),
+        "helper_addresses": lambda v: (
+            rf"^\s+ip\s+helper-address\s+{re.escape(str(v))}\s*$"
+        ),
+        "nhrp_nhs": lambda v: rf"^\s+ip\s+nhrp\s+nhs\s+{re.escape(str(v))}\b",
+        "nhrp_map": lambda v: rf"^\s+ip\s+nhrp\s+map\s+{re.escape(str(v))}\s*$",
+        "igmp_join_groups": lambda v: (
+            rf"^\s+ip\s+igmp\s+join-group\s+{re.escape(str(v))}\s*$"
+        ),
+        "igmp_static_groups": lambda v: (
+            rf"^\s+ip\s+igmp\s+static-group\s+{re.escape(str(v))}\s*$"
+        ),
+        "hsrp_groups": lambda g: rf"^\s+(?:standby|hsrp)\s+{g.group_number}\b",
+        "vrrp_groups": lambda g: rf"^\s+vrrp\s+{g.group_number}\b",
+        "glbp_groups": lambda g: rf"^\s+glbp\s+{g.group_number}\b",
+        "ospf_message_digest_keys": lambda key_id: (
+            rf"^\s+ip\s+ospf\s+message-digest-key\s+{key_id}\s"
+        ),
+    }
+
     # Family 3 (service entities): banner CLI keyword ↔ BannerConfig field
     # name (``exec`` is a Python keyword-adjacent name, hence exec_banner).
     # Used by both the removal walk (tombstone/op paths) and the native
@@ -1578,6 +1613,8 @@ class IOSParser(BaseParser):
             ChangeOp,
             Verb,
             interface_list_replace_fields,
+            interface_member_fields,
+            interface_member_key,
             interface_scalar_fields,
         )
         from confgraph.utils.interface import normalize_interface_name
@@ -1601,7 +1638,41 @@ class IOSParser(BaseParser):
 
         ops: list = []
         model_fields = type(iface).model_fields
+        member_fields = interface_member_fields()
         for field_name, field_info in model_fields.items():
+            # Family 8e (CCR Appendix X): collection fields emit one native
+            # SET per MEMBER at ("interface", <norm>, <field>, <key>) —
+            # value = the whole parsed item (md-key entries carry the md5
+            # string), per-member last-occurrence line.  The derived
+            # whole-list twin is retired by the generic container
+            # prefix-claim in derive_ops (the member paths claim it).
+            if field_name in member_fields:
+                value = getattr(iface, field_name)
+                if not value:
+                    continue  # empty == model default — nothing derived either
+                builder = self._IFACE_MEMBER_LINE_BUILDERS.get(field_name)
+                if field_name == "ospf_message_digest_keys":
+                    items = [(str(k), v, k) for k, v in value.items()]
+                else:
+                    items = [
+                        (interface_member_key(field_name, item), item, item)
+                        for item in value
+                    ]
+                for key, op_value, locator_arg in items:
+                    source_line, line_no = _provenance(
+                        builder(locator_arg) if builder else None
+                    )
+                    ops.append(
+                        ChangeOp(
+                            verb=Verb.SET,
+                            path=("interface", norm, field_name, key),
+                            value=op_value,
+                            source_line=source_line,
+                            line_no=line_no,
+                            origin="native",
+                        )
+                    )
+                continue
             in_family2 = field_name in family2
             if field_name not in family and not in_family2:
                 continue
@@ -1689,6 +1760,11 @@ class IOSParser(BaseParser):
         ops.extend(self._native_singleton_section_ops(pc))
         ops.extend(self._native_vlan_ops(pc))
         ops.extend(self._native_simple_keyed_list_ops(pc))
+        # Family 8e (CCR Appendix X): interface member removals + whole-
+        # interface deletes queued by parse_deletion_commands.  Appended in
+        # walk order; replay semantics rest on the ops' LINE NUMBERS (the
+        # 7a posture), not ChangeSet position.
+        ops.extend(getattr(self, "_pending_native_interface_ops", None) or [])
         pc.native_change_ops = ops
 
     def _queue_native_static_delete(self, tombstone: str, obj):
@@ -1839,6 +1915,64 @@ class IOSParser(BaseParser):
         )
         self._pending_native_vlan_ops.append(op)
         return encode_legacy([op]).no_commands
+
+    def _queue_native_iface_member_removal(self, tombstone: str, obj):
+        """Build + queue a native family-8e interface member-removal op from
+        its 5-segment ``field:interface:<name>:helper|nhrp_nhs:<ip>``
+        tombstone (the two interface NESTED_DELETION_RULES templates),
+        returning its ``encode_legacy`` artifacts so the caller re-emits
+        the byte-exact legacy tombstone FROM the op (single source, CCR
+        Appendix X — the family-7a ``_queue_native_vrf_removal`` pattern).
+
+        Path = the colon-split of the tombstone (identical to the deriver's
+        path — exact-path dedupe retires the derived twin); the child
+        patterns are IPv4-dotted-quad only, so the split is always 5
+        segments (no IPv6 colon exposure).  Emitted UNCONDITIONALLY at the
+        negation's true line; the re-added-later refresh shape is resolved
+        structurally by the engine replay against the positive member SETs'
+        last-occurrence lines (R.0 — NOT emission suppression, so the
+        legacy twin keeps flowing and byte-identity holds).
+        """
+        from confgraph.change_ir import ChangeOp, Verb, encode_legacy
+
+        op = ChangeOp(
+            verb=Verb.LIST_REMOVE,
+            path=tuple(tombstone.split(":")),
+            value=None,
+            source_line=obj.text.strip(),
+            line_no=obj.linenum,
+            origin="native",
+        )
+        self._pending_native_interface_ops.append(op)
+        return encode_legacy([op])
+
+    def _queue_native_interface_delete(self, tombstone: str, obj):
+        """Build + queue the native family-8e whole-interface OBJECT_DELETE
+        from its ``interface:<norm>`` tombstone (``no interface <name>``),
+        returning its ``encode_legacy`` artifacts (byte-exact tombstone
+        re-emitted from the op — single source, the
+        ``_queue_native_vrf_delete`` pattern).  Line-numbered: the engine
+        replay applies it DELETE-WINS unless the interface is re-created
+        LATER in the script (any native interface SET with a later line),
+        in which case the interface is rebuilt fresh from the post-delete
+        ops (the ordered delete+recreate capability, CCR Appendix X.3).
+        Implicit sub-interface fan-out stays a consumer semantic
+        (``_del_interface`` — one tombstone, one op).  NX-OS/EOS share this
+        walk via ``super().parse_deletion_commands()``; IOS-XR overrides
+        without ``super()`` and never emits the shape.
+        """
+        from confgraph.change_ir import ChangeOp, Verb, encode_legacy
+
+        op = ChangeOp(
+            verb=Verb.OBJECT_DELETE,
+            path=tuple(tombstone.split(":")),
+            value=None,
+            source_line=obj.text.strip(),
+            line_no=obj.linenum,
+            origin="native",
+        )
+        self._pending_native_interface_ops.append(op)
+        return encode_legacy([op])
 
     def _native_vlan_ops(self, pc) -> list:
         """Native family-8c VLAN-database ops (CCR Appendix V).
@@ -5985,6 +6119,13 @@ class IOSParser(BaseParser):
         # UNCONDITIONALLY at their true lines; the byte-exact ``vlan:<id>``
         # tombstones are regenerated FROM them.  Re-initialized per call.
         self._pending_native_vlan_ops: list = []
+        # Change-IR Phase 3 family 8e (CCR Appendix X): native interface
+        # member-removal ops (``no ip helper-address`` / ``no ip nhrp nhs``
+        # nested walks) + whole-interface OBJECT_DELETEs (``no interface``)
+        # queued UNCONDITIONALLY at their true lines; the byte-exact
+        # tombstones are regenerated FROM them (single source).
+        # Re-initialized per call.
+        self._pending_native_interface_ops: list = []
 
         # --- static route deletions ---
         # Tombstone format: "static:<vrf>:<dest/plen>[:<nh_spec>]" where vrf=""
@@ -6590,7 +6731,14 @@ class IOSParser(BaseParser):
         for obj in parse.find_objects(r"^no\s+interface\s+"):
             m = re.search(r"^no\s+interface\s+(\S+)", obj.text)
             if m:
-                tombstones.append(f"interface:{normalize_interface_name(m.group(1))}")
+                # Change-IR family 8e (CCR Appendix X): queue the native
+                # line-numbered OBJECT_DELETE and regenerate the tombstone
+                # FROM it (single source, byte-exact).
+                tombstones.extend(
+                    self._queue_native_interface_delete(
+                        f"interface:{normalize_interface_name(m.group(1))}", obj
+                    ).no_commands
+                )
 
         # --- ACE-level deletions: "no <seq>" inside ip access-list blocks ---
         for acl_obj in parse.find_objects(
@@ -6644,6 +6792,19 @@ class IOSParser(BaseParser):
                     if rule.template.startswith("vrfs:"):
                         tombstones.extend(
                             self._queue_native_vrf_removal(
+                                nested_tombstone, child
+                            ).no_commands
+                        )
+                    # Change-IR family 8e (CCR Appendix X): the two
+                    # interface member-removal templates (helper /
+                    # nhrp_nhs) are queued as NATIVE line-numbered
+                    # LIST_REMOVE ops and the byte-exact tombstone is
+                    # regenerated FROM the op at this same position
+                    # (single source, the 7a pattern).  Other templates
+                    # are unchanged.
+                    elif rule.template.startswith("interface:"):
+                        tombstones.extend(
+                            self._queue_native_iface_member_removal(
                                 nested_tombstone, child
                             ).no_commands
                         )
