@@ -159,6 +159,14 @@ __all__ = [
     "is_native_vlan_op",
     "simple_keyed_list_fields",
     "simple_keyed_list_key",
+    "policy_object_fields",
+    "policy_member_field",
+    "policy_member_key",
+    "is_native_policy_op",
+    "is_native_policy_instance_create_op",
+    "is_native_policy_member_op",
+    "is_native_policy_removal_op",
+    "is_native_acl_delete_op",
 ]
 
 
@@ -2156,6 +2164,179 @@ def simple_keyed_list_key(field_name: str, item: Any) -> tuple[str, ...]:
     return _TOP_LIST_KEYS[field_name](item)
 
 
+# ---------------------------------------------------------------------------
+# Family 8f — policy objects (CCR Appendix Y)
+# ---------------------------------------------------------------------------
+# The five named policy-object collections decomposed to a whole-object
+# CREATE op + per-member SETs.  ``(member_attr, key_fn(item, idx))`` per
+# field; key functions are op-identity labels (the engine reconstructs the
+# member LIST by appending values in op order — the merge identities live
+# in the merger's own key logic, applied on the batched path):
+#   - route_maps / prefix_lists: the sequence number (the seq-removal
+#     replay and the re-added-later refresh reason over it).
+#   - acls: the ACE sequence when present (``acl-seq:`` twins address it);
+#     positional ``@<idx>`` for unsequenced/remark ACEs (no negation
+#     surface addresses them — the legacy dedup key stays a MERGE
+#     semantic, applied by ``_merge_acls`` on the batched path).
+#   - community_lists / as_path_lists: positional (zero negation surface).
+_POLICY_MEMBER_KEYS: dict[str, tuple[str, "Callable[[Any, int], str]"]] = {
+    "route_maps": ("sequences", lambda s, i: str(s.sequence)),
+    "prefix_lists": ("sequences", lambda e, i: str(e.sequence)),
+    "acls": (
+        "entries",
+        lambda e, i: str(e.sequence) if e.sequence is not None else f"@{i}",
+    ),
+    "community_lists": ("entries", lambda e, i: f"@{i}"),
+    "as_path_lists": ("entries", lambda e, i: f"@{i}"),
+}
+
+# Removal-twin path heads (the FOUR IOS walk shapes — CCR Appendix Y.0).
+# ``route-map:``/``prefix-list:`` whole-object shapes (IOS-XR, D1) are NOT
+# here: XR is gated and its derived deletes keep the legacy/fix-forward
+# paths untouched.
+_POLICY_SEQ_REMOVAL_HEADS: frozenset[str] = frozenset(
+    {"acl-seq", "route-map", "prefix-list"}
+)
+
+
+@_lru_cache(maxsize=1)
+def policy_object_fields() -> frozenset[str]:
+    """Family-8f boundary (CCR Appendix Y): the five named policy-object
+    collections — ``acls`` / ``route_maps`` / ``prefix_lists`` /
+    ``community_lists`` / ``as_path_lists``.  The LAST derived whole-object
+    SETs of Phase 3: on the IOS family (INCREMENTAL merge strategy) each
+    parsed object emits a whole-object CREATE op + per-member SETs and the
+    derived SET is retired via the create op's ``path[:2]`` claim.
+    ATOMIC_REPLACE producers (IOS-XR gated; JunOS/PAN-OS natives-less) keep
+    their derived SETs → the batched ``_os_aware_rule`` applies the atomic
+    replace verbatim (``Verb.BLOCK_REPLACE`` stays dormant until Phase 5).
+    """
+    return frozenset(_POLICY_MEMBER_KEYS)
+
+
+def policy_member_field(field_name: str) -> str:
+    """The member-list attribute of one family-8f collection
+    (``sequences`` for route_maps/prefix_lists, ``entries`` otherwise).
+    Codec-owned — the parser emission and the engine routing share it.
+    """
+    return _POLICY_MEMBER_KEYS[field_name][0]
+
+
+def policy_member_key(field_name: str, item: Any, index: int) -> str:
+    """Identity path segment for one family-8f member SET (see
+    ``_POLICY_MEMBER_KEYS``).  Codec-owned; the parser must not
+    re-implement the keys — the engine's seq-removal replay matches
+    removal tombstone seqs against these segments.
+    """
+    return _POLICY_MEMBER_KEYS[field_name][1](item, index)
+
+
+def is_native_policy_instance_create_op(op: "ChangeOp") -> bool:
+    """True iff *op* is the family-8f whole-object CREATE op.
+
+    ``SET (<field>, <name>, "instance")`` — value = the parsed object
+    (block provenance).  Claims its ``(<field>, <name>)`` prefix in
+    :func:`derive_ops` (the L/Q/S create-op mechanism) so the derived
+    whole-object SET is retired inline.  The engine appends a creation
+    seed (member list emptied — the members ride their own SETs) to the
+    reconstructed proposal in ``_proposal_from_ops``: creation keeps the
+    legacy additive-pass POSITION, so whole-object delete-wins ordering
+    is preserved by construction (CCR Appendix Y.2).
+    """
+    return (
+        getattr(op, "origin", "derived") == "native"
+        and op.verb is Verb.SET
+        and len(op.path) == 3
+        and op.path[0] in policy_object_fields()
+        and op.path[2] == "instance"
+    )
+
+
+def is_native_policy_member_op(op: "ChangeOp") -> bool:
+    """True iff *op* is a family-8f per-member SET.
+
+    ``SET (<field>, <name>, <member_attr>, <key>)`` — value = the parsed
+    member model (whole — no per-field reconstruction, no parser-absence
+    exposure).  Routed INTO the object created by the sibling create op in
+    ``_proposal_from_ops`` (append in op order — the rebuilt list IS the
+    parsed list, so the batched OS-aware merge applies exact legacy
+    semantics).  Carries the member's LAST-occurrence line where a
+    negation surface exists (route-map/prefix-list seqs, sequenced ACEs)
+    — the re-added-later ordering basis for the seq-removal replay.
+    """
+    return (
+        getattr(op, "origin", "derived") == "native"
+        and op.verb is Verb.SET
+        and len(op.path) == 4
+        and op.path[0] in policy_object_fields()
+        and op.path[2] == policy_member_field(op.path[0])
+    )
+
+
+def is_native_policy_removal_op(op: "ChangeOp") -> bool:
+    """True iff *op* is a native family-8f seq-level removal.
+
+    ``LIST_REMOVE`` on the byte-exact colon-split of one of the three
+    seq-shaped legacy twins (``acl-seq:<name>:<seq>``,
+    ``route-map:<name>:seq:<n>``, ``prefix-list:<name>:seq:<n>`` — the
+    verb comes from the codec's own tombstone→verb registry).  SKIPPED
+    from the batched reconstruction and replayed by the engine with the
+    re-added-later rule (refresh capability); a removal with no later
+    re-add applies via the exact legacy handlers (delete-wins == legacy).
+    DERIVED twins (same paths) return False (origin gate) and keep the
+    batched tombstone path — the IOS-XR whole-object OBJECT_DELETE shapes
+    (D1) never match (different verb) and stay fully derived.
+    """
+    return (
+        getattr(op, "origin", "derived") == "native"
+        and op.verb is Verb.LIST_REMOVE
+        and len(op.path) >= 3
+        and op.path[0] in _POLICY_SEQ_REMOVAL_HEADS
+    )
+
+
+def is_native_acl_delete_op(op: "ChangeOp") -> bool:
+    """True iff *op* is the native family-8f whole-ACL delete.
+
+    ``OBJECT_DELETE ("acl", <name…>)`` at the ``no ip access-list
+    standard|extended <name>`` line — byte-exact colon-split of the legacy
+    ``acl:<name>`` tombstone.  SKIPPED from the batched reconstruction and
+    replayed by ``_apply_native_policy_ops``: delete-wins == legacy,
+    EXCEPT an ACL re-defined LATER in the script (create op with a later
+    line), which is rebuilt FRESH from the post-delete ops — the ordered
+    delete+recreate capability (the 8c-vlan/8e-interface class).  The
+    IOS-XR derived ``acl:<name>`` twin returns False (origin gate) and
+    keeps the batched tombstone path (``_del_acl`` — honored in BOTH
+    modes today, unchanged).
+    """
+    return (
+        getattr(op, "origin", "derived") == "native"
+        and op.verb is Verb.OBJECT_DELETE
+        and len(op.path) >= 2
+        and op.path[0] == "acl"
+    )
+
+
+def is_native_policy_op(op: "ChangeOp") -> bool:
+    """True iff *op* belongs to family 8f (any of the four shapes).
+
+    Excluded from the generic container prefix-claim in
+    :func:`derive_ops` (the H/M/R exclusion pattern): a member SET must
+    not claim its ``(<field>, <name>)`` prefix on its own (graceful
+    degradation — retirement is create-op-scoped), and a native seq
+    removal such as ``("route-map", <name>, "seq", <n>)`` must never
+    prefix-claim ``("route-map", <name>)`` — that path IS the IOS-XR
+    derived whole-object delete (the 8e X.0 latent-claim class, closed
+    here by exclusion).
+    """
+    return (
+        is_native_policy_instance_create_op(op)
+        or is_native_policy_member_op(op)
+        or is_native_policy_removal_op(op)
+        or is_native_acl_delete_op(op)
+    )
+
+
 def _static_nh_key(r: Any) -> str:
     """Stable NH identity segment for a static route (mirrors merger identity)."""
     nh = r.next_hop
@@ -2422,6 +2603,13 @@ def derive_ops(proposal: "ParsedConfig") -> ChangeSet:
         and not is_native_ospf_op(op)
         and not is_native_vrf_op(op)
         and not is_native_singleton_section_op(op)
+        # Family 8f (CCR Appendix Y): policy-object ops must not claim
+        # generically — retirement is create-op-scoped (below), and a
+        # native seq removal ("route-map", <name>, "seq", <n>) would
+        # otherwise prefix-claim ("route-map", <name>) — the IOS-XR
+        # derived whole-object delete path (the 8e X.0 latent-claim
+        # class, excluded here).
+        and not is_native_policy_op(op)
         for i in range(1, len(op.path))
     }
     # 5c-B.2 retirement (CCR Appendix L — the one authorized derive_ops touch),
@@ -2446,12 +2634,19 @@ def derive_ops(proposal: "ParsedConfig") -> ChangeSet:
     # Family 7b (CCR Appendix S): the whole-VRF CREATE op claims its
     # ``("vrfs", name)`` prefix — same len-2 shape as the IS-IS single-tag
     # claim.  Gated VRFs (IOS-XR) emit no create op → their derived SET
-    # survives (the 7a coexistence, unchanged).
+    # survives (the 7a coexistence, unchanged).  Family 8f (CCR Appendix
+    # Y): the policy-object CREATE op claims its ``(<field>, <name>)``
+    # prefix — the SAME len-2 shape — retiring the derived whole-object
+    # SET for the five policy collections.  Gated (IOS-XR) / natives-less
+    # (JunOS, PAN-OS) producers emit no create op → their derived SETs
+    # survive → the batched OS-aware ATOMIC_REPLACE keeps exact legacy
+    # behavior (BLOCK_REPLACE stays dormant until Phase 5).
     native_prefix_claims |= {
         op.path[:2]
         for op in natives
         if is_native_isis_instance_create_op(op)
         or is_native_vrf_instance_create_op(op)
+        or is_native_policy_instance_create_op(op)
     }
     # Family 8a (CCR Appendix T): the whole-SECTION create op claims its
     # ``(<section>,)`` len-1 prefix — exactly the derived whole-singleton

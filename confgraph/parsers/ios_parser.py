@@ -1760,6 +1760,7 @@ class IOSParser(BaseParser):
         ops.extend(self._native_singleton_section_ops(pc))
         ops.extend(self._native_vlan_ops(pc))
         ops.extend(self._native_simple_keyed_list_ops(pc))
+        ops.extend(self._native_policy_object_ops(pc))
         # Family 8e (CCR Appendix X): interface member removals + whole-
         # interface deletes queued by parse_deletion_commands.  Appended in
         # walk order; replay semantics rest on the ops' LINE NUMBERS (the
@@ -1887,6 +1888,47 @@ class IOSParser(BaseParser):
             origin="native",
         )
         self._pending_native_singleton_ops.append(op)
+        return encode_legacy([op])
+
+    def _queue_native_policy_removal(self, tombstone: str, obj):
+        """Build + queue a native family-8f policy-object removal op from
+        its legacy tombstone (``acl:<name>`` whole-ACL deletes and the
+        three seq shapes ``acl-seq:<name>:<seq>`` /
+        ``route-map:<name>:seq:<n>`` / ``prefix-list:<name>:seq:<n>``),
+        returning its ``encode_legacy`` artifacts so the caller re-emits
+        the byte-exact legacy tombstone FROM the op (single source, CCR
+        Appendix Y — the family-4/7a/8a ``_queue_native_*`` pattern).
+
+        The op path is the colon-split of the tombstone (identical to the
+        derived twin's path, so exact-path dedupe retires it) and the VERB
+        comes from the codec's own tombstone→verb registry
+        (``_verb_for_top_tombstone`` — OBJECT_DELETE for ``acl:``,
+        LIST_REMOVE for the seq shapes; single source).  Emitted
+        UNCONDITIONALLY at the negation's true line — the engine replay
+        resolves the re-added-later refresh (seq shapes) and the
+        delete+recreate ordering (whole-ACL) against the positive ops'
+        last-occurrence lines; without a later re-add it applies via the
+        exact legacy handlers (delete-wins == legacy).  NX-OS/EOS share
+        these walk sites via ``super().parse_deletion_commands()``; IOS-XR
+        overrides the method without ``super()`` and stays fully derived
+        (gated — its ``acl:``/``route-map:``/``prefix-list:`` whole-object
+        shapes keep the legacy/D1-fix-forward paths untouched).
+        """
+        from confgraph.change_ir import (
+            ChangeOp,
+            _verb_for_top_tombstone,
+            encode_legacy,
+        )
+
+        op = ChangeOp(
+            verb=_verb_for_top_tombstone(tombstone),
+            path=tuple(tombstone.split(":")),
+            value=None,
+            source_line=obj.text.strip(),
+            line_no=obj.linenum,
+            origin="native",
+        )
+        self._pending_native_policy_ops.append(op)
         return encode_legacy([op])
 
     def _queue_native_vlan_delete(self, vid: str, obj) -> list:
@@ -2078,6 +2120,166 @@ class IOSParser(BaseParser):
                         origin="native",
                     )
                 )
+        return ops
+
+    def _policy_objects_gated(self) -> bool:
+        """Family-8f per-OS gate (CCR Appendix Y.1): True iff this parser's
+        policy-object surface (acls / route_maps / prefix_lists /
+        community_lists / as_path_lists) must stay fully DERIVED.
+
+        Today exactly **IOS-XR** — the ONE native-ops-capable parser whose
+        merge strategy for the OS-aware collections is ATOMIC_REPLACE
+        (``merger._strategy``): emitting incremental member SETs would
+        diverge from the atomic name-replace, and XR's own
+        ``parse_deletion_commands`` (no ``super()``) emits the DERIVED
+        whole-object ``acl:``/``route-map:``/``prefix-list:`` shapes (the
+        D1 fix-forward set) with no native twin — Phase-5 surface.  Keeping
+        the derived whole-object SETs is the S.2-consistent rot-safe
+        posture; ``Verb.BLOCK_REPLACE`` stays dormant until Phase 5.
+        NX-OS/EOS are UNGATED (INCREMENTAL strategy): their own parse
+        overrides feed the SAME state walk, and they inherit the IOS
+        removal walks via ``super().parse_deletion_commands()``.
+        JunOS/PAN-OS subclass BaseParser — natives-less by construction.
+        """
+        os_val = getattr(self.os_type, "value", self.os_type)
+        return os_val == "ios_xr"
+
+    def _policy_member_last_lines(self) -> dict:
+        """Map ``(field, name, seq_key)`` → ``(source_line, linenum)`` for
+        the seq-addressable policy members, LAST occurrence winning
+        (family 8f, CCR Appendix Y.2 — the re-added-later ordering basis
+        for the engine's seq-removal replay).
+
+        One parse-object scan per collection over the IOS-family
+        spellings the inherited walks share:
+
+        - ``route-map <name> permit|deny <seq>`` block heads,
+        - ``ip prefix-list <name> seq <n> …`` lines,
+        - sequenced ACE children of ``ip access-list`` blocks.
+
+        Members not matched (unsequenced ACEs, community/as-path entries,
+        EOS child-form prefix-list seqs) fall back to their object's block
+        head line at the emission site — block position preserves correct
+        delete/recreate ordering, and no seq-removal shape addresses them.
+        """
+        lines: dict = {}
+        parse = self._get_parse_obj()
+        for obj in parse.find_objects(r"^route-map\s+"):
+            m = re.match(
+                r"^route-map\s+(\S+)\s+(?:permit|deny)\s+(\d+)", obj.text.strip()
+            )
+            if m:
+                lines[("route_maps", m.group(1), m.group(2))] = (
+                    obj.text.strip(),
+                    obj.linenum,
+                )
+        for obj in parse.find_objects(r"^ip\s+prefix-list\s+"):
+            m = re.match(
+                r"^ip\s+prefix-list\s+(\S+)\s+seq\s+(\d+)", obj.text.strip()
+            )
+            if m:
+                lines[("prefix_lists", m.group(1), m.group(2))] = (
+                    obj.text.strip(),
+                    obj.linenum,
+                )
+        for acl_obj in parse.find_objects(r"^ip\s+access-list\s+\S+"):
+            m = re.search(
+                r"^ip\s+access-list\s+(?:(?:standard|extended)\s+)?(\S+)",
+                acl_obj.text,
+            )
+            if not m:
+                continue
+            acl_name = m.group(1)
+            for child in acl_obj.children:
+                cm = re.match(r"^(\d+)\s+(?:permit|deny)\s", child.text.strip())
+                if cm:
+                    lines[("acls", acl_name, cm.group(1))] = (
+                        child.text.strip(),
+                        child.linenum,
+                    )
+        return lines
+
+    def _native_policy_object_ops(self, pc) -> list:
+        """Native family-8f policy-object ops (CCR Appendix Y) — positives
+        + queued removals.
+
+        Positive side: a parser-agnostic STATE WALK over the FINAL parsed
+        collections (covers the NX-OS/EOS own-parse overrides uniformly —
+        runs at parse finalization via ``_attach_native_change_ops``).
+        Per parsed object, in parse order:
+
+        - ``SET (<field>, <name>, "instance")`` — whole-object CREATE op
+          (value = the parsed object, block-head provenance; claims the
+          derived whole-object SET's ``path[:2]`` in ``derive_ops`` →
+          inline retirement).  The engine seeds the reconstructed proposal
+          from it (member list emptied — ``_policy_creation_seed``) inside
+          the batched additive pass, so whole-object delete-wins ordering
+          is preserved by construction (Appendix Y.2).
+        - ``SET (<field>, <name>, <member_attr>, <key>)`` per member
+          (``policy_member_key`` — seq numbers for the seq-addressable
+          members, positional for the rest), carrying the member's
+          LAST-occurrence line (``_policy_member_last_lines``; block-head
+          fallback).  NO scalar ops: every object-level scalar
+          (``acl_type`` / ``list_type`` / ``afi`` / ``description``) is
+          creation-only in the legacy merge fns and rides the create
+          value (blind-on-existing in BOTH modes — enumerated parity,
+          Appendix Y.2).
+
+        Delete side: the pending ops queued by
+        ``_queue_native_policy_removal`` at their true negation lines.
+        GATED parsers (IOS-XR — ATOMIC_REPLACE strategy, Appendix Y.1)
+        return no ops: their derived whole-object SETs and derived
+        deletion shapes keep exact legacy (and D1 fix-forward) behavior.
+        """
+        if self._policy_objects_gated():
+            return []
+
+        from confgraph.change_ir import (
+            ChangeOp,
+            Verb,
+            policy_member_field,
+            policy_member_key,
+            policy_object_fields,
+        )
+
+        member_lines = self._policy_member_last_lines()
+        ops: list = []
+        for field in sorted(policy_object_fields()):
+            for obj in getattr(pc, field, None) or []:
+                raw_lines = obj.raw_lines or []
+                line_numbers = obj.line_numbers or []
+                block_line = (
+                    (raw_lines[0].strip() if raw_lines else ""),
+                    (line_numbers[0] if line_numbers else -1),
+                )
+                ops.append(
+                    ChangeOp(
+                        verb=Verb.SET,
+                        path=(field, obj.name, "instance"),
+                        value=obj,
+                        source_line=block_line[0],
+                        line_no=block_line[1],
+                        origin="native",
+                    )
+                )
+                member_attr = policy_member_field(field)
+                for idx, member in enumerate(getattr(obj, member_attr)):
+                    key = policy_member_key(field, member, idx)
+                    source_line, line_no = member_lines.get(
+                        (field, obj.name, key), block_line
+                    )
+                    ops.append(
+                        ChangeOp(
+                            verb=Verb.SET,
+                            path=(field, obj.name, member_attr, key),
+                            value=member,
+                            source_line=source_line,
+                            line_no=line_no,
+                            origin="native",
+                        )
+                    )
+
+        ops.extend(getattr(self, "_pending_native_policy_ops", None) or [])
         return ops
 
     def _singleton_section_gated(self) -> bool:
@@ -6126,6 +6328,12 @@ class IOSParser(BaseParser):
         # tombstones are regenerated FROM them (single source).
         # Re-initialized per call.
         self._pending_native_interface_ops: list = []
+        # Change-IR Phase 3 family 8f (CCR Appendix Y): native policy-object
+        # removal ops (whole-ACL deletes + the three seq-shaped removals)
+        # queued UNCONDITIONALLY at their true lines; the byte-exact
+        # tombstones are regenerated FROM them (single source).
+        # Re-initialized per call.
+        self._pending_native_policy_ops: list = []
 
         # --- static route deletions ---
         # Tombstone format: "static:<vrf>:<dest/plen>[:<nh_spec>]" where vrf=""
@@ -6283,28 +6491,49 @@ class IOSParser(BaseParser):
                 self._pending_native_eigrp_ops.append(op)
                 tombstones.extend(encode_legacy([op]).no_commands)
 
+        # Change-IR family 8f (CCR Appendix Y): the whole-ACL delete is a
+        # NATIVE line-numbered OBJECT_DELETE; the byte-exact ``acl:<name>``
+        # tombstone is regenerated FROM it (single source).  The engine
+        # replay applies it delete-wins == legacy unless the ACL is
+        # re-defined LATER in the script (ordered delete+recreate).
         for obj in parse.find_objects(r"^no\s+ip\s+access-list\s+"):
             m = re.search(
                 r"^no\s+ip\s+access-list\s+(?:standard|extended)\s+(\S+)", obj.text
             )
             if m:
-                tombstones.append(f"acl:{m.group(1)}")
+                tombstones.extend(
+                    self._queue_native_policy_removal(
+                        f"acl:{m.group(1)}", obj
+                    ).no_commands
+                )
 
         # --- route-map sequence deletion ---
+        # Family 8f: native LIST_REMOVE at the true line; the engine replay
+        # resolves the seq-refresh (re-added-later) against the positive
+        # member SETs' last-occurrence lines.
         for obj in parse.find_objects(r"^no\s+route-map\s+"):
             m = re.search(
                 r"^no\s+route-map\s+(\S+)\s+(?:permit|deny)\s+(\d+)", obj.text
             )
             if m:
-                tombstones.append(f"route-map:{m.group(1)}:seq:{m.group(2)}")
+                tombstones.extend(
+                    self._queue_native_policy_removal(
+                        f"route-map:{m.group(1)}:seq:{m.group(2)}", obj
+                    ).no_commands
+                )
 
         # --- prefix-list sequence deletion ---
+        # Family 8f: native LIST_REMOVE (same posture as route-map seqs).
         for obj in parse.find_objects(r"^no\s+ip\s+prefix-list\s+"):
             m = re.search(
                 r"^no\s+ip\s+prefix-list\s+(\S+)\s+seq\s+(\d+)", obj.text
             )
             if m:
-                tombstones.append(f"prefix-list:{m.group(1)}:seq:{m.group(2)}")
+                tombstones.extend(
+                    self._queue_native_policy_removal(
+                        f"prefix-list:{m.group(1)}:seq:{m.group(2)}", obj
+                    ).no_commands
+                )
 
         # --- singleton protocol removals (whole-section) ---
         # Change-IR family 8b (CCR Appendix U): the whole-section multicast
@@ -6754,7 +6983,14 @@ class IOSParser(BaseParser):
                 child_text = child.text.strip()
                 m2 = re.match(r"^no\s+(\d+)$", child_text)
                 if m2:
-                    tombstones.append(f"acl-seq:{acl_name}:{m2.group(1)}")
+                    # Family 8f (CCR Appendix Y): native ACE removal at the
+                    # true child line; the ``acl-seq:<name>:<seq>``
+                    # tombstone is regenerated FROM it (single source).
+                    tombstones.extend(
+                        self._queue_native_policy_removal(
+                            f"acl-seq:{acl_name}:{m2.group(1)}", child
+                        ).no_commands
+                    )
 
         # --- Registry-driven nested block deletions ---
         # Each NestedDeletionRule maps a (parent_block, nested_no_command) pair
