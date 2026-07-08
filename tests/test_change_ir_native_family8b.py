@@ -328,10 +328,18 @@ class TestRetirement:
             assert sum(1 for op in ops if op.path == (sect, "instance")) == 1, sect
 
     def test_unmigrated_singletons_still_derived(self):
-        pc = _parse("vtp domain CORP\ncdp run\nip dhcp snooping\n")
+        # Pin flipped by WI-8c (CCR Appendix V): the original controls were
+        # ``vtp``/``cdp`` — both migrated in family 8c.  The still-unmigrated
+        # controls are now ``nat`` (custom ``_nat_rule``) and ``crypto``
+        # (``_singleton_rule``), neither of which has native emission.
+        pc = _parse(
+            "ip nat pool POOL1 10.1.1.1 10.1.1.10 netmask 255.255.255.0\n"
+            "crypto isakmp policy 10\n encryption aes\n"
+            "ip dhcp snooping\n"
+        )
         ops = derive_ops(pc)
-        assert any(op.path == ("vtp",) and op.origin == "derived" for op in ops)
-        assert any(op.path == ("cdp",) and op.origin == "derived" for op in ops)
+        assert any(op.path == ("nat",) and op.origin == "derived" for op in ops)
+        assert any(op.path == ("crypto",) and op.origin == "derived" for op in ops)
 
     def test_anti_rot_family8b_never_derived(self):
         pc = _parse(KITCHEN_SINK + "no ip multicast-routing\nno ip flow-export\n")

@@ -303,9 +303,15 @@ class TestRetirement:
             ), sect
 
     def test_unmigrated_singletons_still_derived(self):
-        pc = _parse("vtp domain CORP\nntp server 10.0.0.1\n")
+        # Pin flipped by WI-8c (CCR Appendix V): the original control was
+        # ``vtp`` — migrated in family 8c, so the still-unmigrated control is
+        # now ``nat`` (custom ``_nat_rule``, no native emission).
+        pc = _parse(
+            "ip nat pool POOL1 10.1.1.1 10.1.1.10 netmask 255.255.255.0\n"
+            "ntp server 10.0.0.1\n"
+        )
         ops = derive_ops(pc)
-        assert any(op.path == ("vtp",) and op.origin == "derived" for op in ops)
+        assert any(op.path == ("nat",) and op.origin == "derived" for op in ops)
 
     def test_anti_rot_family8a_never_derived(self):
         pc = _parse(KITCHEN_SINK + "no snmp-server\nno ip domain-lookup\n")

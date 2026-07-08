@@ -150,6 +150,7 @@ __all__ = [
     "singleton_line_detected_scalars",
     "is_native_singleton_section_op",
     "is_native_singleton_instance_create_op",
+    "is_native_vlan_op",
 ]
 
 
@@ -1664,6 +1665,23 @@ _SINGLETON_MEMBER_KEYS: dict[str, dict[str, Callable[[Any], tuple[str, ...]]]] =
         "flood_vtep_list": lambda f: (str(f),),
     },
     "vpc": {},
+    # Family 8c (CCR Appendix V) — visibility + L2 global singletons.  Same
+    # discipline: keys mirror the merger ``_SINGLETON_SECTION_LIST_KEYS``
+    # identities exactly.  ``cdp`` / ``vtp`` are scalar-only sections.
+    # ``spanning_tree``'s legacy merge is the CUSTOM ``_spanning_tree_rule``;
+    # its ``vlan_configs`` arm is a keyed whole-object replace on
+    # ``vlan_id`` — the registry entry feeds ONLY the engine replay (the
+    # legacy rule is untouched; equivalence pinned in the engine tests).
+    # STPVlanConfig.vlan_id is already a str (may be a range spec like
+    # "10-20" — one path segment either way).
+    "lldp": {
+        "tlv_select": lambda t: (str(t),),
+    },
+    "cdp": {},
+    "spanning_tree": {
+        "vlan_configs": lambda v: (str(v.vlan_id),),
+    },
+    "vtp": {},
 }
 
 # Scalars whose native op is LINE-DETECTED (tri-state), not state-derived —
@@ -1673,6 +1691,16 @@ _SINGLETON_MEMBER_KEYS: dict[str, dict[str, Callable[[Any], tuple[str, ...]]]] =
 _SINGLETON_LINE_DETECTED_SCALARS: dict[str, frozenset[str]] = {
     "syslog": frozenset({"enabled"}),
     "dns": frozenset({"lookup_enabled"}),
+    # Family 8c (CCR Appendix V.2): the visibility True-default booleans.
+    # ``lldp.enabled`` / ``cdp.enabled`` are tri-state on the IOS family
+    # (positive ``lldp run``/``cdp run`` re-assert vs ``no … run`` negation)
+    # and carry the NX-OS parser-absence trap (``feature lldp``/``feature
+    # cdp`` — absence parses to False ≠ model default True), so the parser
+    # emits them from dedicated line scans (NX-OS: unconditionally when the
+    # section exists).  ``cdp.advertise_v2`` is a plain tri-state
+    # (absence == default True on every OS).
+    "lldp": frozenset({"enabled"}),
+    "cdp": frozenset({"enabled", "advertise_v2"}),
 }
 
 
@@ -1735,14 +1763,18 @@ def singleton_scalar_fields(section: str) -> frozenset[str]:
     """
     from confgraph.models.aaa import AAAConfig
     from confgraph.models.bfd import BFDConfig
+    from confgraph.models.cdp import CDPConfig
     from confgraph.models.dhcp import DHCPConfig
     from confgraph.models.dns import DNSConfig
+    from confgraph.models.lldp import LLDPConfig
     from confgraph.models.logging_config import SyslogConfig
     from confgraph.models.mpls import MPLSConfig
     from confgraph.models.multicast import MulticastConfig
     from confgraph.models.netflow import NetFlowConfig
     from confgraph.models.ntp import NTPConfig
     from confgraph.models.snmp import SNMPConfig
+    from confgraph.models.stp import STPConfig
+    from confgraph.models.vlan import VTPConfig
     from confgraph.models.vpc import VPCConfig
     from confgraph.models.vxlan import VXLANConfig
 
@@ -1759,6 +1791,10 @@ def singleton_scalar_fields(section: str) -> frozenset[str]:
         "mpls": MPLSConfig,
         "vxlan": VXLANConfig,
         "vpc": VPCConfig,
+        "lldp": LLDPConfig,
+        "cdp": CDPConfig,
+        "spanning_tree": STPConfig,
+        "vtp": VTPConfig,
     }
     fields: set[str] = set()
     for name, info in models[section].model_fields.items():
@@ -1847,6 +1883,46 @@ def is_native_singleton_section_op(op: "ChangeOp") -> bool:
             and path[0] == "field"
             and path[1] in _SINGLETON_MEMBER_KEYS
         )
+    return False
+
+
+def is_native_vlan_op(op: "ChangeOp") -> bool:
+    """True iff *op* is a parser-emitted family-8c VLAN-database op.
+
+    Two shapes (both ``origin == "native"`` — CCR Appendix V.1):
+
+    - ``SET ("vlans", <id>)``          — VLAN (re)creation.  value = the
+          parsed ``VLANEntry``; the path is IDENTICAL to the derived keyed
+          SET (``_TOP_LIST_KEYS["vlans"]`` — ``str(vlan_id)``), so the
+          exact-path dedupe in :func:`derive_ops` retires the derived twin
+          (no creation seed / prefix claim needed — keyed top-level
+          collection, the family-3 shape).  Carries the entry's
+          LAST-occurrence line (``VLANEntry`` has no provenance fields; the
+          parser re-scans the ``vlan <spec>`` lines for line numbers).
+    - ``OBJECT_DELETE ("vlan", <id>)`` — ``no vlan <spec>`` per expanded id
+          (ranges/commas expand; each id carries the spec line's number).
+          Byte-exact colon-split of the legacy ``vlan:<id>`` tombstone —
+          ``encode_legacy`` reproduces it via the top-level fall-through.
+
+    The engine replays both IN ChangeSet order (``_apply_native_vlan_ops``,
+    the family-3 in-order mechanism): delete-then-recreate in one proposal →
+    the VLAN SURVIVES (device truth — the legacy batched adds-then-deletes
+    order false-removes it, the W5 class); recreate-then-delete → REMOVED,
+    parity with legacy.  Owned by the codec module: the engine's replay pass
+    and its ``_proposal_from_ops`` skip MUST share this predicate.  Derived
+    twins (same path, ``origin="derived"``) return False (origin gate) and
+    keep the batched legacy path so natives-less producers retain exact
+    legacy parity.
+    """
+    if getattr(op, "origin", "derived") != "native":
+        return False
+    path = op.path
+    if len(path) != 2:
+        return False
+    if op.verb is Verb.SET:
+        return path[0] == "vlans"
+    if op.verb is Verb.OBJECT_DELETE:
+        return path[0] == "vlan"
     return False
 
 

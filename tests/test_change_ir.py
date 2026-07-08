@@ -61,7 +61,8 @@ def _is_reordered_native_tombstone(t: str) -> bool:
     ``singleton:snmp`` / ``singleton:aaa`` null-outs, CCR Appendix T) +
     family 8b (the seven infra-singleton sections' entry removals /
     scalar resets and the ``singleton:netflow`` / ``singleton:multicast``
-    null-outs, CCR Appendix U) — each
+    null-outs, CCR Appendix U) + family 8c (``field:lldp:tlv:`` TLV removals
+    and ``vlan:`` VLAN-database deletes, CCR Appendix V) — each
     encodes byte-exactly but no longer at its legacy walk-group position in
     ``no_commands``.  Non-weakening: order among these and other families is
     semantically inert — each dispatches to an independent
@@ -95,6 +96,7 @@ def _is_reordered_native_tombstone(t: str) -> bool:
                 "field:mpls:",
             )
         )
+        or t.startswith(("field:lldp:", "vlan:"))
         or t in ("singleton:snmp", "singleton:aaa", "singleton:netflow", "singleton:multicast")
     )
 

@@ -1687,6 +1687,7 @@ class IOSParser(BaseParser):
         ops.extend(self._native_ospf_ops(pc))
         ops.extend(self._native_vrf_ops(pc))
         ops.extend(self._native_singleton_section_ops(pc))
+        ops.extend(self._native_vlan_ops(pc))
         pc.native_change_ops = ops
 
     def _queue_native_static_delete(self, tombstone: str, obj):
@@ -1810,6 +1811,93 @@ class IOSParser(BaseParser):
         )
         self._pending_native_singleton_ops.append(op)
         return encode_legacy([op])
+
+    def _queue_native_vlan_delete(self, vid: str, obj) -> list:
+        """Build + queue a native family-8c VLAN OBJECT_DELETE for one
+        expanded id from a ``no vlan <spec>`` line, returning the byte-exact
+        legacy tombstone(s) regenerated FROM the op via ``encode_legacy``
+        (single source, CCR Appendix V — the ``_queue_native_vrf_delete``
+        pattern).  Path = the colon-split of ``vlan:<id>`` (identical to the
+        deriver's path, so exact-path dedupe retires the derived twin); each
+        id of a range/comma spec carries the spec line's number — the
+        ordering basis for the engine's in-order replay against the native
+        ``("vlans", <id>)`` creation SETs (the delete-then-recreate
+        capability).  NX-OS/EOS share this walk via
+        ``super().parse_deletion_commands()``; IOS-XR overrides without
+        ``super()`` and never emits these shapes.
+        """
+        from confgraph.change_ir import ChangeOp, Verb, encode_legacy
+
+        op = ChangeOp(
+            verb=Verb.OBJECT_DELETE,
+            path=("vlan", vid),
+            value=None,
+            source_line=obj.text.strip(),
+            line_no=obj.linenum,
+            origin="native",
+        )
+        self._pending_native_vlan_ops.append(op)
+        return encode_legacy([op]).no_commands
+
+    def _native_vlan_ops(self, pc) -> list:
+        """Native family-8c VLAN-database ops (CCR Appendix V).
+
+        Positive side — one ``SET ("vlans", <id>)`` per FINAL parsed
+        ``VLANEntry`` (value = the entry; path identical to the derived keyed
+        SET, so composition dedupe retires the twin).  ``VLANEntry`` carries
+        no provenance fields, so line numbers come from a dedicated scan of
+        the ``vlan <spec>`` lines (same regex + expansion semantics as
+        ``parse_vlans``): each entry gets its LAST-occurrence line — the
+        re-added-later ordering basis.  Delete side: the pending
+        OBJECT_DELETEs queued by ``_queue_native_vlan_delete``.  Everything
+        stable-sorted by line; a SET whose line could not be resolved keeps
+        ``-1`` and sorts FIRST, so an unresolvable order degrades to
+        delete-wins == legacy (never the other way).
+        """
+        from confgraph.change_ir import ChangeOp, Verb
+
+        pending = list(getattr(self, "_pending_native_vlan_ops", None) or [])
+        if not pc.vlans and not pending:
+            return []
+
+        # Last-occurrence line per vlan id (mirrors the parse_vlans walk).
+        parse = self._get_parse_obj()
+        line_by_vid: dict[int, Any] = {}
+        for obj in parse.find_objects(r"^vlan\s+\d"):
+            m = re.match(r"^vlan\s+([\d,\-]+)", obj.text.strip())
+            if not m:
+                continue
+            for part in m.group(1).split(","):
+                part = part.strip()
+                if "-" in part:
+                    try:
+                        start, end = part.split("-", 1)
+                        for vid in range(int(start), int(end) + 1):
+                            line_by_vid[vid] = obj
+                    except ValueError:
+                        pass
+                else:
+                    try:
+                        line_by_vid[int(part)] = obj
+                    except ValueError:
+                        pass
+
+        ops: list = []
+        for entry in pc.vlans:
+            obj = line_by_vid.get(entry.vlan_id)
+            ops.append(
+                ChangeOp(
+                    verb=Verb.SET,
+                    path=("vlans", str(entry.vlan_id)),
+                    value=entry,
+                    source_line=obj.text.strip() if obj is not None else "",
+                    line_no=obj.linenum if obj is not None else -1,
+                    origin="native",
+                )
+            )
+        ops.extend(pending)
+        ops.sort(key=lambda op: op.line_no)
+        return ops
 
     def _singleton_section_gated(self) -> bool:
         """Family-8a per-OS gate (CCR Appendix T.0): True iff this parser's
@@ -1962,6 +2050,102 @@ class IOSParser(BaseParser):
                         origin="native",
                     )
                 )
+
+        # --- family 8c line-detected tri-state booleans (Appendix V.2) ---
+        # lldp.enabled / cdp.enabled / cdp.advertise_v2.  IOS-family
+        # spellings mirror the parse predicates EXACTLY (parse_lldp/parse_cdp
+        # match stripped text, so the filters below can never drift from the
+        # state semantics).  NX-OS overrides parse_lldp/parse_cdp with the
+        # ``feature lldp``/``feature cdp`` spellings AND flips the
+        # parser-absence to False (≠ the model default True — the O.1
+        # trap), so on NX-OS the enabled op is emitted UNCONDITIONALLY when
+        # the section exists (value = final parsed state; provenance = the
+        # last feature line, block head fallback) — the state anchor rides
+        # the op, never the generic seed.
+        def _last(objs):
+            return max(objs, key=lambda o: o.linenum, default=None)
+
+        def _tristate_winner(neg_objs, pos_objs):
+            last_neg, last_pos = _last(neg_objs), _last(pos_objs)
+            if last_pos is not None and (
+                last_neg is None or last_pos.linenum > last_neg.linenum
+            ):
+                return last_pos, True
+            if last_neg is not None:
+                return last_neg, False
+            return None, None
+
+        def _emit_scalar(sect, fname, value, obj):
+            ops.append(
+                ChangeOp(
+                    verb=Verb.SET,
+                    path=(sect, "scalar", fname),
+                    value=value,
+                    source_line=obj.text.strip() if obj is not None else "",
+                    line_no=obj.linenum if obj is not None else -1,
+                    origin="native",
+                )
+            )
+
+        os_val = getattr(self.os_type, "value", self.os_type)
+        for sect, run_word in (("lldp", "lldp"), ("cdp", "cdp")):
+            obj_sect = getattr(pc, sect, None)
+            if obj_sect is None:
+                continue
+            if os_val == "nxos":
+                feature = parse.find_objects(rf"^(?:no\s+)?feature\s+{run_word}\b")
+                anchor = _last(feature)
+                if anchor is None:
+                    raw_lines = obj_sect.raw_lines or []
+                    line_numbers = obj_sect.line_numbers or []
+
+                    class _Blk:  # block-head provenance fallback
+                        text = raw_lines[0] if raw_lines else ""
+                        linenum = line_numbers[0] if line_numbers else -1
+
+                    anchor = _Blk
+                _emit_scalar(sect, "enabled", obj_sect.enabled, anchor)
+            else:
+                sect_objs = parse.find_objects(rf"^(?:no\s+)?{run_word}\b")
+                neg = [
+                    o
+                    for o in sect_objs
+                    if o.text.strip() in (f"no {run_word} run", f"no {run_word}")
+                ]
+                pos = [o for o in sect_objs if o.text.strip() == f"{run_word} run"]
+                winner, value = _tristate_winner(neg, pos)
+                if winner is not None:
+                    _emit_scalar(sect, "enabled", value, winner)
+        if getattr(pc, "cdp", None) is not None:
+            cdp_objs = parse.find_objects(r"^(?:no\s+)?cdp\b")
+            # parse_cdp matches the negation by SUBSTRING ("no cdp
+            # advertise-v2" in t) — mirrored here.
+            neg = [o for o in cdp_objs if "no cdp advertise-v2" in o.text.strip()]
+            pos = [o for o in cdp_objs if o.text.strip() == "cdp advertise-v2"]
+            winner, value = _tristate_winner(neg, pos)
+            if winner is not None:
+                _emit_scalar("cdp", "advertise_v2", value, winner)
+
+        # --- family 8c: lacp_system_priority (Appendix V.1) ---
+        # A plain top-level ``int | None`` ParsedConfig scalar (no model) —
+        # it cannot ride the section codec.  The native len-1 SET has the
+        # SAME path as the derived op (exact-path dedupe retires the twin)
+        # and deliberately flows the batched engine path (zero engine
+        # change, parity by construction).  parse_lacp_system_priority reads
+        # the FIRST matching line — provenance mirrors it.
+        if getattr(pc, "lacp_system_priority", None) is not None:
+            objs = parse.find_objects(r"^lacp\s+system-priority\s+\d+")
+            first = objs[0] if objs else None
+            ops.append(
+                ChangeOp(
+                    verb=Verb.SET,
+                    path=("lacp_system_priority",),
+                    value=pc.lacp_system_priority,
+                    source_line=first.text.strip() if first is not None else "",
+                    line_no=first.linenum if first is not None else -1,
+                    origin="native",
+                )
+            )
 
         ops.extend(getattr(self, "_pending_native_singleton_ops", None) or [])
         ops.sort(key=lambda op: op.line_no if op.line_no >= 0 else float("inf"))
@@ -5737,6 +5921,11 @@ class IOSParser(BaseParser):
         # byte-exact tombstones are regenerated FROM them (single source).
         # Re-initialized per call.
         self._pending_native_singleton_ops: list = []
+        # Change-IR Phase 3 family 8c (CCR Appendix V): native VLAN-database
+        # OBJECT_DELETE ops (``no vlan <spec>``, ranges expanded) queued
+        # UNCONDITIONALLY at their true lines; the byte-exact ``vlan:<id>``
+        # tombstones are regenerated FROM them.  Re-initialized per call.
+        self._pending_native_vlan_ops: list = []
 
         # --- static route deletions ---
         # Tombstone format: "static:<vrf>:<dest/plen>[:<nh_spec>]" where vrf=""
@@ -5779,6 +5968,14 @@ class IOSParser(BaseParser):
                     self._queue_native_static_delete(tombstone, obj).no_commands
                 )
         # --- vlan database deletions ---
+        # Change-IR Phase 3 family 8c (CCR Appendix V): each expanded id
+        # becomes a NATIVE, line-numbered OBJECT_DELETE ``("vlan", <id>)``
+        # (every id from a range/comma spec carries the spec line's number)
+        # and the byte-exact legacy ``vlan:<id>`` tombstone is regenerated
+        # FROM the op via encode_legacy (single source, same walk position
+        # and expansion order).  The engine replays these IN script order
+        # against the native ``("vlans", <id>)`` creation SETs — the
+        # delete-then-recreate ordering capability.
         for obj in parse.find_objects(r"^no\s+vlan\s+"):
             m = re.search(r"^no\s+vlan\s+([\d,\-]+)", obj.text)
             if m:
@@ -5789,11 +5986,15 @@ class IOSParser(BaseParser):
                         try:
                             start, end = part.split("-", 1)
                             for vid in range(int(start), int(end) + 1):
-                                tombstones.append(f"vlan:{vid}")
+                                tombstones.extend(
+                                    self._queue_native_vlan_delete(str(vid), obj)
+                                )
                         except ValueError:
                             pass
                     else:
-                        tombstones.append(f"vlan:{part}")
+                        tombstones.extend(
+                            self._queue_native_vlan_delete(part, obj)
+                        )
 
 
         # --- process-level deletions ---
@@ -6196,10 +6397,17 @@ class IOSParser(BaseParser):
                 )
 
         # --- LLDP entry-level tombstones ---
+        # Change-IR family 8c (CCR Appendix V): native LIST_REMOVE queued at
+        # the true line; the byte-exact ``field:lldp:tlv:<name>`` twin is
+        # regenerated FROM the op (single source, same walk position).
         for obj in parse.find_objects(r"^no\s+lldp\s+tlv-select\s+"):
             m = re.match(r"^no\s+lldp\s+tlv-select\s+(\S+)", obj.text.strip())
             if m:
-                tombstones.append(f"field:lldp:tlv:{m.group(1)}")
+                tombstones.extend(
+                    self._queue_native_singleton_removal(
+                        f"field:lldp:tlv:{m.group(1)}", obj
+                    ).no_commands
+                )
 
         # --- Service entity removals: IP SLA / object track / EEM / banner ---
         # (CCR confgraph_service_entity_removal_tombstones.md.)  Path segments
