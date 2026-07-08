@@ -65,10 +65,12 @@ VRF_FULL = (
 class TestPositiveEmission:
     def test_full_surface_member_sets(self):
         pc = _parse(VRF_FULL)
+        # len-4 member SETs only — the len-3 whole-VRF CREATE op (family 7b,
+        # Appendix S) is asserted separately in TestComposition.
         sets = {
             (op.path[2], op.path[3]): op
             for op in _f7(pc)
-            if op.verb is Verb.SET
+            if op.verb is Verb.SET and len(op.path) == 4
         }
         assert ("scalar", "rd") in sets and sets[("scalar", "rd")].value == "65400:1"
         assert sets[("scalar", "route_map_import")].value == "RM-IN"
@@ -88,7 +90,7 @@ class TestPositiveEmission:
         by_key = {
             (op.path[2], op.path[3]): op.line_no
             for op in _f7(pc)
-            if op.verb is Verb.SET
+            if op.verb is Verb.SET and len(op.path) == 4
         }
         # Lines are 0-based parse positions; assert strict per-member ordering
         # rather than absolute numbers: rd < rt export < rt import < rt both.
@@ -115,9 +117,13 @@ class TestPositiveEmission:
         # The R.0 ordering basis: the re-add line is AFTER the removal line.
         assert positive.line_no > removal.line_no >= 0
 
-    def test_default_fields_emit_no_set(self):
+    def test_default_fields_emit_no_member_set(self):
+        # Pin flipped by 7b (Appendix S.3): a bare VRF now emits exactly its
+        # whole-VRF CREATE op (the retirement creation path) and still NO
+        # member SETs.
         pc = _parse("vrf definition EMPTY\n")
-        assert [op for op in _f7(pc) if op.verb is Verb.SET] == []
+        sets = [op for op in _f7(pc) if op.verb is Verb.SET]
+        assert [op.path for op in sets] == [("vrfs", "EMPTY", "instance")]
 
 
 class TestRemovalEmission:
@@ -182,16 +188,27 @@ class TestColonRoundTrip:
 
 
 class TestComposition:
-    def test_derived_whole_vrf_set_survives(self):
-        # 7a co-existence — retirement is 7b (H.3 exclusion).
+    def test_derived_whole_vrf_set_retired(self):
+        # Pin flipped by 7b (Appendix S.3): 7a explicitly deferred retirement
+        # to 7b; delivered — the derived whole-VRF SET is claimed away by the
+        # native CREATE op (one per fully-native VRF).
         ops = derive_ops(_parse(VRF_FULL))
         survivors = [
             op
             for op in ops
-            if op.verb is Verb.SET and op.path == ("vrfs", "GUEST")
+            if op.verb is Verb.SET and len(op.path) == 2 and op.path[0] == "vrfs"
         ]
-        assert len(survivors) == 1
-        assert survivors[0].origin == "derived"
+        assert survivors == []
+        creates = [
+            op
+            for op in ops
+            if op.verb is Verb.SET
+            and len(op.path) == 3
+            and op.path[0] == "vrfs"
+            and op.path[2] == "instance"
+        ]
+        assert sorted(op.path[1] for op in creates) == ["GUEST"]
+        assert all(op.origin == "native" for op in creates)
 
     def test_derived_twins_deduped(self):
         # The native removals claim their derived twins via exact-path dedupe.
@@ -223,9 +240,16 @@ class TestComposition:
         ops = derive_ops(pc)
         # Family-7a natives present beside the other families' ops.
         assert any(is_native_vrf_op(op) for op in ops)
-        # Derived whole-VRF SET survives; whole-instance OSPF/BGP creates are
-        # the 6e/L retirement shapes (unchanged by 7a).
-        assert any(op.path == ("vrfs", "GUEST") and op.origin == "derived" for op in ops)
+        # Pin flipped by 7b (Appendix S.3): the survival assertion WAS the 7a
+        # coexistence pin — the whole-VRF SET is now retired and the CREATE op
+        # claims it, joining the 6e/L retirement shapes.
+        assert not any(
+            op.verb is Verb.SET and op.path == ("vrfs", "GUEST") for op in ops
+        )
+        assert any(
+            op.path == ("vrfs", "GUEST", "instance") and op.origin == "native"
+            for op in ops
+        )
         assert any(op.path[0] == "ospf_instances" and op.origin == "native" for op in ops)
 
 

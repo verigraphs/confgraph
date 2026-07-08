@@ -142,6 +142,7 @@ __all__ = [
     "is_native_ospf_instance_create_op",
     "is_native_vrf_op",
     "is_native_vrf_delete_op",
+    "is_native_vrf_instance_create_op",
 ]
 
 
@@ -1506,6 +1507,30 @@ def is_native_vrf_delete_op(op: "ChangeOp") -> bool:
     )
 
 
+def is_native_vrf_instance_create_op(op: "ChangeOp") -> bool:
+    """True iff *op* is the family-7b whole-VRF CREATE op (CCR Appendix S).
+
+    ``SET ("vrfs", <name>, "instance")`` (3-seg — the VRF key is the single
+    name) — emitted by the parser for every FULLY-NATIVE VRF (retirement
+    gate: NOT emitted for gated shapes — IOS-XR, whose own
+    ``parse_deletion_commands`` emits the DERIVED ``vrf:<name>`` D1 shape —
+    so their derived whole-VRF SET survives).  value = the parsed
+    ``VRFConfig`` (the engine seeds a new VRF from it via
+    ``_vrf_creation_seed``).  This op CLAIMS its ``("vrfs", name)`` prefix in
+    :func:`derive_ops` so the derived whole-VRF SET is RETIRED for
+    fully-native VRFs (the Appendix L/Q pattern); the member sub-ops still do
+    not claim (a gated VRF's surviving SET must not be claimed away).
+    """
+    path = op.path
+    return (
+        getattr(op, "origin", "derived") == "native"
+        and op.verb is Verb.SET
+        and len(path) == 3
+        and path[0] == "vrfs"
+        and path[2] == "instance"
+    )
+
+
 def is_native_vrf_op(op: "ChangeOp") -> bool:
     """True iff *op* is a parser-emitted family-7a VRF op (CCR Appendix R).
 
@@ -1548,6 +1573,8 @@ def is_native_vrf_op(op: "ChangeOp") -> bool:
     if not path:
         return False
     if op.verb is Verb.SET:
+        if len(path) == 3 and path[0] == "vrfs" and path[2] == "instance":
+            return True  # family 7b whole-VRF CREATE op
         return len(path) == 4 and path[0] == "vrfs" and path[2] in _VRF_SET_KINDS
     if op.verb is Verb.LIST_REMOVE:
         return _is_vrf_member_removal(path)
@@ -1844,8 +1871,15 @@ def derive_ops(proposal: "ParsedConfig") -> ChangeSet:
         or is_native_eigrp_instance_create_op(op)
         or is_native_ospf_instance_create_op(op)
     }
+    # Family 7b (CCR Appendix S): the whole-VRF CREATE op claims its
+    # ``("vrfs", name)`` prefix — same len-2 shape as the IS-IS single-tag
+    # claim.  Gated VRFs (IOS-XR) emit no create op → their derived SET
+    # survives (the 7a coexistence, unchanged).
     native_prefix_claims |= {
-        op.path[:2] for op in natives if is_native_isis_instance_create_op(op)
+        op.path[:2]
+        for op in natives
+        if is_native_isis_instance_create_op(op)
+        or is_native_vrf_instance_create_op(op)
     }
     return natives + [
         op

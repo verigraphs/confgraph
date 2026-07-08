@@ -1807,6 +1807,28 @@ class IOSParser(BaseParser):
                 (line_numbers[0] if line_numbers else -1),
             )
 
+            # Family 7b retirement (CCR Appendix S): the whole-VRF CREATE op.
+            # Emitted for every FULLY-NATIVE VRF so it claims the
+            # ``("vrfs", name)`` prefix in derive_ops → the derived whole-VRF
+            # SET is RETIRED.  GATED VRFs (IOS-XR — derived ``vrf:`` deletion
+            # shape, Phase-5 surface; S.2) keep the derived SET (no create
+            # op).  value = the parsed VRFConfig; the engine seeds a NEW VRF
+            # from it (_vrf_creation_seed — parser-absence == model default
+            # for every migrated field, R.2) and no-ops for an EXISTING one
+            # (the retired SET was fully inert, S.0).  Block provenance;
+            # position is irrelevant (order-independent pre-pass consumer).
+            if not self._vrf_instance_gated(vrf):
+                ops.append(
+                    ChangeOp(
+                        verb=Verb.SET,
+                        path=("vrfs", vrf.name, "instance"),
+                        value=vrf,
+                        source_line=block_line[0],
+                        line_no=block_line[1],
+                        origin="native",
+                    )
+                )
+
             def _emit(kind, key, value, _vrf=vrf, _blk=block_line):
                 # LAST-occurrence provenance from the parse-object scan (the
                 # R.0 re-added-later ordering basis — a re-added member
@@ -2395,6 +2417,29 @@ class IOSParser(BaseParser):
         ``super()`` wrapper + VRF backfill, and the same-pid backfill mislabel
         cannot cause a wrong-instance retirement (create op and derived SET
         key from the same model instance — Appendix Q.2).
+        """
+        os_val = getattr(self.os_type, "value", self.os_type)
+        return os_val == "ios_xr"
+
+    def _vrf_instance_gated(self, vrf) -> bool:
+        """7b retirement gate for VRF (CCR Appendix S): True iff *vrf*'s
+        derived whole-VRF SET must SURVIVE (no CREATE op emitted, prefix not
+        claimed).
+
+        Today exactly **IOS-XR**.  Unlike the IGP gates, XR POSITIVES are
+        fully covered (the family-7a emission is a parser-agnostic state walk
+        over ``pc.vrfs``, not a per-parse walk) — the gate exists for the
+        DELETION side: ``iosxr_parser.parse_deletion_commands`` (no
+        ``super()``) emits the DERIVED ``vrf:<name>`` D1 shape that legacy
+        drops and ops fix-forwards; keeping the derived SET is the
+        6e-consistent rot-safe posture until the XR deletion walk migrates
+        (Phase 5).  **EOS is deliberately UNGATED** (Appendix S.2): its own
+        ``parse_vrfs`` feeds the same state walk (no per-parse ``_pending``
+        channel to miss — the hole class that gated EOS IS-IS does not exist
+        here), and EOS has NO VRF deletion walk, so creation can never fight
+        a deletion (rot-safe by construction).  NX-OS is UNGATED (state walk
+        + native deletion walk since 7a).  JunOS/PAN-OS subclass BaseParser
+        and emit no native ops at all (natives-less — derived SET survives).
         """
         os_val = getattr(self.os_type, "value", self.os_type)
         return os_val == "ios_xr"
