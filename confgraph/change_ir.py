@@ -136,6 +136,7 @@ __all__ = [
     "eigrp_summary_key",
     "is_native_eigrp_op",
     "is_native_eigrp_network_removal_op",
+    "is_native_eigrp_field_negation_op",
     "is_native_eigrp_instance_create_op",
     "ospf_redistribute_key",
     "ospf_network_key",
@@ -144,6 +145,7 @@ __all__ = [
     "is_native_ospf_op",
     "is_native_ospf_network_removal_op",
     "is_native_ospf_area_range_removal_op",
+    "is_native_ospf_field_negation_op",
     "is_native_ospf_instance_create_op",
     "is_native_vrf_op",
     "is_native_vrf_delete_op",
@@ -254,6 +256,16 @@ _TOP_TOMBSTONE_VERBS: tuple[tuple[re.Pattern[str], Verb], ...] = (
         Verb.LIST_REMOVE,
     ),
     (re.compile(r"^field:ospf:[^:]+:area:[^:]+:(stub_reset|nssa_reset)$"), Verb.UNSET),
+    # WI-DB2 (CCR Appendix AD) — family-6 IGP withdrawal twins.  These are
+    # VRF-SCOPED (new surface, designed (pid|asn, vrf)-exact — segment 3 is
+    # the vrf, "" for global), unlike the pre-existing VRF-BLIND area resets
+    # above.  Keyed-member removals → LIST_REMOVE; field resets → UNSET
+    # (the DIO reset clears the five default_information_originate* fields —
+    # the stub_reset compound precedent).
+    (re.compile(r"^field:(ospf|eigrp):[^:]+:[^:]*:redistribute:"), Verb.LIST_REMOVE),
+    (re.compile(r"^field:ospf:[^:]+:[^:]*:default_information_originate$"), Verb.UNSET),
+    (re.compile(r"^field:ospf:[^:]+:[^:]*:area:[^:]+:virtual_link:"), Verb.LIST_REMOVE),
+    (re.compile(r"^field:ospf:[^:]+:[^:]*:area:[^:]+:filter_list_(in|out)$"), Verb.UNSET),
     (re.compile(r"^field:ntp:(server|peer|auth_key):"), Verb.LIST_REMOVE),
     (re.compile(r"^field:snmp:(community|host|view|group|user):"), Verb.LIST_REMOVE),
     (
@@ -1307,6 +1319,42 @@ def is_native_eigrp_network_removal_op(op: "ChangeOp") -> bool:
     )
 
 
+def _is_eigrp_field_negation(path: tuple[str, ...]) -> bool:
+    """True for the WI-DB2 EIGRP ``no redistribute`` twin path (Appendix AD).
+
+    ``("field", "eigrp", <asn>, <vrf>, "redistribute", <proto>, <pid>)`` —
+    the byte-exact colon-split of the legacy twin tombstone
+    ``field:eigrp:<asn>:<vrf>:redistribute:<proto>:<pid>`` (vrf-scoped — ""
+    for global; pid "" when the protocol carries none), so ``encode_legacy``
+    regenerates the tombstone via the top-level fall-through and the
+    exact-path dedupe in :func:`derive_ops` retires the derived twin.
+    Identity ``(proto, pid)`` mirrors :func:`eigrp_redistribute_key`.
+    """
+    return (
+        len(path) == 7
+        and path[0] == "field"
+        and path[1] == "eigrp"
+        and path[4] == "redistribute"
+    )
+
+
+def is_native_eigrp_field_negation_op(op: "ChangeOp") -> bool:
+    """True iff *op* is the WI-DB2 EIGRP ``no redistribute`` removal op.
+
+    Emitted by ``parse_eigrp`` at the negation line (suppressed when the same
+    (proto, pid) reappears as a positive ``redistribute`` line LATER in the
+    block — the WI-8 refresh pattern, shared with the legacy twin so BOTH
+    modes see re-add-wins).  Unlike the ops-only ``no network``, this shape
+    HAS a byte-exact legacy twin (the B1 posture — legacy gains the fix):
+    ``parse_deletion_commands`` drains the tombstone regenerated from this op.
+    """
+    return (
+        getattr(op, "origin", "derived") == "native"
+        and op.verb is Verb.LIST_REMOVE
+        and _is_eigrp_field_negation(op.path)
+    )
+
+
 def is_native_eigrp_instance_create_op(op: "ChangeOp") -> bool:
     """True iff *op* is the family-6e EIGRP whole-instance CREATE op.
 
@@ -1362,6 +1410,9 @@ def is_native_eigrp_op(op: "ChangeOp") -> bool:
           (``no router eigrp`` — applied DELETE-WINS, VRF-blind, in 6b).
     - ``LIST_REMOVE ("eigrp_instance", asn, vrf, "network", <cidr>)``  ops-only
           ``no network`` withdrawal (SINGULAR scope prefix, no legacy twin).
+    - ``LIST_REMOVE ("field", "eigrp", asn, vrf, "redistribute", proto, pid)``
+          WI-DB2 ``no redistribute`` withdrawal (Appendix AD — byte-exact
+          legacy twin, both modes gain the fix).
 
     Owned by the codec module: the engine's ``_apply_native_eigrp_ops`` pass and
     its ``_proposal_from_ops`` skip MUST share this predicate.  Derived twins
@@ -1383,7 +1434,7 @@ def is_native_eigrp_op(op: "ChangeOp") -> bool:
     if op.verb is Verb.OBJECT_DELETE:
         return _is_eigrp_process_delete(path)
     if op.verb is Verb.LIST_REMOVE:
-        return _is_eigrp_network_removal(path)
+        return _is_eigrp_network_removal(path) or _is_eigrp_field_negation(path)
     return False
 
 
@@ -1552,6 +1603,63 @@ def is_native_ospf_area_range_removal_op(op: "ChangeOp") -> bool:
     )
 
 
+def _is_ospf_field_negation(path: tuple[str, ...], verb: "Verb") -> bool:
+    """True for the four WI-DB2 OSPF withdrawal twin paths (Appendix AD).
+
+    Each path is the byte-exact colon-split of its legacy twin tombstone
+    (``encode_legacy`` top-level fall-through regenerates it; the exact-path
+    dedupe in :func:`derive_ops` retires the derived twin).  All are
+    VRF-SCOPED — segment 3 is ``vrf or ""`` — unlike the pre-existing
+    VRF-blind ``field:ospf:<pid>:area:…`` stub/nssa resets (new surface,
+    designed (pid, vrf)-exact so ops and legacy can never diverge on
+    multi-VRF same-pid configs):
+
+    - ``LIST_REMOVE ("field","ospf",pid,vrf,"redistribute",proto,rpid)``
+          ``no redistribute <proto> [<pid>]`` — keyed removal, identity ==
+          :func:`ospf_redistribute_key`.
+    - ``UNSET ("field","ospf",pid,vrf,"default_information_originate")``
+          bare ``no default-information originate`` — compound reset of the
+          five DIO fields (the stub_reset precedent; trailered negation
+          forms stay blind, enumerated in Appendix AD).
+    - ``LIST_REMOVE ("field","ospf",pid,vrf,"area",aid,"virtual_link",rid)``
+          ``no area N virtual-link R`` — keyed removal, identity ==
+          :func:`ospf_area_virtual_link_key` (canonical dotted-quad).
+    - ``UNSET ("field","ospf",pid,vrf,"area",aid,"filter_list_in"|"…_out")``
+          ``no area N filter-list prefix PL in|out`` — scalar reset (the PL
+          name is not baseline-checked, the AA.2 VIP posture; ``out`` is
+          merge-only — read nowhere in the simulator, disclosed).
+    """
+    if len(path) < 5 or path[0] != "field" or path[1] != "ospf":
+        return False
+    if verb is Verb.LIST_REMOVE:
+        return (len(path) == 7 and path[4] == "redistribute") or (
+            len(path) == 8 and path[4] == "area" and path[6] == "virtual_link"
+        )
+    if verb is Verb.UNSET:
+        return (len(path) == 5 and path[4] == "default_information_originate") or (
+            len(path) == 7
+            and path[4] == "area"
+            and path[6] in ("filter_list_in", "filter_list_out")
+        )
+    return False
+
+
+def is_native_ospf_field_negation_op(op: "ChangeOp") -> bool:
+    """True iff *op* is one of the four WI-DB2 OSPF withdrawal removal ops.
+
+    Emitted by ``parse_ospf`` at the negation lines (suppressed when the same
+    member/field reappears as a positive line LATER in the block — the WI-8
+    refresh pattern, shared with the legacy twin so BOTH modes see
+    re-add-wins).  Unlike the ops-only ``no network`` / area-range removals,
+    these shapes HAVE byte-exact legacy twins (the B1 posture — legacy gains
+    the fix): ``parse_deletion_commands`` drains the tombstones regenerated
+    from these ops.
+    """
+    return getattr(op, "origin", "derived") == "native" and _is_ospf_field_negation(
+        op.path, op.verb
+    )
+
+
 def is_native_ospf_instance_create_op(op: "ChangeOp") -> bool:
     """True iff *op* is the family-6e OSPF whole-instance CREATE op.
 
@@ -1617,6 +1725,10 @@ def is_native_ospf_op(op: "ChangeOp") -> bool:
           ops-only ``no network`` withdrawal (SINGULAR scope, no legacy twin).
     - ``LIST_REMOVE ("ospf_instance", pid, vrf, "area", <aid>, "range",
           <prefix>)``  family-6d ops-only area-range withdrawal (no legacy twin).
+    - the four WI-DB2 ``("field", "ospf", pid, vrf, …)`` withdrawal shapes
+          (redistribute / default-information originate / area virtual-link /
+          area filter-list — see :func:`_is_ospf_field_negation`; byte-exact
+          legacy twins, both modes gain the fix — CCR Appendix AD).
 
     The stub/nssa area-reset tombstones stay DERIVED (Appendix P.2 — the
     coexistence suppress-set lives in the engine replay, not here).  Owned by
@@ -1640,7 +1752,13 @@ def is_native_ospf_op(op: "ChangeOp") -> bool:
     if op.verb is Verb.OBJECT_DELETE:
         return _is_ospf_process_delete(path)
     if op.verb is Verb.LIST_REMOVE:
-        return _is_ospf_network_removal(path) or _is_ospf_area_range_removal(path)
+        return (
+            _is_ospf_network_removal(path)
+            or _is_ospf_area_range_removal(path)
+            or _is_ospf_field_negation(path, op.verb)
+        )
+    if op.verb is Verb.UNSET:
+        return _is_ospf_field_negation(path, op.verb)
     return False
 
 

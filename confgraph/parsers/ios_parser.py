@@ -4393,6 +4393,12 @@ class IOSParser(BaseParser):
         # getattr-safe), so the reset here owns the per-parse lifecycle.  NX-OS
         # inherits this walk (nxos_parser.parse_ospf wraps super().parse_ospf()).
         self._pending_native_ospf_ops = []
+        # WI-DB2 (CCR Appendix AD): byte-exact legacy twins for the four
+        # withdrawal ops emitted below (redistribute / default-information
+        # originate / area virtual-link / area filter-list) — regenerated
+        # FROM the ops via encode_legacy (single source) and drained into
+        # ``no_commands`` by parse_deletion_commands.
+        self._pending_ospf_negation_tombstones = []
 
         # Find all OSPF router configs
         ospf_objs = parse.find_objects(r"^router\s+ospf\s+(\d+)")
@@ -4647,8 +4653,14 @@ class IOSParser(BaseParser):
             # Parse areas
             areas = self._parse_ospf_areas(ospf_obj)
 
-            # Parse redistribution
-            redistribute = self._parse_ospf_redistribute(ospf_obj)
+            # Parse redistribution — WI-DB2 (CCR Appendix AD): the helper
+            # also fills the LAST positive-line map per (proto, pid) key so
+            # the ``no redistribute`` suppression below shares the exact
+            # positive key extraction (no drift).
+            positive_redist_last_line: dict[tuple[str, str], int] = {}
+            redistribute = self._parse_ospf_redistribute(
+                ospf_obj, positive_lines=positive_redist_last_line
+            )
 
             # Default-information originate
             # Max-metric router-lsa
@@ -4758,6 +4770,172 @@ class IOSParser(BaseParser):
 
             # BFD all-interfaces
             bfd_all = len(ospf_obj.find_child_objects(r"^\s+bfd\s+all-interfaces")) > 0
+
+            # ---------------------------------------------------------------
+            # WI-DB2 (CCR Appendix AD): the four deferred family-6 withdrawal
+            # spellings (Appendix O.4/O.7 + P.7 deferrals, now delivered).
+            # Each emits a native line-numbered op whose path IS the
+            # colon-split of its byte-exact legacy twin tombstone
+            # (``field:ospf:<pid>:<vrf>:…`` — VRF-SCOPED, "" for global; B1
+            # posture, legacy gains the fix).  Twins are regenerated FROM the
+            # ops via encode_legacy (single source) and drained into
+            # ``no_commands`` by parse_deletion_commands.  All four share the
+            # WI-8 ``_readded_later`` suppression: when the same member/field
+            # reappears as a positive line LATER in the block, NEITHER the op
+            # NOR the twin is emitted — refresh → re-add wins in BOTH modes.
+            # Over-trigger discipline (enumerated blind in Appendix AD): bare
+            # ``no redistribute`` / non-whitelisted or trailered redistribute
+            # forms, bare ``no default-information`` and the trailered
+            # ``no default-information originate always|metric …`` option
+            # negations, router-id-less ``no area N virtual-link`` and
+            # trailered virtual-link option forms, PL-less / direction-less /
+            # non-prefix (NX-OS route-map) filter-list forms.
+            _neg_prefix = ("field", "ospf", str(process_id), ospf_vrf or "")
+
+            def _queue_ospf_negation(verb, path_tail, child):
+                from confgraph.change_ir import encode_legacy
+                op = ChangeOp(
+                    verb=verb,
+                    path=_neg_prefix + path_tail,
+                    value=None,
+                    source_line=child.text.strip(),
+                    line_no=child.linenum,
+                    origin="native",
+                )
+                self._pending_native_ospf_ops.append(op)
+                self._pending_ospf_negation_tombstones.extend(
+                    encode_legacy([op]).no_commands
+                )
+
+            # (1) ``no redistribute <proto> [<pid>]`` — keyed removal; the
+            # consumer (static.py apply_ospf_redistribution + igp.py
+            # _apply_ospf_redistributed_statics) extends IGP reachability.
+            # Protocol whitelist + $-anchor: trailered forms (which on a real
+            # device remove only the OPTION) stay blind; a pid token on a
+            # protocol whose positive walk never parses one is an unknown
+            # trailer (blind).
+            for nrc in ospf_obj.find_child_objects(r"^\s+no\s+redistribute\s+"):
+                nrm = re.match(
+                    r"^\s+no\s+redistribute\s+"
+                    r"(connected|static|bgp|ospf|eigrp|isis|rip)"
+                    r"(?:\s+(\d+))?\s*$",
+                    nrc.text,
+                )
+                if not nrm:
+                    continue
+                nproto, npid = nrm.group(1), nrm.group(2)
+                if npid is not None and nproto not in ("bgp", "ospf", "eigrp", "isis"):
+                    continue
+                nkey = (nproto, npid or "")
+                if positive_redist_last_line.get(nkey, -1) > nrc.linenum:
+                    continue  # re-added later in the block — suppressed
+                _queue_ospf_negation(
+                    Verb.LIST_REMOVE, ("redistribute", nkey[0], nkey[1]), nrc
+                )
+
+            # (2) bare ``no default-information originate`` — compound reset
+            # of the five DIO fields (the consumer igp.py
+            # _inject_ospf_defaults reads originate/always/metric/type).
+            # Exactly the bare form: ``no default-information originate
+            # always`` removes only the option on a real device — blind.
+            # Suppression key: ANY later positive DIO line re-asserts.
+            _dio_last_positive = max(
+                (c.linenum for c in di_children), default=-1
+            )
+            for ndc in ospf_obj.find_child_objects(
+                r"^\s+no\s+default-information\s+originate\s*$"
+            ):
+                if _dio_last_positive > ndc.linenum:
+                    continue  # re-asserted later in the block — suppressed
+                _queue_ospf_negation(
+                    Verb.UNSET, ("default_information_originate",), ndc
+                )
+
+            # (3) ``no area N virtual-link R`` — keyed removal (consumer
+            # igp.py _augment_ospf_virtual_links; a withdrawal partitions
+            # area 0 across the transit area).  The router-id is canonicalized
+            # through the SAME IPv4Address construction as the positive parse
+            # (_parse_ospf_areas) — unparseable operands stay blind on BOTH
+            # walks; $-anchored, so option negations (hello-interval …) and
+            # the router-id-less form stay blind.
+            positive_vlink_last_line: dict[tuple[str, str], int] = {}
+            for vc in ospf_obj.find_child_objects(
+                r"^\s+area\s+\S+\s+virtual-link\s+"
+            ):
+                vm = re.match(
+                    r"^\s+area\s+(\S+)\s+virtual-link\s+(\S+)", vc.text
+                )
+                if not vm:
+                    continue
+                try:
+                    vrid = str(IPv4Address(vm.group(2)))
+                except ValueError:
+                    continue
+                vkey = (vm.group(1), vrid)
+                positive_vlink_last_line[vkey] = max(
+                    positive_vlink_last_line.get(vkey, -1), vc.linenum
+                )
+            for nvc in ospf_obj.find_child_objects(
+                r"^\s+no\s+area\s+\S+\s+virtual-link\s+"
+            ):
+                nvm = re.match(
+                    r"^\s+no\s+area\s+(\S+)\s+virtual-link\s+(\S+)\s*$", nvc.text
+                )
+                if not nvm:
+                    continue
+                try:
+                    nvrid = str(IPv4Address(nvm.group(2)))
+                except ValueError:
+                    continue
+                nvkey = (nvm.group(1), nvrid)
+                if positive_vlink_last_line.get(nvkey, -1) > nvc.linenum:
+                    continue  # re-added later in the block — suppressed
+                _queue_ospf_negation(
+                    Verb.LIST_REMOVE,
+                    ("area", nvkey[0], "virtual_link", nvkey[1]),
+                    nvc,
+                )
+
+            # (4) ``no area N filter-list prefix PL in|out`` — scalar reset
+            # (consumer for ``in``: igp.py abr_in_filters_by_area — removal
+            # UNBLOCKS inter-area prefixes, a restore-only direction;
+            # ``out`` is read nowhere in the simulator → merge-only,
+            # disclosed).  The stated PL name is matched but not
+            # baseline-checked (the AA.2 VIP posture — a device errors on a
+            # mismatch, a parse cannot).  Suppression key: (area, direction)
+            # — a later positive filter-list line for the same direction
+            # carries the fresh PL and must win.
+            positive_filter_last_line: dict[tuple[str, str], int] = {}
+            for fc in ospf_obj.find_child_objects(
+                r"^\s+area\s+\S+\s+filter-list\s+"
+            ):
+                fm = re.match(
+                    r"^\s+area\s+(\S+)\s+filter-list\s+prefix\s+\S+\s+(in|out)\b",
+                    fc.text,
+                )
+                if not fm:
+                    continue
+                fkey = (fm.group(1), fm.group(2))
+                positive_filter_last_line[fkey] = max(
+                    positive_filter_last_line.get(fkey, -1), fc.linenum
+                )
+            for nfc in ospf_obj.find_child_objects(
+                r"^\s+no\s+area\s+\S+\s+filter-list\s+"
+            ):
+                nfm = re.match(
+                    r"^\s+no\s+area\s+(\S+)\s+filter-list\s+prefix\s+\S+\s+(in|out)\s*$",
+                    nfc.text,
+                )
+                if not nfm:
+                    continue
+                nfkey = (nfm.group(1), nfm.group(2))
+                if positive_filter_last_line.get(nfkey, -1) > nfc.linenum:
+                    continue  # re-asserted later in the block — suppressed
+                _queue_ospf_negation(
+                    Verb.UNSET,
+                    ("area", nfkey[0], f"filter_list_{nfkey[1]}"),
+                    nfc,
+                )
 
             ospf_instances.append(
                 OSPFConfig(
@@ -5797,8 +5975,18 @@ class IOSParser(BaseParser):
 
         return areas
 
-    def _parse_ospf_redistribute(self, ospf_obj) -> list[OSPFRedistribute]:
-        """Parse OSPF redistribution configurations."""
+    def _parse_ospf_redistribute(
+        self, ospf_obj, positive_lines: "dict[tuple[str, str], int] | None" = None
+    ) -> list[OSPFRedistribute]:
+        """Parse OSPF redistribution configurations.
+
+        When *positive_lines* is given (WI-DB2, CCR Appendix AD), it is
+        filled with the LAST positive-line number per ``(protocol, pid)``
+        key — the SAME key extraction as the parse below, so the
+        ``no redistribute`` suppression in ``parse_ospf`` can never drift
+        from the positive walk.  IOS-XR keeps its own
+        ``_parse_ospf_redistribute_iosxr`` (untouched, Phase 5).
+        """
         redistribute = []
         redist_children = ospf_obj.find_child_objects(r"^\s+redistribute\s+(\S+)")
 
@@ -5822,6 +6010,12 @@ class IOSParser(BaseParser):
                 process_match = re.match(r"(\d+)", remaining)
                 if process_match:
                     process_id = int(process_match.group(1))
+
+            if positive_lines is not None:
+                rkey = (protocol, str(process_id) if process_id is not None else "")
+                positive_lines[rkey] = max(
+                    positive_lines.get(rkey, -1), redist_child.linenum
+                )
 
             # Extract route-map
             rm_match = re.search(r"route-map\s+(\S+)", remaining)
@@ -7709,6 +7903,22 @@ class IOSParser(BaseParser):
                     else:
                         tombstones.append(nested_tombstone)
 
+        # WI-DB2 (CCR Appendix AD): drain the byte-exact legacy twins of the
+        # family-6 IGP withdrawal ops queued by parse_ospf / parse_eigrp
+        # (both run BEFORE this step in the base parse loop).  The strings
+        # were regenerated FROM the ops via encode_legacy at emission time
+        # (single source); suppression (WI-8 re-added-later) already applied
+        # there, so a suppressed refresh emits NEITHER the op NOR the twin.
+        # IOS-XR overrides parse_deletion_commands without super() — its own
+        # parse_ospf never emits these; the inherited parse_eigrp op stays
+        # ops-only on XR (disclosed, the `no network` posture).
+        tombstones.extend(
+            getattr(self, "_pending_ospf_negation_tombstones", None) or []
+        )
+        tombstones.extend(
+            getattr(self, "_pending_eigrp_negation_tombstones", None) or []
+        )
+
         return tombstones
 
     def parse_acls(self) -> list[ACLConfig]:
@@ -8339,6 +8549,11 @@ class IOSParser(BaseParser):
         # (the ``process:eigrp`` whole-process delete emitter, which APPENDS
         # getattr-safe), so the reset here owns the per-parse lifecycle.
         self._pending_native_eigrp_ops = []
+        # WI-DB2 (CCR Appendix AD): byte-exact legacy twins for the
+        # ``no redistribute`` withdrawal ops emitted below — regenerated FROM
+        # the ops via encode_legacy (single source) and drained into
+        # ``no_commands`` by parse_deletion_commands.
+        self._pending_eigrp_negation_tombstones = []
 
         for eigrp_obj in parse.find_objects(r"^router\s+eigrp\s+"):
             m = re.match(r"^router\s+eigrp\s+(\S+)", eigrp_obj.text)
@@ -8472,8 +8687,11 @@ class IOSParser(BaseParser):
                     else:
                         passive_ifs.append(intf_name)
 
-            # redistribute
+            # redistribute.  Track the LAST positive-line number per
+            # (proto, pid) key so the WI-DB2 ``no redistribute`` suppression
+            # below can compare positions (WI-8 pattern — CCR Appendix AD).
             redistribute = []
+            positive_redist_last_line: dict[tuple[str, str], int] = {}
             for rc in eigrp_obj.find_child_objects(r"^\s+redistribute\s+"):
                 rm = re.match(r"^\s+redistribute\s+(\S+)", rc.text)
                 if not rm:
@@ -8488,6 +8706,10 @@ class IOSParser(BaseParser):
                     pid_match = re.match(r"(\d+)", remaining)
                     if pid_match:
                         pid = int(pid_match.group(1))
+                rkey = (proto, str(pid) if pid is not None else "")
+                positive_redist_last_line[rkey] = max(
+                    positive_redist_last_line.get(rkey, -1), rc.linenum
+                )
 
                 route_map = self._extract_match(rc.text, r"\broute-map\s+(\S+)")
                 tag = None
@@ -8507,6 +8729,64 @@ class IOSParser(BaseParser):
                 redistribute.append(EIGRPRedistribute(
                     protocol=proto, process_id=pid, metric=metric, route_map=route_map, tag=tag
                 ))
+
+            # WI-DB2 (CCR Appendix AD): ``no redistribute <proto> [<pid>]``
+            # withdrawal.  The positive walk above is anchored (never matches
+            # a ``no redistribute`` line) and the keyed ``redistribute`` merge
+            # is additive-keyed, so the line was silently dropped — while the
+            # consumer (static.py apply_eigrp_redistribution, invoked from
+            # the snapshot builder) genuinely extends IGP reachability
+            # (the Appendix N.8 deferral, now delivered).  Emit a native
+            # line-numbered LIST_REMOVE whose path IS the colon-split of the
+            # legacy twin tombstone ``field:eigrp:<asn>:<vrf>:redistribute:
+            # <proto>:<pid>`` (B1 posture — legacy gains the fix; the twin is
+            # regenerated from the op via encode_legacy, single source, and
+            # drained by parse_deletion_commands).  Over-trigger discipline:
+            # the protocol token is whitelist-anchored ($-anchored, so
+            # trailered forms — ``no redistribute static route-map X``, which
+            # on a real device removes only the OPTION — and non-protocol
+            # tokens (``no redistribute maximum-prefix 100``) stay blind,
+            # enumerated in Appendix AD); a pid token on a protocol whose
+            # positive walk never parses one is treated as an unknown trailer
+            # (blind).  SUPPRESSION (WI-8 ``_readded_later``): skipped when
+            # the same (proto, pid) reappears as a positive line LATER in the
+            # block — refresh → re-add wins in BOTH modes (no op, no twin).
+            for nrc in eigrp_obj.find_child_objects(r"^\s+no\s+redistribute\s+"):
+                nrm = re.match(
+                    r"^\s+no\s+redistribute\s+"
+                    r"(connected|static|bgp|ospf|eigrp|isis|rip)"
+                    r"(?:\s+(\d+))?\s*$",
+                    nrc.text,
+                )
+                if not nrm:
+                    continue
+                nproto, npid = nrm.group(1), nrm.group(2)
+                if npid is not None and nproto not in ("bgp", "ospf", "eigrp"):
+                    continue  # unknown trailer for a pid-less protocol — blind
+                nkey = (nproto, npid or "")
+                if positive_redist_last_line.get(nkey, -1) > nrc.linenum:
+                    continue  # re-added later in the block — removal suppressed
+                op = ChangeOp(
+                    verb=Verb.LIST_REMOVE,
+                    path=(
+                        "field",
+                        "eigrp",
+                        str(as_number),
+                        vrf_early,
+                        "redistribute",
+                        nkey[0],
+                        nkey[1],
+                    ),
+                    value=None,
+                    source_line=nrc.text.strip(),
+                    line_no=nrc.linenum,
+                    origin="native",
+                )
+                self._pending_native_eigrp_ops.append(op)
+                from confgraph.change_ir import encode_legacy
+                self._pending_eigrp_negation_tombstones.extend(
+                    encode_legacy([op]).no_commands
+                )
 
             # misc
             auto_summary = bool(eigrp_obj.find_child_objects(r"^\s+auto-summary"))

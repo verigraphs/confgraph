@@ -19,6 +19,8 @@ Run:
 
 from __future__ import annotations
 
+import re
+
 import pytest
 
 from confgraph.change_ir import (
@@ -44,6 +46,18 @@ _FAMILY3_TOMBSTONE_PREFIXES = (
     "field:object_tracks:",
     "field:eem_applets:",
     "field:banners:",
+)
+
+# WI-DB2 (CCR Appendix AD): the four OSPF withdrawal-twin shapes + the EIGRP
+# redistribute twin — vrf-scoped (segment 3 is the vrf, "" for global), which
+# keeps them disjoint from the derived VRF-blind stub/nssa area resets.
+_DB2_IGP_TWIN_RE = re.compile(
+    r"^field:(?:"
+    r"(?:ospf|eigrp):[^:]+:[^:]*:redistribute:"
+    r"|ospf:[^:]+:[^:]*:default_information_originate$"
+    r"|ospf:[^:]+:[^:]*:area:[^:]+:virtual_link:"
+    r"|ospf:[^:]+:[^:]*:area:[^:]+:filter_list_(?:in|out)$"
+    r")"
 )
 
 
@@ -97,6 +111,15 @@ def _is_reordered_native_tombstone(t: str) -> bool:
             )
         )
         or t.startswith(("field:lldp:", "vlan:"))
+        # WI-DB2 (CCR Appendix AD): the family-6 IGP withdrawal twins
+        # (``field:ospf:<pid>:<vrf>:…`` / ``field:eigrp:<asn>:<vrf>:…``,
+        # vrf-scoped) are regenerated from NATIVE line-numbered ops hoisted
+        # to the front of the composed ChangeSet.  Non-weakening: same
+        # F-precedent argument — each dispatches to a dedicated
+        # _FIELD_PATH_ACCESSORS accessor over disjoint fields.  The regex is
+        # shape-exact so the DERIVED stub/nssa ``field:ospf:<pid>:area:…``
+        # resets KEEP their byte-exact sequence pin.
+        or _DB2_IGP_TWIN_RE.match(t) is not None
         # Family 8e (CCR Appendix X): interface member removals
         # (helper / nhrp_nhs — the only two ``field:interface:…`` 5-segment
         # shapes) and whole-interface deletes.  Non-weakening: the member
