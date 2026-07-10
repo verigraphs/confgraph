@@ -21,6 +21,7 @@ from __future__ import annotations
 from pydantic import BaseModel, Field
 
 from confgraph.models.parsed_config import ParsedConfig
+from confgraph.utils.interface import is_discard_interface
 
 
 # ---------------------------------------------------------------------------
@@ -125,6 +126,7 @@ class DependencyResolver:
         links.extend(self._resolve_eigrp())
         links.extend(self._resolve_rip())
         links.extend(self._resolve_interfaces())
+        links.extend(self._resolve_vrfs())
         links.extend(self._resolve_route_maps())
         links.extend(self._resolve_static_routes())
         links.extend(self._resolve_ntp())
@@ -365,10 +367,38 @@ class DependencyResolver:
                 links.append(self._link(
                     "static_route", str(sr.destination), "vrf", "vrf", sr.vrf,
                 ))
-            if sr.next_hop_interface:
+            # Null0 / NullN and each vendor's discard target are blackhole
+            # pseudo-interfaces: traffic is dropped, no InterfaceConfig exists.
+            # They are routing sinks, not resolvable objects, so emit no link
+            # (skipping avoids a false dangling-interface ERROR). See
+            # confgraph.utils.interface.is_discard_interface for the vendor table.
+            if sr.next_hop_interface and not is_discard_interface(sr.next_hop_interface):
                 links.append(self._link(
                     "static_route", str(sr.destination),
                     "next_hop_interface", "interface", sr.next_hop_interface,
+                ))
+        return links
+
+    # ------------------------------------------------------------------
+    # VRFs
+    # ------------------------------------------------------------------
+
+    def _resolve_vrfs(self) -> list[DependencyLink]:
+        """Resolve VRF import/export route-map references.
+
+        Without this, VRF route-maps are never marked referenced and are
+        wrongly reported as orphaned. Where a VRF has no route-map, no edge
+        is emitted.
+        """
+        links: list[DependencyLink] = []
+        for vrf in self._config.vrfs:
+            if vrf.route_map_import:
+                links.append(self._link(
+                    "vrf", vrf.name, "route_map_import", "route_map", vrf.route_map_import,
+                ))
+            if vrf.route_map_export:
+                links.append(self._link(
+                    "vrf", vrf.name, "route_map_export", "route_map", vrf.route_map_export,
                 ))
         return links
 

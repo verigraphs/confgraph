@@ -214,6 +214,54 @@ def normalize_interface_name(name: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Discard / pseudo-interface predicate
+# ---------------------------------------------------------------------------
+# A static route whose next hop is one of these names is a blackhole: traffic
+# is dropped, and the name never corresponds to a real InterfaceConfig. The
+# resolver must treat such a next hop as a discard, NOT as a dangling interface
+# reference. Keeping the set here (next to interface-name canonicalization)
+# means a future vendor's discard target is added in exactly ONE place — a
+# single frozenset entry — rather than a new branch inside the resolver.
+
+_DISCARD_INTERFACE_NAMES: frozenset[str] = frozenset({
+    "null",     # IOS / IOS-XE / EOS / IOS-XR:  Null0, NullN, bare Null
+    "discard",  # JunOS discard next-hop keyword
+    "dsc",      # JunOS dsc discard pseudo-interface
+})
+
+
+def is_discard_interface(name: str) -> bool:
+    """Return True if *name* denotes a discard / blackhole pseudo-interface.
+
+    Matches on the leading alphabetic *type* token (case-insensitive), so unit
+    numbers and slot/path suffixes are ignored: ``Null0``, ``NullN`` and bare
+    ``Null`` all match, while real interfaces such as ``Ethernet0`` or a
+    near-miss like ``Nullipsis0`` do not.
+
+    Examples
+    --------
+    >>> is_discard_interface("Null0")
+    True
+    >>> is_discard_interface("null")
+    True
+    >>> is_discard_interface("discard")
+    True
+    >>> is_discard_interface("Ethernet0")
+    False
+    >>> is_discard_interface("Nullipsis0")
+    False
+    """
+    if not name:
+        return False
+    stripped = name.strip()
+    # Leading run of alphabetic characters = the interface *type* token.
+    i = 0
+    while i < len(stripped) and stripped[i].isalpha():
+        i += 1
+    return stripped[:i].lower() in _DISCARD_INTERFACE_NAMES
+
+
+# ---------------------------------------------------------------------------
 # Display (short) form
 # ---------------------------------------------------------------------------
 
