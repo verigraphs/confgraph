@@ -6165,7 +6165,9 @@ class IOSParser(BaseParser):
             prefix_str = net_match.group(1)
             mask_str = net_match.group(2)
 
-            rm_match = re.search(r"\broute-map\s+(\S+)", t)
+            # route-map (IOS/NX-OS/EOS) or route-policy (IOS-XR); the latter
+            # never appears on the other OSes, so the alternation is inert there.
+            rm_match = re.search(r"\broute-(?:map|policy)\s+(\S+)", t)
             backdoor = bool(re.search(r"\bbackdoor\b", t))
 
             try:
@@ -6207,7 +6209,7 @@ class IOSParser(BaseParser):
             if pid_match:
                 process_id = int(pid_match.group(1))
 
-            rm_match = re.search(r"route-map\s+(\S+)", remaining)
+            rm_match = re.search(r"route-(?:map|policy)\s+(\S+)", remaining)
             if rm_match:
                 route_map = rm_match.group(1)
 
@@ -6225,6 +6227,47 @@ class IOSParser(BaseParser):
             )
 
         return redistribute
+
+    def _parse_bgp_aggregate_stmts(self, config_objs) -> list["BGPAggregate"]:
+        """Parse ``aggregate-address`` statements from config-line objects.
+
+        Shared entry point (CCR-0032) used by the IOS-XR AF parser. Accepts the
+        dotted-mask IOS form and the classless ``prefix/len`` form (IOS-XR); the
+        optional-mask group matches only a dotted mask, so ``summary-only`` is
+        never mis-read as the mask.
+        """
+        from confgraph.models.bgp import BGPAggregate
+
+        aggregates: list[BGPAggregate] = []
+        for obj in config_objs:
+            m = re.search(
+                r"^\s+aggregate-address\s+(\S+)(?:\s+(\d+\.\d+\.\d+\.\d+))?(.*)$",
+                obj.text,
+            )
+            if not m:
+                continue
+            prefix_str = m.group(1)
+            mask = m.group(2)
+            remaining = (m.group(3) or "").strip()
+            try:
+                if mask:
+                    prefix = IPv4Network(f"{prefix_str}/{mask}", strict=False)
+                elif ":" in prefix_str:
+                    prefix = IPv6Network(prefix_str, strict=False)
+                else:
+                    prefix = IPv4Network(prefix_str, strict=False)
+            except ValueError:
+                continue
+            rm = re.search(r"\broute-(?:map|policy)\s+(\S+)", remaining)
+            aggregates.append(
+                BGPAggregate(
+                    prefix=prefix,
+                    summary_only="summary-only" in remaining,
+                    as_set="as-set" in remaining,
+                    route_map=rm.group(1) if rm else None,
+                )
+            )
+        return aggregates
 
     def _parse_bgp_address_families(self, bgp_obj) -> list[BGPAddressFamily]:
         """Parse BGP address-families (global, non-VRF)."""
@@ -6671,6 +6714,133 @@ class IOSParser(BaseParser):
             )
 
         return vrf_instances
+
+    # -----------------------------------------------------------------------
+    # Shared nested-block traversal (CCR-0032)
+    #
+    # ONE descent point for "router BLOCK → vrf NAME → …".  BGP-VRF and
+    # OSPF-VRF both walk child blocks through _iter_router_vrf_blocks, so
+    # adding another protocol's VRF sub-block is a call, not a new walk.
+    # -----------------------------------------------------------------------
+
+    def _iter_router_vrf_blocks(self, router_obj):
+        """Yield ``(vrf_name, vrf_obj)`` for each direct-child ``vrf NAME`` block.
+
+        The single traversal helper for descending from a ``router bgp`` /
+        ``router ospf`` (etc.) block into its per-VRF sub-blocks.  Uses
+        ``find_child_objects`` (direct children only) so global-scope neighbors,
+        areas and redistribute lines are never swept into a VRF instance.
+        """
+        for vrf_obj in router_obj.find_child_objects(r"^\s+vrf\s+(\S+)\s*$"):
+            vrf_name = self._extract_match(vrf_obj.text, r"^\s+vrf\s+(\S+)")
+            if vrf_name:
+                yield vrf_name, vrf_obj
+
+    def _parse_bgp_vrf_blocks(self, bgp_obj, asn: int) -> list["BGPConfig"]:
+        """Shared block-form BGP-VRF parser (``router bgp`` → ``vrf NAME`` block).
+
+        Used by NX-OS, IOS-XR and EOS — all three place VRF BGP config in a
+        ``vrf NAME`` block (IOS-XE instead uses ``address-family ipv4 vrf NAME``,
+        handled by ``_parse_bgp_vrf_instances``).  Neighbor parsing delegates to
+        the polymorphic ``self._parse_bgp_neighbors(vrf_obj)`` so each OS's single
+        neighbor traversal is reused — the NX-OS VRF neighbor drop was exactly a
+        VRF path that had re-implemented (and diverged from) that traversal.
+        """
+        vrf_instances: list[BGPConfig] = []
+
+        for vrf_name, vrf_obj in self._iter_router_vrf_blocks(bgp_obj):
+            raw_lines, line_numbers = self._get_raw_lines_and_line_numbers(vrf_obj)
+
+            # RD — declared directly under the VRF block. Surface on the BGP
+            # instance (BGPConfig.rd) and record for any VRFConfig back-fill.
+            rd = None
+            rd_ch = vrf_obj.find_child_objects(r"^\s+rd\s+(\S+)")
+            if rd_ch:
+                rd = self._extract_match(rd_ch[0].text, r"^\s+rd\s+(\S+)")
+                if rd is not None:
+                    bgp_vrf_rd = getattr(self, "_bgp_vrf_rd", None)
+                    if isinstance(bgp_vrf_rd, dict):
+                        bgp_vrf_rd[vrf_name] = rd
+
+            neighbors = self._parse_bgp_neighbors(vrf_obj)
+
+            redistribute = self._parse_bgp_redistribute_stmts(
+                [c for c in vrf_obj.all_children
+                 if re.match(r"^\s+redistribute\s+\S+", c.text)]
+            )
+
+            vrf_instances.append(
+                BGPConfig(
+                    object_id=f"bgp_{asn}_vrf_{vrf_name}",
+                    raw_lines=raw_lines,
+                    source_os=self.os_type,
+                    line_numbers=line_numbers,
+                    asn=asn,
+                    router_id=None,
+                    vrf=vrf_name,
+                    rd=rd,
+                    log_neighbor_changes=False,
+                    bestpath_options=BGPBestpathOptions(),
+                    neighbors=neighbors,
+                    peer_groups=[],
+                    address_families=[],
+                    redistribute=redistribute,
+                )
+            )
+
+        return vrf_instances
+
+    def _parse_ospf_vrf_instances(self, parse) -> list["OSPFConfig"]:
+        """OSPF-VRF instances from ``router ospf N`` → ``vrf NAME`` nested blocks.
+
+        Reuses the SAME ``_iter_router_vrf_blocks`` traversal as BGP-VRF; the
+        per-instance field extraction is delegated to ``_build_ospf_vrf_instance``
+        (overridable per OS for flat vs nested area syntax).  The IOS-XE
+        ``router ospf N vrf NAME`` header form is handled by ``parse_ospf`` and
+        produces no nested ``vrf`` block, so there is no double-count.
+        """
+        instances: list[OSPFConfig] = []
+        for ospf_obj in parse.find_objects(r"^router\s+ospf\s+(\d+)"):
+            pid_str = self._extract_match(ospf_obj.text, r"^router\s+ospf\s+(\d+)")
+            if not pid_str:
+                continue
+            process_id = int(pid_str)
+            for vrf_name, vrf_obj in self._iter_router_vrf_blocks(ospf_obj):
+                instances.append(
+                    self._build_ospf_vrf_instance(process_id, vrf_name, vrf_obj)
+                )
+        return instances
+
+    def _build_ospf_vrf_instance(self, process_id, vrf_name, vrf_obj) -> "OSPFConfig":
+        """Build one OSPFConfig for a ``vrf NAME`` block (IOS flat-area syntax).
+
+        IOS-XR overrides this to use its nested ``area > interface`` area parser.
+        """
+        raw_lines, line_numbers = self._get_raw_lines_and_line_numbers(vrf_obj)
+
+        router_id = None
+        rid_ch = vrf_obj.find_child_objects(r"^\s+router-id\s+(\S+)")
+        if rid_ch:
+            rid_str = self._extract_match(rid_ch[0].text, r"^\s+router-id\s+(\S+)")
+            try:
+                router_id = IPv4Address(rid_str)
+            except ValueError:
+                pass
+
+        redistribute = self._parse_ospf_redistribute(vrf_obj)
+        areas = self._parse_ospf_areas(vrf_obj)
+
+        return OSPFConfig(
+            object_id=f"ospf_{process_id}_vrf_{vrf_name}",
+            raw_lines=raw_lines,
+            source_os=self.os_type,
+            line_numbers=line_numbers,
+            process_id=process_id,
+            vrf=vrf_name,
+            router_id=router_id,
+            areas=areas,
+            redistribute=redistribute,
+        )
 
     def parse_static_routes(self) -> list[StaticRoute]:
         """Parse static route configurations."""

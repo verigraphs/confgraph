@@ -368,6 +368,10 @@ class BGPConfig(BaseConfigObject):
         default=None,
         description="VRF context (None = global, otherwise references VRFConfig)",
     )
+    rd: str | None = Field(
+        default=None,
+        description="Route-distinguisher declared inside the BGP VRF sub-block",
+    )
     log_neighbor_changes: bool = Field(
         default=True, description="Log neighbor state changes"
     )

@@ -1020,28 +1020,49 @@ class JunOSParser(BaseParser):
         if not isinstance(static, dict):
             return
 
-        routes = static.get("route", [])
+        # ``static.route`` takes three shapes depending on which route forms are
+        # present (CCR-0032 — data corruption):
+        #   - str  : a single flat ``route PREFIX next-hop NH;``
+        #   - list : several flat routes
+        #   - dict : any route used the block form ``route PREFIX { … }`` — the
+        #            tokenizer then keys EVERY route (block-form AND flat sibling)
+        #            under ``route`` as a dict.  The old code handled only
+        #            str/list, so one block-form route erased the whole block.
+        # Normalize all three into ``(prefix_str, inline_tokens, block_attrs)``.
+        routes = static.get("route", None)
+        entries: list[tuple[str, list[str], dict]] = []
         if isinstance(routes, str):
-            routes = [routes]
-        elif not isinstance(routes, list):
-            routes = []
+            toks = (routes or "").split()
+            if toks:
+                entries.append((toks[0], toks[1:], {}))
+        elif isinstance(routes, list):
+            for item in routes:
+                toks = (_str_val(item) or "").split()
+                if toks:
+                    entries.append((toks[0], toks[1:], {}))
+        elif isinstance(routes, dict):
+            for key, val in routes.items():
+                toks = str(key).split()
+                if not toks:
+                    continue
+                block = val if isinstance(val, dict) else {}
+                entries.append((toks[0], toks[1:], block))
 
         from ipaddress import ip_network, ip_address
-        for route_str in routes:
-            route_str = (_str_val(route_str) or "").strip()
-            if not route_str:
-                continue
-            parts = route_str.split()
-            if not parts:
-                continue
-            prefix_str = parts[0]
-            next_hop_str = parts[2] if len(parts) >= 3 and parts[1] == "next-hop" else None
-            if next_hop_str is None and len(parts) >= 2:
-                next_hop_str = parts[1]
+        for prefix_str, inline, block in entries:
             try:
                 destination = ip_network(prefix_str, strict=False)
             except ValueError:
                 continue
+
+            # Next-hop from the block body or the inline remainder.
+            next_hop_str = None
+            if "next-hop" in block:
+                next_hop_str = _str_val(block.get("next-hop"))
+            elif len(inline) >= 2 and inline[0] == "next-hop":
+                next_hop_str = inline[1]
+            elif inline:
+                next_hop_str = inline[0]
 
             next_hop = None
             if next_hop_str and next_hop_str not in ("discard", "reject", "blackhole"):
@@ -1050,6 +1071,22 @@ class JunOSParser(BaseParser):
                 except ValueError:
                     next_hop = next_hop_str  # interface name
 
+            # ``preference`` → administrative distance; ``tag`` → route tag.
+            distance = 1
+            pref_val = _str_val(block.get("preference")) if "preference" in block else None
+            if pref_val is not None:
+                try:
+                    distance = int(pref_val)
+                except (TypeError, ValueError):
+                    pass
+            tag = None
+            tag_val = _str_val(block.get("tag")) if "tag" in block else None
+            if tag_val is not None:
+                try:
+                    tag = int(tag_val)
+                except (TypeError, ValueError):
+                    pass
+
             result.append(StaticRoute(
                 object_id=f"static_{prefix_str}" + (f"_vrf_{vrf}" if vrf else ""),
                 raw_lines=self._raw_lines_for("routing-options", "static") if not vrf else self._raw_lines_for("routing-instances", vrf, "routing-options", "static"),
@@ -1057,6 +1094,8 @@ class JunOSParser(BaseParser):
                 line_numbers=[],
                 destination=destination,
                 next_hop=next_hop,
+                distance=distance,
+                tag=tag,
                 vrf=vrf,
             ))
 

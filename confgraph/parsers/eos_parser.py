@@ -6,7 +6,7 @@ from ipaddress import IPv4Address, IPv4Interface, IPv4Network, IPv6Address, IPv6
 from confgraph.parsers.ios_parser import IOSParser
 from confgraph.parsers.base import _BASE_KNOWN_PATTERNS, _BASE_BEST_GUESS_KEYWORDS, _default_pg_data, apply_peer_group_command
 from confgraph.models.base import OSType
-from confgraph.models.bgp import BGPAddressFamily, BGPNeighbor, BGPPeerGroup
+from confgraph.models.bgp import BGPAddressFamily, BGPConfig, BGPNeighbor, BGPPeerGroup
 from confgraph.models.vrf import VRFConfig
 from confgraph.models.prefix_list import PrefixListConfig, PrefixListEntry
 from confgraph.models.static_route import StaticRoute
@@ -976,6 +976,17 @@ class EOSParser(IOSParser):
             )
 
         return neighbors
+
+    def _parse_bgp_vrf_instances(self, bgp_obj, asn: int) -> list[BGPConfig]:
+        """Parse VRF-specific BGP instances (``router bgp`` → ``vrf NAME`` block).
+
+        EOS uses the same block form as NX-OS and IOS-XR, not the IOS-XE
+        ``address-family ipv4 vrf NAME`` form the inherited IOS parser expects —
+        which is why the whole VRF instance was previously dropped. Delegates to
+        the shared block-form traversal ``_parse_bgp_vrf_blocks`` (CCR-0032),
+        reusing the EOS neighbor parser for the VRF neighbors.
+        """
+        return self._parse_bgp_vrf_blocks(bgp_obj, asn)
 
     def _parse_bgp_address_families(self, bgp_obj) -> list[BGPAddressFamily]:
         """Parse BGP address-families for EOS.

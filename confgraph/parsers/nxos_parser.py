@@ -271,123 +271,15 @@ class NXOSParser(IOSParser):
         return peer_groups
 
     def _parse_bgp_vrf_instances(self, bgp_obj, asn: int) -> list[BGPConfig]:
-        """Parse VRF-specific BGP instances.
+        """Parse VRF-specific BGP instances (``router bgp`` → ``vrf NAME`` block).
 
-        NX-OS uses ``vrf VRFNAME`` blocks directly under ``router bgp``.
+        Delegates to the shared block-form traversal ``_parse_bgp_vrf_blocks``
+        (CCR-0032), which descends into each ``vrf NAME`` sub-block and reuses
+        the NX-OS neighbor parser (``_parse_bgp_neighbors``) so nested-block VRF
+        neighbors — previously dropped by a hand-rolled inline-only loop — are
+        captured with their address-family route-maps.
         """
-        from ipaddress import IPv4Address, IPv6Address
-
-        vrf_instances = []
-        vrf_children = bgp_obj.find_child_objects(r"^\s+vrf\s+(\S+)")
-
-        for vrf_child in vrf_children:
-            vrf_name = self._extract_match(vrf_child.text, r"^\s+vrf\s+(\S+)")
-            if not vrf_name:
-                continue
-
-            raw_lines, line_numbers = self._get_raw_lines_and_line_numbers(vrf_child)
-
-            # VRF neighbors
-            vrf_neighbors = []
-            neighbor_dict: dict[str, dict] = {}
-
-            for child in vrf_child.all_children:
-                text = child.text.strip()
-                n_match = re.match(r"neighbor\s+(\S+)\s+(.+)", text)
-                if not n_match:
-                    continue
-
-                peer_ip_str = n_match.group(1)
-                command = n_match.group(2)
-
-                if peer_ip_str not in neighbor_dict:
-                    neighbor_dict[peer_ip_str] = {
-                        "peer_ip": peer_ip_str,
-                        "remote_as": None,
-                        "description": None,
-                        "route_map_in": None,
-                        "route_map_out": None,
-                    }
-
-                if command.startswith("remote-as "):
-                    val = command.replace("remote-as ", "").strip()
-                    try:
-                        neighbor_dict[peer_ip_str]["remote_as"] = int(val)
-                    except ValueError:
-                        neighbor_dict[peer_ip_str]["remote_as"] = val
-                elif command.startswith("description "):
-                    neighbor_dict[peer_ip_str]["description"] = command.replace("description ", "").strip()
-                elif command.startswith("route-map ") and " in" in command:
-                    neighbor_dict[peer_ip_str]["route_map_in"] = (
-                        command.replace("route-map ", "").replace(" in", "").strip()
-                    )
-                elif command.startswith("route-map ") and " out" in command:
-                    neighbor_dict[peer_ip_str]["route_map_out"] = (
-                        command.replace("route-map ", "").replace(" out", "").strip()
-                    )
-
-            for peer_ip_str, nd in neighbor_dict.items():
-                try:
-                    peer_ip = IPv4Address(peer_ip_str)
-                except ValueError:
-                    try:
-                        peer_ip = IPv6Address(peer_ip_str)
-                    except ValueError:
-                        continue
-
-                if nd["remote_as"] is None:
-                    continue
-
-                vrf_neighbors.append(
-                    BGPNeighbor(
-                        peer_ip=peer_ip,
-                        remote_as=nd["remote_as"],
-                        description=nd["description"],
-                        route_map_in=nd["route_map_in"],
-                        route_map_out=nd["route_map_out"],
-                    )
-                )
-
-            # Redistribution inside vrf block
-            redistribute: list[BGPRedistribute] = []
-            for child in vrf_child.all_children:
-                text = child.text.strip()
-                rd_m = re.match(r"redistribute\s+(\S+)(.*)", text)
-                if not rd_m:
-                    continue
-                protocol = rd_m.group(1)
-                remaining = rd_m.group(2).strip()
-                process_id = None
-                route_map = None
-                pid_m = re.search(r"(\d+)", remaining)
-                if pid_m:
-                    process_id = int(pid_m.group(1))
-                rm_m = re.search(r"route-map\s+(\S+)", remaining)
-                if rm_m:
-                    route_map = rm_m.group(1)
-                redistribute.append(
-                    BGPRedistribute(protocol=protocol, process_id=process_id, route_map=route_map)
-                )
-
-            vrf_instances.append(
-                BGPConfig(
-                    object_id=f"bgp_{asn}_vrf_{vrf_name}",
-                    raw_lines=raw_lines,
-                    source_os=self.os_type,
-                    line_numbers=line_numbers,
-                    asn=asn,
-                    router_id=None,
-                    vrf=vrf_name,
-                    log_neighbor_changes=False,
-                    bestpath_options=BGPBestpathOptions(),
-                    neighbors=vrf_neighbors,
-                    peer_groups=[],
-                    address_families=[],
-                    redistribute=redistribute,
-                )
-            )
-
-        return vrf_instances
+        return self._parse_bgp_vrf_blocks(bgp_obj, asn)
 
     # -----------------------------------------------------------------------
     # BGP — NX-OS nested neighbor blocks + inherit peer
@@ -652,6 +544,10 @@ class NXOSParser(IOSParser):
                 if inst.process_id == process_id and inst.vrf is None:
                     inst.vrf = vrf_name
                     break
+
+        # NX-OS native OSPF-VRF: nested ``router ospf N`` → ``vrf NAME`` blocks
+        # (CCR-0032). Same VRF-block traversal as BGP-VRF (_iter_router_vrf_blocks).
+        instances.extend(self._parse_ospf_vrf_instances(parse))
 
         return instances
 

@@ -485,120 +485,16 @@ class IOSXRParser(IOSParser):
         return peer_groups
 
     def _parse_bgp_vrf_instances(self, bgp_obj, asn: int) -> list[BGPConfig]:
-        """Parse VRF-specific BGP instances.
+        """Parse VRF-specific BGP instances (``router bgp`` → ``vrf NAME`` block).
 
-        IOS-XR uses ``vrf VRFNAME`` blocks directly under ``router bgp``.
+        Delegates to the shared block-form traversal ``_parse_bgp_vrf_blocks``
+        (CCR-0032). That helper descends via ``_iter_router_vrf_blocks``, reads
+        the RD (recorded in ``self._bgp_vrf_rd`` for VRFConfig back-fill and set
+        on ``BGPConfig.rd``), and delegates neighbors to this class's
+        ``_parse_bgp_neighbors`` — the same block-form neighbor parser used for
+        the global instance, so the two paths can no longer diverge.
         """
-        vrf_instances = []
-        vrf_children = bgp_obj.find_child_objects(r"^\s+vrf\s+(\S+)")
-
-        for vrf_child in vrf_children:
-            vrf_name = self._extract_match(vrf_child.text, r"^\s+vrf\s+(\S+)")
-            if not vrf_name:
-                continue
-
-            raw_lines, line_numbers = self._get_raw_lines_and_line_numbers(vrf_child)
-
-            # RD is inside the VRF block — store for X6 back-fill onto VRFConfig
-            rd = None
-            rd_ch = vrf_child.find_child_objects(r"^\s+rd\s+(\S+)")
-            if rd_ch:
-                rd = self._extract_match(rd_ch[0].text, r"^\s+rd\s+(\S+)")
-                if rd and vrf_name:
-                    self._bgp_vrf_rd[vrf_name] = rd
-
-            # VRF neighbors — IOS-XR uses block syntax per neighbor
-            vrf_neighbors: list[BGPNeighbor] = []
-            for nb_child in vrf_child.find_child_objects(r"^\s+neighbor\s+(\S+)\s*$"):
-                peer_str = self._extract_match(nb_child.text, r"^\s+neighbor\s+(\S+)\s*$")
-                if not peer_str:
-                    continue
-                try:
-                    peer_ip = IPv4Address(peer_str)
-                except ValueError:
-                    try:
-                        peer_ip = IPv6Address(peer_str)
-                    except ValueError:
-                        continue
-
-                nd = self._parse_iosxr_neighbor_block(nb_child)
-
-                has_policy = (
-                    nd["route_map_in"] or nd["route_map_out"] or nd["next_hop_self"]
-                    or nd["prefix_list_in"] or nd["prefix_list_out"]
-                )
-                if nd["remote_as"] is None and nd["peer_group"] is None:
-                    if not has_policy:
-                        continue
-                    nd["remote_as"] = "inherited"
-
-                vrf_neighbors.append(BGPNeighbor(
-                    peer_ip=peer_ip,
-                    remote_as=nd["remote_as"] if nd["remote_as"] is not None else "inherited",
-                    peer_group=nd["peer_group"],
-                    description=nd["description"],
-                    update_source=nd["update_source"],
-                    ebgp_multihop=nd["ebgp_multihop"],
-                    password=nd["password"],
-                    shutdown=nd["shutdown"],
-                    fall_over_bfd=nd["fall_over_bfd"],
-                    local_as=nd["local_as"],
-                    local_as_no_prepend=nd["local_as_no_prepend"],
-                    local_as_replace_as=nd["local_as_replace_as"],
-                    next_hop_self=nd["next_hop_self"],
-                    send_community=nd["send_community"],
-                    route_reflector_client=nd["route_reflector_client"],
-                    route_map_in=nd["route_map_in"],
-                    route_map_out=nd["route_map_out"],
-                    prefix_list_in=nd["prefix_list_in"],
-                    prefix_list_out=nd["prefix_list_out"],
-                    timers=nd["timers"],
-                ))
-
-            # Redistribution
-            redistribute: list[BGPRedistribute] = []
-            for child in vrf_child.all_children:
-                text = child.text.strip()
-                rd_m = re.match(r"redistribute\s+(\S+)(.*)", text)
-                if not rd_m:
-                    continue
-                protocol = rd_m.group(1)
-                remaining = rd_m.group(2).strip()
-                process_id = None
-                route_map = None
-                # Process ID — only for protocols that carry one,
-                # and only as the leading positional token.
-                if protocol in ("ospf", "eigrp", "isis"):
-                    pid_m = re.match(r"(\d+)", remaining)
-                    if pid_m:
-                        process_id = int(pid_m.group(1))
-                rm_m = re.search(r"route-policy\s+(\S+)", remaining)
-                if rm_m:
-                    route_map = rm_m.group(1)
-                redistribute.append(
-                    BGPRedistribute(protocol=protocol, process_id=process_id, route_map=route_map)
-                )
-
-            vrf_instances.append(
-                BGPConfig(
-                    object_id=f"bgp_{asn}_vrf_{vrf_name}",
-                    raw_lines=raw_lines,
-                    source_os=self.os_type,
-                    line_numbers=line_numbers,
-                    asn=asn,
-                    router_id=None,
-                    vrf=vrf_name,
-                    log_neighbor_changes=False,
-                    bestpath_options=BGPBestpathOptions(),
-                    neighbors=vrf_neighbors,
-                    peer_groups=[],
-                    address_families=[],
-                    redistribute=redistribute,
-                    no_commands=[],
-                )
-            )
-
-        return vrf_instances
+        return self._parse_bgp_vrf_blocks(bgp_obj, asn)
 
     # -----------------------------------------------------------------------
     # BGP address-families — "address-family ipv4 unicast" + "maximum-paths ebgp N"
@@ -640,10 +536,28 @@ class IOSXRParser(IOSParser):
                 if v:
                     maximum_paths_ibgp = int(v)
 
+            # CCR-0032: descend into the AF block for the prefixes the router
+            # originates/redistributes/aggregates. Reuses the shared IOS
+            # statement helpers (extended to accept route-policy as well as
+            # route-map), so adding an AF child is one shared change, not a
+            # new per-OS walk. IOS-XR spells these with route-policy.
+            networks = self._parse_bgp_network_stmts(
+                af_child.find_child_objects(r"^\s+network\s+")
+            )
+            redistribute = self._parse_bgp_redistribute_stmts(
+                af_child.find_child_objects(r"^\s+redistribute\s+(\S+)")
+            )
+            aggregates = self._parse_bgp_aggregate_stmts(
+                af_child.find_child_objects(r"^\s+aggregate-address\s+(\S+)")
+            )
+
             address_families.append(BGPAddressFamily(
                 afi=afi,
                 safi="unicast",
                 vrf=None,
+                networks=networks,
+                redistribute=redistribute,
+                aggregate_addresses=aggregates,
                 maximum_paths=maximum_paths,
                 maximum_paths_ibgp=maximum_paths_ibgp,
             ))
@@ -852,7 +766,43 @@ class IOSXRParser(IOSParser):
                 )
             )
 
+        # CCR-0032: OSPF-VRF via the same VRF-block traversal as BGP-VRF.
+        ospf_instances.extend(self._parse_ospf_vrf_instances(parse))
+
         return ospf_instances
+
+    def _build_ospf_vrf_instance(self, process_id, vrf_name, vrf_obj) -> OSPFConfig:
+        """Build one OSPFConfig for an IOS-XR ``vrf NAME`` OSPF sub-block.
+
+        Overrides the IOS flat-area default to use IOS-XR's nested
+        ``area > interface`` area parser (CCR-0032).
+        """
+        raw_lines, line_numbers = self._get_raw_lines_and_line_numbers(vrf_obj)
+
+        router_id = None
+        rid_ch = vrf_obj.find_child_objects(r"^\s+router-id\s+(\S+)")
+        if rid_ch:
+            rid_str = self._extract_match(rid_ch[0].text, r"^\s+router-id\s+(\S+)")
+            try:
+                router_id = IPv4Address(rid_str)
+            except ValueError:
+                pass
+
+        areas, passive_interfaces = self._parse_ospf_areas_iosxr(vrf_obj)
+        redistribute = self._parse_ospf_redistribute_iosxr(vrf_obj)
+
+        return OSPFConfig(
+            object_id=f"ospf_{process_id}_vrf_{vrf_name}",
+            raw_lines=raw_lines,
+            source_os=self.os_type,
+            line_numbers=line_numbers,
+            process_id=process_id,
+            vrf=vrf_name,
+            router_id=router_id,
+            areas=areas,
+            passive_interfaces=passive_interfaces,
+            redistribute=redistribute,
+        )
 
     def _parse_ospf_areas_iosxr(self, ospf_obj) -> tuple[list[OSPFArea], list[str]]:
         """Parse OSPF areas with nested interface blocks (IOS-XR style).
