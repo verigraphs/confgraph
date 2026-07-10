@@ -413,11 +413,21 @@ class PANOSParser(BaseParser):
 
                 nexthop_ip_str = text_val(route_el, "nexthop/ip-address")
                 nexthop_iface = text_val(route_el, "interface")
+                # PAN-OS carries administrative distance in <admin-dist> and the
+                # route metric in <metric>; the two are distinct (CCR-0030 bug 3).
+                admin_dist_str = text_val(route_el, "admin-dist")
                 metric_str = text_val(route_el, "metric")
                 try:
-                    distance = int(metric_str) if metric_str else 1
+                    # PAN-OS default static-route administrative distance is 10.
+                    distance = int(admin_dist_str) if admin_dist_str else 10
                 except ValueError:
-                    distance = 1
+                    distance = 10
+                metric = None
+                if metric_str:
+                    try:
+                        metric = int(metric_str)
+                    except ValueError:
+                        metric = None
 
                 nexthop: IPv4Address | str | None = None
                 if nexthop_ip_str:
@@ -432,6 +442,7 @@ class PANOSParser(BaseParser):
                     next_hop=nexthop,
                     next_hop_interface=nexthop_iface,
                     distance=distance,
+                    metric=metric,
                     vrf=vr_name if vr_name != "default" else None,
                     raw_lines=[raw_xml(route_el)],
                 ))

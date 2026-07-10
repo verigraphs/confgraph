@@ -407,20 +407,17 @@ class JunOSParser(BaseParser):
                     if v:
                         rt_both.append(v)
 
-            # vrf-import / vrf-export (less common, explicit)
+            # vrf-import / vrf-export name *policy-statements*, not route-targets.
+            # They belong in the policy-reference fields (route_map_import /
+            # route_map_export), never in route_target_* (CCR-0030 bug 1).
+            policy_import: str | None = None
+            policy_export: str | None = None
             vi = vrf_data.get("vrf-import")
             if vi:
-                for v in (vi if isinstance(vi, list) else [vi]):
-                    v = (_str_val(v) or "").replace("target:", "")
-                    if v:
-                        rt_import.append(v)
-
+                policy_import = _str_val(vi) or None
             ve = vrf_data.get("vrf-export")
             if ve:
-                for v in (ve if isinstance(ve, list) else [ve]):
-                    v = (_str_val(v) or "").replace("target:", "")
-                    if v:
-                        rt_export.append(v)
+                policy_export = _str_val(ve) or None
 
             # Member interfaces
             # Brace-style: interface = "ge-0/0/0.0" (scalar) or list
@@ -450,6 +447,8 @@ class JunOSParser(BaseParser):
                 route_target_import=rt_import,
                 route_target_export=rt_export,
                 route_target_both=rt_both,
+                route_map_import=policy_import,
+                route_map_export=policy_export,
                 interfaces=intf_members,
             ))
 
@@ -1289,9 +1288,20 @@ class JunOSParser(BaseParser):
         srv_val = ntp_data.get("server")
         if srv_val:
             for sv in (srv_val if isinstance(srv_val, list) else [srv_val]):
-                addr = _str_val(sv) or ""
+                leaf = _str_val(sv) or ""
+                if not leaf:
+                    continue
+                # Tokenize: "10.0.0.1 prefer" / "10.0.0.1 key 5 version 4".
+                # The first token is the address; trailing keywords are
+                # attributes, not part of the address (CCR-0030 bug 2).
+                addr, prefer, key_id, version = _split_ntp_server(leaf)
                 if addr:
-                    servers.append(NTPServer(address=addr))
+                    servers.append(NTPServer(
+                        address=addr,
+                        prefer=prefer,
+                        key_id=key_id,
+                        version=version,
+                    ))
 
         if not servers:
             return None
@@ -1389,6 +1399,40 @@ def _find_in_block(d: dict[str, Any], key: str) -> Any:
             if found is not None:
                 return found
     return None
+
+
+def _split_ntp_server(leaf: str) -> tuple[str | None, bool, int | None, int | None]:
+    """Split a JunOS ``ntp server`` leaf into (address, prefer, key_id, version).
+
+    The address is the first token; ``prefer``, ``key <id>`` and ``version <n>``
+    are trailing keyword attributes that must not be glommed onto the address.
+    """
+    tokens = leaf.split()
+    if not tokens:
+        return None, False, None, None
+    address = tokens[0]
+    prefer = False
+    key_id: int | None = None
+    version: int | None = None
+    i = 1
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok == "prefer":
+            prefer = True
+        elif tok == "key" and i + 1 < len(tokens):
+            try:
+                key_id = int(tokens[i + 1])
+            except ValueError:
+                pass
+            i += 1
+        elif tok == "version" and i + 1 < len(tokens):
+            try:
+                version = int(tokens[i + 1])
+            except ValueError:
+                pass
+            i += 1
+        i += 1
+    return address, prefer, key_id, version
 
 
 def _str_val(v: Any) -> str | None:

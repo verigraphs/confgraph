@@ -28,6 +28,10 @@ class StaticRoute(BaseConfigObject):
         default=1,
         description="Administrative distance (default 1)",
     )
+    metric: int | None = Field(
+        default=None,
+        description="Route metric (distinct from administrative distance)",
+    )
     tag: int | None = Field(
         default=None,
         description="Route tag for filtering/tracking",

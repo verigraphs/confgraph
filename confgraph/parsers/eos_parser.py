@@ -882,6 +882,7 @@ class EOSParser(IOSParser):
                     "update_source": None,
                     "ebgp_multihop": None,
                     "password": None,
+                    "password_encryption_type": None,
                     "route_map_in": None,
                     "route_map_out": None,
                     "prefix_list_in": None,
@@ -913,6 +914,13 @@ class EOSParser(IOSParser):
                 neighbor_dict[peer_ip_str]["description"] = command.replace("description ", "").strip()
             elif command.startswith("update-source "):
                 neighbor_dict[peer_ip_str]["update_source"] = command.replace("update-source ", "").strip()
+            elif command.startswith("password "):
+                # EOS previously had no password branch here, dropping the key
+                # entirely for peer-group-form neighbors. Use the shared
+                # extractor inherited from IOSParser (CCR-0030 bug 4).
+                key, enc = self._split_bgp_password(command[len("password "):])
+                neighbor_dict[peer_ip_str]["password"] = key
+                neighbor_dict[peer_ip_str]["password_encryption_type"] = enc
             elif command == "shutdown":
                 neighbor_dict[peer_ip_str]["shutdown"] = True
 
@@ -946,6 +954,7 @@ class EOSParser(IOSParser):
                     update_source=ndata["update_source"],
                     ebgp_multihop=ndata["ebgp_multihop"],
                     password=ndata["password"],
+                    password_encryption_type=ndata["password_encryption_type"],
                     route_map_in=ndata["route_map_in"],
                     route_map_out=ndata["route_map_out"],
                     prefix_list_in=ndata["prefix_list_in"],

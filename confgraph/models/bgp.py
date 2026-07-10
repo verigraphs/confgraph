@@ -189,6 +189,10 @@ class BGPNeighbor(BaseModel):
         default=False, description="Configure as route-reflector client"
     )
     password: str | None = Field(default=None, description="MD5 password")
+    password_encryption_type: str | None = Field(
+        default=None,
+        description="Encryption/hash type token preceding the MD5 key (e.g. '7', '3')",
+    )
     shutdown: bool = Field(default=False, description="Administratively shut down")
     timers: BGPTimers | None = Field(default=None, description="BGP timers")
     route_map_in: str | None = Field(

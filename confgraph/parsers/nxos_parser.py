@@ -407,6 +407,7 @@ class NXOSParser(IOSParser):
         nd: dict = {
             "remote_as": None, "peer_group": None, "description": None,
             "update_source": None, "ebgp_multihop": None, "password": None,
+            "password_encryption_type": None,
             "route_map_in": None, "route_map_out": None,
             "prefix_list_in": None, "prefix_list_out": None,
             "filter_list_in": None, "filter_list_out": None,
@@ -439,7 +440,11 @@ class NXOSParser(IOSParser):
             elif cmd.startswith("ebgp-multihop "):
                 nd["ebgp_multihop"] = int(cmd.replace("ebgp-multihop ", "").strip())
             elif cmd.startswith("password "):
-                nd["password"] = cmd.replace("password ", "").strip()
+                # Shared extractor inherited from IOSParser (CCR-0030 bug 4);
+                # this walk is a staticmethod, so reference it via the class.
+                key, enc = NXOSParser._split_bgp_password(cmd[len("password "):])
+                nd["password"] = key
+                nd["password_encryption_type"] = enc
             elif cmd.startswith("route-map ") and " in" in cmd:
                 nd["route_map_in"] = cmd.replace("route-map ", "").replace(" in", "").strip()
             elif cmd.startswith("route-map ") and " out" in cmd:
@@ -577,6 +582,7 @@ class NXOSParser(IOSParser):
                 update_source=nd["update_source"],
                 ebgp_multihop=nd["ebgp_multihop"],
                 password=nd["password"],
+                password_encryption_type=nd["password_encryption_type"],
                 route_map_in=nd["route_map_in"],
                 route_map_out=nd["route_map_out"],
                 prefix_list_in=nd["prefix_list_in"],

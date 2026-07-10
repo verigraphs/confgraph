@@ -62,7 +62,9 @@ class TestInlineNeighborChildren:
 
     def test_password(self):
         n = _get_neighbor(_parse(self.INLINE_CONFIG), "10.0.0.1")
-        assert n.password == "3 abc123"
+        # CCR-0030 bug 4: the encryption-type token is no longer glommed on.
+        assert n.password == "abc123"
+        assert n.password_encryption_type == "3"
 
     def test_update_source(self):
         n = _get_neighbor(_parse(self.INLINE_CONFIG), "10.0.0.1")
@@ -163,7 +165,9 @@ class TestSplitNeighborChildren:
 
     def test_password(self):
         n = _get_neighbor(_parse(self.SPLIT_CONFIG), "10.0.0.2")
-        assert n.password == "7 secretXYZ"
+        # CCR-0030 bug 4: encryption-type separated from key material.
+        assert n.password == "secretXYZ"
+        assert n.password_encryption_type == "7"
 
     def test_update_source(self):
         n = _get_neighbor(_parse(self.SPLIT_CONFIG), "10.0.0.2")
@@ -296,13 +300,15 @@ class TestMixedInlineAndSplit:
         n = _get_neighbor(_parse(self.CONFIG), "10.0.0.1")
         assert n.remote_as == 65100
         assert n.description == "INLINE-PEER"
-        assert n.password == "3 inlinepass"
+        assert n.password == "inlinepass"
+        assert n.password_encryption_type == "3"
 
     def test_split_fields(self):
         n = _get_neighbor(_parse(self.CONFIG), "10.0.0.2")
         assert n.remote_as == 65200
         assert n.description == "SPLIT-PEER"
-        assert n.password == "7 splitpass"
+        assert n.password == "splitpass"
+        assert n.password_encryption_type == "7"
 
     def test_neighbor_count(self):
         pc = _parse(self.CONFIG)

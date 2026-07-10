@@ -5651,6 +5651,23 @@ class IOSParser(BaseParser):
 
         return tombstones
 
+    @staticmethod
+    def _split_bgp_password(arg: str) -> tuple[str | None, str | None]:
+        """Split a BGP neighbor ``password`` argument into (key, encryption_type).
+
+        Cisco-family syntax is ``neighbor X password [<0-7>] <key>``. A leading
+        numeric token is the encryption/hash *type* and must be separated from
+        the key material rather than glommed onto it (CCR-0030 bug 4). This is
+        the single field-extraction point; ``NXOSParser`` and ``EOSParser``
+        inherit it unchanged so every Cisco-family neighbor walk shares it.
+        """
+        tokens = arg.split()
+        if not tokens:
+            return None, None
+        if len(tokens) >= 2 and tokens[0].isdigit():
+            return " ".join(tokens[1:]), tokens[0]
+        return " ".join(tokens), None
+
     def _parse_bgp_neighbors(self, bgp_obj) -> list[BGPNeighbor]:
         """Parse BGP neighbors."""
         neighbors = []
@@ -5688,6 +5705,7 @@ class IOSParser(BaseParser):
                     "update_source": None,
                     "ebgp_multihop": None,
                     "password": None,
+                    "password_encryption_type": None,
                     "route_map_in": None,
                     "route_map_out": None,
                     "prefix_list_in": None,
@@ -5727,7 +5745,9 @@ class IOSParser(BaseParser):
                 except ValueError:
                     pass
             elif command.startswith("password "):
-                neighbor_dict[peer_ip_str]["password"] = command.replace("password ", "").strip()
+                key, enc = self._split_bgp_password(command[len("password "):])
+                neighbor_dict[peer_ip_str]["password"] = key
+                neighbor_dict[peer_ip_str]["password_encryption_type"] = enc
             elif command.startswith("route-map ") and " in" in command:
                 rm_name = command.replace("route-map ", "").replace(" in", "").strip()
                 neighbor_dict[peer_ip_str]["route_map_in"] = rm_name
@@ -5822,6 +5842,7 @@ class IOSParser(BaseParser):
                     update_source=neighbor_data["update_source"],
                     ebgp_multihop=neighbor_data["ebgp_multihop"],
                     password=neighbor_data["password"],
+                    password_encryption_type=neighbor_data["password_encryption_type"],
                     route_map_in=neighbor_data["route_map_in"],
                     route_map_out=neighbor_data["route_map_out"],
                     prefix_list_in=neighbor_data["prefix_list_in"],
