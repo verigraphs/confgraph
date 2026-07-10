@@ -29,6 +29,8 @@ from pathlib import Path
 
 import networkx as nx
 
+from confgraph.utils.escaping import json_for_script
+
 # Reuse the bundled Cytoscape.js assets from the existing graph exporter
 _ASSETS_DIR = Path(__file__).parent.parent / "graph" / "assets"
 _CYTOSCAPE_JS = _ASSETS_DIR / "cytoscape.min.js"
@@ -132,7 +134,7 @@ def export_topology_html(g: nx.MultiGraph, title: str = "Network Topology") -> s
             }
         })
 
-    elements_json = json.dumps({"nodes": nodes, "edges": edges})
+    elements_json = json_for_script({"nodes": nodes, "edges": edges})
 
     return f"""<!DOCTYPE html>
 <html lang="en">

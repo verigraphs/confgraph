@@ -14,6 +14,7 @@ import networkx as nx
 
 from confgraph.graph.exporters.base import BaseExporter
 from confgraph.graph.exporters.json import JSONExporter
+from confgraph.utils.escaping import escape_html, json_for_script
 
 # Path to the bundled Cytoscape.js asset (resolved relative to this file)
 _ASSETS_DIR = Path(__file__).parent.parent / "assets"
@@ -61,7 +62,7 @@ class HTMLExporter(BaseExporter):
 
         cytoscape_js = _load_cytoscape()
         dagre_js = _load_dagre()
-        elements_json = json.dumps(graph_json["elements"])
+        elements_json = json_for_script(graph_json["elements"])
 
         type_styles: dict[str, dict] = {}
         for _, attrs in graph.nodes(data=True):
@@ -73,8 +74,8 @@ class HTMLExporter(BaseExporter):
                     "group": attrs.get("group", "other"),
                 }
 
-        legend_items_js = json.dumps(type_styles)
-        status_style_rules_js = json.dumps([
+        legend_items_js = json_for_script(type_styles)
+        status_style_rules_js = json_for_script([
             {"selector": "node[status = 'missing']",
              "style": {"border-style": "dashed", "border-opacity": 0.7, "opacity": 0.45}},
             {"selector": "node[status = 'orphan']",
@@ -86,7 +87,7 @@ class HTMLExporter(BaseExporter):
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>confgraph — {hostname}</title>
+<title>confgraph — {escape_html(hostname)}</title>
 <script>{cytoscape_js}</script>
 <script>{dagre_js}</script>
 <style>
@@ -471,7 +472,7 @@ body {{
   <div id="sidebar-header">
     <h1>confgraph</h1>
     <div class="meta">
-      <strong>{hostname}</strong> &nbsp;·&nbsp; {os_type.upper()}<br>
+      <strong>{escape_html(hostname)}</strong> &nbsp;·&nbsp; {escape_html(os_type.upper())}<br>
       {node_count} nodes &nbsp;·&nbsp; {edge_count} edges<br>
       {generated_at}
     </div>
