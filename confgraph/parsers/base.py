@@ -32,6 +32,63 @@ class ParseError(Exception):
             f"  Cause: {type(original).__name__}: {original}"
         )
 
+class PatternSet:
+    """An ordered set of alternative regex spellings for ONE command family.
+
+    The structural answer to CCR-0031. A command's accepted dialects live in a
+    data list, not in stacked ``if``/second-regex branches inside a parse
+    method. Adding the Nth dialect is appending one pattern; a subclass adds an
+    OS-native dialect with ``ParentClass._X_PATTERNS.extended(...)`` instead of
+    overriding the whole method and re-implementing the common case (handbook
+    §7.3).
+
+    Every pattern SHOULD use the same *named* groups so all dialects normalize
+    to one field set at the call site. Dialect order is priority:
+
+    - ``match(text)`` / ``search(text)`` return the first hit's ``re.Match``
+      (or ``None``) — put the more specific spelling first when two could
+      overlap.
+    - ``union`` builds a single ``find_objects`` regex over every dialect.
+    - ``extended(*more)`` returns a NEW PatternSet = these patterns then *more*;
+      the parent set is left untouched (safe to share as a class attribute).
+    """
+
+    __slots__ = ("patterns", "_compiled")
+
+    def __init__(self, *patterns: str) -> None:
+        self.patterns: tuple[str, ...] = tuple(patterns)
+        self._compiled = tuple(re.compile(p) for p in patterns)
+
+    def extended(self, *patterns: str) -> "PatternSet":
+        """Return a superset with *patterns* appended (parent unchanged)."""
+        return PatternSet(*self.patterns, *patterns)
+
+    @property
+    def union(self) -> str:
+        """A single regex matching any dialect — for ``find_objects``.
+
+        Named groups are demoted to non-capturing so the same group name may
+        appear across dialects (the union only locates lines; extraction is
+        done per-dialect by ``match``/``search``).
+        """
+        stripped = [re.sub(r"\(\?P<[^>]+>", "(?:", p) for p in self.patterns]
+        return "|".join(f"(?:{p})" for p in stripped)
+
+    def match(self, text: str) -> "re.Match | None":
+        for rx in self._compiled:
+            m = rx.match(text)
+            if m:
+                return m
+        return None
+
+    def search(self, text: str) -> "re.Match | None":
+        for rx in self._compiled:
+            m = rx.search(text)
+            if m:
+                return m
+        return None
+
+
 from confgraph.models.base import OSType, UnrecognizedBlock
 from confgraph.models.parsed_config import ParsedConfig
 from confgraph.models.vrf import VRFConfig
@@ -80,6 +137,7 @@ _BASE_KNOWN_PATTERNS: list[str] = [
     r"^router eigrp",
     r"^router rip",
     r"^vrf definition",
+    r"^ip vrf",
     r"^interface",
     r"^route-map",
     r"^ip prefix-list",
@@ -107,6 +165,7 @@ _BASE_KNOWN_PATTERNS: list[str] = [
     r"^bfd-template",
     # IP SLA
     r"^ip sla\s+\d",
+    r"^ip sla monitor\s+\d",
     # EEM
     r"^event\s+manager\s+applet",
     # Object tracking

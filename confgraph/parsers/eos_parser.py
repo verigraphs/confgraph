@@ -4,7 +4,7 @@ import re
 from ipaddress import IPv4Address, IPv4Interface, IPv4Network, IPv6Address, IPv6Interface, IPv6Network
 
 from confgraph.parsers.ios_parser import IOSParser
-from confgraph.parsers.base import _BASE_KNOWN_PATTERNS, _BASE_BEST_GUESS_KEYWORDS, _default_pg_data, apply_peer_group_command
+from confgraph.parsers.base import PatternSet, _BASE_KNOWN_PATTERNS, _BASE_BEST_GUESS_KEYWORDS, _default_pg_data, apply_peer_group_command
 from confgraph.models.base import OSType
 from confgraph.models.bgp import BGPAddressFamily, BGPConfig, BGPNeighbor, BGPPeerGroup
 from confgraph.models.vrf import VRFConfig
@@ -38,7 +38,8 @@ class EOSParser(IOSParser):
     _KNOWN_TOP_LEVEL_PATTERNS: list[str] = [
         p for p in _BASE_KNOWN_PATTERNS if p != r"^vrf definition"
     ] + [
-        r"^vrf instance",          # EOS VRF syntax
+        r"^vrf instance",          # EOS VRF syntax (EOS >= 4.23)
+        r"^vrf definition",        # EOS VRF syntax (EOS < 4.23) — parse_vrfs handles both
         r"^management api",        # EOS: management api http-commands etc.
         r"^management ssh",        # EOS: management ssh
         r"^management telnet",     # EOS: management telnet
@@ -70,6 +71,23 @@ class EOSParser(IOSParser):
         ("platform",        "platform"),
     ]
 
+    # CCR-0031 EOS dialect extensions (§7.3 — extend the parent set, don't
+    # re-implement). Interface VRF: IOS "vrf forwarding" (in-scope old EOS
+    # spelling) is already in the parent set; EOS adds bare "vrf NAME".
+    _IFACE_VRF_PATTERNS = IOSParser._IFACE_VRF_PATTERNS.extended(
+        r"^\s+vrf\s+(?!forwarding\b)(?P<vrf>\S+)\s*$",
+    )
+
+    # Global VRF header: EOS-native "vrf instance" plus legacy "vrf definition".
+    _VRF_HEADER_PATTERNS = PatternSet(
+        r"^vrf\s+instance\s+(?P<name>\S+)",
+        r"^vrf\s+definition\s+(?P<name>\S+)",
+    )
+
+    # BGP neighbor verb alias: EOS-native "maximum-routes" == IOS
+    # "maximum-prefix" (one dict entry — alias-normalization ahead of dispatch).
+    _BGP_CMD_ALIASES = {"maximum-routes": "maximum-prefix"}
+
     def __init__(self, config_text: str):
         """Initialize EOS parser.
 
@@ -79,19 +97,9 @@ class EOSParser(IOSParser):
         # Call the parent IOSParser __init__ but set OS type to EOS
         super().__init__(config_text, OSType.EOS)
 
-    def _extract_interface_vrf(self, intf_obj) -> str | None:
-        """Extract VRF name from an EOS interface object.
-
-        EOS format: ``vrf VRFNAME`` (no "forwarding" keyword).
-        Uses end-of-line anchor to avoid matching other ``vrf``-prefixed
-        sub-commands (e.g. hypothetical ``vrf-filter`` or similar).
-        """
-        vrf_children = intf_obj.find_child_objects(r"^\s+vrf\s+(\S+)\s*$")
-        if vrf_children:
-            return self._extract_match(
-                vrf_children[0].text, r"^\s+vrf\s+(\S+)\s*$"
-            )
-        return None
+    # EOS interface VRF binding is handled by the inherited pattern-set walk
+    # in IOSParser._extract_interface_vrf; EOS contributes its dialects via
+    # _IFACE_VRF_PATTERNS above (§7.3), so no method override is needed.
 
     def parse_interfaces(self) -> list:
         """Parse interfaces — patches CIDR IPv4 and EOS OSPF area.
@@ -169,10 +177,12 @@ class EOSParser(IOSParser):
         vrfs = []
         parse = self._get_parse_obj()
 
-        # EOS style: vrf instance
-        vrf_objs = parse.find_objects(r"^vrf\s+instance\s+(\S+)")
+        # EOS-native "vrf instance" plus legacy "vrf definition" (one entry each
+        # in _VRF_HEADER_PATTERNS). Both bodies expose rd / route-target alike.
+        vrf_objs = parse.find_objects(self._VRF_HEADER_PATTERNS.union)
         for vrf_obj in vrf_objs:
-            vrf_name = self._extract_match(vrf_obj.text, r"^vrf\s+instance\s+(\S+)")
+            hdr = self._VRF_HEADER_PATTERNS.match(vrf_obj.text)
+            vrf_name = hdr.group("name") if hdr else None
             if not vrf_name:
                 continue
 
@@ -252,7 +262,35 @@ class EOSParser(IOSParser):
         pl_dict: dict[str, dict] = {}
 
         for pl_obj in pl_objs:
-            # Match parent: ip prefix-list NAME
+            # Single-line form ("ip prefix-list NAME seq N permit X", also the
+            # no-seq shorthand) — one entry per line. Reuses the inherited IOS
+            # prefix-list line pattern set (§7.3).
+            line_match = self._PREFIX_LIST_LINE_PATTERNS.match(pl_obj.text)
+            if line_match:
+                g = line_match.groupdict()
+                pl_name = g["name"]
+                if pl_name not in pl_dict:
+                    raw_lines, line_numbers = self._get_raw_lines_and_line_numbers(pl_obj)
+                    pl_dict[pl_name] = {
+                        "name": pl_name,
+                        "sequences": [],
+                        "raw_lines": raw_lines,
+                        "line_numbers": line_numbers,
+                    }
+                seq = int(g["seq"]) if g.get("seq") else (len(pl_dict[pl_name]["sequences"]) + 1) * 5
+                rest = pl_obj.text[line_match.end():]
+                ge = int(m.group(1)) if (m := re.search(r"\sge\s+(\d+)", rest)) else None
+                le = int(m.group(1)) if (m := re.search(r"\sle\s+(\d+)", rest)) else None
+                try:
+                    prefix = IPv4Network(g["prefix"])
+                except ValueError:
+                    continue
+                pl_dict[pl_name]["sequences"].append(
+                    PrefixListEntry(sequence=seq, action=g["action"], prefix=prefix, ge=ge, le=le)
+                )
+                continue
+
+            # Match parent: ip prefix-list NAME  (block/show-run form)
             parent_match = re.search(r"^ip\s+prefix-list\s+(\S+)$", pl_obj.text)
             if not parent_match:
                 continue
@@ -668,21 +706,22 @@ class EOSParser(IOSParser):
         cl_dict: dict[str, dict] = {}
 
         for cl_obj in cl_objs:
-            # EOS syntax: ip community-list [regexp] NAME permit|deny COMMUNITIES
+            # EOS syntax: ip community-list [regexp|expanded] NAME permit|deny COMMUNITIES
             match = re.search(
-                r"^ip\s+community-list\s+(?:(regexp)\s+)?(\S+)\s+(permit|deny)\s+(.+)$",
+                r"^ip\s+community-list\s+(?:(regexp|expanded)\s+)?(\S+)\s+(permit|deny)\s+(.+)$",
                 cl_obj.text,
             )
             if not match:
                 continue
 
-            is_regexp = match.group(1) == "regexp"
+            kw = match.group(1)
             cl_name = match.group(2)
             action = match.group(3)
             communities_str = match.group(4).strip()
 
-            # Determine list type
-            list_type = "expanded" if is_regexp else "standard"
+            # Determine list type ("regexp" is EOS-native, "expanded" IOS-style;
+            # both denote regex-matched communities)
+            list_type = "expanded" if kw in ("regexp", "expanded") else "standard"
 
             if cl_name not in cl_dict:
                 cl_dict[cl_name] = {
@@ -1390,7 +1429,8 @@ class EOSParser(IOSParser):
                 udp_port = int(m.group(1))
                 continue
 
-            m = re.match(r"vxlan\s+vlan\s+(\d+)\s+vni\s+(\d+)", t)
+            # "vxlan vlan N vni M" and EOS >= 4.27 "vxlan vlan add N vni M"
+            m = re.match(r"vxlan\s+vlan\s+(?:add\s+)?(\d+)\s+vni\s+(\d+)", t)
             if m:
                 vni_mappings.append(VXLANVniMapping(
                     vni=int(m.group(2)), vlan=int(m.group(1)),

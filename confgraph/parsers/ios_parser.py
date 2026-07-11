@@ -3,7 +3,7 @@
 import re
 from ipaddress import IPv4Address, IPv4Interface, IPv4Network, IPv6Address, IPv6Interface, IPv6Network
 
-from confgraph.parsers.base import BaseParser, apply_peer_group_command, _default_pg_data
+from confgraph.parsers.base import BaseParser, PatternSet, apply_peer_group_command, _default_pg_data
 from confgraph.utils.interface import normalize_interface_name
 from confgraph.models.base import OSType
 from confgraph.models.vrf import VRFConfig
@@ -341,6 +341,86 @@ class IOSParser(BaseParser):
 
     _KNOWN_CHILD_PATTERNS: list[tuple[str, list[str]]] = _IOS_KNOWN_CHILD_PATTERNS
 
+    # ------------------------------------------------------------------
+    # CCR-0031 per-command pattern sets. Each dialect is one data entry;
+    # subclasses extend a set via ``IOSParser._X.extended(...)`` rather than
+    # re-implementing the common case (handbook §7.1/§7.3). Named groups are
+    # shared across a set so every dialect normalizes to the same field set.
+    # ------------------------------------------------------------------
+
+    # Global VRF block header: IOS-XE "vrf definition" and classic "ip vrf".
+    _VRF_HEADER_PATTERNS = PatternSet(
+        r"^vrf\s+definition\s+(?P<name>\S+)",
+        r"^ip\s+vrf\s+(?P<name>\S+)",
+    )
+
+    # Interface VRF binding. IOS accepts both "vrf forwarding" (IOS-XE) and
+    # "ip vrf forwarding" (classic). Subclasses extend with their native form.
+    _IFACE_VRF_PATTERNS = PatternSet(
+        r"^\s+vrf\s+forwarding\s+(?P<vrf>\S+)\s*$",
+        r"^\s+ip\s+vrf\s+forwarding\s+(?P<vrf>\S+)\s*$",
+    )
+
+    # Static route line. Traditional "DEST MASK NH" and CIDR "DEST/PLEN NH"
+    # (NX-OS global routes reach this by inheritance).
+    _STATIC_ROUTE_PATTERNS = PatternSet(
+        r"^ip\s+route\s+(?:vrf\s+(?P<vrf>\S+)\s+)?"
+        r"(?P<dest>\d+\.\d+\.\d+\.\d+)\s+(?P<mask>\d+\.\d+\.\d+\.\d+)\s+"
+        r"(?P<nh>\S+)(?P<rest>.*)$",
+        r"^ip\s+route\s+(?:vrf\s+(?P<vrf>\S+)\s+)?"
+        r"(?P<dest>\d+\.\d+\.\d+\.\d+/\d+)\s+(?P<nh>\S+)(?P<rest>.*)$",
+    )
+
+    # Prefix-list single line: with "seq N" and the no-seq shorthand.
+    _PREFIX_LIST_LINE_PATTERNS = PatternSet(
+        r"^ip\s+prefix-list\s+(?P<name>\S+)\s+seq\s+(?P<seq>\d+)\s+"
+        r"(?P<action>permit|deny)\s+(?P<prefix>\S+)",
+        r"^ip\s+prefix-list\s+(?P<name>\S+)\s+(?P<action>permit|deny)\s+(?P<prefix>\S+)",
+    )
+
+    # OSPF process header: numeric process id and string process tag
+    # (NX-OS "router ospf UNDERLAY", IOS-XR "router ospf CORE").
+    _OSPF_PROC_PATTERNS = PatternSet(
+        r"^router\s+ospf\s+(?P<pid>\d+)",
+        r"^router\s+ospf\s+(?P<pid>\S+)",
+    )
+
+    # OSPF SPF-throttle timers: modern 3-arg throttle, EOS "delay initial",
+    # and the legacy 2-arg "timers spf <spf> <hold>".
+    _OSPF_SPF_TIMER_PATTERNS = PatternSet(
+        r"^\s+timers\s+throttle\s+spf\s+(?P<initial>\d+)\s+(?P<min>\d+)\s+(?P<max>\d+)",
+        r"^\s+timers\s+spf\s+delay\s+initial\s+(?P<initial>\d+)\s+(?P<min>\d+)\s+(?P<max>\d+)",
+        r"^\s+timers\s+spf\s+(?P<initial>\d+)\s+(?P<min>\d+)\s*$",
+    )
+
+    # Community-list line: named (standard/expanded keyword) and legacy
+    # numbered (no keyword; number range implies the type).
+    _COMMLIST_PATTERNS = PatternSet(
+        r"^ip\s+community-list\s+(?P<type>standard|expanded)\s+(?P<name>\S+)\s+"
+        r"(?P<action>permit|deny)\s+(?P<comm>.+)$",
+        r"^ip\s+community-list\s+(?P<name>\d+)\s+(?P<action>permit|deny)\s+(?P<comm>.+)$",
+    )
+
+    # IP SLA operation header: modern "ip sla N" and legacy "ip sla monitor N".
+    _IP_SLA_HEADER_PATTERNS = PatternSet(
+        r"^ip\s+sla\s+(?P<id>\d+)$",
+        r"^ip\s+sla\s+monitor\s+(?P<id>\d+)$",
+    )
+
+    # BGP neighbor/peer-group verb aliases: an OS-native spelling rewritten to
+    # its canonical twin before the shared command dispatch (alias-normalization
+    # ahead of matching). Subclasses extend (e.g. EOS maximum-routes).
+    _BGP_CMD_ALIASES: dict[str, str] = {}
+
+    def _apply_bgp_cmd_alias(self, command: str) -> str:
+        """Rewrite the leading verb of a BGP neighbor/peer-group *command* to
+        its canonical spelling using ``self._BGP_CMD_ALIASES`` (dialect = one
+        dict entry). Non-aliased commands pass through unchanged."""
+        for native, canonical in self._BGP_CMD_ALIASES.items():
+            if command == native or command.startswith(native + " "):
+                return canonical + command[len(native):]
+        return command
+
     def __init__(self, config_text: str, os_type: OSType = OSType.IOS):
         """Initialize IOS parser.
 
@@ -360,10 +440,13 @@ class IOSParser(BaseParser):
         vrfs = []
         parse = self._get_parse_obj()
 
-        # IOS-XE style: vrf definition
-        vrf_objs = parse.find_objects(r"^vrf\s+definition\s+(\S+)")
+        # Accept every VRF header spelling in the pattern set (IOS-XE
+        # "vrf definition" + classic "ip vrf"). Both bodies expose rd /
+        # route-target the same way, so one block walk serves all dialects.
+        vrf_objs = parse.find_objects(self._VRF_HEADER_PATTERNS.union)
         for vrf_obj in vrf_objs:
-            vrf_name = self._extract_match(vrf_obj.text, r"^vrf\s+definition\s+(\S+)")
+            hdr = self._VRF_HEADER_PATTERNS.match(vrf_obj.text)
+            vrf_name = hdr.group("name") if hdr else None
             if not vrf_name:
                 continue
 
@@ -430,8 +513,6 @@ class IOSParser(BaseParser):
                     route_map_export=route_map_export,
                 )
             )
-
-        # TODO: Add support for "ip vrf NAME" (older IOS style)
 
         return vrfs
 
@@ -4215,12 +4296,14 @@ class IOSParser(BaseParser):
             asn = int(asn_str)
             raw_lines, line_numbers = self._get_raw_lines_and_line_numbers(bgp_obj)
 
-            # Router ID
+            # Router ID. One walk over "(bgp )?router-id" clears the IOS
+            # canonical "bgp router-id" AND the EOS/NX-OS-native bare
+            # "router-id" (same shared-seam shape as the graceful-restart fix).
             router_id = None
-            rid_children = bgp_obj.find_child_objects(r"^\s+bgp\s+router-id\s+(\S+)")
+            rid_children = bgp_obj.find_child_objects(r"^\s+(?:bgp\s+)?router-id\s+(\S+)")
             if rid_children:
                 rid_str = self._extract_match(
-                    rid_children[0].text, r"^\s+bgp\s+router-id\s+(\S+)"
+                    rid_children[0].text, r"^\s+(?:bgp\s+)?router-id\s+(\S+)"
                 )
                 try:
                     router_id = IPv4Address(rid_str)
@@ -4400,15 +4483,18 @@ class IOSParser(BaseParser):
         # ``no_commands`` by parse_deletion_commands.
         self._pending_ospf_negation_tombstones = []
 
-        # Find all OSPF router configs
-        ospf_objs = parse.find_objects(r"^router\s+ospf\s+(\d+)")
+        # Find all OSPF router configs. The process header pattern set accepts
+        # a numeric process id and a string process tag (NX-OS / IOS-XR);
+        # ``process_id`` is ``int | str`` so a tag is kept verbatim.
+        ospf_objs = parse.find_objects(self._OSPF_PROC_PATTERNS.union)
 
         for ospf_obj in ospf_objs:
-            process_id_str = self._extract_match(ospf_obj.text, r"^router\s+ospf\s+(\d+)")
+            hdr = self._OSPF_PROC_PATTERNS.match(ospf_obj.text)
+            process_id_str = hdr.group("pid") if hdr else None
             if not process_id_str:
                 continue
 
-            process_id = int(process_id_str)
+            process_id: int | str = int(process_id_str) if process_id_str.isdigit() else process_id_str
             # Capture VRF from "router ospf <pid> vrf <name>" (IOS VRF-Lite style)
             ospf_vrf = self._extract_match(
                 ospf_obj.text, r"^router\s+ospf\s+\d+\s+vrf\s+(\S+)"
@@ -4736,17 +4822,20 @@ class IOSParser(BaseParser):
                 if v:
                     max_lsa = int(v)
 
-            # Timers throttle SPF: "timers throttle spf <initial> <min> <max>"
+            # SPF-throttle timers across dialects (modern 3-arg throttle, EOS
+            # "delay initial", legacy 2-arg "timers spf <spf> <hold>") — one
+            # entry per spelling in _OSPF_SPF_TIMER_PATTERNS.
             spf_initial: int | None = None
             spf_min: int | None = None
             spf_max: int | None = None
-            spf_ch = ospf_obj.find_child_objects(r"^\s+timers\s+throttle\s+spf\s+")
-            if spf_ch:
-                m = re.search(r"timers\s+throttle\s+spf\s+(\d+)\s+(\d+)\s+(\d+)", spf_ch[0].text)
+            for spf_child in ospf_obj.children:
+                m = self._OSPF_SPF_TIMER_PATTERNS.match(spf_child.text)
                 if m:
-                    spf_initial = int(m.group(1))
-                    spf_min = int(m.group(2))
-                    spf_max = int(m.group(3))
+                    g = m.groupdict()
+                    spf_initial = int(g["initial"])
+                    spf_min = int(g["min"])
+                    spf_max = int(g["max"]) if g.get("max") else None
+                    break
 
             # Timers throttle LSA: "timers throttle lsa all <msec>"
             lsa_all: int | None = None
@@ -5136,28 +5225,30 @@ class IOSParser(BaseParser):
         prefix_lists = []
         parse = self._get_parse_obj()
 
-        # Find all prefix-list entries
-        pl_objs = parse.find_objects(
-            r"^ip\s+prefix-list\s+(\S+)\s+seq\s+(\d+)\s+(permit|deny)\s+(\S+)"
-        )
+        # Accept both the "seq N" spelling and the no-seq shorthand
+        # (dialects live in _PREFIX_LIST_LINE_PATTERNS). A no-seq entry gets an
+        # auto-assigned running sequence per list, matching IOS behaviour.
+        pl_objs = parse.find_objects(self._PREFIX_LIST_LINE_PATTERNS.union)
 
         # Group by prefix-list name
         pl_dict: dict[str, list] = {}
         for pl_obj in pl_objs:
-            match = re.search(
-                r"^ip\s+prefix-list\s+(\S+)\s+seq\s+(\d+)\s+(permit|deny)\s+(\S+)",
-                pl_obj.text,
-            )
+            match = self._PREFIX_LIST_LINE_PATTERNS.match(pl_obj.text)
             if not match:
                 continue
 
-            pl_name = match.group(1)
-            sequence = int(match.group(2))
-            action = match.group(3)
-            prefix_str = match.group(4)
+            g = match.groupdict()
+            pl_name = g["name"]
+            action = g["action"]
+            prefix_str = g["prefix"]
 
             if pl_name not in pl_dict:
                 pl_dict[pl_name] = []
+
+            if g.get("seq"):
+                sequence = int(g["seq"])
+            else:
+                sequence = (len(pl_dict[pl_name]) + 1) * 5
 
             # Parse ge/le
             ge = None
@@ -5235,17 +5326,19 @@ class IOSParser(BaseParser):
     # Helper methods
 
     def _extract_interface_vrf(self, intf_obj) -> str | None:
-        """Extract VRF name from an interface object.
+        """Extract the interface VRF binding using ``_IFACE_VRF_PATTERNS``.
 
-        IOS/IOS-XE format: ``vrf forwarding VRFNAME``
-        Subclasses can override for OS-specific syntax.
+        A subclass adds its OS-native spelling by *extending* this class
+        attribute (``IOSParser._IFACE_VRF_PATTERNS.extended(...)``) — it does
+        not re-implement this walk (handbook §7.3). Last matching child wins,
+        mirroring IOS running-config merge semantics.
         """
-        vrf_children = intf_obj.find_child_objects(r"^\s+vrf\s+forwarding\s+(\S+)")
-        if vrf_children:
-            return self._extract_match(
-                vrf_children[-1].text, r"^\s+vrf\s+forwarding\s+(\S+)"
-            )
-        return None
+        result = None
+        for child in intf_obj.children:
+            m = self._IFACE_VRF_PATTERNS.match(child.text)
+            if m:
+                result = m.group("vrf")
+        return result
 
     def _determine_interface_type(self, intf_name: str) -> InterfaceType:
         """Determine interface type from interface name.
@@ -5279,32 +5372,39 @@ class IOSParser(BaseParser):
 
         return vlans
 
-    def _parse_hsrp_groups(self, intf_obj) -> list[HSRPGroup]:
-        """Parse HSRP groups from interface configuration."""
-        hsrp_groups = []
+    def _collect_hsrp_commands(self, intf_obj) -> tuple[list[tuple[int, str]], int | None]:
+        """Return ``([(group, command), ...], version)`` for an interface.
 
-        # Capture interface-level "standby version <n>" (applies to all groups)
-        hsrp_version: int | None = None
+        This is the dialect seam for HSRP: the IOS flat spelling
+        (``standby N <cmd>`` / ``standby version N``) lives here; a subclass
+        with a block spelling (NX-OS ``hsrp N`` + ``hsrp version N``) extends
+        this collector and reuses the shared applier below — the command
+        vocabulary (``ip``/``priority``/``preempt``/...) is defined once.
+        """
+        version: int | None = None
         version_children = intf_obj.find_child_objects(r"^\s+standby\s+version\s+(\d+)")
         if version_children:
             vm = re.search(r"standby\s+version\s+(\d+)", version_children[-1].text)
             if vm:
-                hsrp_version = int(vm.group(1))
+                version = int(vm.group(1))
 
-        # Find all standby commands with a group number
-        standby_children = intf_obj.find_child_objects(r"^\s+standby\s+(\d+)")
+        pairs: list[tuple[int, str]] = []
+        for standby_child in intf_obj.find_child_objects(r"^\s+standby\s+(\d+)"):
+            match = re.search(r"^\s+standby\s+(\d+)\s+(.+)", standby_child.text)
+            if match:
+                pairs.append((int(match.group(1)), match.group(2)))
+        return pairs, version
+
+    def _parse_hsrp_groups(self, intf_obj) -> list[HSRPGroup]:
+        """Parse HSRP groups from interface configuration."""
+        hsrp_groups = []
+
+        commands, hsrp_version = self._collect_hsrp_commands(intf_obj)
 
         # Group by HSRP group number
         hsrp_dict: dict[int, dict] = {}
 
-        for standby_child in standby_children:
-            match = re.search(r"^\s+standby\s+(\d+)\s+(.+)", standby_child.text)
-            if not match:
-                continue
-
-            group_num = int(match.group(1))
-            command = match.group(2)
-
+        for group_num, command in commands:
             if group_num not in hsrp_dict:
                 hsrp_dict[group_num] = {
                     "group_number": group_num,
@@ -5348,24 +5448,28 @@ class IOSParser(BaseParser):
 
         return hsrp_groups
 
+    def _collect_vrrp_commands(self, intf_obj) -> list[tuple[int, str]]:
+        """Return ``[(group, command), ...]`` for VRRP on an interface.
+
+        The IOS flat spelling (``vrrp N <cmd>``) lives here; a subclass with a
+        block spelling (NX-OS ``vrrp N`` + ``address ADDR``) extends this
+        collector and reuses the shared applier below.
+        """
+        pairs: list[tuple[int, str]] = []
+        for vrrp_child in intf_obj.find_child_objects(r"^\s+vrrp\s+(\d+)"):
+            match = re.search(r"^\s+vrrp\s+(\d+)\s+(.+)", vrrp_child.text)
+            if match:
+                pairs.append((int(match.group(1)), match.group(2)))
+        return pairs
+
     def _parse_vrrp_groups(self, intf_obj) -> list[VRRPGroup]:
         """Parse VRRP groups from interface configuration."""
         vrrp_groups = []
 
-        # Find all vrrp commands
-        vrrp_children = intf_obj.find_child_objects(r"^\s+vrrp\s+(\d+)")
-
         # Group by VRRP group number
         vrrp_dict: dict[int, dict] = {}
 
-        for vrrp_child in vrrp_children:
-            match = re.search(r"^\s+vrrp\s+(\d+)\s+(.+)", vrrp_child.text)
-            if not match:
-                continue
-
-            group_num = int(match.group(1))
-            command = match.group(2)
-
+        for group_num, command in self._collect_vrrp_commands(intf_obj):
             if group_num not in vrrp_dict:
                 vrrp_dict[group_num] = {
                     "group_number": group_num,
@@ -5689,7 +5793,7 @@ class IOSParser(BaseParser):
                 continue
 
             peer_ip_str = match.group(1)
-            command = match.group(2)
+            command = self._apply_bgp_cmd_alias(match.group(2))
 
             # Skip peer-group definition lines (neighbor GROUPNAME peer-group)
             # These are already captured in peer_group_names set
@@ -6853,23 +6957,28 @@ class IOSParser(BaseParser):
         for route_obj in route_objs:
             raw_lines, line_numbers = self._get_raw_lines_and_line_numbers(route_obj)
 
-            # Parse: ip route [vrf NAME] destination mask next-hop [distance] [tag TAG] [name NAME] [permanent] [track TRACK]
-            match = re.search(
-                r"^ip\s+route\s+(?:vrf\s+(\S+)\s+)?(\S+)\s+(\S+)\s+(\S+)(.*)$",
-                route_obj.text,
-            )
+            # Parse via the static-route pattern set: traditional
+            # "DEST MASK NH" and CIDR "DEST/PLEN NH" (the latter reaching this
+            # method by inheritance on NX-OS). Adding another dialect is one
+            # entry in ``_STATIC_ROUTE_PATTERNS``.
+            match = self._STATIC_ROUTE_PATTERNS.match(route_obj.text)
             if not match:
                 continue
 
-            vrf = match.group(1)
-            dest_str = match.group(2)
-            mask_str = match.group(3)
-            next_hop_str = match.group(4)
-            remaining = match.group(5).strip() if match.group(5) else ""
+            groups = match.groupdict()
+            vrf = groups.get("vrf")
+            dest_str = groups["dest"]
+            mask_str = groups.get("mask")
+            next_hop_str = groups["nh"]
+            remaining = (groups.get("rest") or "").strip()
 
-            # Parse destination
+            # Parse destination (dotted-mask twins get a "/mask" suffix; CIDR
+            # dialects already carry their prefix length).
             try:
-                destination = IPv4Network(f"{dest_str}/{mask_str}", strict=False)
+                if mask_str:
+                    destination = IPv4Network(f"{dest_str}/{mask_str}", strict=False)
+                else:
+                    destination = IPv4Network(dest_str, strict=False)
             except ValueError:
                 continue
 
@@ -8137,156 +8246,10 @@ class IOSParser(BaseParser):
 
             # Parse entries
             entries = []
-            entry_children = acl_obj.children
-
-            for entry_child in entry_children:
-                entry_text = entry_child.text.strip()
-
-                # Handle remark
-                if entry_text.startswith("remark "):
-                    remark = entry_text.replace("remark ", "").strip()
-                    entries.append(
-                        ACLEntry(
-                            action="remark",
-                            remark=remark,
-                        )
-                    )
-                    continue
-
-                # Parse standard ACL entry: [seq] (permit|deny) source [wildcard] [log]
-                # Parse extended ACL entry: [seq] (permit|deny) protocol source [port] dest [port] [flags]
-                parts = entry_text.split()
-                if len(parts) < 2:
-                    continue
-
-                # Check if first part is sequence number
-                sequence = None
-                if parts[0].isdigit():
-                    sequence = int(parts[0])
-                    parts = parts[1:]
-
-                if len(parts) < 2:
-                    continue
-
-                action = parts[0]  # permit or deny
-                if action not in ["permit", "deny"]:
-                    continue
-
-                if acl_type == "standard":
-                    # Standard ACL: permit/deny source [wildcard]
-                    source = parts[1] if len(parts) > 1 else None
-                    source_wildcard = None
-
-                    if source == "host":
-                        source = parts[2] if len(parts) > 2 else None
-                        source_wildcard = None
-                    elif source == "any":
-                        source_wildcard = None
-                    elif len(parts) > 2 and not parts[2] in ["log"]:
-                        source_wildcard = parts[2]
-
-                    flags = []
-                    if "log" in entry_text:
-                        flags.append("log")
-
-                    entries.append(
-                        ACLEntry(
-                            sequence=sequence,
-                            action=action,
-                            source=source,
-                            source_wildcard=source_wildcard,
-                            flags=flags,
-                        )
-                    )
-
-                elif acl_type == "extended":
-                    # Extended ACL: permit/deny protocol source [port] dest [port] [flags]
-                    protocol = parts[1] if len(parts) > 1 else None
-                    remaining_parts = parts[2:]
-
-                    # Parse source
-                    source = None
-                    source_wildcard = None
-                    source_port = None
-                    idx = 0
-
-                    if idx < len(remaining_parts):
-                        if remaining_parts[idx] == "host":
-                            idx += 1
-                            source = remaining_parts[idx] if idx < len(remaining_parts) else None
-                            idx += 1
-                        elif remaining_parts[idx] == "any":
-                            source = "any"
-                            idx += 1
-                        else:
-                            source = remaining_parts[idx]
-                            idx += 1
-                            if idx < len(remaining_parts) and not remaining_parts[idx] in ["eq", "range", "gt", "lt", "host", "any"]:
-                                source_wildcard = remaining_parts[idx]
-                                idx += 1
-
-                    # Parse source port
-                    if idx < len(remaining_parts) and remaining_parts[idx] in ["eq", "range", "gt", "lt"]:
-                        port_op = remaining_parts[idx]
-                        idx += 1
-                        if port_op == "range" and idx + 1 < len(remaining_parts):
-                            source_port = f"{port_op} {remaining_parts[idx]} {remaining_parts[idx + 1]}"
-                            idx += 2
-                        elif idx < len(remaining_parts):
-                            source_port = f"{port_op} {remaining_parts[idx]}"
-                            idx += 1
-
-                    # Parse destination
-                    destination = None
-                    destination_wildcard = None
-                    destination_port = None
-
-                    if idx < len(remaining_parts):
-                        if remaining_parts[idx] == "host":
-                            idx += 1
-                            destination = remaining_parts[idx] if idx < len(remaining_parts) else None
-                            idx += 1
-                        elif remaining_parts[idx] == "any":
-                            destination = "any"
-                            idx += 1
-                        else:
-                            destination = remaining_parts[idx]
-                            idx += 1
-                            if idx < len(remaining_parts) and not remaining_parts[idx] in ["eq", "range", "gt", "lt"]:
-                                destination_wildcard = remaining_parts[idx]
-                                idx += 1
-
-                    # Parse destination port
-                    if idx < len(remaining_parts) and remaining_parts[idx] in ["eq", "range", "gt", "lt"]:
-                        port_op = remaining_parts[idx]
-                        idx += 1
-                        if port_op == "range" and idx + 1 < len(remaining_parts):
-                            destination_port = f"{port_op} {remaining_parts[idx]} {remaining_parts[idx + 1]}"
-                            idx += 2
-                        elif idx < len(remaining_parts):
-                            destination_port = f"{port_op} {remaining_parts[idx]}"
-                            idx += 1
-
-                    # Parse flags
-                    flags = []
-                    while idx < len(remaining_parts):
-                        flags.append(remaining_parts[idx])
-                        idx += 1
-
-                    entries.append(
-                        ACLEntry(
-                            sequence=sequence,
-                            action=action,
-                            protocol=protocol,
-                            source=source,
-                            source_wildcard=source_wildcard,
-                            source_port=source_port,
-                            destination=destination,
-                            destination_wildcard=destination_wildcard,
-                            destination_port=destination_port,
-                            flags=flags,
-                        )
-                    )
+            for entry_child in acl_obj.children:
+                entry = self._parse_acl_entry(entry_child.text.strip(), acl_type)
+                if entry is not None:
+                    entries.append(entry)
 
             acls.append(
                 ACLConfig(
@@ -8300,35 +8263,221 @@ class IOSParser(BaseParser):
                 )
             )
 
-        # TODO: Add support for numbered ACLs (1-99, 100-199, etc.)
+        # Numbered ACLs: "access-list <N> <permit|deny> ...". Each matching
+        # top-level line is one entry of ACL <N>; the number range implies the
+        # type. Same entry grammar as the named form (shared _parse_acl_entry).
+        self._parse_numbered_acls(parse, acls)
 
         return acls
+
+    @staticmethod
+    def _numbered_acl_type(number: int) -> str | None:
+        """Map a numbered-ACL number to 'standard'/'extended' by IOS range."""
+        if 1 <= number <= 99 or 1300 <= number <= 1999:
+            return "standard"
+        if 100 <= number <= 199 or 2000 <= number <= 2699:
+            return "extended"
+        return None
+
+    def _parse_numbered_acls(self, parse, acls: list) -> None:
+        """Parse legacy numbered ACLs into ``acls`` (append, group by number)."""
+        by_num: dict[str, dict] = {}
+        for obj in parse.find_objects(r"^access-list\s+\d+\s+(?:permit|deny)\b"):
+            m = re.match(r"^access-list\s+(\d+)\s+(.+)$", obj.text.strip())
+            if not m:
+                continue
+            number = int(m.group(1))
+            acl_type = self._numbered_acl_type(number)
+            if acl_type is None:
+                continue  # not an IP ACL range (e.g. MAC/IPX) — leave unparsed
+            entry = self._parse_acl_entry(m.group(2).strip(), acl_type)
+            if entry is None:
+                continue
+            key = str(number)
+            slot = by_num.setdefault(
+                key,
+                {"acl_type": acl_type, "entries": [], "raw_lines": [], "line_numbers": []},
+            )
+            slot["entries"].append(entry)
+            slot["raw_lines"].append(obj.text)
+            slot["line_numbers"].append(obj.linenum)
+
+        for name, slot in by_num.items():
+            acls.append(
+                ACLConfig(
+                    object_id=f"acl_{name}",
+                    raw_lines=slot["raw_lines"],
+                    source_os=self.os_type,
+                    line_numbers=slot["line_numbers"],
+                    name=name,
+                    acl_type=slot["acl_type"],
+                    entries=slot["entries"],
+                )
+            )
+
+    def _parse_acl_entry(self, entry_text: str, acl_type: str) -> "ACLEntry | None":
+        """Parse one ACL entry line (named child or numbered body) into an
+        ``ACLEntry``. ``acl_type`` selects the standard vs extended grammar;
+        both the named and numbered spellings share this one parser."""
+        # Handle remark
+        if entry_text.startswith("remark "):
+            return ACLEntry(action="remark", remark=entry_text.replace("remark ", "").strip())
+
+        parts = entry_text.split()
+        if len(parts) < 2:
+            return None
+
+        # Check if first part is sequence number
+        sequence = None
+        if parts[0].isdigit():
+            sequence = int(parts[0])
+            parts = parts[1:]
+
+        if len(parts) < 2:
+            return None
+
+        action = parts[0]  # permit or deny
+        if action not in ["permit", "deny"]:
+            return None
+
+        if acl_type == "standard":
+            # Standard ACL: permit/deny source [wildcard]
+            source = parts[1] if len(parts) > 1 else None
+            source_wildcard = None
+
+            if source == "host":
+                source = parts[2] if len(parts) > 2 else None
+                source_wildcard = None
+            elif source == "any":
+                source_wildcard = None
+            elif len(parts) > 2 and not parts[2] in ["log"]:
+                source_wildcard = parts[2]
+
+            flags = []
+            if "log" in entry_text:
+                flags.append("log")
+
+            return ACLEntry(
+                sequence=sequence,
+                action=action,
+                source=source,
+                source_wildcard=source_wildcard,
+                flags=flags,
+            )
+
+        # Extended ACL: permit/deny protocol source [port] dest [port] [flags]
+        protocol = parts[1] if len(parts) > 1 else None
+        remaining_parts = parts[2:]
+
+        # Parse source
+        source = None
+        source_wildcard = None
+        source_port = None
+        idx = 0
+
+        if idx < len(remaining_parts):
+            if remaining_parts[idx] == "host":
+                idx += 1
+                source = remaining_parts[idx] if idx < len(remaining_parts) else None
+                idx += 1
+            elif remaining_parts[idx] == "any":
+                source = "any"
+                idx += 1
+            else:
+                source = remaining_parts[idx]
+                idx += 1
+                if idx < len(remaining_parts) and not remaining_parts[idx] in ["eq", "range", "gt", "lt", "host", "any"]:
+                    source_wildcard = remaining_parts[idx]
+                    idx += 1
+
+        # Parse source port
+        if idx < len(remaining_parts) and remaining_parts[idx] in ["eq", "range", "gt", "lt"]:
+            port_op = remaining_parts[idx]
+            idx += 1
+            if port_op == "range" and idx + 1 < len(remaining_parts):
+                source_port = f"{port_op} {remaining_parts[idx]} {remaining_parts[idx + 1]}"
+                idx += 2
+            elif idx < len(remaining_parts):
+                source_port = f"{port_op} {remaining_parts[idx]}"
+                idx += 1
+
+        # Parse destination
+        destination = None
+        destination_wildcard = None
+        destination_port = None
+
+        if idx < len(remaining_parts):
+            if remaining_parts[idx] == "host":
+                idx += 1
+                destination = remaining_parts[idx] if idx < len(remaining_parts) else None
+                idx += 1
+            elif remaining_parts[idx] == "any":
+                destination = "any"
+                idx += 1
+            else:
+                destination = remaining_parts[idx]
+                idx += 1
+                if idx < len(remaining_parts) and not remaining_parts[idx] in ["eq", "range", "gt", "lt"]:
+                    destination_wildcard = remaining_parts[idx]
+                    idx += 1
+
+        # Parse destination port
+        if idx < len(remaining_parts) and remaining_parts[idx] in ["eq", "range", "gt", "lt"]:
+            port_op = remaining_parts[idx]
+            idx += 1
+            if port_op == "range" and idx + 1 < len(remaining_parts):
+                destination_port = f"{port_op} {remaining_parts[idx]} {remaining_parts[idx + 1]}"
+                idx += 2
+            elif idx < len(remaining_parts):
+                destination_port = f"{port_op} {remaining_parts[idx]}"
+                idx += 1
+
+        # Parse flags
+        flags = []
+        while idx < len(remaining_parts):
+            flags.append(remaining_parts[idx])
+            idx += 1
+
+        return ACLEntry(
+            sequence=sequence,
+            action=action,
+            protocol=protocol,
+            source=source,
+            source_wildcard=source_wildcard,
+            source_port=source_port,
+            destination=destination,
+            destination_wildcard=destination_wildcard,
+            destination_port=destination_port,
+            flags=flags,
+        )
 
     def parse_community_lists(self) -> list[CommunityListConfig]:
         """Parse BGP community-list configurations."""
         community_lists = []
         parse = self._get_parse_obj()
 
-        # Find all community-list entries
-        cl_objs = parse.find_objects(
-            r"^ip\s+community-list\s+(standard|expanded)\s+(\S+)\s+(permit|deny)\s+"
-        )
+        # Accept the named form ("standard|expanded NAME") and the legacy
+        # numbered form ("ip community-list 1 permit ...", no keyword — the
+        # number range implies the type). Both dialects normalize to the same
+        # (type, name, action, communities) field set.
+        cl_objs = parse.find_objects(self._COMMLIST_PATTERNS.union)
 
         # Group by community-list name
         cl_dict: dict[str, dict] = {}
 
         for cl_obj in cl_objs:
-            match = re.search(
-                r"^ip\s+community-list\s+(standard|expanded)\s+(\S+)\s+(permit|deny)\s+(.+)$",
-                cl_obj.text,
-            )
+            match = self._COMMLIST_PATTERNS.match(cl_obj.text)
             if not match:
                 continue
 
-            list_type = match.group(1)
-            cl_name = match.group(2)
-            action = match.group(3)
-            communities_str = match.group(4).strip()
+            g = match.groupdict()
+            cl_name = g["name"]
+            action = g["action"]
+            communities_str = g["comm"].strip()
+            list_type = g.get("type")
+            if not list_type:
+                # numbered: 1-99 standard, 100-500 expanded (IOS ranges)
+                list_type = "standard" if cl_name.isdigit() and int(cl_name) <= 99 else "expanded"
 
             if cl_name not in cl_dict:
                 cl_dict[cl_name] = {
@@ -10212,11 +10361,11 @@ class IOSParser(BaseParser):
         parse = self._get_parse_obj()
         operations: dict[int, dict] = {}
 
-        for obj in parse.find_objects(r"^ip\s+sla\s+\d+$"):
-            m = re.match(r"^ip\s+sla\s+(\d+)$", obj.text.strip())
+        for obj in parse.find_objects(self._IP_SLA_HEADER_PATTERNS.union):
+            m = self._IP_SLA_HEADER_PATTERNS.match(obj.text.strip())
             if not m:
                 continue
-            sla_id = int(m.group(1))
+            sla_id = int(m.group("id"))
             raw_lines, line_numbers = self._get_raw_lines_and_line_numbers(obj)
 
             op_type = destination = source_interface = source_ip = None
@@ -10225,6 +10374,15 @@ class IOSParser(BaseParser):
 
             for c in obj.children:
                 ct = c.text.strip()
+                # Legacy "ip sla monitor" body: "type echo protocol ipIcmpEcho ADDR"
+                # normalizes to the modern icmp-echo operation.
+                legacy_echo = re.match(
+                    r"^type\s+echo\s+protocol\s+ipIcmpEcho\s+(\S+)", ct
+                )
+                if legacy_echo:
+                    op_type = "icmp-echo"
+                    destination = legacy_echo.group(1)
+                    continue
                 for op in ("icmp-echo", "udp-jitter", "tcp-connect", "udp-echo", "http", "dns", "ftp", "dhcp"):
                     if ct.startswith(op + " "):
                         op_type = op

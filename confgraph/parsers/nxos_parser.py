@@ -158,6 +158,50 @@ class NXOSParser(IOSParser):
         return None
 
     # -----------------------------------------------------------------------
+    # FHRP block spellings — NX-OS uses "hsrp N" / "vrrp N" sub-blocks whose
+    # attribute lines (ip / address / priority / preempt) are the group's
+    # commands. We EXTEND the parent collectors (handbook §7.3): the flat IOS
+    # "standby N <cmd>" pairs from super() plus the block-form pairs here feed
+    # the one shared HSRP/VRRP applier — the command vocabulary is not
+    # re-implemented.
+    # -----------------------------------------------------------------------
+
+    def _collect_hsrp_commands(self, intf_obj) -> tuple[list[tuple[int, str]], int | None]:
+        pairs, version = super()._collect_hsrp_commands(intf_obj)
+        # Interface-level "hsrp version N" (applies to all block-form groups)
+        for vch in intf_obj.find_child_objects(r"^\s+hsrp\s+version\s+(\d+)\s*$"):
+            vm = re.search(r"hsrp\s+version\s+(\d+)", vch.text)
+            if vm:
+                version = int(vm.group(1))
+        # "hsrp N" blocks: each child line is a group command (normalized to
+        # the IOS "standby N <cmd>" vocabulary; "address" -> "ip").
+        for blk in intf_obj.find_child_objects(r"^\s+hsrp\s+(\d+)\s*$"):
+            gm = re.match(r"^\s+hsrp\s+(\d+)\s*$", blk.text)
+            if not gm:
+                continue
+            group_num = int(gm.group(1))
+            for cmd_child in blk.children:
+                cmd = cmd_child.text.strip()
+                if cmd.startswith("address "):
+                    cmd = "ip " + cmd[len("address "):]
+                pairs.append((group_num, cmd))
+        return pairs, version
+
+    def _collect_vrrp_commands(self, intf_obj) -> list[tuple[int, str]]:
+        pairs = super()._collect_vrrp_commands(intf_obj)
+        for blk in intf_obj.find_child_objects(r"^\s+vrrp\s+(\d+)\s*$"):
+            gm = re.match(r"^\s+vrrp\s+(\d+)\s*$", blk.text)
+            if not gm:
+                continue
+            group_num = int(gm.group(1))
+            for cmd_child in blk.children:
+                cmd = cmd_child.text.strip()
+                if cmd.startswith("address "):
+                    cmd = "ip " + cmd[len("address "):]
+                pairs.append((group_num, cmd))
+        return pairs
+
+    # -----------------------------------------------------------------------
     # Interfaces — CIDR notation (ip address X.X.X.X/24)
     # -----------------------------------------------------------------------
 
@@ -179,18 +223,28 @@ class NXOSParser(IOSParser):
             if intf_cfg is None:
                 continue
 
-            # NX-OS: ip address X.X.X.X/24
+            # NX-OS: ip address X.X.X.X/24 [secondary]
             cidr_children = intf_obj.find_child_objects(
                 r"^\s+ip\s+address\s+(\d+\.\d+\.\d+\.\d+/\d+)"
             )
-            if cidr_children:
+            cidr_primary = [c for c in cidr_children if "secondary" not in c.text.lower()]
+            if cidr_primary:
                 match = re.search(
                     r"^\s+ip\s+address\s+(\d+\.\d+\.\d+\.\d+/\d+)",
-                    cidr_children[0].text,
+                    cidr_primary[0].text,
                 )
                 if match:
                     try:
                         intf_cfg.ip_address = IPv4Interface(match.group(1))
+                    except ValueError:
+                        pass
+            for sec in (c for c in cidr_children if "secondary" in c.text.lower()):
+                sm = re.search(r"^\s+ip\s+address\s+(\d+\.\d+\.\d+\.\d+/\d+)", sec.text)
+                if sm:
+                    try:
+                        ip = IPv4Interface(sm.group(1))
+                        if ip not in intf_cfg.secondary_ips:
+                            intf_cfg.secondary_ips.append(ip)
                     except ValueError:
                         pass
 

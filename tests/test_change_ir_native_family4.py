@@ -291,13 +291,20 @@ class TestMultiOS:
         for op in _f4_ops(pc):
             assert op.origin == "native"
 
-    def test_nxos_global_cidr_positive_debt(self):
-        # Pre-existing debt (Appendix G / Phase 5): NX-OS drops positive global
-        # CIDR statics.  The emitter walks final state, so it emits NO SET —
-        # neither fixing nor worsening the debt (legacy parity).
+    def test_nxos_global_cidr_positive(self):
+        # CCR-0031: NX-OS global CIDR statics ("ip route A/PL NH") are now
+        # parsed via the inherited static-route pattern set (was pre-existing
+        # debt / Appendix G).  The family-4 emitter walks final state, so the
+        # newly-parsed route yields one native SET — same shape as the
+        # dotted-mask form.
         pc = _parse("ip route 10.0.0.0/24 192.0.2.1\n", NXOSParser)
-        assert pc.static_routes == []
-        assert _sets(_f4_ops(pc)) == []
+        assert [(str(r.destination), str(r.next_hop)) for r in pc.static_routes] == [
+            ("10.0.0.0/24", "192.0.2.1")
+        ]
+        sets = _sets(_f4_ops(pc))
+        assert len(sets) == 1
+        for op in _f4_ops(pc):
+            assert op.origin == "native"
 
     def test_nxos_vrf_context_delete_is_native(self):
         pc = _parse(

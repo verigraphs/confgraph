@@ -209,20 +209,33 @@ class IOSXRParser(IOSParser):
             if intf_cfg is None:
                 continue
 
-            # IOS-XR: ipv4 address X.X.X.X MASK
+            # IOS-XR: ipv4 address X.X.X.X MASK [secondary]
             ipv4_children = intf_obj.find_child_objects(
                 r"^\s+ipv4\s+address\s+(\d+\.\d+\.\d+\.\d+)\s+(\d+\.\d+\.\d+\.\d+)"
             )
-            if ipv4_children:
+            ipv4_primary = [c for c in ipv4_children if "secondary" not in c.text.lower()]
+            if ipv4_primary:
                 match = re.search(
                     r"^\s+ipv4\s+address\s+(\d+\.\d+\.\d+\.\d+)\s+(\d+\.\d+\.\d+\.\d+)",
-                    ipv4_children[0].text,
+                    ipv4_primary[0].text,
                 )
                 if match:
                     try:
                         intf_cfg.ip_address = IPv4Interface(
                             f"{match.group(1)}/{match.group(2)}"
                         )
+                    except ValueError:
+                        pass
+            for sec in (c for c in ipv4_children if "secondary" in c.text.lower()):
+                sm = re.search(
+                    r"^\s+ipv4\s+address\s+(\d+\.\d+\.\d+\.\d+)\s+(\d+\.\d+\.\d+\.\d+)",
+                    sec.text,
+                )
+                if sm:
+                    try:
+                        ip = IPv4Interface(f"{sm.group(1)}/{sm.group(2)}")
+                        if ip not in intf_cfg.secondary_ips:
+                            intf_cfg.secondary_ips.append(ip)
                     except ValueError:
                         pass
 
@@ -577,13 +590,16 @@ class IOSXRParser(IOSParser):
         ospf_instances = []
         parse = self._get_parse_obj()
 
-        ospf_objs = parse.find_objects(r"^router\s+ospf\s+(\d+)")
+        # Process header pattern set: numeric id and string tag ("router ospf
+        # CORE"). ``process_id`` is ``int | str`` so a tag is kept verbatim.
+        ospf_objs = parse.find_objects(self._OSPF_PROC_PATTERNS.union)
         for ospf_obj in ospf_objs:
-            process_id_str = self._extract_match(ospf_obj.text, r"^router\s+ospf\s+(\d+)")
+            hdr = self._OSPF_PROC_PATTERNS.match(ospf_obj.text)
+            process_id_str = hdr.group("pid") if hdr else None
             if not process_id_str:
                 continue
 
-            process_id = int(process_id_str)
+            process_id: int | str = int(process_id_str) if process_id_str.isdigit() else process_id_str
             raw_lines, line_numbers = self._get_raw_lines_and_line_numbers(ospf_obj)
 
             # Router ID
