@@ -13,6 +13,20 @@ Coverage:
   7. NAT policies → NATConfig
   8. IPsec / IKE → CryptoConfig
   9. Security zones → PANOSZoneConfig
+
+Two document layouts are read (CCR-0034):
+
+  * **local firewall** — ``devices/entry/{deviceconfig,network,vsys/entry}``
+  * **Panorama** — security/NAT policy under
+    ``devices/entry/device-group/entry/{pre,post}-rulebase`` (plus
+    ``/config/shared`` and the ``/config/readonly`` device-group hierarchy), and
+    network/vsys config under ``devices/entry/template/entry/config/devices/entry``.
+
+Which layout a document is in is decided **once**, by
+``panos_xml.detect_layout``; the methods below only ever see its neutral scopes
+(device / vsys / policy).  A document in neither layout raises ``ParseError`` —
+an empty model would be indistinguishable from a firewall with no config, which
+is exactly the harm CCR-0034 exists to end.
 """
 
 from __future__ import annotations
@@ -36,9 +50,10 @@ from confgraph.models.crypto import (
 )
 from confgraph.models.panos_zone import PANOSZoneConfig
 
-from confgraph.parsers.base import BaseParser
+from confgraph.parsers.base import BaseParser, ParseError
 from confgraph.parsers.panos_xml import (
-    parse_panos_xml, find_device, find_vsys, find_all_vsys,
+    parse_panos_xml, detect_layout, UnrecognizedPANOSLayout,
+    DeviceScope, PANOSLayout, PolicyScope, VsysScope,
     entries, text_val, members, raw_xml,
 )
 
@@ -96,12 +111,12 @@ class PANOSParser(BaseParser):
         # syntax="ios" is never used — we override all CiscoConfParse paths
         super().__init__(config_text, OSType.PANOS, syntax="ios")
         self._root: Element | None = None
-        self._device_el: Element | None = None
+        self._layout_view: PANOSLayout | None = None
         # zone_name → interface_name  (populated lazily)
         self._zone_of_iface: dict[str, str] = {}
 
     # ------------------------------------------------------------------
-    # XML root access (lazy)
+    # XML root + document layout (lazy, resolved exactly once)
     # ------------------------------------------------------------------
 
     def _get_root(self) -> Element:
@@ -109,26 +124,47 @@ class PANOSParser(BaseParser):
             self._root = parse_panos_xml(self.config_text)
         return self._root
 
-    def _get_device(self) -> Element | None:
-        if self._device_el is None:
-            self._device_el = find_device(self._get_root())
-        return self._device_el
+    def _layout(self) -> PANOSLayout:
+        """The document's layout — the only place that knows local vs Panorama.
 
-    def _all_vsys(self) -> list[Element]:
-        dev = self._get_device()
-        if dev is None:
-            return []
-        return find_all_vsys(dev)
+        Every parse method below consumes the neutral scopes this returns, so a
+        new layout costs one branch in ``detect_layout`` and nothing here.
+
+        Raises:
+            ParseError: the document is in no layout we can read.  An
+                unreadable layout must be loud: returning an empty model made
+                "no rules configured" indistinguishable from "rules we never
+                looked for" (CCR-0034).
+        """
+        if self._layout_view is None:
+            try:
+                self._layout_view = detect_layout(self._get_root())
+            except UnrecognizedPANOSLayout as exc:
+                raise ParseError("layout", 0, "", exc) from exc
+        return self._layout_view
+
+    def _device_scopes(self) -> tuple[DeviceScope, ...]:
+        """Elements owning ``deviceconfig``/``network`` (device or template)."""
+        return self._layout().devices
+
+    def _vsys_scopes(self) -> tuple[VsysScope, ...]:
+        """vsys entries owning ``zone`` (local, or inside a template)."""
+        return self._layout().vsys
+
+    def _policy_scopes(self) -> tuple[PolicyScope, ...]:
+        """Rulebase chains in evaluation order (vsys, or device-group)."""
+        return self._layout().policies
 
     # ------------------------------------------------------------------
     # BaseParser overrides (avoid CiscoConfParse)
     # ------------------------------------------------------------------
 
     def _extract_hostname(self) -> str | None:
-        dev = self._get_device()
-        if dev is None:
-            return None
-        return text_val(dev, "deviceconfig/system/hostname")
+        for scope in self._device_scopes():
+            hostname = text_val(scope.element, "deviceconfig/system/hostname")
+            if hostname:
+                return hostname
+        return None
 
     def _collect_unrecognized_blocks(self) -> list[UnrecognizedBlock]:
         # PAN-OS XML has a flat, well-known structure — nothing to collect here
@@ -138,12 +174,16 @@ class PANOSParser(BaseParser):
     # 1. VRFs  (Virtual Routers)
     # ------------------------------------------------------------------
 
+    def _virtual_routers(self) -> list[Element]:
+        """Every ``network/virtual-router`` entry, across all device scopes."""
+        vrs: list[Element] = []
+        for scope in self._device_scopes():
+            vrs.extend(entries(scope.element, "network/virtual-router"))
+        return vrs
+
     def parse_vrfs(self) -> list[VRFConfig]:
-        dev = self._get_device()
-        if dev is None:
-            return []
         vrfs: list[VRFConfig] = []
-        for vr in entries(dev, "network/virtual-router"):
+        for vr in self._virtual_routers():
             name = vr.get("name", "")
             if not name:
                 continue
@@ -160,14 +200,10 @@ class PANOSParser(BaseParser):
     # ------------------------------------------------------------------
 
     def parse_interfaces(self) -> list[InterfaceConfig]:
-        dev = self._get_device()
-        if dev is None:
-            return []
-
         # Build zone_of_iface map
         zone_of_iface: dict[str, str] = {}
-        for vs in self._all_vsys():
-            for zone_el in entries(vs, "zone"):
+        for vsys in self._vsys_scopes():
+            for zone_el in entries(vsys.element, "zone"):
                 zone_name = zone_el.get("name", "")
                 net_el = zone_el.find("network")
                 if net_el is not None:
@@ -178,7 +214,7 @@ class PANOSParser(BaseParser):
 
         # Build vr_of_iface map
         vr_of_iface: dict[str, str] = {}
-        for vr in entries(dev, "network/virtual-router"):
+        for vr in self._virtual_routers():
             vr_name = vr.get("name", "")
             for m in members(vr, "interface"):
                 vr_of_iface[m] = vr_name
@@ -223,47 +259,48 @@ class PANOSParser(BaseParser):
                 raw_lines=[raw_xml(el)],
             )
 
-        net = dev.find("network")
-        if net is None:
-            return ifaces
-
-        # Ethernet interfaces (physical + sub-interfaces)
-        for eth in entries(net, "interface/ethernet"):
-            eth_name = eth.get("name", "")
-            if not eth_name:
+        for scope in self._device_scopes():
+            net = scope.element.find("network")
+            if net is None:
                 continue
-            sub_entries = entries(eth, "layer3/units")
-            if sub_entries:
-                for sub in sub_entries:
-                    sub_name = sub.get("name", eth_name)
-                    ifaces.append(_build(sub, sub_name))
-            else:
-                ifaces.append(_build(eth, eth_name))
 
-        # Loopback interfaces
-        for lo in entries(net, "interface/loopback/units"):
-            lo_name = lo.get("name", "")
-            if lo_name:
-                ifaces.append(_build(lo, lo_name))
+            # Ethernet interfaces (physical + sub-interfaces)
+            for eth in entries(net, "interface/ethernet"):
+                eth_name = eth.get("name", "")
+                if not eth_name:
+                    continue
+                sub_entries = entries(eth, "layer3/units")
+                if sub_entries:
+                    for sub in sub_entries:
+                        sub_name = sub.get("name", eth_name)
+                        ifaces.append(_build(sub, sub_name))
+                else:
+                    ifaces.append(_build(eth, eth_name))
 
-        # Tunnel interfaces
-        for tun in entries(net, "interface/tunnel/units"):
-            tun_name = tun.get("name", "")
-            if tun_name:
-                ifaces.append(_build(tun, tun_name))
+            # Loopback interfaces
+            for lo in entries(net, "interface/loopback/units"):
+                lo_name = lo.get("name", "")
+                if lo_name:
+                    ifaces.append(_build(lo, lo_name))
 
-        # Aggregate-ethernet (AE/LACP bond)
-        for ae in entries(net, "interface/aggregate-ethernet"):
-            ae_name = ae.get("name", "")
-            if not ae_name:
-                continue
-            sub_entries = entries(ae, "layer3/units")
-            if sub_entries:
-                for sub in sub_entries:
-                    sub_name = sub.get("name", ae_name)
-                    ifaces.append(_build(sub, sub_name))
-            else:
-                ifaces.append(_build(ae, ae_name))
+            # Tunnel interfaces
+            for tun in entries(net, "interface/tunnel/units"):
+                tun_name = tun.get("name", "")
+                if tun_name:
+                    ifaces.append(_build(tun, tun_name))
+
+            # Aggregate-ethernet (AE/LACP bond)
+            for ae in entries(net, "interface/aggregate-ethernet"):
+                ae_name = ae.get("name", "")
+                if not ae_name:
+                    continue
+                sub_entries = entries(ae, "layer3/units")
+                if sub_entries:
+                    for sub in sub_entries:
+                        sub_name = sub.get("name", ae_name)
+                        ifaces.append(_build(sub, sub_name))
+                else:
+                    ifaces.append(_build(ae, ae_name))
 
         return ifaces
 
@@ -272,12 +309,9 @@ class PANOSParser(BaseParser):
     # ------------------------------------------------------------------
 
     def parse_bgp(self) -> list[BGPConfig]:
-        dev = self._get_device()
-        if dev is None:
-            return []
         bgp_list: list[BGPConfig] = []
 
-        for vr in entries(dev, "network/virtual-router"):
+        for vr in self._virtual_routers():
             vr_name = vr.get("name", "")
             bgp_el = vr.find("protocol/bgp")
             if bgp_el is None:
@@ -346,12 +380,9 @@ class PANOSParser(BaseParser):
     # ------------------------------------------------------------------
 
     def parse_ospf(self) -> list[OSPFConfig]:
-        dev = self._get_device()
-        if dev is None:
-            return []
         ospf_list: list[OSPFConfig] = []
 
-        for vr in entries(dev, "network/virtual-router"):
+        for vr in self._virtual_routers():
             vr_name = vr.get("name", "")
             ospf_el = vr.find("protocol/ospf")
             if ospf_el is None:
@@ -398,12 +429,9 @@ class PANOSParser(BaseParser):
     # ------------------------------------------------------------------
 
     def parse_static_routes(self) -> list[StaticRoute]:
-        dev = self._get_device()
-        if dev is None:
-            return []
         routes: list[StaticRoute] = []
 
-        for vr in entries(dev, "network/virtual-router"):
+        for vr in self._virtual_routers():
             vr_name = vr.get("name", "")
             for route_el in entries(vr, "routing-table/ip/static-route"):
                 dest_str = text_val(route_el, "destination")
@@ -454,51 +482,58 @@ class PANOSParser(BaseParser):
     # ------------------------------------------------------------------
 
     def parse_acls(self) -> list[ACLConfig]:
+        """One ACLConfig per policy scope (vsys locally, device-group under Panorama).
+
+        A scope's rulebases arrive already ordered by the layout — locally the
+        single vsys rulebase, under Panorama the resolved
+        shared-pre → DG-pre → DG-post → shared-post chain — so ascending ACL
+        sequence numbers carry the firewall's evaluation order.
+        """
         acls: list[ACLConfig] = []
-        for vs in self._all_vsys():
-            vs_name = vs.get("name", "vsys1")
-            rulebase = vs.find("rulebase")
-            if rulebase is None:
-                continue
-            security_el = rulebase.find("security")
-            if security_el is None:
-                continue
-
+        for scope in self._policy_scopes():
             ace_entries: list[ACLEntry] = []
+            raw_lines: list[str] = []
             seq = 10
-            for rule in entries(security_el, "rules"):
-                rule_name = rule.get("name", "")
-                action_str = text_val(rule, "action") or "allow"
-                action = "permit" if action_str == "allow" else "deny"
 
-                from_zones = members(rule, "from")
-                to_zones = members(rule, "to")
-                src_addrs = members(rule, "source")
-                dst_addrs = members(rule, "destination")
-                apps = members(rule, "application")
+            for rulebase in scope.rulebases:
+                security_el = rulebase.find("security")
+                if security_el is None:
+                    continue
+                raw_lines.append(raw_xml(security_el))
 
-                remark = (
-                    f"rule:{rule_name} "
-                    f"from:{','.join(from_zones)} to:{','.join(to_zones)} "
-                    f"src:{','.join(src_addrs)} dst:{','.join(dst_addrs)} "
-                    f"app:{','.join(apps)}"
-                )
+                for rule in entries(security_el, "rules"):
+                    rule_name = rule.get("name", "")
+                    action_str = text_val(rule, "action") or "allow"
+                    action = "permit" if action_str == "allow" else "deny"
 
-                ace_entries.append(ACLEntry(
-                    sequence=seq,
-                    action=action,
-                    remark=remark,
-                ))
-                seq += 10
+                    from_zones = members(rule, "from")
+                    to_zones = members(rule, "to")
+                    src_addrs = members(rule, "source")
+                    dst_addrs = members(rule, "destination")
+                    apps = members(rule, "application")
+
+                    remark = (
+                        f"rule:{rule_name} "
+                        f"from:{','.join(from_zones)} to:{','.join(to_zones)} "
+                        f"src:{','.join(src_addrs)} dst:{','.join(dst_addrs)} "
+                        f"app:{','.join(apps)}"
+                    )
+
+                    ace_entries.append(ACLEntry(
+                        sequence=seq,
+                        action=action,
+                        remark=remark,
+                    ))
+                    seq += 10
 
             if ace_entries:
                 acls.append(ACLConfig(
-                    object_id=f"acl_security_{vs_name}",
+                    object_id=f"acl_security_{scope.name}",
                     source_os=self.os_type,
-                    name=f"security-policy-{vs_name}",
+                    name=f"security-policy-{scope.name}",
                     acl_type="extended",
                     entries=ace_entries,
-                    raw_lines=[raw_xml(security_el)],
+                    raw_lines=raw_lines,
                 ))
 
         return acls
@@ -511,15 +546,14 @@ class PANOSParser(BaseParser):
         static_entries: list[NATStaticEntry] = []
         dynamic_entries: list[NATDynamicEntry] = []
 
-        for vs in self._all_vsys():
-            rulebase = vs.find("rulebase")
-            if rulebase is None:
-                continue
-            nat_el = rulebase.find("nat")
-            if nat_el is None:
-                continue
+        for scope in self._policy_scopes():
+            nat_rules: list[Element] = []
+            for rulebase in scope.rulebases:
+                nat_el = rulebase.find("nat")
+                if nat_el is not None:
+                    nat_rules.extend(entries(nat_el, "rules"))
 
-            for rule in entries(nat_el, "rules"):
+            for rule in nat_rules:
                 rule_name = rule.get("name", "")
                 dst_trans = rule.find("destination-translation")
                 src_trans = rule.find("source-translation")
@@ -563,14 +597,6 @@ class PANOSParser(BaseParser):
     # ------------------------------------------------------------------
 
     def parse_crypto(self) -> CryptoConfig | None:
-        dev = self._get_device()
-        if dev is None:
-            return None
-
-        net = dev.find("network")
-        if net is None:
-            return None
-
         ikev1_policies: list[IKEv1Policy] = []
         ikev2_proposals: list[IKEv2Proposal] = []
         ikev2_policies: list[IKEv2Policy] = []
@@ -578,50 +604,58 @@ class PANOSParser(BaseParser):
         crypto_map_entries: list[CryptoMapEntry] = []
 
         priority = 10
-        # IKE crypto profiles → IKEv1 policies
-        for profile in entries(net, "ike/crypto-profiles/ike-crypto-profiles"):
-            enc_list = members(profile, "encryption")
-            hash_list = members(profile, "hash")
-            dh_group_list = members(profile, "dh-group")
-            lifetime_str = text_val(profile, "lifetime/hours")
-            lifetime = None
-            if lifetime_str and lifetime_str.isdigit():
-                lifetime = int(lifetime_str) * 3600
-
-            ikev1_policies.append(IKEv1Policy(
-                priority=priority,
-                encryption=enc_list[0] if enc_list else None,
-                hash=hash_list[0] if hash_list else None,
-                group=(
-                    int(dh_group_list[0].replace("group", ""))
-                    if dh_group_list and dh_group_list[0].replace("group", "").isdigit()
-                    else None
-                ),
-                lifetime=lifetime,
-            ))
-            priority += 10
-
-        # IPsec crypto profiles → transform sets
-        for profile in entries(net, "ike/crypto-profiles/ipsec-crypto-profiles"):
-            profile_name = profile.get("name", "")
-            transforms = members(profile, "esp/encryption") + members(profile, "esp/authentication")
-            transform_sets.append(IPSecTransformSet(
-                name=profile_name,
-                transforms=transforms,
-                mode="tunnel",
-            ))
-
-        # IKE gateways → crypto map entries
         seq = 10
-        for gw in entries(net, "ike/gateway"):
-            peer_ip = _safe_addr(text_val(gw, "peer-address/ip"))
-            crypto_profile = text_val(gw, "ike-crypto-profile")
-            crypto_map_entries.append(CryptoMapEntry(
-                sequence=seq,
-                peer=peer_ip,
-                transform_sets=[crypto_profile] if crypto_profile else [],
-            ))
-            seq += 10
+        for scope in self._device_scopes():
+            net = scope.element.find("network")
+            if net is None:
+                continue
+
+            # IKE crypto profiles → IKEv1 policies
+            for profile in entries(net, "ike/crypto-profiles/ike-crypto-profiles"):
+                enc_list = members(profile, "encryption")
+                hash_list = members(profile, "hash")
+                dh_group_list = members(profile, "dh-group")
+                lifetime_str = text_val(profile, "lifetime/hours")
+                lifetime = None
+                if lifetime_str and lifetime_str.isdigit():
+                    lifetime = int(lifetime_str) * 3600
+
+                ikev1_policies.append(IKEv1Policy(
+                    priority=priority,
+                    encryption=enc_list[0] if enc_list else None,
+                    hash=hash_list[0] if hash_list else None,
+                    group=(
+                        int(dh_group_list[0].replace("group", ""))
+                        if dh_group_list and dh_group_list[0].replace("group", "").isdigit()
+                        else None
+                    ),
+                    lifetime=lifetime,
+                ))
+                priority += 10
+
+            # IPsec crypto profiles → transform sets
+            for profile in entries(net, "ike/crypto-profiles/ipsec-crypto-profiles"):
+                profile_name = profile.get("name", "")
+                transforms = (
+                    members(profile, "esp/encryption")
+                    + members(profile, "esp/authentication")
+                )
+                transform_sets.append(IPSecTransformSet(
+                    name=profile_name,
+                    transforms=transforms,
+                    mode="tunnel",
+                ))
+
+            # IKE gateways → crypto map entries
+            for gw in entries(net, "ike/gateway"):
+                peer_ip = _safe_addr(text_val(gw, "peer-address/ip"))
+                crypto_profile = text_val(gw, "ike-crypto-profile")
+                crypto_map_entries.append(CryptoMapEntry(
+                    sequence=seq,
+                    peer=peer_ip,
+                    transform_sets=[crypto_profile] if crypto_profile else [],
+                ))
+                seq += 10
 
         if not ikev1_policies and not transform_sets and not crypto_map_entries:
             return None
@@ -649,9 +683,9 @@ class PANOSParser(BaseParser):
 
     def parse_zones(self) -> list[PANOSZoneConfig]:
         zones: list[PANOSZoneConfig] = []
-        for vs in self._all_vsys():
-            vs_name = vs.get("name", "vsys1")
-            for zone_el in entries(vs, "zone"):
+        for vsys in self._vsys_scopes():
+            vs_name = vsys.name
+            for zone_el in entries(vsys.element, "zone"):
                 zone_name = zone_el.get("name", "")
                 if not zone_name:
                     continue
