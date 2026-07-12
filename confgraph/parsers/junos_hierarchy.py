@@ -1,16 +1,40 @@
-"""JunOS brace-style configuration tokenizer.
+"""JunOS configuration tokenizer — one canonical tree for both renderings.
 
-Converts JunOS hierarchical (brace-delimited) config text into a nested
-dict structure that downstream parsers can navigate.
+A JunOS device prints its single configuration database in two forms, and both
+are device-emitted (``show configuration`` and ``show configuration | display
+set``); real automation stores both.  They are two renderings of ONE tree:
 
-Structure rules
----------------
-- Leaf statement  ``keyword value;``  → ``{keyword: value_str}``
-- Anonymous block ``keyword { ... }`` → ``{keyword: {…}}``
-- Named block     ``keyword name { … }`` → ``{keyword: {name: {…}}}``
-- Bracketed list  ``keyword [ a b c ];`` → ``{keyword: "a b c"}``
-- Duplicate keys: first occurrence wins for scalars; blocks accumulate
-  under the same dict so later children are merged in.
+    protocols { bgp { group EXT { peer-as 65001; } } }      # brace
+    set protocols bgp group EXT peer-as 65001               # set
+
+The two carry exactly the same token sequence, so this module parses both into
+exactly the same nested dict — the *canonical tree*:
+
+**Every node is a dict.  A statement's trailing tokens are its nested keys.**
+
+    keyword;                     → {keyword: {}}
+    keyword a;                   → {keyword: {a: {}}}
+    keyword a b;                 → {keyword: {a: {b: {}}}}
+    keyword name { child x; }    → {keyword: {name: {child: {x: {}}}}}
+    keyword [ a b ];             → {keyword: {a: {}, b: {}}}
+    set … keyword a b            → {keyword: {a: {b: {}}}}      (identical)
+
+Consequences the parser layer relies on:
+
+- There are **no ``str`` or ``list`` values** in the tree, so extractors need no
+  per-statement shape branch; ``_str_val()`` yields a scalar from any node.
+- A leaf statement's inline options survive as a key chain, so
+  ``stub default-metric 10 no-summaries;`` and the two ``set`` lines that mean
+  the same thing both flatten (DFS pre-order) to the token list
+  ``["default-metric", "10", "no-summaries"]`` — see ``_stmt_tokens()`` in
+  ``junos_parser``.
+- Duplicate statements merge into sibling keys rather than degrading into a
+  list, so ``route`` is a dict whether the block form is used or not.
+
+Group inheritance (``groups`` / ``apply-groups``) is expanded here as well:
+``show configuration`` prints groups UNEXPANDED, and the JunOS software
+processes only ever see the expanded form, so the effective configuration is the
+expanded one (see :mod:`confgraph.parsers.junos_groups`).
 
 Comments (``/* … */`` and ``#``-to-EOL) are stripped before tokenising.
 """
@@ -28,20 +52,20 @@ from typing import Any
 def parse_junos_config(text: str) -> dict[str, Any]:
     """Parse JunOS config *text* — auto-detects brace-style vs ``set``-style.
 
-    Returns a ``dict[str, Any]`` where values are:
-    - ``str``   — leaf statement value (brace-style only)
-    - ``dict``  — child block / named block
-    - ``list``  — multiple values for the same keyword (brace-style)
+    Returns the canonical tree described in the module docstring: a
+    ``dict[str, dict]`` in which *every* value is a dict, for both input forms.
 
-    In set-style output every node is a ``dict``; leaf values are single-key
-    dicts, e.g. ``{'peer-as': {'65006': {}}}`` instead of ``{'peer-as': '65006'}``.
-    Use ``_str_val()`` in the parser layer to transparently handle both shapes.
+    ``groups`` / ``apply-groups`` inheritance is expanded before the tree is
+    returned, so callers always see the **effective** configuration.
     """
+    from confgraph.parsers.junos_groups import expand_apply_groups
+
     if _is_set_style(text):
-        return _parse_set_style(text)
-    tokens = _tokenize(text)
-    result, _ = _parse_block(tokens, 0)
-    return result
+        tree = _parse_set_style(text)
+    else:
+        tokens = _tokenize(text)
+        tree, _ = _parse_block(tokens, 0)
+    return expand_apply_groups(tree)
 
 
 def _is_set_style(text: str) -> bool:
@@ -96,21 +120,20 @@ def _tokenize_set_line(line: str) -> list[str]:
 
 
 def _parse_set_style(text: str) -> dict[str, Any]:
-    """Convert JunOS ``set``-style config into the same nested dict as brace-style.
+    """Convert JunOS ``set``-style config into the canonical tree.
 
-    Each ``set A B C … Z`` line becomes a path ``A → B → C → … → Z`` of nested
-    dicts.  The last token is stored as a key pointing to ``{}`` so that the
-    caller can always use ``.get(key)`` and get either a dict of children or an
-    empty dict representing the presence of a leaf.
+    Each ``set A B C … Z`` line is the path ``A → B → C → … → Z``.  This is the
+    same operation the brace parser performs on a leaf statement's token
+    sequence — which is why the two forms converge on one tree.
 
-    The parser layer uses :func:`_str_val` to extract a scalar from either a
-    plain string (brace-style leaf) or the first key of such a dict (set-style).
+    A bracketed list (``set … apply-groups [ a b ]``) becomes sibling keys, as
+    it does in brace form.
     """
     result: dict[str, Any] = {}
 
     for raw_line in text.splitlines():
         line = raw_line.strip()
-        # Strip inline ## comments
+        # Strip inline ## comments (e.g. the ## SECRET-DATA marker)
         comment_idx = line.find("##")
         if comment_idx != -1:
             line = line[:comment_idx].strip()
@@ -121,21 +144,31 @@ def _parse_set_style(text: str) -> dict[str, Any]:
         if not parts:
             continue
 
-        # Navigate / create nested dicts for each token in the path
-        node = result
-        for part in parts[:-1]:
-            if part not in node or not isinstance(node[part], dict):
-                node[part] = {}
-            node = node[part]
-
-        # Last token: insert as key → {} (merges if already present as dict)
-        last = parts[-1]
-        if last not in node:
-            node[last] = {}
-        elif not isinstance(node[last], dict):
-            node[last] = {}  # overwrite stray scalar (shouldn't happen)
+        _merge_at_path(result, _fold_brackets(parts), {})
 
     return result
+
+
+def _fold_brackets(parts: list[str]) -> list[str | list[str]]:
+    """Fold a bracketed run ``[ a b ]`` in a token list into one list element."""
+    if "[" not in parts:
+        return list(parts)
+    path: list[str | list[str]] = []
+    items: list[str] | None = None
+    for tok in parts:
+        if tok == "[":
+            items = []
+        elif tok == "]":
+            if items:
+                path.append(items)
+            items = None
+        elif items is not None:
+            items.append(tok)
+        else:
+            path.append(tok)
+    if items:
+        path.append(items)
+    return path
 
 
 # ---------------------------------------------------------------------------
@@ -166,7 +199,10 @@ def _tokenize(text: str) -> list[str]:
             continue
 
         if ch == '"':
-            # Quoted string — scan to closing quote, respecting backslash escapes
+            # Quoted string — scan to closing quote, respecting backslash
+            # escapes.  The quotes are stripped so that a quoted value produces
+            # the same canonical key as the ``set`` rendering of the same
+            # statement, where ``_tokenize_set_line`` also strips them.
             j = i + 1
             while j < n:
                 if text[j] == "\\" and j + 1 < n:
@@ -175,7 +211,7 @@ def _tokenize(text: str) -> list[str]:
                 if text[j] == '"':
                     break
                 j += 1
-            tokens.append(text[i : j + 1])
+            tokens.append(text[i + 1 : j])
             i = j + 1
             continue
 
@@ -216,8 +252,9 @@ def _parse_block(tokens: list[str], pos: int) -> tuple[dict[str, Any], int]:
         keyword = tok
         pos += 1
 
-        # Collect value-part tokens until we hit ``{``, ``;``, ``}``, or EOF
-        value_parts: list[str] = []
+        # Collect value-part tokens until we hit ``{``, ``;``, ``}``, or EOF.
+        # A bracketed list becomes ONE value-part holding several alternatives.
+        value_parts: list[str | list[str]] = []
         while pos < len(tokens) and tokens[pos] not in ("{", ";", "}"):
             if tokens[pos] == "[":
                 # Bracketed value list: [ a b c ]
@@ -228,7 +265,7 @@ def _parse_block(tokens: list[str], pos: int) -> tuple[dict[str, Any], int]:
                         list_items.append(tokens[pos])
                     pos += 1
                 pos += 1  # consume ']'
-                value_parts.append(" ".join(list_items))
+                value_parts.append(list_items)
             else:
                 value_parts.append(tokens[pos])
                 pos += 1
@@ -236,47 +273,16 @@ def _parse_block(tokens: list[str], pos: int) -> tuple[dict[str, Any], int]:
         if pos < len(tokens) and tokens[pos] == "{":
             pos += 1  # consume '{'
             child, pos = _parse_block(tokens, pos)
-
-            if value_parts:
-                # Named block: keyword  name  { … }
-                # Store as result[keyword][name] = child
-                name = " ".join(value_parts)
-                if keyword not in result:
-                    result[keyword] = {}
-                container = result[keyword]
-                if not isinstance(container, dict):
-                    # Promote existing bare leaf(s) into the dict as
-                    # empty-bodied entries so they aren't lost.
-                    existing = container
-                    container = {}
-                    if isinstance(existing, list):
-                        for v in existing:
-                            container[v] = {}
-                    else:
-                        container[existing] = {}
-                    result[keyword] = container
-                if name in container:
-                    # Merge duplicate named blocks
-                    existing = container[name]
-                    if isinstance(existing, dict):
-                        _deep_merge(existing, child)
-                    else:
-                        container[name] = child
-                else:
-                    container[name] = child
-            else:
-                # Anonymous block: keyword  { … }
-                if keyword not in result:
-                    result[keyword] = child
-                elif isinstance(result[keyword], dict):
-                    _deep_merge(result[keyword], child)
-                else:
-                    result[keyword] = child
+            # Named block ``keyword name { … }`` and anonymous block
+            # ``keyword { … }`` are the same operation on the canonical tree:
+            # walk the path [keyword, *name_tokens] and merge the body in.
+            _merge_at_path(result, [keyword, *value_parts], child)
 
         elif pos < len(tokens) and tokens[pos] == ";":
             pos += 1  # consume ';'
-            value = " ".join(value_parts)
-            _set_leaf(result, keyword, value)
+            # Leaf statement: the trailing tokens ARE the nested path, exactly
+            # as the ``set`` rendering of the same statement would produce.
+            _merge_at_path(result, [keyword, *value_parts], {})
 
         # else: EOF before semicolon or brace — discard incomplete statement
 
@@ -287,35 +293,38 @@ def _parse_block(tokens: list[str], pos: int) -> tuple[dict[str, Any], int]:
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _set_leaf(result: dict[str, Any], key: str, value: str) -> None:
-    """Insert *value* under *key*, converting to list on duplicates.
+def _merge_at_path(
+    root: dict[str, Any],
+    path: list[str | list[str]],
+    body: dict[str, Any],
+) -> None:
+    """Merge *body* into *root* at *path*, creating intermediate dicts.
 
-    When *key* already holds a dict (from a named block), insert the bare
-    leaf as an empty-bodied entry so it isn't lost.
+    *path* is the statement's token sequence (keyword first).  A path element
+    that is a ``list`` is a bracketed value list: its members become sibling
+    keys at that position, so ``export [ A B ];`` and the two ``set … export A``
+    / ``set … export B`` lines both yield ``{export: {A: {}, B: {}}}``.
     """
-    if key not in result:
-        result[key] = value
-    else:
-        existing = result[key]
-        if isinstance(existing, dict):
-            # Named block already present — add bare leaf as empty entry
-            existing[value] = {}
-        elif isinstance(existing, list):
-            existing.append(value)
+    if not path:
+        return
+    head, rest = path[0], path[1:]
+    names = head if isinstance(head, list) else [head]
+    for name in names:
+        child = root.get(name)
+        if not isinstance(child, dict):
+            child = {}
+            root[name] = child
+        if rest:
+            _merge_at_path(child, rest, body)
         else:
-            result[key] = [existing, value]
+            _deep_merge(child, body)
 
 
 def _deep_merge(base: dict[str, Any], overlay: dict[str, Any]) -> None:
-    """Merge *overlay* into *base* in-place (recursive for nested dicts)."""
+    """Merge *overlay* into *base* in-place (recursive)."""
     for key, val in overlay.items():
-        if key in base and isinstance(base[key], dict) and isinstance(val, dict):
-            _deep_merge(base[key], val)
-        elif key in base:
-            existing = base[key]
-            if isinstance(existing, list):
-                existing.append(val)
-            else:
-                base[key] = [existing, val]
+        existing = base.get(key)
+        if isinstance(existing, dict) and isinstance(val, dict):
+            _deep_merge(existing, val)
         else:
             base[key] = val

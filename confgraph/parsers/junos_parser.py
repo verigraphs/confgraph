@@ -38,8 +38,11 @@ from confgraph.models.logging_config import SyslogConfig, LoggingHost
 from confgraph.models.multicast import MulticastConfig
 from confgraph.models.bgp import (
     BGPConfig, BGPNeighbor, BGPPeerGroup, BGPNeighborAF, BGPAddressFamily,
+    BGPTimers,
 )
-from confgraph.models.ospf import OSPFConfig, OSPFArea, OSPFAreaType
+from confgraph.models.ospf import (
+    OSPFConfig, OSPFArea, OSPFAreaType, OSPFRedistribute,
+)
 from confgraph.models.acl import ACLConfig, ACLEntry
 from confgraph.models.static_route import StaticRoute
 
@@ -83,9 +86,7 @@ class JunOSParser(BaseParser):
         """Extract hostname from ``system { host-name X; }``."""
         system = self._get_hierarchy().get("system", {})
         if isinstance(system, dict):
-            hn = system.get("host-name")
-            if isinstance(hn, str):
-                return hn.strip('"')
+            return _str_val(system.get("host-name"))
         return None
 
     def _collect_unrecognized_blocks(self) -> list[UnrecognizedBlock]:
@@ -105,7 +106,11 @@ class JunOSParser(BaseParser):
                     for key, val in attrs.items():
                         setattr(intf, key, val)
 
-        # 1b: reverse-resolve BGP local-address IP → interface name
+        # 1b: reverse-resolve BGP local-address IP → interface name.  JunOS names
+        # an update source by ADDRESS; ``update_source`` names an INTERFACE, so
+        # an unresolvable address is left unset rather than written into a field
+        # that means something else (CCR-0030: a wrong value beats no value only
+        # for the checker, never for the consumer).
         if pc.bgp_instances:
             ip_to_intf = self._build_ip_to_intf_map(pc.interfaces)
             for bgp_inst in pc.bgp_instances:
@@ -115,8 +120,26 @@ class JunOSParser(BaseParser):
                         resolved = ip_to_intf.get(local_addr)
                         if resolved:
                             nbr.update_source = resolved
+                for pg in bgp_inst.peer_groups:
+                    pg.update_source = self._resolve_local_address(
+                        pg.update_source, ip_to_intf
+                    )
 
         return pc
+
+    @staticmethod
+    def _resolve_local_address(
+        value: str | None, ip_to_intf: dict[str, str]
+    ) -> str | None:
+        """Map a BGP ``local-address`` to the interface that owns it."""
+        if not value:
+            return None
+        from ipaddress import ip_address
+        try:
+            canon = str(ip_address(value))
+        except ValueError:
+            return value  # already an interface name
+        return ip_to_intf.get(canon)
 
     @staticmethod
     def _build_ip_to_intf_map(interfaces: list[InterfaceConfig]) -> dict[str, str]:
@@ -487,42 +510,32 @@ class JunOSParser(BaseParser):
 
             entries: list[PrefixListEntry] = []
             seq = 10
-            for key, val in pl_data.items():
-                # Each key in a prefix-list block is a prefix
-                if key in ("description",):
+            for prefix_str, qualifiers in pl_data.items():
+                # Each key in a prefix-list block is a prefix; any ``upto`` /
+                # ``orlonger`` qualifier is an inline option of that statement.
+                if prefix_str in ("description", "apply-groups", "apply-groups-except"):
                     continue
-                prefixes = val if isinstance(val, list) else [val]
-                if not isinstance(prefixes, list):
-                    prefixes = [prefixes]
-                # key itself is the prefix when value is empty dict or str
-                # In JunOS: "10.0.0.0/8;" → tokenizer gives key="10.0.0.0/8", val=""
-                prefix_str = key.split()[0]
-                ge_val: int | None = None
+                tokens = _stmt_tokens(qualifiers)
                 le_val: int | None = None
-                # Check for qualifiers in the key tokens
-                tokens = key.split()
-                for i, t in enumerate(tokens):
-                    if t == "upto" and i + 1 < len(tokens):
-                        try:
-                            le_val = int(tokens[i + 1].lstrip("/"))
-                        except ValueError:
-                            pass
-                    elif t == "orlonger":
-                        # orlonger = ge N+1 le 32 — approximate as le 32
-                        le_val = 32
+                upto = _token_arg(tokens, "upto")
+                if upto:
+                    le_val = _int_or_none(upto.lstrip("/"))
+                elif "orlonger" in tokens:
+                    # orlonger = ge N+1 le 32 — approximate as le 32
+                    le_val = 32
                 try:
                     from ipaddress import ip_network
-                    network = ip_network(prefix_str, strict=False)
-                    entries.append(PrefixListEntry(
-                        sequence=seq,
-                        action="permit",
-                        prefix=network,
-                        ge=ge_val,
-                        le=le_val,
-                    ))
-                    seq += 10
+                    network = ip_network(str(prefix_str), strict=False)
                 except ValueError:
-                    pass
+                    continue
+                entries.append(PrefixListEntry(
+                    sequence=seq,
+                    action="permit",
+                    prefix=network,
+                    ge=None,
+                    le=le_val,
+                ))
+                seq += 10
 
             result.append(PrefixListConfig(
                 object_id=f"prefix_list_{pl_name}",
@@ -539,48 +552,31 @@ class JunOSParser(BaseParser):
     def parse_community_lists(self) -> list[CommunityListConfig]:
         """Parse community definitions from ``policy-options``.
 
-        JunOS community definitions appear as flat statements::
+        The flat form and the block form are one statement in the canonical
+        tree, so there is one code path::
 
-            community NO-EXPORT members no-export;
-            community LOCAL-PREF-100 members 65000:100;
+            community CL members [ 65000:100 65000:200 ];   # emitted
+            community CL { members 65000:100; }             # equivalent
+            set policy-options community CL members 65000:100
 
-        which the hierarchy tokenizer stores as a list of strings:
-        ``["NO-EXPORT members no-export", "LOCAL-PREF-100 members 65000:100"]``.
-
-        Also handles the block form::
-
-            community NAME { members VALUE; }
+        all give ``{community: {CL: {members: {65000:100: {}, …}}}}``.
         """
         hier = self._get_hierarchy()
         po = hier.get("policy-options", {})
         if not isinstance(po, dict):
             return []
 
-        comm_val = po.get("community")
-        if comm_val is None:
+        comm_block = po.get("community")
+        if not isinstance(comm_block, dict):
             return []
 
         result: list[CommunityListConfig] = []
-
-        if isinstance(comm_val, dict):
-            # Block form: {name: {members: value}}
-            for comm_name, comm_data in comm_val.items():
-                if not isinstance(comm_data, dict):
-                    continue
-                members = _str_val(comm_data.get("members", "")) or ""
-                communities = [m for m in members.split() if m]
-                result.append(self._make_community(comm_name, communities))
-        else:
-            # Flat statement form: list of "NAME members VALUE" strings
-            items = comm_val if isinstance(comm_val, list) else [comm_val]
-            for item in items:
-                item = _str_val(item) or ""
-                # Format: "NAME members VALUE1 VALUE2 ..."
-                if " members " in item:
-                    name_part, _, members_part = item.partition(" members ")
-                    comm_name = name_part.strip()
-                    communities = [m for m in members_part.split() if m]
-                    result.append(self._make_community(comm_name, communities))
+        for comm_name, comm_data in comm_block.items():
+            comm_name = str(comm_name).strip('"')
+            if not comm_name or not isinstance(comm_data, dict):
+                continue
+            members = _str_vals(comm_data.get("members"))
+            result.append(self._make_community(comm_name, members))
 
         return result
 
@@ -598,39 +594,24 @@ class JunOSParser(BaseParser):
     def parse_as_path_lists(self) -> list[ASPathListConfig]:
         """Parse AS-path definitions from ``policy-options``.
 
-        JunOS AS-path definitions appear as flat statements::
-
-            as-path CUSTOMER-AS "^65001$";
-
-        which the hierarchy tokenizer stores as a list of strings:
-        ``['CUSTOMER-AS "^65001$"', 'UPSTREAM-AS "^64512_"']``.
+        ``as-path AS-OWN "^65000$";`` is a named statement whose value is the
+        regex: ``{as-path: {AS-OWN: {^65000$: {}}}}``.
         """
         hier = self._get_hierarchy()
         po = hier.get("policy-options", {})
         if not isinstance(po, dict):
             return []
 
-        asp_val = po.get("as-path")
-        if asp_val is None:
+        asp_block = po.get("as-path")
+        if not isinstance(asp_block, dict):
             return []
 
         result: list[ASPathListConfig] = []
-
-        if isinstance(asp_val, dict):
-            # Block form: {name: regex_str}
-            for asp_name, asp_data in asp_val.items():
-                regex = _str_val(asp_data).strip('"') if not isinstance(asp_data, dict) else ""
-                result.append(self._make_as_path(asp_name, regex))
-        else:
-            # Flat statement form: list of "NAME regex" strings
-            items = asp_val if isinstance(asp_val, list) else [asp_val]
-            for item in items:
-                item = _str_val(item) or ""
-                parts = item.split(None, 1)
-                if len(parts) >= 1:
-                    asp_name = parts[0]
-                    regex = parts[1].strip('"') if len(parts) > 1 else ""
-                    result.append(self._make_as_path(asp_name, regex))
+        for asp_name, asp_data in asp_block.items():
+            asp_name = str(asp_name).strip('"')
+            if not asp_name:
+                continue
+            result.append(self._make_as_path(asp_name, _str_val(asp_data) or ""))
 
         return result
 
@@ -722,31 +703,13 @@ class JunOSParser(BaseParser):
                             values=[_str_val(a) or "" for a in asps],
                         ))
 
+                # ``then accept;`` (leaf) and ``then { … }`` (block) are the same
+                # node in the canonical tree — both are dicts.
                 then_block = term_data.get("then", {})
-                # then can be a dict or a scalar (e.g. "then accept;")
-                # Set-style: then.accept = {} or then.reject = {}
-                if isinstance(then_block, str):
-                    action_str = then_block.strip()
-                    action = "permit" if action_str in ("accept",) else "deny"
-                elif isinstance(then_block, dict):
-                    action = "deny" if "reject" in then_block else "permit"
-                    comm_set = then_block.get("community")
-                    if comm_set:
-                        comm_add = comm_set if isinstance(comm_set, dict) else {}
-                        add_val = comm_add.get("add") or comm_add.get("set")
-                        if add_val:
-                            set_clauses.append(RouteMapSet(
-                                set_type="community",
-                                values=[_str_val(add_val) or ""],
-                            ))
-                    lp = then_block.get("local-preference")
-                    if lp:
-                        set_clauses.append(RouteMapSet(
-                            set_type="local-preference",
-                            values=[_str_val(lp) or ""],
-                        ))
-                else:
-                    action = "permit"
+                if not isinstance(then_block, dict):
+                    then_block = {}
+                action = "deny" if "reject" in then_block else "permit"
+                set_clauses.extend(self._policy_set_clauses(then_block))
 
                 sequences.append(RouteMapSequence(
                     sequence=seq,
@@ -766,6 +729,44 @@ class JunOSParser(BaseParser):
             ))
 
         return result
+
+    #: JunOS ``then`` actions that carry a single value → RouteMapSet.set_type.
+    #: Adding another scalar action is one row here, not a new branch.  Only
+    #: statements attested by the syntax corpus are listed — an unverified row
+    #: would be an invented statement name that nothing tests.
+    _POLICY_SET_ACTIONS: tuple[tuple[str, str], ...] = (
+        ("local-preference", "local-preference"),
+        ("metric", "metric"),
+    )
+
+    #: JunOS community operations (``then community add|set|delete NAME;``).
+    #: The operation is part of the set_type, as IOS-XR does for
+    #: ``as-path prepend`` — consumers substring-match on "community".
+    _POLICY_COMMUNITY_OPS: tuple[str, ...] = ("add", "set", "delete")
+
+    def _policy_set_clauses(self, then_block: dict[str, Any]) -> list[RouteMapSet]:
+        """Build the set-clauses of one policy term from its ``then`` block."""
+        clauses: list[RouteMapSet] = []
+
+        for keyword, set_type in self._POLICY_SET_ACTIONS:
+            val = _str_val(then_block.get(keyword))
+            if val:
+                clauses.append(RouteMapSet(set_type=set_type, values=[val]))
+
+        # ``community add CL;`` — the community actions the policy→community
+        # dependency edge depends on.  Renderings converge on
+        # ``{community: {add: {CL: {}}}}``.
+        comm = then_block.get("community")
+        if isinstance(comm, dict):
+            for op in self._POLICY_COMMUNITY_OPS:
+                names = _str_vals(comm.get(op))
+                if names:
+                    clauses.append(RouteMapSet(
+                        set_type=f"community {op}",
+                        values=names,
+                    ))
+
+        return clauses
 
     # ------------------------------------------------------------------
     # BGP parsing (Stage 7) — protocols bgp + routing-instances VRF BGP
@@ -832,6 +833,109 @@ class JunOSParser(BaseParser):
 
         return result
 
+    # JunOS BGP session attributes are legal at THREE levels — ``bgp``,
+    # ``group`` and ``neighbor`` — and a peer inherits whatever it does not
+    # override.  Every one of them is read by the same table-driven extractor,
+    # so supporting the next attribute is one row here (handbook §7: a fix that
+    # needs a change in two places within a layer is still a patch).
+    #
+    # (statement, model field, reader, inheritable)
+    _BGP_ATTRS: tuple[tuple[str, str, str, bool], ...] = (
+        ("local-address", "update_source", "str", True),
+        ("authentication-key", "password", "str", True),
+        ("hold-time", "timers", "timers", True),
+        ("multihop", "ebgp_multihop", "multihop", True),
+        ("family", "maximum_prefix", "prefix_limit", True),
+        ("import", "route_map_in", "str", True),
+        ("export", "route_map_out", "str", True),
+        # A description describes the object it is written on; it is not a
+        # session attribute a peer inherits from its group.
+        ("description", "description", "str", False),
+    )
+
+    @classmethod
+    def _bgp_attrs(cls, node: dict[str, Any], *, inherited: bool = False) -> dict[str, Any]:
+        """Read every BGP session attribute present on one hierarchy node.
+
+        Returns only the attributes the node actually configures, so that
+        :meth:`_bgp_inherit` can layer neighbor over group over instance without
+        a per-field ``or`` chain.  With *inherited* set, only the attributes a
+        child level inherits are returned.
+        """
+        out: dict[str, Any] = {}
+        for stmt, field, kind, inheritable in cls._BGP_ATTRS:
+            if inherited and not inheritable:
+                continue
+            raw = node.get(stmt)
+            if raw is None:
+                continue
+            value: Any = None
+            if kind == "str":
+                value = _str_val(raw)
+            elif kind == "timers":
+                # JunOS configures the hold time only; the keepalive interval is
+                # one third of it and is not separately configurable.
+                hold = _int_val(raw)
+                if hold is not None:
+                    value = BGPTimers(keepalive=max(hold // 3, 1), holdtime=hold)
+            elif kind == "multihop":
+                # Two vendor pages disagree on the emitted shape — the statement
+                # page gives a container (``multihop { ttl 2; }``), the group
+                # page a leaf (``multihop 2;``) — and ``set`` form gives
+                # ``multihop ttl 2``.  Flattening the statement to its option
+                # tokens reads all three, so the disagreement costs no branch.
+                # A bare ``multihop;`` means multihop with the default TTL (64).
+                tokens = _stmt_tokens(raw)
+                ttl = _token_arg(tokens, "ttl")
+                if ttl is None:
+                    ttl = next((t for t in tokens if t.isdigit()), None)
+                value = _int_or_none(ttl) or 64
+            elif kind == "prefix_limit":
+                value = cls._prefix_limit_maximum(raw)
+            if value is not None:
+                out[field] = value
+        return out
+
+    @staticmethod
+    def _prefix_limit_maximum(family: Any) -> int | None:
+        """Read ``family <af> { <safi> { prefix-limit { maximum N; } } }``.
+
+        This WALKS THE PATH; it must not search for a ``maximum`` key wherever it
+        appears under ``family``.  ``accepted-prefix-limit`` is a separate,
+        identically-shaped statement at the same level with a different meaning —
+        ``prefix-limit`` tears the session down, ``accepted-prefix-limit`` merely
+        stops accepting further routes — and a key-hunt reports a peer that sets
+        only the soft limit as having a hard limit it does not have.  So do the
+        sibling containers ``drop-excess`` / ``hide-excess`` / ``teardown``.
+        """
+        if not isinstance(family, dict):
+            return None
+        for afi_data in family.values():          # inet | inet6 | inet-vpn | …
+            if not isinstance(afi_data, dict):
+                continue
+            for safi_data in afi_data.values():   # unicast | multicast | …
+                if not isinstance(safi_data, dict):
+                    continue
+                limit = safi_data.get("prefix-limit")
+                if isinstance(limit, dict):
+                    maximum = _int_val(limit.get("maximum"))
+                    if maximum is not None:
+                        return maximum
+        return None
+
+    @staticmethod
+    def _bgp_inherit(*levels: dict[str, Any]) -> dict[str, Any]:
+        """Flatten instance → group → neighbor attributes; the last one wins.
+
+        This is the *inherited peer configuration* concept the JunOS group,
+        the PAN-OS peer-group and the IOS peer-group all need: a peer reports
+        the attributes of its group unless it overrides them.
+        """
+        merged: dict[str, Any] = {}
+        for level in levels:
+            merged.update(level)
+        return merged
+
     def _parse_bgp_block(
         self,
         bgp_data: dict[str, Any],
@@ -848,6 +952,10 @@ class JunOSParser(BaseParser):
         if not isinstance(groups, dict):
             groups = {}
 
+        # Attributes configured directly under ``protocols bgp`` apply to every
+        # group and peer beneath it.
+        inst_attrs = self._bgp_attrs(bgp_data, inherited=True)
+
         for grp_name, grp_data in groups.items():
             if not isinstance(grp_data, dict):
                 continue
@@ -859,14 +967,17 @@ class JunOSParser(BaseParser):
             except ValueError:
                 remote_as = peer_as_str or 0
 
-            # 1b: local-address captured; reverse-resolved to interface in parse()
-            grp_local_addr = _str_val(grp_data.get("local-address"))
+            # What the group itself reports, and what its members inherit — the
+            # latter drops the attributes that describe only the group.
+            grp_attrs = self._bgp_inherit(inst_attrs, self._bgp_attrs(grp_data))
+            grp_inherited = self._bgp_inherit(
+                inst_attrs, self._bgp_attrs(grp_data, inherited=True)
+            )
 
             pg = BGPPeerGroup(
                 name=grp_name,
                 remote_as=remote_as if remote_as != 0 else None,
-                route_map_in=_str_val(grp_data.get("import")),
-                route_map_out=_str_val(grp_data.get("export")),
+                **grp_attrs,
             )
             peer_groups.append(pg)
 
@@ -890,14 +1001,11 @@ class JunOSParser(BaseParser):
                     except ValueError:
                         pass
 
-                # J15: BGP authentication-key
-                nbr_password = (
-                    _str_val(nbr_data.get("authentication-key"))
-                    or _str_val(grp_data.get("authentication-key"))
-                )
-
-                rm_in = _str_val(nbr_data.get("import")) or _str_val(grp_data.get("import"))
-                rm_out = _str_val(nbr_data.get("export")) or _str_val(grp_data.get("export"))
+                # The peer's effective configuration: inherited group attributes
+                # unless the peer overrides them.
+                attrs = self._bgp_inherit(grp_inherited, self._bgp_attrs(nbr_data))
+                rm_in = attrs.get("route_map_in")
+                rm_out = attrs.get("route_map_out")
 
                 # J9: resolve "internal" to the device's own ASN
                 effective_remote_as: int | str
@@ -906,8 +1014,9 @@ class JunOSParser(BaseParser):
                 else:
                     effective_remote_as = nbr_remote_as
 
-                # 1b: capture local-address for reverse resolution in parse()
-                local_addr = _str_val(nbr_data.get("local-address")) or grp_local_addr
+                # 1b: local-address is an IP; parse() reverse-resolves it to the
+                # interface that owns it, so update_source names an interface.
+                local_addr = attrs.pop("update_source", None)
                 if local_addr:
                     # Canonicalize both peer IP key and local-address value
                     # so IPv6 forms like 2001:DB8::1 match the map built
@@ -931,11 +1040,8 @@ class JunOSParser(BaseParser):
                     peer_ip=peer_ip,
                     remote_as=effective_remote_as,
                     peer_group=grp_name,
-                    description=_str_val(nbr_data.get("description")),
-                    password=nbr_password,
-                    route_map_in=rm_in,
-                    route_map_out=rm_out,
                     address_families=[af],
+                    **attrs,
                 ))
 
         if not neighbors and not peer_groups:
@@ -1124,30 +1230,39 @@ class JunOSParser(BaseParser):
                 intf_block = _as_named_block(area_data.get("interface", {}))
                 intf_names = list(intf_block.keys())
 
-                # J7: area type (stub / nssa)
+                # J7: area type (stub / nssa).
+                # ``stub`` is a LEAF STATEMENT WITH INLINE OPTIONS —
+                # ``stub default-metric 10 no-summaries;`` — so its options are
+                # read from the flattened token list, which is identical for the
+                # brace chain and the set-form branches.
                 area_type = OSPFAreaType.NORMAL
                 stub_no_summary = False
                 nssa_no_summary = False
                 nssa_dio = False
+                default_cost: int | None = None
                 if "stub" in area_data:
-                    stub_data = area_data["stub"]
-                    if isinstance(stub_data, dict) and "no-summaries" in stub_data:
+                    stub_tokens = _stmt_tokens(area_data["stub"])
+                    default_cost = _int_or_none(
+                        _token_arg(stub_tokens, "default-metric")
+                    )
+                    if "no-summaries" in stub_tokens:
                         area_type = OSPFAreaType.TOTALLY_STUB
                         stub_no_summary = True
                     else:
                         area_type = OSPFAreaType.STUB
                 elif "nssa" in area_data:
                     nssa_data = area_data["nssa"]
-                    if isinstance(nssa_data, dict):
-                        if "no-summaries" in nssa_data:
-                            area_type = OSPFAreaType.TOTALLY_NSSA
-                            nssa_no_summary = True
-                        else:
-                            area_type = OSPFAreaType.NSSA
-                        if "default-lsa" in nssa_data:
-                            nssa_dio = True
+                    nssa_tokens = _stmt_tokens(nssa_data)
+                    default_cost = _int_or_none(
+                        _token_arg(nssa_tokens, "default-metric")
+                    )
+                    if "no-summaries" in nssa_tokens:
+                        area_type = OSPFAreaType.TOTALLY_NSSA
+                        nssa_no_summary = True
                     else:
                         area_type = OSPFAreaType.NSSA
+                    if "default-lsa" in nssa_tokens:
+                        nssa_dio = True
 
                 # J7: per-interface sub-attributes (back-fill onto InterfaceConfig in parse())
                 for intf_name, intf_ospf in intf_block.items():
@@ -1195,6 +1310,7 @@ class JunOSParser(BaseParser):
                     stub_no_summary=stub_no_summary,
                     nssa_no_summary=nssa_no_summary,
                     nssa_default_information_originate=nssa_dio,
+                    default_cost=default_cost,
                 ))
 
         # ---- OSPF-advanced fields ----
@@ -1241,6 +1357,18 @@ class JunOSParser(BaseParser):
             except ValueError:
                 pass
 
+        # ``export [ POLICY … ];`` is how redistribution INTO OSPF is expressed
+        # on JunOS — there is no ``redistribute`` keyword.  Everything a device
+        # injects into OSPF from static/BGP/direct arrives through an export
+        # policy, so a model that ignores ``export`` cannot see redistribution
+        # at all, and the OSPF→policy dependency edge is lost.  The source
+        # protocol is not named here (it lives in the policy's own ``from
+        # protocol`` terms), so it is recorded as "policy".
+        redistribute = [
+            OSPFRedistribute(protocol="policy", route_map=policy)
+            for policy in _str_vals(ospf_data.get("export"))
+        ]
+
         return [OSPFConfig(
             object_id="ospf_1",
             raw_lines=self._raw_lines_for("protocols", "ospf"),
@@ -1255,27 +1383,54 @@ class JunOSParser(BaseParser):
             graceful_restart_helper=graceful_restart_helper,
             bfd_all_interfaces=bfd_all,
             max_metric_router_lsa=max_metric_router_lsa,
+            redistribute=redistribute,
         )]
 
     # ------------------------------------------------------------------
     # Firewall filter → ACL (Stage 10)
     # ------------------------------------------------------------------
 
+    def _iter_filters(self, fw: dict[str, Any]):
+        """Yield ``(filter_name, filter_data, afi)`` for every firewall filter.
+
+        ``[edit firewall]`` and ``[edit firewall family inet]`` are EQUIVALENT
+        hierarchy levels: the ``family`` statement is required only for a family
+        other than IPv4, and a device emits back whichever form was configured —
+        it does not rewrite the family-less one.  (Juniper's own YANG model
+        carries both paths as siblings sharing one body grouping.)  So this is
+        not two parsers for two syntaxes; it is one walk over the two datastore
+        paths the filter body can hang from.
+        """
+        # Family-less filters: [edit firewall filter <name>] — IPv4.
+        direct = fw.get("filter")
+        if isinstance(direct, dict):
+            for name, data in direct.items():
+                if isinstance(data, dict):
+                    yield str(name), data, "ipv4"
+
+        # [edit firewall family <family-name> filter <name>]
+        families = fw.get("family")
+        if isinstance(families, dict):
+            for fam_name, fam_data in families.items():
+                if not isinstance(fam_data, dict):
+                    continue
+                filters = fam_data.get("filter")
+                if not isinstance(filters, dict):
+                    continue
+                afi = "ipv6" if str(fam_name) == "inet6" else "ipv4"
+                for name, data in filters.items():
+                    if isinstance(data, dict):
+                        yield str(name), data, afi
+
     def parse_acls(self) -> list[ACLConfig]:
-        """Parse ``firewall { filter FILTER-NAME { term T { … } } }`` blocks."""
+        """Parse ``firewall { [family F {] filter NAME { term T { … } } [}] }``."""
         hier = self._get_hierarchy()
         fw = hier.get("firewall", {})
         if not isinstance(fw, dict):
             return []
 
-        filter_block = fw.get("filter", {})
-        if not isinstance(filter_block, dict):
-            return []
-
         result: list[ACLConfig] = []
-        for filter_name, filter_data in filter_block.items():
-            if not isinstance(filter_data, dict):
-                continue
+        for filter_name, filter_data, afi in self._iter_filters(fw):
             entries: list[ACLEntry] = []
             terms = filter_data.get("term", {})
             if isinstance(terms, dict):
@@ -1284,17 +1439,7 @@ class JunOSParser(BaseParser):
                     if not isinstance(term_data, dict):
                         seq += 10
                         continue
-                    then_block = term_data.get("then", {})
-                    action = "deny"
-                    if isinstance(then_block, dict):
-                        action = "deny" if "discard" in then_block or "reject" in then_block else "permit"
-                    elif isinstance(then_block, str):
-                        action = "permit" if then_block in ("accept",) else "deny"
-                    entries.append(ACLEntry(
-                        sequence=seq,
-                        action=action,
-                        remark=term_name,
-                    ))
+                    entries.extend(self._make_acl_entries(seq, str(term_name), term_data))
                     seq += 10
 
             result.append(ACLConfig(
@@ -1308,6 +1453,78 @@ class JunOSParser(BaseParser):
             ))
 
         return result
+
+    @classmethod
+    def _make_acl_entries(
+        cls, seq: int, term_name: str, term_data: dict[str, Any]
+    ) -> list[ACLEntry]:
+        """Build the ACLEntry(s) for one firewall-filter ``term``.
+
+        ``then`` collapses to a leaf for a single action (``then accept;``) and is
+        a block for several (``then { log; syslog; discard; }``) — one node in the
+        canonical tree either way.
+
+        An address match is the mirror image: ``source-address`` is emitted as a
+        CONTAINER holding **one prefix per line**, and stays a container even for
+        a single prefix, while the ``set`` rendering flattens the same statement
+        to a trailing token.  A term may therefore match SEVERAL source and
+        several destination prefixes, and it matches the cross product of them —
+        but ``ACLEntry.source``/``.destination`` are single strings (a Cisco ACE
+        has exactly one of each).  Rather than keep the first prefix and silently
+        drop the rest — a confidently wrong answer to "does this filter permit
+        X?" — one ACLEntry is emitted per (source, destination) pair, all sharing
+        the term's name, action and sequence.  Reachability semantics survive;
+        the term is still recoverable by grouping on ``sequence``/``remark``.
+        """
+        then_tokens = _stmt_tokens(term_data.get("then", {}))
+        action = "deny" if ("discard" in then_tokens or "reject" in then_tokens) else "permit"
+
+        from_block = term_data.get("from", {})
+        if not isinstance(from_block, dict):
+            from_block = {}
+
+        sources = cls._address_match(from_block, "source")
+        destinations = cls._address_match(from_block, "destination")
+
+        return [
+            ACLEntry(
+                sequence=seq,
+                action=action,
+                remark=term_name,
+                protocol=_str_val(from_block.get("protocol")),
+                source=source,
+                destination=destination,
+                source_port=_str_val(from_block.get("source-port")),
+                destination_port=_str_val(from_block.get("destination-port")),
+            )
+            for source in sources
+            for destination in destinations
+        ]
+
+    @staticmethod
+    def _address_match(from_block: dict[str, Any], side: str) -> list[str | None]:
+        """Every prefix (or prefix-list) matched on one side of a term.
+
+        Returns ``[None]`` when the term does not match on this side, so that the
+        caller's cross product still yields one entry.
+
+        A prefix carrying the per-prefix ``except`` modifier
+        (``source-address { 0.0.0.0/0; 10.0.0.0/8 except; }``) is an EXCLUSION,
+        and ``ACLEntry`` has no way to express one: emitting it as a match would
+        invert its meaning.  It is therefore not emitted — the entry over-matches
+        rather than mis-matching — and the loss is recorded as a model limitation
+        in CCR-0036 rather than papered over.
+        """
+        addresses = from_block.get(f"{side}-address")
+        prefixes: list[str | None] = []
+        if isinstance(addresses, dict):
+            for prefix, options in addresses.items():
+                prefix = str(prefix).strip('"')
+                if prefix and "except" not in _stmt_tokens(options):
+                    prefixes.append(prefix)
+        if not prefixes:
+            prefixes = list(_str_vals(from_block.get(f"{side}-prefix-list")))
+        return prefixes or [None]
 
     # ------------------------------------------------------------------
     # Management — NTP, SNMP, Syslog (Stage 11)
@@ -1323,24 +1540,23 @@ class JunOSParser(BaseParser):
         if not isinstance(ntp_data, dict):
             return None
 
+        # ``server`` is a named block keyed by address; each address carries its
+        # own option tokens (``prefer``, ``key <id>``, ``version <n>``).  The
+        # address is the key, never part of the option string (CCR-0030 bug 2).
         servers: list[NTPServer] = []
-        srv_val = ntp_data.get("server")
-        if srv_val:
-            for sv in (srv_val if isinstance(srv_val, list) else [srv_val]):
-                leaf = _str_val(sv) or ""
-                if not leaf:
+        srv_block = ntp_data.get("server")
+        if isinstance(srv_block, dict):
+            for addr, opts in srv_block.items():
+                addr = str(addr).strip('"')
+                if not addr:
                     continue
-                # Tokenize: "10.0.0.1 prefer" / "10.0.0.1 key 5 version 4".
-                # The first token is the address; trailing keywords are
-                # attributes, not part of the address (CCR-0030 bug 2).
-                addr, prefer, key_id, version = _split_ntp_server(leaf)
-                if addr:
-                    servers.append(NTPServer(
-                        address=addr,
-                        prefer=prefer,
-                        key_id=key_id,
-                        version=version,
-                    ))
+                tokens = _stmt_tokens(opts)
+                servers.append(NTPServer(
+                    address=addr,
+                    prefer="prefer" in tokens,
+                    key_id=_int_or_none(_token_arg(tokens, "key")),
+                    version=_int_or_none(_token_arg(tokens, "version")),
+                ))
 
         if not servers:
             return None
@@ -1353,22 +1569,27 @@ class JunOSParser(BaseParser):
         )
 
     def parse_snmp(self) -> SNMPConfig | None:
-        """Parse ``system { snmp { community NAME { authorization ro|rw; } } }``."""
+        """Parse the top-level ``snmp { … }`` stanza.
+
+        ``snmp`` is a TOP-LEVEL stanza on JunOS — a sibling of ``protocols`` and
+        ``firewall``, not a child of ``system`` (hierarchy level ``[edit snmp]``,
+        `community (SNMP)` CLI reference).  Reading it from under ``system`` is
+        reading a path no device emits.
+        """
         hier = self._get_hierarchy()
-        system = hier.get("system", {})
-        if not isinstance(system, dict):
-            return None
-        snmp_data = system.get("snmp", {})
-        if not isinstance(snmp_data, dict):
+        snmp_data = hier.get("snmp", {})
+        if not isinstance(snmp_data, dict) or not snmp_data:
             return None
 
         communities: list[SNMPCommunity] = []
         comm_block = snmp_data.get("community", {})
         if isinstance(comm_block, dict):
             for comm_name, comm_data in comm_block.items():
-                if not isinstance(comm_data, dict):
+                comm_name = str(comm_name).strip('"')
+                if not comm_name:
                     continue
-                auth = _str_val(comm_data.get("authorization", "read-only")) or "read-only"
+                # ``authorization`` is a nested statement, not a trailing token.
+                auth = _str_val(comm_data.get("authorization")) or "read-only"
                 access = "ro" if "read-only" in auth else "rw"
                 communities.append(SNMPCommunity(
                     community_string=comm_name,
@@ -1440,47 +1661,27 @@ def _find_in_block(d: dict[str, Any], key: str) -> Any:
     return None
 
 
-def _split_ntp_server(leaf: str) -> tuple[str | None, bool, int | None, int | None]:
-    """Split a JunOS ``ntp server`` leaf into (address, prefer, key_id, version).
-
-    The address is the first token; ``prefer``, ``key <id>`` and ``version <n>``
-    are trailing keyword attributes that must not be glommed onto the address.
-    """
-    tokens = leaf.split()
-    if not tokens:
-        return None, False, None, None
-    address = tokens[0]
-    prefer = False
-    key_id: int | None = None
-    version: int | None = None
-    i = 1
-    while i < len(tokens):
-        tok = tokens[i]
-        if tok == "prefer":
-            prefer = True
-        elif tok == "key" and i + 1 < len(tokens):
-            try:
-                key_id = int(tokens[i + 1])
-            except ValueError:
-                pass
-            i += 1
-        elif tok == "version" and i + 1 < len(tokens):
-            try:
-                version = int(tokens[i + 1])
-            except ValueError:
-                pass
-            i += 1
-        i += 1
-    return address, prefer, key_id, version
+def _int_or_none(s: str | None) -> int | None:
+    """Return *s* as an int, or None if absent / not numeric."""
+    if s is None:
+        return None
+    try:
+        return int(s)
+    except ValueError:
+        return None
 
 
 def _str_val(v: Any) -> str | None:
-    """Return *v* as a plain string, stripping quotes, or None.
+    """Return the value of a canonical-tree statement node as a string, or None.
 
-    Handles three shapes produced by the hierarchy parsers:
-    - ``str``  — brace-style leaf value (``peer-as 65006;`` → ``'65006'``)
-    - ``dict`` — set-style leaf (``{'65006': {}}`` → ``'65006'``)
-    - ``list`` — repeated brace-style values (takes first element)
+    In the canonical tree a statement's value is its first child key
+    (``peer-as 65006;`` and ``set … peer-as 65006`` both give ``{'65006': {}}``).
+    Taking the *first* key is also what makes configuration-group precedence
+    work: an explicit local value is inserted before any inherited one
+    (see :mod:`confgraph.parsers.junos_groups`).
+
+    ``str``/``list`` inputs are still accepted so that callers may pass a value
+    that has already been reduced to a scalar.
     """
     if v is None:
         return None
@@ -1489,12 +1690,69 @@ def _str_val(v: Any) -> str | None:
     if v is None:
         return None
     if isinstance(v, dict):
-        # Set-style: the scalar value is the first (usually only) key
         keys = [k for k in v if k != ""]
         if not keys:
             return None
         return str(keys[0]).strip('"') or None
     return str(v).strip('"')
+
+
+def _str_vals(v: Any) -> list[str]:
+    """Return *all* values of a canonical statement node, in configured order.
+
+    ``members [ 65000:100 65000:200 ];`` and the two equivalent ``set`` lines
+    both yield ``['65000:100', '65000:200']``.
+    """
+    if v is None:
+        return []
+    if isinstance(v, dict):
+        return [str(k).strip('"') for k in v if str(k).strip('"')]
+    if isinstance(v, list):
+        return [s for s in (_str_val(item) for item in v) if s]
+    s = _str_val(v)
+    return [s] if s else []
+
+
+def _stmt_tokens(v: Any) -> list[str]:
+    """Flatten a statement node into its inline option tokens (DFS pre-order).
+
+    This is the single reader for *leaf statements that carry inline options*,
+    and it is what lets one code path handle every rendering of them:
+
+    ==========================================  ==========================
+    Config                                      ``_stmt_tokens`` result
+    ==========================================  ==========================
+    ``stub default-metric 10 no-summaries;``    ``[default-metric, 10, no-summaries]``
+    ``set … stub default-metric 10``
+        + ``set … stub no-summaries``           ``[default-metric, 10, no-summaries]``
+    ``multihop { ttl 2; }``                     ``[ttl, 2]``
+    ``multihop 2;``                             ``[2]``
+    ``set … multihop ttl 2``                    ``[ttl, 2]``
+    ==========================================  ==========================
+
+    The brace form nests inline options in a *chain* and the ``set`` form splits
+    them across sibling branches, so neither the chain nor the branch shape can
+    be assumed — but the flattened token sequence is the same for both, and it is
+    the sequence the operator wrote.
+    """
+    out: list[str] = []
+    if not isinstance(v, dict):
+        s = _str_val(v)
+        return [s] if s else []
+    for key, child in v.items():
+        key = str(key).strip('"')
+        if key:
+            out.append(key)
+        out.extend(_stmt_tokens(child))
+    return out
+
+
+def _token_arg(tokens: list[str], keyword: str) -> str | None:
+    """Return the token following *keyword* in a flattened statement, or None."""
+    for i, tok in enumerate(tokens):
+        if tok == keyword and i + 1 < len(tokens):
+            return tokens[i + 1]
+    return None
 
 
 def _int_val(v: Any) -> int | None:
