@@ -346,6 +346,14 @@ class DependencyResolver:
     def _infer_match_ref_type(match_type: str) -> str | None:
         """Map a route-map match_type string to its referenced object type."""
         mt = match_type.lower()
+        # An INLINE match references nothing: its values are literal patterns or
+        # prefixes, not the names of objects. Cisco matches an as-path by naming
+        # an as-path access-list; PAN-OS carries the regex in the policy rule
+        # itself. Inferring a reference from those values would manufacture a
+        # dangling ref for every such rule — the harm this method exists to
+        # avoid. Parsers signal the inline case with a "-regex" suffix.
+        if mt.endswith("-regex") or mt.endswith(" regex"):
+            return None
         if "prefix-list" in mt:
             return "prefix_list"
         if "as-path" in mt:

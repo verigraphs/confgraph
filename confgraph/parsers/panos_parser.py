@@ -38,12 +38,17 @@ from confgraph.models.base import OSType, UnrecognizedBlock
 from confgraph.models.interface import InterfaceConfig, InterfaceType
 from confgraph.models.vrf import VRFConfig
 from confgraph.models.bgp import (
-    BGPConfig, BGPNeighbor, BGPRedistribute,
+    BGPConfig, BGPNeighbor, BGPPeerGroup, BGPRedistribute, BGPTimers,
 )
-from confgraph.models.ospf import OSPFConfig, OSPFArea, OSPFRedistribute
+from confgraph.models.ospf import (
+    OSPFConfig, OSPFArea, OSPFAreaType, OSPFRedistribute,
+)
+from confgraph.models.route_map import (
+    RouteMapConfig, RouteMapMatch, RouteMapSequence, RouteMapSet,
+)
 from confgraph.models.static_route import StaticRoute
 from confgraph.models.acl import ACLConfig, ACLEntry
-from confgraph.models.nat import NATConfig, NATStaticEntry
+from confgraph.models.nat import NATConfig, NATDynamicEntry, NATStaticEntry
 from confgraph.models.crypto import (
     CryptoConfig, IKEv1Policy, IKEv2Proposal, IKEv2Policy,
     IPSecTransformSet, CryptoMapEntry, CryptoMap,
@@ -87,6 +92,44 @@ def _safe_iface(addr: str | None) -> IPv4Interface | None:
         return IPv4Interface(addr)
     except ValueError:
         return None
+
+
+def _safe_int(val: str | None) -> int | None:
+    if val is None:
+        return None
+    try:
+        return int(val.strip())
+    except ValueError:
+        return None
+
+
+def _choice(parent: Element | None, path: str) -> str | None:
+    """Return the NAME of the child element at ``path`` — PAN-OS's enum encoding.
+
+    PAN-OS encodes enumerations as ELEMENT NAMES, not text values.  An OSPF area
+    type is ``<type><stub/></type>`` and never ``<type>stub</type>``; a BGP
+    policy action is ``<action><deny/></action>``; a peer-group type is
+    ``<type><ebgp>…</ebgp></type>``; a redist-profile action is
+    ``<action><redist/></action>``.  Reading the *text* of those elements yields
+    the empty string on every real device — that single mistake is CCR-0035 gaps
+    #5 and #1.  This helper is the one place that reads the pattern, so the next
+    enum costs a call, not a new branch.
+    """
+    el = parent.find(path) if parent is not None else None
+    if el is None:
+        return None
+    for child in el:
+        return child.tag
+    return None
+
+
+def _nat_source_acl_name(rule_name: str) -> str:
+    """The ACL that holds the address set a source-NAT rule translates.
+
+    ``parse_acls`` materializes it and ``parse_nat`` points ``NATDynamicEntry.acl``
+    at it — one name, one definition, so the nat→acl edge always resolves.
+    """
+    return f"nat-source-{rule_name}"
 
 
 def _classify_iface(name: str) -> InterfaceType:
@@ -219,6 +262,9 @@ class PANOSParser(BaseParser):
             for m in members(vr, "interface"):
                 vr_of_iface[m] = vr_name
 
+        # OSPF per-interface settings live inside the AREA, not on the interface.
+        ospf_of_iface = self._ospf_interface_attrs()
+
         ifaces: list[InterfaceConfig] = []
 
         def _build(el: Element, name: str) -> InterfaceConfig:
@@ -244,6 +290,8 @@ class PANOSParser(BaseParser):
             if mtu_str and mtu_str.isdigit():
                 mtu = int(mtu_str)
 
+            ospf = ospf_of_iface.get(name, {})
+
             return InterfaceConfig(
                 object_id=f"iface_{name}",
                 source_os=self.os_type,
@@ -256,6 +304,9 @@ class PANOSParser(BaseParser):
                 mtu=mtu,
                 zone=zone_of_iface.get(name),
                 virtual_router=vr_of_iface.get(name),
+                ospf_area=ospf.get("area"),
+                ospf_cost=ospf.get("cost"),
+                ospf_passive=bool(ospf.get("passive", False)),
                 raw_lines=[raw_xml(el)],
             )
 
@@ -308,6 +359,69 @@ class PANOSParser(BaseParser):
     # 3. BGP
     # ------------------------------------------------------------------
 
+    def _redist_profiles(self, vr: Element) -> dict[str, list[str]]:
+        """redist-profile name → the source protocols in its ``filter/type`` members.
+
+        PAN-OS does not name the redistributed protocol on the redistribution
+        *rule*.  BGP's ``redist-rules`` and OSPF's ``export-rules`` entries are
+        keyed by the NAME of a ``redist-profile`` that sits beside ``<bgp>`` and
+        ``<ospf>`` under ``<protocol>``; the protocols live in that profile's
+        ``<filter><type><member>`` list.  ``address-family-identifier`` on the
+        rule is ``ipv4|ipv6`` — an address family, not a protocol; reading it as
+        the protocol is a category error (CCR-0035 #4).
+
+        One resolver, both protocols: BGP and OSPF redistribution differ only in
+        the container name (``redist-rules`` vs ``export-rules``).
+        """
+        profiles: dict[str, list[str]] = {}
+        for container in ("protocol/redist-profile", "protocol/redist-profile-ipv6"):
+            for prof in entries(vr, container):
+                name = prof.get("name", "")
+                if not name:
+                    continue
+                types = members(prof, "filter/type")
+                if types:
+                    profiles.setdefault(name, []).extend(types)
+        return profiles
+
+    def _bgp_auth_secrets(self, bgp_el: Element) -> dict[str, str]:
+        """auth-profile name → secret.
+
+        PAN-OS puts no password on the peer: the peer's
+        ``connection-options/authentication`` holds the NAME of a profile under
+        ``bgp/auth-profile``, and the secret lives there.  Authentication is a
+        two-part relation, not a leaf (CCR-0035 #3).
+        """
+        secrets: dict[str, str] = {}
+        for prof in entries(bgp_el, "auth-profile"):
+            name = prof.get("name", "")
+            secret = text_val(prof, "secret")
+            if name and secret:
+                secrets[name] = secret
+        return secrets
+
+    def _bgp_policy_bindings(self, bgp_el: Element) -> dict[str, dict[str, str]]:
+        """peer-group name → {"import": rule, "export": rule}.
+
+        A BGP policy rule binds to peer-groups through its ``<used-by>`` member
+        list — that, not a per-peer statement, is PAN-OS's policy→peer edge.  A
+        disabled rule (``<enable>no</enable>``) is not bound; it still exists as
+        a policy node (``parse_route_maps``).  Where a group has several enabled
+        rules in one direction, the first in document order is the one the
+        normalized model can name — the rest remain visible as policy nodes.
+        """
+        bindings: dict[str, dict[str, str]] = {}
+        for direction in ("import", "export"):
+            for rule in entries(bgp_el, f"policy/{direction}/rules"):
+                if text_val(rule, "enable") == "no":
+                    continue
+                rule_name = rule.get("name", "")
+                if not rule_name:
+                    continue
+                for pg_name in members(rule, "used-by"):
+                    bindings.setdefault(pg_name, {}).setdefault(direction, rule_name)
+        return bindings
+
     def parse_bgp(self) -> list[BGPConfig]:
         bgp_list: list[BGPConfig] = []
 
@@ -328,39 +442,86 @@ class PANOSParser(BaseParser):
                 continue
 
             router_id = _safe_addr(text_val(bgp_el, "router-id"))
+            auth_secrets = self._bgp_auth_secrets(bgp_el)
+            bindings = self._bgp_policy_bindings(bgp_el)
 
             neighbors: list[BGPNeighbor] = []
-            # Peers live inside peer-group entries
-            pg_container = bgp_el.find("peer-group")
-            if pg_container is not None:
-                for pg in (pg_container.findall("entry") or []):
-                    for peer in entries(pg, "peer"):
-                        peer_ip_str = text_val(peer, "peer-address/ip")
-                        remote_as_str = text_val(peer, "connection-options/remote-as")
-                        if not peer_ip_str or not remote_as_str:
-                            continue
-                        peer_ip = _safe_addr(peer_ip_str)
-                        if peer_ip is None:
-                            continue
-                        try:
-                            remote_as = int(remote_as_str)
-                        except ValueError:
-                            remote_as = remote_as_str  # type: ignore[assignment]
-                        shutdown = (text_val(peer, "enable") == "no")
-                        update_source = text_val(peer, "local-address/interface")
-                        neighbors.append(BGPNeighbor(
-                            peer_ip=peer_ip,
-                            remote_as=remote_as,
-                            description=peer.get("name", ""),
-                            shutdown=shutdown,
-                            update_source=update_source,
-                        ))
+            peer_groups: list[BGPPeerGroup] = []
+
+            # Peers are ALWAYS nested in a peer-group — PAN-OS has no ungrouped peer.
+            for pg in entries(bgp_el, "peer-group"):
+                pg_name = pg.get("name", "")
+                if not pg_name:
+                    continue
+                pg_type = _choice(pg, "type")           # ebgp | ibgp | *-confed
+                export_nexthop = (
+                    text_val(pg, f"type/{pg_type}/export-nexthop") if pg_type else None
+                )
+                bound = bindings.get(pg_name, {})
+                route_map_in = bound.get("import")
+                route_map_out = bound.get("export")
+
+                peer_groups.append(BGPPeerGroup(
+                    name=pg_name,
+                    next_hop_self=(export_nexthop == "use-self"),
+                    route_map_in=route_map_in,
+                    route_map_out=route_map_out,
+                ))
+
+                for peer in entries(pg, "peer"):
+                    peer_ip_str = text_val(peer, "peer-address/ip")
+                    # <peer-as> is a DIRECT child of the peer entry. It is not
+                    # spelled remote-as and it is not under connection-options —
+                    # no device emits either of those (CCR-0035 #8).
+                    remote_as_str = text_val(peer, "peer-as")
+                    if not peer_ip_str or not remote_as_str:
+                        continue
+                    # The GUI accepts an IP or IP/mask for the peer address.
+                    peer_ip = _safe_addr(peer_ip_str.split("/")[0])
+                    if peer_ip is None:
+                        continue
+                    try:
+                        remote_as = int(remote_as_str)
+                    except ValueError:
+                        remote_as = remote_as_str  # type: ignore[assignment]
+
+                    opts = peer.find("connection-options")
+                    keepalive = _safe_int(text_val(opts, "keep-alive-interval"))
+                    holdtime = _safe_int(text_val(opts, "hold-time"))
+                    timers = (
+                        BGPTimers(keepalive=keepalive, holdtime=holdtime)
+                        if keepalive is not None and holdtime is not None
+                        else None
+                    )
+                    # <multihop> is a TTL (0-255), not a boolean: 0 means "the
+                    # protocol default" (1 for eBGP, 255 for iBGP), not "off".
+                    multihop = _safe_int(text_val(opts, "multihop"))
+                    auth_name = text_val(opts, "authentication")
+
+                    neighbors.append(BGPNeighbor(
+                        peer_ip=peer_ip,
+                        remote_as=remote_as,
+                        peer_group=pg_name,
+                        description=peer.get("name", ""),
+                        shutdown=(text_val(peer, "enable") == "no"),
+                        update_source=text_val(peer, "local-address/interface"),
+                        timers=timers,
+                        ebgp_multihop=multihop,
+                        password=auth_secrets.get(auth_name) if auth_name else None,
+                        maximum_prefix=_safe_int(text_val(peer, "max-prefixes")),
+                        next_hop_self=(export_nexthop == "use-self"),
+                        route_map_in=route_map_in,
+                        route_map_out=route_map_out,
+                    ))
 
             redistribute: list[BGPRedistribute] = []
-            for redist in entries(bgp_el, "redistribution-rules"):
-                proto = text_val(redist, "address-family-identifier")
-                if proto:
-                    redistribute.append(BGPRedistribute(protocol=proto))
+            profiles = self._redist_profiles(vr)
+            for redist in entries(bgp_el, "redist-rules"):
+                if text_val(redist, "enable") == "no":
+                    continue
+                metric = _safe_int(text_val(redist, "metric"))
+                for proto in profiles.get(redist.get("name", ""), []):
+                    redistribute.append(BGPRedistribute(protocol=proto, metric=metric))
 
             bgp_list.append(BGPConfig(
                 object_id=f"bgp_{local_as}_{vr_name}",
@@ -369,6 +530,7 @@ class PANOSParser(BaseParser):
                 router_id=router_id,
                 vrf=vr_name if vr_name != "default" else None,
                 neighbors=neighbors,
+                peer_groups=peer_groups,
                 redistribute=redistribute,
                 raw_lines=[raw_xml(bgp_el)],
             ))
@@ -376,8 +538,147 @@ class PANOSParser(BaseParser):
         return bgp_list
 
     # ------------------------------------------------------------------
+    # 3b. BGP import/export policy → RouteMapConfig (the policy nodes)
+    # ------------------------------------------------------------------
+
+    #: PAN-OS policy match elements → the normalized ``match_type``.  None of
+    #: these names may collide with the Cisco vocabulary the dependency resolver
+    #: treats as a REFERENCE ("as-path", "community", "prefix-list", "ip
+    #: address"), because PAN-OS matches are INLINE values, not named objects —
+    #: emitting them as references would manufacture dangling refs.  The
+    #: ``-regex`` suffix is the resolver's signal for "inline pattern".
+    _POLICY_TEXT_MATCHES = (
+        ("as-path/regex", "as-path-regex"),
+        ("community/regex", "community-regex"),
+        ("extended-community/regex", "extended-community-regex"),
+        ("med", "med"),
+        ("route-table", "route-table"),
+    )
+
+    #: action/allow/update child → the normalized ``set_type``.
+    _POLICY_TEXT_SETS = (
+        ("local-preference", "local-preference"),
+        ("med", "metric"),
+        ("weight", "weight"),
+        ("nexthop", "next-hop"),
+        ("origin", "origin"),
+        ("as-path-limit", "as-path-limit"),
+    )
+
+    def _policy_rule_to_route_map(self, rule: Element, direction: str) -> RouteMapConfig:
+        """One PAN-OS BGP policy rule → one policy node, in the shared model.
+
+        A graph consumer must not be able to tell which vendor produced a policy
+        node, so a PAN-OS import/export rule becomes a ``RouteMapConfig`` with a
+        single sequence, exactly as a Cisco ``route-map NAME permit 10`` does.
+        """
+        name = rule.get("name", "")
+        # <action> is element-name-as-value: <allow>…</allow> or <deny/>.
+        action_el = _choice(rule, "action")
+        action = "deny" if action_el == "deny" else "permit"
+
+        match_el = rule.find("match")
+        matches: list[RouteMapMatch] = []
+        if match_el is not None:
+            prefixes = [
+                e.get("name", "") for e in entries(match_el, "address-prefix")
+                if e.get("name")
+            ]
+            if prefixes:
+                matches.append(RouteMapMatch(
+                    match_type="address-prefix", values=prefixes,
+                ))
+            from_peer = members(match_el, "from-peer")
+            if from_peer:
+                matches.append(RouteMapMatch(match_type="from-peer", values=from_peer))
+            for path, match_type in self._POLICY_TEXT_MATCHES:
+                val = text_val(match_el, path)
+                if val:
+                    matches.append(RouteMapMatch(match_type=match_type, values=[val]))
+
+        sets: list[RouteMapSet] = []
+        update_el = rule.find("action/allow/update")
+        if update_el is not None:
+            for path, set_type in self._POLICY_TEXT_SETS:
+                val = text_val(update_el, path)
+                if val:
+                    sets.append(RouteMapSet(set_type=set_type, values=[val]))
+            # as-path / community updates are element-name-as-value again:
+            # <as-path><prepend>2</prepend></as-path>, <community><none/></community>.
+            for path, set_type in (("as-path", "as-path"), ("community", "community")):
+                op = _choice(update_el, path)
+                if not op:
+                    continue
+                arg = text_val(update_el, f"{path}/{op}")
+                sets.append(RouteMapSet(
+                    set_type=set_type,
+                    values=[op] + ([arg] if arg else []),
+                ))
+
+        return RouteMapConfig(
+            object_id=f"policy_{direction}_{name}",
+            source_os=self.os_type,
+            name=name,
+            sequences=[RouteMapSequence(
+                sequence=10,
+                action=action,
+                match_clauses=matches,
+                set_clauses=sets,
+                description=f"panos bgp {direction} rule",
+            )],
+            raw_lines=[raw_xml(rule)],
+        )
+
+    def parse_route_maps(self) -> list[RouteMapConfig]:
+        route_maps: list[RouteMapConfig] = []
+        for vr in self._virtual_routers():
+            bgp_el = vr.find("protocol/bgp")
+            if bgp_el is None:
+                continue
+            for direction in ("import", "export"):
+                for rule in entries(bgp_el, f"policy/{direction}/rules"):
+                    if rule.get("name"):
+                        route_maps.append(
+                            self._policy_rule_to_route_map(rule, direction)
+                        )
+        return route_maps
+
+    # ------------------------------------------------------------------
     # 4. OSPF
     # ------------------------------------------------------------------
+
+    #: PAN-OS area <type> child element → normalized area type.
+    _AREA_TYPES = {
+        "normal": OSPFAreaType.NORMAL,
+        "stub": OSPFAreaType.STUB,
+        "nssa": OSPFAreaType.NSSA,
+    }
+
+    def _ospf_interface_attrs(self) -> dict[str, dict[str, object]]:
+        """interface name → its OSPF attributes, read from inside the AREA.
+
+        PAN-OS has no `ip ospf cost` on the interface object: an interface joins
+        OSPF by being an ``<entry>`` INSIDE an area, and its cost is the
+        ``<metric>`` on that entry (CCR-0035 #6).  parse_interfaces cannot find
+        it by looking at ``network/interface`` — it has to come here.
+        """
+        attrs: dict[str, dict[str, object]] = {}
+        for vr in self._virtual_routers():
+            ospf_el = vr.find("protocol/ospf")
+            if ospf_el is None:
+                continue
+            for area_el in entries(ospf_el, "area"):
+                area_id = area_el.get("name", "")
+                for iface_el in entries(area_el, "interface"):
+                    name = iface_el.get("name", "")
+                    if not name:
+                        continue
+                    attrs[name] = {
+                        "area": area_id,
+                        "cost": _safe_int(text_val(iface_el, "metric")),
+                        "passive": text_val(iface_el, "passive") == "yes",
+                    }
+        return attrs
 
     def parse_ospf(self) -> list[OSPFConfig]:
         ospf_list: list[OSPFConfig] = []
@@ -400,16 +701,51 @@ class PANOSParser(BaseParser):
                     iface_name = iface_el.get("name", "")
                     if iface_name:
                         area_ifaces.append(iface_name)
+
+                # The area type is an ELEMENT NAME: <type><stub>…</stub></type>.
+                # PAN-OS has no `no-summary` keyword — a stub/NSSA area whose
+                # <accept-summary> is "no" IS the totally-stubby case, per the
+                # vendor's own area doc (CCR-0035 #5).
+                kind = _choice(area_el, "type")
+                no_summary = (
+                    text_val(area_el, f"type/{kind}/accept-summary") == "no"
+                    if kind else False
+                )
+                area_type = self._AREA_TYPES.get(kind or "", OSPFAreaType.NORMAL)
+                if no_summary and area_type is OSPFAreaType.STUB:
+                    area_type = OSPFAreaType.TOTALLY_STUB
+                elif no_summary and area_type is OSPFAreaType.NSSA:
+                    area_type = OSPFAreaType.TOTALLY_NSSA
+
+                # <default-route><advertise><metric>N — the cost of the default
+                # route this ABR injects into the stub/NSSA area.
+                default_cost = _safe_int(
+                    text_val(area_el, f"type/{kind}/default-route/advertise/metric")
+                ) if kind else None
+
                 areas.append(OSPFArea(
                     area_id=area_id,
+                    area_type=area_type,
+                    stub_no_summary=(no_summary and kind == "stub"),
+                    nssa_no_summary=(no_summary and kind == "nssa"),
+                    default_cost=default_cost,
                     interfaces=area_ifaces,
                 ))
 
             redistrib: list[OSPFRedistribute] = []
+            profiles = self._redist_profiles(vr)
             for redist in entries(ospf_el, "export-rules"):
-                name = redist.get("name", "")
-                if name:
-                    redistrib.append(OSPFRedistribute(protocol=name))
+                # ext-1 / ext-2 → the E1/E2 metric type; the SOURCE protocol is
+                # in the referenced redist-profile, exactly as for BGP.
+                path_type = text_val(redist, "new-path-type")
+                metric_type = 1 if path_type == "ext-1" else (2 if path_type == "ext-2" else None)
+                for proto in profiles.get(redist.get("name", ""), []):
+                    redistrib.append(OSPFRedistribute(
+                        protocol=proto,
+                        metric=_safe_int(text_val(redist, "metric")),
+                        metric_type=metric_type,
+                        tag=_safe_int(text_val(redist, "new-tag")),
+                    ))
 
             ospf_list.append(OSPFConfig(
                 object_id=f"ospf_1_{vr_name}",
@@ -481,6 +817,30 @@ class PANOSParser(BaseParser):
     # 6. Security policies → ACLConfig
     # ------------------------------------------------------------------
 
+    def _nat_rules(self) -> list[tuple[PolicyScope, Element]]:
+        """Every NAT rule, with the policy scope it came from, in evaluation order."""
+        rules: list[tuple[PolicyScope, Element]] = []
+        for scope in self._policy_scopes():
+            for rulebase in scope.rulebases:
+                nat_el = rulebase.find("nat")
+                if nat_el is None:
+                    continue
+                for rule in entries(nat_el, "rules"):
+                    if rule.get("name"):
+                        rules.append((scope, rule))
+        return rules
+
+    @staticmethod
+    def _rule_match_remark(rule: Element) -> str:
+        """The rule's match set (zones + addresses + service), as an ACL remark."""
+        return (
+            f"from:{','.join(members(rule, 'from'))} "
+            f"to:{','.join(members(rule, 'to'))} "
+            f"src:{','.join(members(rule, 'source'))} "
+            f"dst:{','.join(members(rule, 'destination'))} "
+            f"svc:{text_val(rule, 'service') or ''}"
+        )
+
     def parse_acls(self) -> list[ACLConfig]:
         """One ACLConfig per policy scope (vsys locally, device-group under Panorama).
 
@@ -488,6 +848,15 @@ class PANOSParser(BaseParser):
         single vsys rulebase, under Panorama the resolved
         shared-pre → DG-pre → DG-post → shared-post chain — so ascending ACL
         sequence numbers carry the firewall's evaluation order.
+
+        A source-NAT rule additionally gets an ACL of its own, holding the
+        address set that rule translates.  ``NATDynamicEntry.acl`` must name the
+        set of addresses being translated; a Cisco device names an ACL there, and
+        PAN-OS carries the same information INLINE on the NAT rule.  Materializing
+        it — with the same rulebase→ACLConfig mapping this parser already applies
+        to security rules — is what lets source NAT enter the model at all
+        (CCR-0035 #7) without the dangling ``nat → acl`` reference that made the
+        previous author skip it.
         """
         acls: list[ACLConfig] = []
         for scope in self._policy_scopes():
@@ -536,6 +905,24 @@ class PANOSParser(BaseParser):
                     raw_lines=raw_lines,
                 ))
 
+        # The address set each source-NAT rule translates (see docstring).
+        for scope, rule in self._nat_rules():
+            if rule.find("source-translation") is None:
+                continue
+            rule_name = rule.get("name", "")
+            acls.append(ACLConfig(
+                object_id=f"acl_nat_{scope.name}_{rule_name}",
+                source_os=self.os_type,
+                name=_nat_source_acl_name(rule_name),
+                acl_type="extended",
+                entries=[ACLEntry(
+                    sequence=10,
+                    action="permit",
+                    remark=f"nat-rule:{rule_name} {self._rule_match_remark(rule)}",
+                )],
+                raw_lines=[raw_xml(rule)],
+            ))
+
         return acls
 
     # ------------------------------------------------------------------
@@ -543,44 +930,70 @@ class PANOSParser(BaseParser):
     # ------------------------------------------------------------------
 
     def parse_nat(self) -> NATConfig | None:
+        """Destination NAT → static entries; source / PAT NAT → dynamic entries.
+
+        ``<source-translation>`` has three mutually exclusive branches, chosen by
+        element name: ``dynamic-ip-and-port`` (PAT), ``dynamic-ip`` (1:1 dynamic,
+        no ports) and ``static-ip``.  ``<translated-address>`` is a **member
+        list** under the two dynamic branches and a **text node** under
+        ``static-ip`` — one element name, two shapes.
+        """
         static_entries: list[NATStaticEntry] = []
         dynamic_entries: list[NATDynamicEntry] = []
 
-        for scope in self._policy_scopes():
-            nat_rules: list[Element] = []
-            for rulebase in scope.rulebases:
-                nat_el = rulebase.find("nat")
-                if nat_el is not None:
-                    nat_rules.extend(entries(nat_el, "rules"))
+        for _scope, rule in self._nat_rules():
+            rule_name = rule.get("name", "")
+            dst_trans = rule.find("destination-translation")
 
-            for rule in nat_rules:
-                rule_name = rule.get("name", "")
-                dst_trans = rule.find("destination-translation")
-                src_trans = rule.find("source-translation")
+            if dst_trans is not None:
+                translated_ip = text_val(dst_trans, "translated-address")
+                translated_port_str = text_val(dst_trans, "translated-port")
+                dst_addrs = members(rule, "destination")
+                dst_ip_str = dst_addrs[0] if dst_addrs else None
 
-                if dst_trans is not None:
-                    translated_ip = text_val(dst_trans, "translated-address")
-                    translated_port_str = text_val(dst_trans, "translated-port")
-                    dst_addrs = members(rule, "destination")
-                    dst_ip_str = dst_addrs[0] if dst_addrs else None
+                if translated_ip and dst_ip_str:
+                    local_ip = _safe_addr(dst_ip_str)
+                    global_ip = _safe_addr(translated_ip)
+                    if local_ip and global_ip:
+                        translated_port = None
+                        if translated_port_str and translated_port_str.isdigit():
+                            translated_port = int(translated_port_str)
+                        static_entries.append(NATStaticEntry(
+                            local_ip=local_ip,
+                            global_ip=global_ip,
+                            local_port=translated_port,
+                            direction="outside",
+                        ))
 
-                    if translated_ip and dst_ip_str:
-                        local_ip = _safe_addr(dst_ip_str)
-                        global_ip = _safe_addr(translated_ip)
-                        if local_ip and global_ip:
-                            translated_port = None
-                            if translated_port_str and translated_port_str.isdigit():
-                                translated_port = int(translated_port_str)
-                            static_entries.append(NATStaticEntry(
-                                local_ip=local_ip,
-                                global_ip=global_ip,
-                                local_port=translated_port,
-                                direction="outside",
-                            ))
+            kind = _choice(rule, "source-translation")
+            if kind is None:
+                continue
+            src = rule.find(f"source-translation/{kind}")
+            acl_name = _nat_source_acl_name(rule_name)
 
-                # PAN-OS source NAT (dynamic PAT) — no external ACL reference in PAN-OS;
-                # source addresses are defined inline in the NAT rule.
-                # We skip NATDynamicEntry to avoid false dangling refs.
+            if kind == "static-ip":
+                # Source static NAT: <translated-address> is a TEXT node here.
+                translated = _safe_addr(text_val(src, "translated-address"))
+                src_addrs = members(rule, "source")
+                local_ip = _safe_addr(src_addrs[0]) if src_addrs else None
+                if translated and local_ip:
+                    static_entries.append(NATStaticEntry(
+                        local_ip=local_ip,
+                        global_ip=translated,
+                        direction="inside",
+                    ))
+                continue
+
+            # dynamic-ip-and-port (PAT) | dynamic-ip (no port overload)
+            iface = text_val(src, "interface-address/interface")
+            pool_members = members(src, "translated-address")
+            dynamic_entries.append(NATDynamicEntry(
+                direction="inside",
+                acl=acl_name,
+                pool=pool_members[0] if pool_members else None,
+                interface=iface,
+                overload=(kind == "dynamic-ip-and-port"),
+            ))
 
         if not static_entries and not dynamic_entries:
             return None
@@ -719,8 +1132,8 @@ class PANOSParser(BaseParser):
     # Stubs for unused abstract methods
     # ------------------------------------------------------------------
 
-    def parse_route_maps(self):
-        return []
-
     def parse_prefix_lists(self):
+        # PAN-OS has no named prefix-list object: BGP policy rules carry their
+        # prefixes inline (match/address-prefix), which parse_route_maps keeps
+        # on the policy node itself.
         return []
