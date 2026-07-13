@@ -764,6 +764,11 @@ class BaseParser(ABC):
                         if intf.name in area_intfs or intf.ospf_process_id == ospf.process_id:
                             intf.ospf_passive = True
 
+        # CCR-0038 Theme 2: attribute OSPF settings written INSIDE the routing
+        # process back onto the interface they name. One shared walk for every
+        # OS — see _backfill_ospf_interface_settings.
+        self._backfill_ospf_interface_settings(pc)
+
         # Change-IR Phase 3: native op emission for migrated command
         # families (CCR change_ir_proposal_operations.md, Appendix D).
         # Runs LAST so op values reflect the final parsed state (all
@@ -772,6 +777,88 @@ class BaseParser(ABC):
         self._attach_native_change_ops(pc)
 
         return pc
+
+    # OSPFInterfaceConfig field → InterfaceConfig field. THE table for CCR-0038
+    # Theme 2: attributing the (N+1)th process-scoped OSPF setting back onto the
+    # interface is one row here, not one branch per OS.
+    #
+    # A parser writes `process_id` into its OSPFInterfaceConfig only when the
+    # device really HAS one. IOS-XR does (`router ospf 1`). PAN-OS does not — its
+    # OSPFConfig.process_id of 1 is confgraph's own invention for a vendor with no
+    # process concept — so the PAN-OS parser leaves it None and this row writes
+    # nothing there. Asserting an invented process id onto an interface would also
+    # manufacture an unresolvable interface→ospf_instance reference in the
+    # DependencyResolver, which keys that node by `iface.vrf` while PAN-OS records
+    # an interface's virtual-router in `virtual_router` (a real resolver/model
+    # mismatch, and a follow-up — but not one to smuggle in here).
+    _OSPF_IFACE_BACKFILL: tuple[tuple[str, str], ...] = (
+        ("area_id",            "ospf_area"),
+        ("process_id",         "ospf_process_id"),
+        ("cost",               "ospf_cost"),
+        ("priority",           "ospf_priority"),
+        ("hello_interval",     "ospf_hello_interval"),
+        ("dead_interval",      "ospf_dead_interval"),
+        ("network_type",       "ospf_network_type"),
+        ("passive",            "ospf_passive"),
+        ("authentication",     "ospf_authentication"),
+        ("authentication_key", "ospf_authentication_key"),
+        ("mtu_ignore",         "ospf_mtu_ignore"),
+        ("bfd_interval",       "bfd_interval"),
+        ("bfd_min_rx",         "bfd_min_rx"),
+        ("bfd_multiplier",     "bfd_multiplier"),
+    )
+
+    def _backfill_ospf_interface_settings(self, pc: ParsedConfig) -> None:
+        """Carry ``area > interface`` OSPF settings out to ``InterfaceConfig``.
+
+        Half the vendors confgraph parses configure OSPF **on the interface**
+        (IOS/NX-OS/EOS: ``ip ospf cost 100``) and half configure it **inside the
+        routing process** (IOS-XR/JunOS/PAN-OS: ``router ospf 1 > area 0 >
+        interface Gi0/0/0/0 > cost 100``).  ``InterfaceConfig.ospf_cost`` is the
+        universal home either way: a consumer asking what a link's OSPF cost is
+        must not have to know which vendor wrote the config, and must not read
+        ``None`` and be unable to tell "no cost configured" from "this parser
+        cannot see cost on this OS" ([[CCR-0038]] Theme 2).
+
+        So the process-scoped parsers put an ``OSPFInterfaceConfig`` in
+        ``OSPFArea.interface_settings[<name>]`` — a MODEL structure, not a
+        private per-parser dict — and this one walk, shared by every parser,
+        attributes it onto the ``InterfaceConfig`` of that name.  Three
+        OS-specific back-fills (JunOS's ``_ospf_intf_attrs``, PAN-OS's
+        ``_ospf_interface_attrs``, and IOS-XR's missing one) collapse into this.
+
+        **A parsed value never loses to a back-filled one.**  A field is written
+        only where the interface still holds the model default, so an explicit
+        ``ip ospf cost`` on the interface always wins, and the walk is a no-op on
+        IOS/NX-OS/EOS — which populate ``interface_settings`` for nobody.
+        """
+        if not pc.ospf_instances or not pc.interfaces:
+            return
+
+        intf_by_name = {i.name: i for i in pc.interfaces}
+        for ospf in pc.ospf_instances:
+            for area in ospf.areas:
+                for name, settings in area.interface_settings.items():
+                    intf = intf_by_name.get(name)
+                    if intf is None:
+                        continue
+                    for src_field, dst_field in self._OSPF_IFACE_BACKFILL:
+                        value = getattr(settings, src_field, None)
+                        # None/False = "the vendor did not say", never "off".
+                        if value is None or value is False:
+                            continue
+                        # Never clobber a value the interface block itself set.
+                        #
+                        # Compared with `is`, not `in (None, False)`: in Python
+                        # `0 == False`, so a membership test would read an
+                        # explicitly parsed ZERO as "unset" and overwrite it.
+                        # `ip ospf priority 0` is a real, meaningful value — it
+                        # says "never become DR" — and silently promoting it to a
+                        # back-filled 33 would invert the operator's intent.
+                        current = getattr(intf, dst_field, None)
+                        if current is not None and current is not False:
+                            continue
+                        setattr(intf, dst_field, value)
 
     def _attach_native_change_ops(self, pc: ParsedConfig) -> None:
         """Hook: populate ``pc.native_change_ops`` for migrated families.

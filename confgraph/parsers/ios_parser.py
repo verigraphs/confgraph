@@ -361,6 +361,40 @@ class IOSParser(BaseParser):
         r"^\s+ip\s+vrf\s+forwarding\s+(?P<vrf>\S+)\s*$",
     )
 
+    # ---- VRF BODY vocabulary (CCR-0038 Theme 1) -----------------------------
+    #
+    # The four Cisco-family parsers each walk a VRF block with its own header
+    # spelling ("vrf definition" / "vrf instance" / "vrf context" / bare "vrf")
+    # and its own nesting, but the BODY LINES they meet are one vocabulary. It
+    # used to be re-implemented in each parse_vrfs, and so `description` — the
+    # single most widely-missing field in confgraph — was in none of them.
+    #
+    # It now lives here once. A field's accepted spellings are one PatternSet,
+    # every dialect exposing the same `val` group; a subclass adds its native
+    # spelling with `.extended(...)` (handbook §7.3) and inherits the rest. All
+    # four walks feed every body line through `_apply_vrf_body_line`, so the
+    # (N+1)th VRF body command is one entry here, not four.
+    _VRF_SCALAR_PATTERNS: dict[str, PatternSet] = {
+        "description": PatternSet(r"^description\s+(?P<val>.+?)\s*$"),
+        # IOS-XE / classic IOS: "route-map <NAME> import|export".
+        "route_map_import": PatternSet(r"^route-map\s+(?P<val>\S+)\s+import\b"),
+        "route_map_export": PatternSet(r"^route-map\s+(?P<val>\S+)\s+export\b"),
+    }
+
+    def _apply_vrf_body_line(self, vrf_data: dict, text: str) -> None:
+        """Apply one VRF body line to *vrf_data* using ``_VRF_SCALAR_PATTERNS``.
+
+        *text* is the stripped body line. First dialect to match a field wins;
+        later lines overwrite earlier ones (last-match-wins, as the CLI merges).
+        Quotes around a description value are stripped — EOS renders a multi-word
+        description both quoted and bare across its own transcripts.
+        """
+        for field, patterns in self._VRF_SCALAR_PATTERNS.items():
+            m = patterns.match(text)
+            if m:
+                vrf_data[field] = m.group("val").strip().strip('"')
+                return
+
     # Static route line. Traditional "DEST MASK NH" and CIDR "DEST/PLEN NH"
     # (NX-OS global routes reach this by inheritance).
     _STATIC_ROUTE_PATTERNS = PatternSet(
@@ -406,6 +440,24 @@ class IOSParser(BaseParser):
         r"^ip\s+sla\s+(?P<id>\d+)$",
         r"^ip\s+sla\s+monitor\s+(?P<id>\d+)$",
     )
+
+    # Line block header (CCR-0038 Theme 4). IOS numbers its lines — `line vty 0 4`,
+    # `line con 0` — and that number is MANDATORY in this dialect. NX-OS and IOS-XR
+    # do not number lines at all, and each declares its own header here rather than
+    # re-implementing the body walk, which is identical across the family.
+    _LINE_HEADER_PATTERNS = PatternSet(
+        r"^line\s+(?P<type>con(?:sole)?|vty|aux|tty)\s+(?P<first>\d+)(?:\s+(?P<last>\d+))?",
+    )
+
+    # Header keyword → LineType. A dialect that introduces a new keyword adds one
+    # entry here; the walk itself never grows an `elif`.
+    _LINE_TYPES: dict[str, LineType] = {
+        "con": LineType.CONSOLE,
+        "console": LineType.CONSOLE,
+        "vty": LineType.VTY,
+        "aux": LineType.AUX,
+        "tty": LineType.TTY,
+    }
 
     # "enable BFD on every interface in this OSPF process". IOS spells it
     # "bfd all-interfaces"; EOS extends this set with its own "bfd default".
@@ -538,8 +590,7 @@ class IOSParser(BaseParser):
             rt_import = []
             rt_export = []
             rt_both = []
-            route_map_import = None
-            route_map_export = None
+            scalars: dict = {}
 
             for child in vrf_obj.all_children:
                 text = child.text.strip()
@@ -555,14 +606,10 @@ class IOSParser(BaseParser):
                     rt_val = self._extract_match(text, r"route-target\s+both\s+(\S+)")
                     if rt_val and rt_val not in rt_both:
                         rt_both.append(rt_val)
-                elif text.startswith("route-map") and "import" in text:
-                    route_map_import = self._extract_match(
-                        text, r"route-map\s+(\S+)\s+import"
-                    )
-                elif text.startswith("route-map") and "export" in text:
-                    route_map_export = self._extract_match(
-                        text, r"route-map\s+(\S+)\s+export"
-                    )
+                else:
+                    # description / route-map import / route-map export and every
+                    # future VRF body command — one shared vocabulary (Theme 1).
+                    self._apply_vrf_body_line(scalars, text)
 
             vrfs.append(
                 VRFConfig(
@@ -575,8 +622,7 @@ class IOSParser(BaseParser):
                     route_target_import=rt_import,
                     route_target_export=rt_export,
                     route_target_both=rt_both,
-                    route_map_import=route_map_import,
-                    route_map_export=route_map_export,
+                    **scalars,
                 )
             )
 
@@ -6625,23 +6671,21 @@ class IOSParser(BaseParser):
 
             def _ensure_af_nb_entry(peer: str) -> None:
                 if peer not in af_nb_data:
-                    af_nb_data[peer] = {
+                    # Seed with the shared peer-command defaults so the shared
+                    # applier always finds every key it may write, then add the
+                    # AF-block-only fields.
+                    data = _default_pg_data(peer)
+                    data.pop("name", None)
+                    data.update({
                         # Default True — consistent with BGPNeighborAF model default.
                         # Only 'no neighbor X activate' overrides this to False.
                         "activate": True,
-                        "next_hop_self": False,
-                        "route_map_in": None,
-                        "route_map_out": None,
-                        "prefix_list_in": None,
-                        "prefix_list_out": None,
-                        "filter_list_in": None,
-                        "filter_list_out": None,
                         "default_originate_route_map": None,
-                        "maximum_prefix": None,
                         "maximum_prefix_warning_only": False,
                         "advertise_map": None,
                         "exist_map": None,
-                    }
+                    })
+                    af_nb_data[peer] = data
 
             # 'no neighbor X activate' — explicit AF deactivation
             nb_no_lines = af_child.find_child_objects(r"^\s+no\s+neighbor\s+(\S+)\s+activate")
@@ -6662,35 +6706,32 @@ class IOSParser(BaseParser):
 
                 _ensure_af_nb_entry(peer_str)
 
+                # The neighbor policy vocabulary — route-map / prefix-list /
+                # filter-list / maximum-prefix / next-hop-self /
+                # route-reflector-client / send-community — is the SAME vocabulary
+                # whether the line sits under `router bgp` or inside an
+                # `address-family` block, so it is read by the one shared applier
+                # (base.apply_peer_group_command) rather than transcribed a second
+                # time here. It was transcribed a second time here, the copy never
+                # learned `send-community`, and so `neighbor X send-community both`
+                # inside an AF block reached the model as None on IOS — while the
+                # identical line at the global level parsed fine ([[CCR-0038]]).
+                #
+                # Extra keys the shared vocabulary writes are dropped below by the
+                # BGPNeighborAF field filter, so it can grow without breaking this
+                # call site.
+                apply_peer_group_command(af_nb_data[peer_str], cmd)
+
+                # AF-block-only commands — no peer-group counterpart, so they are
+                # not part of the shared vocabulary.
                 if cmd == "activate":
                     af_nb_data[peer_str]["activate"] = True
-                elif cmd == "next-hop-self":
-                    af_nb_data[peer_str]["next_hop_self"] = True
-                elif cmd.startswith("route-map ") and cmd.endswith(" in"):
-                    af_nb_data[peer_str]["route_map_in"] = cmd[len("route-map "):-3].strip()
-                elif cmd.startswith("route-map ") and cmd.endswith(" out"):
-                    af_nb_data[peer_str]["route_map_out"] = cmd[len("route-map "):-4].strip()
-                elif cmd.startswith("prefix-list ") and cmd.endswith(" in"):
-                    af_nb_data[peer_str]["prefix_list_in"] = cmd[len("prefix-list "):-3].strip()
-                elif cmd.startswith("prefix-list ") and cmd.endswith(" out"):
-                    af_nb_data[peer_str]["prefix_list_out"] = cmd[len("prefix-list "):-4].strip()
-                elif cmd.startswith("filter-list ") and cmd.endswith(" in"):
-                    af_nb_data[peer_str]["filter_list_in"] = cmd[len("filter-list "):-3].strip()
-                elif cmd.startswith("filter-list ") and cmd.endswith(" out"):
-                    af_nb_data[peer_str]["filter_list_out"] = cmd[len("filter-list "):-4].strip()
                 elif cmd.startswith("default-originate"):
                     rm_m = re.search(r"route-map\s+(\S+)", cmd)
                     if rm_m:
                         af_nb_data[peer_str]["default_originate_route_map"] = rm_m.group(1)
-                elif cmd.startswith("maximum-prefix "):
-                    parts = cmd.replace("maximum-prefix ", "").split()
-                    if parts:
-                        try:
-                            af_nb_data[peer_str]["maximum_prefix"] = int(parts[0])
-                        except ValueError:
-                            pass
-                        if "warning-only" in parts:
-                            af_nb_data[peer_str]["maximum_prefix_warning_only"] = True
+                elif cmd.startswith("maximum-prefix ") and "warning-only" in cmd:
+                    af_nb_data[peer_str]["maximum_prefix_warning_only"] = True
                 elif cmd.startswith("advertise-map "):
                     # advertise-map ADVERTISE-MAP exist-map EXIST-MAP
                     am_m = re.match(r"advertise-map\s+(\S+)\s+exist-map\s+(\S+)", cmd)
@@ -6710,22 +6751,17 @@ class IOSParser(BaseParser):
                 has_content = any(v for v in data.values() if v) or not data.get("activate", True)
                 if not has_content:
                     continue
+                # Keep only what BGPNeighborAF models. The shared vocabulary also
+                # writes peer-level keys (remote_as, timers, password, …) that
+                # have no address-family meaning; dropping them here is what lets
+                # the vocabulary grow in ONE place without breaking this walk.
                 af_entry = BGPNeighborAF(
                     afi=afi,
                     safi=safi,
-                    activate=data["activate"],
-                    next_hop_self=data.get("next_hop_self", False),
-                    route_map_in=data["route_map_in"],
-                    route_map_out=data["route_map_out"],
-                    prefix_list_in=data["prefix_list_in"],
-                    prefix_list_out=data["prefix_list_out"],
-                    filter_list_in=data["filter_list_in"],
-                    filter_list_out=data["filter_list_out"],
-                    default_originate_route_map=data["default_originate_route_map"],
-                    maximum_prefix=data["maximum_prefix"],
-                    maximum_prefix_warning_only=data["maximum_prefix_warning_only"],
-                    advertise_map=data.get("advertise_map"),
-                    exist_map=data.get("exist_map"),
+                    **{
+                        k: v for k, v in data.items()
+                        if k in BGPNeighborAF.model_fields and k not in ("afi", "safi")
+                    },
                 )
                 nb = nb_index.get(peer_str)
                 if nb is not None:
@@ -9810,27 +9846,34 @@ class IOSParser(BaseParser):
     # -------------------------------------------------------------------------
 
     def parse_lines(self) -> list[LineConfig]:
-        """Parse line (console, VTY, aux, TTY) configurations."""
+        """Parse line (console, VTY, aux, TTY, template) configurations.
+
+        The header spelling is the ONLY thing that differs across the Cisco
+        family, and it lives in ``_LINE_HEADER_PATTERNS`` — one entry per
+        dialect. The body (exec-timeout, transport input, access-class, …) is one
+        vocabulary that every OS shares, so a subclass declares its header and
+        inherits the whole walk. NX-OS (`line vty`, no number) and IOS-XR
+        (`line default`) parsed to ``p.lines == []`` purely because this method
+        was hard-wired to the IOS header, which demands a line NUMBER
+        ([[CCR-0038]] Theme 4).
+        """
         parse = self._get_parse_obj()
         lines = []
 
-        for line_obj in parse.find_objects(r"^line\s+(con|vty|aux|tty)\s+"):
-            m = re.match(r"^line\s+(con(?:sole)?|vty|aux|tty)\s+(\d+)(?:\s+(\d+))?", line_obj.text)
+        for line_obj in parse.find_objects(self._LINE_HEADER_PATTERNS.union):
+            m = self._LINE_HEADER_PATTERNS.match(line_obj.text)
             if not m:
                 continue
 
-            raw_type = m.group(1)
-            first_line = int(m.group(2))
-            last_line = int(m.group(3)) if m.group(3) else None
+            groups = m.groupdict()
+            raw_type = groups.get("type") or ""
+            first_raw = groups.get("first")
+            last_raw = groups.get("last")
+            first_line = int(first_raw) if first_raw else None
+            last_line = int(last_raw) if last_raw else None
+            line_name = groups.get("name")
 
-            if raw_type.startswith("con"):
-                line_type = LineType.CONSOLE
-            elif raw_type == "vty":
-                line_type = LineType.VTY
-            elif raw_type == "aux":
-                line_type = LineType.AUX
-            else:
-                line_type = LineType.TTY
+            line_type = self._LINE_TYPES.get(raw_type, LineType.TTY)
 
             raw_lines, line_numbers = self._get_raw_lines_and_line_numbers(line_obj)
 
@@ -9936,12 +9979,19 @@ class IOSParser(BaseParser):
             if fcc:
                 flowcontrol = self._extract_match(fcc[0].text, r"^\s+flowcontrol\s+(\S+)")
 
+            # An unnumbered line (NX-OS `line vty`, IOS-XR `line default`) has no
+            # number to key on; the type — or the template name — is the identity.
+            suffix = (
+                str(first_line) if first_line is not None
+                else (line_name or "default")
+            )
             lines.append(LineConfig(
-                object_id=f"line_{raw_type}_{first_line}",
+                object_id=f"line_{raw_type}_{suffix}",
                 raw_lines=raw_lines,
                 source_os=self.os_type,
                 line_numbers=line_numbers,
                 line_type=line_type,
+                name=line_name,
                 first_line=first_line,
                 last_line=last_line,
                 exec_timeout_minutes=exec_timeout_minutes,
@@ -10473,7 +10523,17 @@ class IOSParser(BaseParser):
                         op_type = op
                         parts = ct.split()
                         destination = parts[1] if len(parts) > 1 else None
-                        src_m = re.search(r"source-ipaddr\s+(\S+)", ct)
+                        # The operation line carries the source, and it names it
+                        # EITHER by interface OR by address — the two are
+                        # alternatives in one optional bracket group
+                        # (`icmp-echo {dest} [source-ip {ip} | source-interface
+                        # {name}]`), so they get separate fields and neither is
+                        # written into the other. `source-ipaddr` is the
+                        # udp-jitter/udp-echo spelling of the same idea.
+                        si_m = re.search(r"source-interface\s+(\S+)", ct)
+                        if si_m:
+                            source_interface = si_m.group(1)
+                        src_m = re.search(r"source-ip(?:addr)?\s+(\S+)", ct)
                         if src_m:
                             try:
                                 from ipaddress import IPv4Address

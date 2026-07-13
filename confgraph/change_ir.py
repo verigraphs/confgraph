@@ -2537,6 +2537,32 @@ def is_native_policy_op(op: "ChangeOp") -> bool:
     )
 
 
+def _line_key(l: Any) -> tuple[str, ...]:
+    """Stable identity segments for a line block.
+
+    A line block is identified by its type plus whatever the OS uses to tell two
+    blocks of that type apart — and that is NOT always a number:
+
+      * IOS NUMBERS them        — ``line vty 0 4``, ``line con 0``
+      * IOS-XR NAMES them       — ``line template NETOPS`` (and several may coexist;
+                                   ``vty-pool default 0 4 line-template NETOPS``
+                                   exists precisely to bind one of them)
+      * NX-OS has exactly one of each — a bare ``line vty``, no number at all
+
+    Keying on ``first_line`` alone was safe only while it was a required int. Once
+    unnumbered lines became representable ([[CCR-0038]] Theme 4), every
+    ``line template`` collapsed onto the single identity path
+    ``('lines', 'template', 'None')`` — and ``lines`` is a
+    ``simple_keyed_list_key`` (family-8d) collection whose exact-path dedupe in
+    :func:`derive_ops` assumes identity paths are unique. The number, when there
+    is one, still keys exactly as before, so IOS paths are unchanged.
+    """
+    discriminator = (
+        str(l.first_line) if l.first_line is not None else (l.name or "")
+    )
+    return (str(l.line_type), discriminator)
+
+
 def _static_nh_key(r: Any) -> str:
     """Stable NH identity segment for a static route (mirrors merger identity)."""
     nh = r.next_hop
@@ -2561,7 +2587,7 @@ _TOP_LIST_KEYS: dict[str, Callable[[Any], tuple[str, ...]]] = {
     "community_lists": lambda c: (c.name,),
     "as_path_lists": lambda a: (a.name,),
     "static_routes": lambda r: (r.vrf or "", str(r.destination), _static_nh_key(r)),
-    "lines": lambda l: (str(l.line_type), str(l.first_line)),
+    "lines": _line_key,
     "class_maps": lambda c: (c.name,),
     "policy_maps": lambda p: (p.name,),
     "ip_sla_operations": lambda s: (str(s.sla_id),),

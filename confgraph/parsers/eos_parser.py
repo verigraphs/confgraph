@@ -276,18 +276,13 @@ class EOSParser(IOSParser):
                     if rt_val:
                         rt_both.append(rt_val)
 
-            # Extract route-maps
-            route_map_import = None
-            route_map_export = None
+            # description / route-map import / route-map export — the shared VRF
+            # body vocabulary on IOSParser (CCR-0038 Theme 1). EOS adds no
+            # dialect of its own here; it simply stopped re-implementing the
+            # walk, and thereby inherited `description`.
+            scalars: dict = {}
             for child in vrf_obj.children:
-                if "route-map" in child.text and "import" in child.text:
-                    route_map_import = self._extract_match(
-                        child.text, r"route-map\s+(\S+)\s+import"
-                    )
-                elif "route-map" in child.text and "export" in child.text:
-                    route_map_export = self._extract_match(
-                        child.text, r"route-map\s+(\S+)\s+export"
-                    )
+                self._apply_vrf_body_line(scalars, child.text.strip())
 
             vrfs.append(
                 VRFConfig(
@@ -300,8 +295,7 @@ class EOSParser(IOSParser):
                     route_target_import=rt_import,
                     route_target_export=rt_export,
                     route_target_both=rt_both,
-                    route_map_import=route_map_import,
-                    route_map_export=route_map_export,
+                    **scalars,
                 )
             )
 

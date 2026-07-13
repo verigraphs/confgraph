@@ -12,13 +12,33 @@ class LineType(str, Enum):
     VTY = "vty"
     AUX = "aux"
     TTY = "tty"
+    #: IOS-XR ``line default`` — the settings template applied to every line that
+    #: has no more specific template. Not a numbered line, and not a console.
+    DEFAULT = "default"
+    #: IOS-XR ``line template <name>`` — a named, reusable settings template.
+    TEMPLATE = "template"
 
 
 class LineConfig(BaseConfigObject):
-    """Configuration for a console, VTY, AUX, or TTY line."""
+    """Configuration for a console, VTY, AUX, TTY, or template line.
+
+    ``first_line`` is OPTIONAL because a numbered line is an IOS habit, not a
+    universal one: IOS writes ``line vty 0 4``, but NX-OS writes a bare
+    ``line vty`` (no number, no range) and IOS-XR writes ``line default`` /
+    ``line console`` / ``line template <name>``. Forcing an invented number onto
+    those would be a fabricated value; ``None`` honestly says "this OS does not
+    number this line" ([[CCR-0038]] Theme 4).
+    """
 
     line_type: LineType = Field(..., description="Line type")
-    first_line: int = Field(..., description="First line number")
+    name: str | None = Field(
+        default=None,
+        description="Template name, for IOS-XR `line template <name>`",
+    )
+    first_line: int | None = Field(
+        default=None,
+        description="First line number (None when the OS does not number lines)",
+    )
     last_line: int | None = Field(default=None, description="Last line number (for ranges like vty 0 4)")
     exec_timeout_minutes: int | None = Field(default=None, description="Exec timeout minutes")
     exec_timeout_seconds: int | None = Field(default=None, description="Exec timeout seconds")

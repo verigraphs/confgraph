@@ -47,6 +47,45 @@ class NXOSParser(IOSParser):
 
     _KNOWN_TOP_LEVEL_PATTERNS: list[str] = _NXOS_KNOWN_PATTERNS
 
+    # CCR-0038 Theme 1 — the NX-OS dialect of the shared VRF body vocabulary.
+    # The CLI token that applies a route-map to VRF import/export is the bare
+    # word `map`, NOT `route-map`:
+    #
+    #     vrf context CUSTOMER_A
+    #       address-family ipv4 unicast
+    #         import map RM_VRF_IN
+    #         export map RM_VRF_OUT
+    #
+    # (`import map <rmap-name> [evpn]` / `export map <rmap-name>`, command mode
+    # /exec/configure/vrf-af-ipv4. The string "import route-map" appears nowhere
+    # in the NX-OS command reference — a fixture carrying it was testing a line
+    # no Nexus emits.) `description` needs no entry: it is spelled the same as on
+    # IOS and comes free from the parent set — which is the whole point of
+    # extending rather than re-implementing.
+    _VRF_SCALAR_PATTERNS = {
+        **IOSParser._VRF_SCALAR_PATTERNS,
+        "route_map_import": IOSParser._VRF_SCALAR_PATTERNS["route_map_import"].extended(
+            r"^import\s+map\s+(?P<val>\S+)",
+        ),
+        "route_map_export": IOSParser._VRF_SCALAR_PATTERNS["route_map_export"].extended(
+            r"^export\s+map\s+(?P<val>\S+)",
+        ),
+    }
+
+    # CCR-0038 Theme 4 — the NX-OS line dialect. NX-OS lines carry NO NUMBER and
+    # no range: the grammar is the bare `line vty` and the bare `line console`
+    # (command mode /exec/configure). `line vty 0 4` is the IOS spelling and has
+    # no NX-OS counterpart, so the inherited IOS header — which requires a digit
+    # — matched nothing and `p.lines` came back empty on every Nexus.
+    #
+    # The BODY (exec-timeout, session-limit, access-class, transport input …) is
+    # the shared walk in IOSParser.parse_lines; only the header differs, so only
+    # the header is declared here. Note NX-OS `exec-timeout` takes MINUTES only,
+    # which the shared body regex already handles (the seconds group is optional).
+    _LINE_HEADER_PATTERNS = IOSParser._LINE_HEADER_PATTERNS.extended(
+        r"^line\s+(?P<type>vty|console)\s*$",
+    )
+
     def __init__(self, config_text: str):
         super().__init__(config_text, os_type=OSType.NXOS)
         # Re-initialize with nxos syntax for CiscoConfParse
@@ -86,8 +125,7 @@ class NXOSParser(IOSParser):
                     "rt_import": [],
                     "rt_export": [],
                     "rt_both": [],
-                    "route_map_import": None,
-                    "route_map_export": None,
+                    "scalars": {},
                 }
             else:
                 vrf_map[vrf_name]["raw_lines"].extend(raw_lines)
@@ -114,10 +152,11 @@ class NXOSParser(IOSParser):
                     val = self._extract_match(text, r"route-target\s+both\s+(\S+)")
                     if val and val not in entry["rt_both"]:
                         entry["rt_both"].append(val)
-                elif text.startswith("route-map") and "import" in text:
-                    entry["route_map_import"] = self._extract_match(text, r"route-map\s+(\S+)\s+import")
-                elif text.startswith("route-map") and "export" in text:
-                    entry["route_map_export"] = self._extract_match(text, r"route-map\s+(\S+)\s+export")
+                else:
+                    # description (direct child of `vrf context`) and
+                    # import/export map (under address-family) — the shared VRF
+                    # body vocabulary, NX-OS dialect (CCR-0038 Theme 1).
+                    self._apply_vrf_body_line(entry["scalars"], text)
 
         for vrf_name, entry in vrf_map.items():
             vrfs.append(
@@ -131,8 +170,7 @@ class NXOSParser(IOSParser):
                     route_target_import=entry["rt_import"],
                     route_target_export=entry["rt_export"],
                     route_target_both=entry["rt_both"],
-                    route_map_import=entry["route_map_import"],
-                    route_map_export=entry["route_map_export"],
+                    **entry["scalars"],
                 )
             )
 

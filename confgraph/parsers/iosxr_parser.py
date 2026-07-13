@@ -17,10 +17,12 @@ from confgraph.models.bgp import (
 from confgraph.models.acl import ACLConfig, ACLEntry
 from confgraph.models.static_route import StaticRoute
 from confgraph.models.multicast import MulticastConfig, PIMRPAddress
+from confgraph.models.line import LineType
 from confgraph.models.ospf import (
     OSPFConfig,
     OSPFArea,
     OSPFAreaType,
+    OSPFInterfaceConfig,
     OSPFRange,
     OSPFRedistribute,
 )
@@ -50,6 +52,10 @@ _IOSXR_KNOWN_PATTERNS: list[str] = [
     )
 ] + [
     r"^vrf\s+\S+",           # "vrf CUSTOMER_A"
+    # XR lines are unnumbered templates, not IOS's "line vty 0 4" — the base
+    # pattern only claims (con|vty|aux|tty), so these blocks were disclosed as
+    # unrecognized. parse_lines consumes them now (CCR-0038 Theme 4).
+    r"^line\s+(default|console|template)",
     r"^route-policy",         # IOS-XR route-policy
     r"^prefix-set",           # IOS-XR prefix-set
     r"^as-path-set",          # IOS-XR as-path-set
@@ -78,6 +84,45 @@ class IOSXRParser(IOSParser):
     # known-child lists would false-flag consumed lines. Needs an XR-specific
     # registry — see CCR confgraph_unrecognized_child_lines_in_claimed_blocks.md.
     _KNOWN_CHILD_PATTERNS: list[tuple[str, list[str]]] = []
+
+    # CCR-0038 Theme 1 — the IOS-XR dialect of the shared VRF body vocabulary.
+    # XR names a *route-policy*, not a route-map, and puts the verb first:
+    # `import route-policy RP-VRF-IN` / `export route-policy RP-VRF-OUT`.
+    # `description` is spelled as everywhere else and comes free from the parent.
+    _VRF_SCALAR_PATTERNS = {
+        **IOSParser._VRF_SCALAR_PATTERNS,
+        "route_map_import": IOSParser._VRF_SCALAR_PATTERNS["route_map_import"].extended(
+            r"^import\s+route-policy\s+(?P<val>\S+)",
+        ),
+        "route_map_export": IOSParser._VRF_SCALAR_PATTERNS["route_map_export"].extended(
+            r"^export\s+route-policy\s+(?P<val>\S+)",
+        ),
+    }
+
+    # CCR-0038 Theme 4 — the IOS-XR line dialect. XR has no numbered vty lines at
+    # all: it configures `line default` (the template every unmatched line
+    # inherits), `line console`, and named `line template <name>` blocks. The
+    # inherited IOS header requires (con|vty|aux|tty) followed by a DIGIT, so it
+    # matched none of them and `p.lines` was empty on every XR device.
+    #
+    # `vty-pool default 0 4 line-template test` is deliberately NOT matched here:
+    # it is a single top-level line that BINDS a template to a vty range, not a
+    # line block, and parsing it as one would invent a block that does not exist.
+    #
+    # Only the header is declared; the body (exec-timeout, transport input,
+    # access-class …) is the shared walk in IOSParser.parse_lines. Note XR emits
+    # `exec-timeout <minutes> <seconds>` with BOTH operands always present, which
+    # the shared body regex already reads.
+    _LINE_HEADER_PATTERNS = IOSParser._LINE_HEADER_PATTERNS.extended(
+        r"^line\s+(?P<type>template)\s+(?P<name>\S+)",
+        r"^line\s+(?P<type>default|console)\s*$",
+    )
+
+    _LINE_TYPES = {
+        **IOSParser._LINE_TYPES,
+        "default": LineType.DEFAULT,
+        "template": LineType.TEMPLATE,
+    }
 
     def __init__(self, config_text: str):
         super().__init__(config_text, os_type=OSType.IOS_XR)
@@ -146,19 +191,11 @@ class IOSXRParser(IOSParser):
                 elif in_export_rt and re.match(r"\d+:\d+", text):
                     rt_export.append(text)
 
-            # Route-policy import/export
-            route_map_import = None
-            route_map_export = None
+            # description + import/export route-policy — the shared VRF body
+            # vocabulary, IOS-XR dialect (CCR-0038 Theme 1).
+            scalars: dict = {}
             for child in vrf_obj.all_children:
-                text = child.text.strip()
-                if text.startswith("import route-policy "):
-                    route_map_import = self._extract_match(
-                        text, r"import\s+route-policy\s+(\S+)"
-                    )
-                elif text.startswith("export route-policy "):
-                    route_map_export = self._extract_match(
-                        text, r"export\s+route-policy\s+(\S+)"
-                    )
+                self._apply_vrf_body_line(scalars, child.text.strip())
 
             vrfs.append(
                 VRFConfig(
@@ -171,8 +208,7 @@ class IOSXRParser(IOSParser):
                     route_target_import=rt_import,
                     route_target_export=rt_export,
                     route_target_both=rt_both,
-                    route_map_import=route_map_import,
-                    route_map_export=route_map_export,
+                    **scalars,
                 )
             )
 
@@ -630,7 +666,7 @@ class IOSXRParser(IOSParser):
             non_passive_interfaces: list[str] = []
 
             # Parse areas — IOS-XR has "area N" stanzas with nested interfaces
-            areas, passive_interfaces = self._parse_ospf_areas_iosxr(ospf_obj)
+            areas, passive_interfaces = self._parse_ospf_areas_iosxr(ospf_obj, process_id)
 
             # Redistribution
             redistribute = self._parse_ospf_redistribute_iosxr(ospf_obj)
@@ -804,7 +840,7 @@ class IOSXRParser(IOSParser):
             except ValueError:
                 pass
 
-        areas, passive_interfaces = self._parse_ospf_areas_iosxr(vrf_obj)
+        areas, passive_interfaces = self._parse_ospf_areas_iosxr(vrf_obj, process_id)
         redistribute = self._parse_ospf_redistribute_iosxr(vrf_obj)
 
         return OSPFConfig(
@@ -820,7 +856,9 @@ class IOSXRParser(IOSParser):
             redistribute=redistribute,
         )
 
-    def _parse_ospf_areas_iosxr(self, ospf_obj) -> tuple[list[OSPFArea], list[str]]:
+    def _parse_ospf_areas_iosxr(
+        self, ospf_obj, process_id: int | str | None = None
+    ) -> tuple[list[OSPFArea], list[str]]:
         """Parse OSPF areas with nested interface blocks (IOS-XR style).
 
         Returns a tuple of (areas, passive_interfaces).
@@ -847,6 +885,7 @@ class IOSXRParser(IOSParser):
                     "ranges": [],
                     "virtual_links": [],
                     "interfaces": [],
+                    "interface_settings": {},
                     "filter_list_in": None,
                     "filter_list_out": None,
                 }
@@ -920,17 +959,83 @@ class IOSXRParser(IOSParser):
             # Interfaces nested under area
             for intf_child in area_child.find_child_objects(r"^\s+interface\s+(\S+)"):
                 intf_name = self._extract_match(intf_child.text, r"^\s+interface\s+(\S+)")
-                if intf_name and intf_name not in area_dict[area_id]["interfaces"]:
+                if not intf_name:
+                    continue
+                if intf_name not in area_dict[area_id]["interfaces"]:
                     area_dict[area_id]["interfaces"].append(intf_name)
                 # IOS-XR marks passive with "passive enable" inside the interface block
-                if intf_name and intf_child.find_child_objects(r"^\s+passive\s+enable"):
+                if intf_child.find_child_objects(r"^\s+passive\s+enable"):
                     if intf_name not in passive_interfaces:
                         passive_interfaces.append(intf_name)
+                area_dict[area_id]["interface_settings"][intf_name] = (
+                    self._parse_ospf_area_interface(
+                        intf_child, intf_name, area_id, process_id
+                    )
+                )
 
         for area_data in area_dict.values():
             areas.append(OSPFArea(**area_data))
 
         return areas, passive_interfaces
+
+    # IOS-XR OSPF `area > interface` body → OSPFInterfaceConfig field. One row per
+    # setting; the regex's `val` group is the value, or the row is a bare flag
+    # (no group) whose presence means True.
+    #
+    # This is the extraction half of CCR-0038 Theme 2. The ATTRIBUTION half — the
+    # part that used to be missing entirely on IOS-XR, and duplicated per-OS on
+    # JunOS and PAN-OS — is BaseParser._backfill_ospf_interface_settings, shared
+    # by every parser. XR spells the cost `cost` (not `metric`, which is JunOS)
+    # and the network type `network point-to-point`.
+    _OSPF_AREA_IFACE_PATTERNS: tuple[tuple[str, str], ...] = (
+        ("cost",           r"^\s+cost\s+(?P<val>\d+)\s*$"),
+        ("priority",       r"^\s+priority\s+(?P<val>\d+)\s*$"),
+        ("hello_interval", r"^\s+hello-interval\s+(?P<val>\d+)\s*$"),
+        ("dead_interval",  r"^\s+dead-interval\s+(?P<val>\d+)\s*$"),
+        ("network_type",   r"^\s+network\s+(?P<val>point-to-point|broadcast|"
+                           r"non-broadcast|point-to-multipoint)\s*$"),
+        ("authentication", r"^\s+authentication\s+(?P<val>message-digest|null)\s*$"),
+        ("bfd_interval",   r"^\s+bfd\s+minimum-interval\s+(?P<val>\d+)\s*$"),
+        ("bfd_multiplier", r"^\s+bfd\s+multiplier\s+(?P<val>\d+)\s*$"),
+        # Bare flags — presence is the value.
+        ("bfd",            r"^\s+bfd\s+fast-detect\s*$"),
+        ("mtu_ignore",     r"^\s+mtu-ignore\s+enable\s*$"),
+        ("passive",        r"^\s+passive\s+enable\s*$"),
+    )
+
+    _OSPF_INT_FIELDS = frozenset({
+        "cost", "priority", "hello_interval", "dead_interval",
+        "bfd_interval", "bfd_multiplier",
+    })
+
+    def _parse_ospf_area_interface(
+        self, intf_child, intf_name: str, area_id: str,
+        process_id: int | str | None = None,
+    ) -> OSPFInterfaceConfig:
+        """One ``area N > interface NAME`` block → OSPFInterfaceConfig.
+
+        IOS-XR writes an interface's OSPF settings inside the routing process, so
+        ``parse_interfaces`` never sees them and ``InterfaceConfig.ospf_cost`` came
+        back None on every XR device — indistinguishable, to a consumer, from "no
+        cost configured" ([[CCR-0038]] Theme 2).
+        """
+        settings = OSPFInterfaceConfig(
+            name=intf_name, area_id=area_id, process_id=process_id
+        )
+        for child in intf_child.children:
+            text = child.text
+            for field, pattern in self._OSPF_AREA_IFACE_PATTERNS:
+                m = re.match(pattern, text)
+                if not m:
+                    continue
+                if "val" in m.groupdict():
+                    raw = m.group("val")
+                    value: object = int(raw) if field in self._OSPF_INT_FIELDS else raw
+                else:
+                    value = True  # bare flag
+                setattr(settings, field, value)
+                break
+        return settings
 
     def _parse_ospf_redistribute_iosxr(self, ospf_obj) -> list[OSPFRedistribute]:
         """Parse OSPF redistribution for IOS-XR (uses route-policy instead of route-map)."""
@@ -2196,20 +2301,13 @@ class IOSXRParser(IOSParser):
 
         pc = super().parse()
 
-        # X4: back-fill InterfaceConfig.ospf_area / ospf_process_id from
-        # OSPFArea.interfaces (IOS-XR stores membership on the area, not
-        # the interface).
-        if pc.ospf_instances:
-            for ospf in pc.ospf_instances:
-                for area in ospf.areas:
-                    for intf_name in area.interfaces:
-                        intf = next(
-                            (i for i in pc.interfaces if i.name == intf_name),
-                            None,
-                        )
-                        if intf and intf.ospf_area is None:
-                            intf.ospf_area = area.area_id
-                            intf.ospf_process_id = ospf.process_id
+        # X4 (back-fill ospf_area / ospf_process_id from OSPFArea.interfaces) is
+        # GONE: it was the IOS-XR copy of a back-fill that JunOS and PAN-OS each
+        # had their own copy of, and it carried only membership — never the cost,
+        # network type or BFD sitting one level deeper, inside the interface block.
+        # All four now run through the model (OSPFArea.interface_settings) and the
+        # one shared walk, BaseParser._backfill_ospf_interface_settings
+        # ([[CCR-0038]] Theme 2).
 
         # X6: populate VRF RD from BGP VRF block (IOS-XR puts RD under
         # "router bgp / vrf NAME / rd X:Y", not under "vrf NAME").

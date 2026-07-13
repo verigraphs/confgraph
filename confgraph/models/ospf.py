@@ -87,6 +87,79 @@ class OSPFVirtualLink(BaseModel):
     )
 
 
+class OSPFInterfaceConfig(BaseModel):
+    """OSPF interface-level configuration.
+
+    Two vendors' worth of grammar meet in this one object.
+
+    IOS / NX-OS / EOS configure OSPF **on the interface** (``ip ospf cost 100``),
+    so their parsers write straight into ``InterfaceConfig.ospf_*``.  IOS-XR,
+    JunOS and PAN-OS configure it **inside the routing process** — ``router ospf
+    1 > area 0 > interface Gi0/0/0/0 > cost 100`` — where ``parse_interfaces``
+    cannot see it.  Those parsers put one of these objects in
+    ``OSPFArea.interface_settings[<interface name>]``, and
+    ``BaseParser._backfill_ospf_interface_settings`` attributes it back onto the
+    ``InterfaceConfig`` of that name.
+
+    That back-fill is the ONLY consumer that matters: ``InterfaceConfig.ospf_*``
+    is the universal home for these settings, so a consumer asking "what is this
+    link's OSPF cost?" never has to know which vendor wrote the config
+    ([[CCR-0038]] Theme 2).
+
+    ``process_id`` / ``area_id`` are optional because an area-scoped settings
+    object is already keyed by its area — the parser fills them when it has them.
+    """
+
+    name: str | None = Field(
+        default=None, description="Interface name these settings belong to"
+    )
+    process_id: int | str | None = Field(default=None, description="OSPF process ID")
+    area_id: str | None = Field(default=None, description="OSPF area ID")
+    cost: int | None = Field(default=None, description="Interface cost override")
+    priority: int | None = Field(
+        default=None, description="Router priority for DR/BDR election"
+    )
+    hello_interval: int | None = Field(
+        default=None, description="Hello interval (seconds)"
+    )
+    dead_interval: int | None = Field(
+        default=None, description="Dead interval (seconds)"
+    )
+    retransmit_interval: int | None = Field(
+        default=None, description="Retransmit interval (seconds)"
+    )
+    transmit_delay: int | None = Field(
+        default=None, description="Transmit delay (seconds)"
+    )
+    network_type: str | None = Field(
+        default=None,
+        description="Network type ('point-to-point', 'broadcast', 'non-broadcast', 'point-to-multipoint')",
+    )
+    passive: bool = Field(default=False, description="Passive interface")
+    authentication: str | None = Field(
+        default=None, description="Authentication type ('message-digest', 'null')"
+    )
+    authentication_key: str | None = Field(
+        default=None, description="Authentication key (plain or simple)"
+    )
+    message_digest_keys: list[OSPFMDKey] = Field(
+        default_factory=list, description="Message-digest keys"
+    )
+    mtu_ignore: bool = Field(
+        default=False, description="Ignore MTU mismatch in DBD packets"
+    )
+    bfd: bool = Field(default=False, description="BFD enabled on this interface")
+    bfd_interval: int | None = Field(
+        default=None, description="BFD min transmit interval (ms)"
+    )
+    bfd_min_rx: int | None = Field(
+        default=None, description="BFD min receive interval (ms)"
+    )
+    bfd_multiplier: int | None = Field(
+        default=None, description="BFD detection multiplier"
+    )
+
+
 class OSPFArea(BaseModel):
     """OSPF area configuration."""
 
@@ -125,6 +198,16 @@ class OSPFArea(BaseModel):
         default_factory=list,
         description="Interface names in this area (references InterfaceConfig)",
     )
+    interface_settings: dict[str, OSPFInterfaceConfig] = Field(
+        default_factory=dict,
+        description=(
+            "Per-interface OSPF settings written INSIDE the routing process "
+            "(IOS-XR/JunOS/PAN-OS `area > interface > cost`), keyed by interface "
+            "name. BaseParser._backfill_ospf_interface_settings attributes these "
+            "back onto InterfaceConfig.ospf_*, which is the universal home. "
+            "Empty on IOS/NX-OS/EOS, which configure OSPF on the interface itself."
+        ),
+    )
     virtual_links: list[OSPFVirtualLink] = Field(
         default_factory=list, description="Virtual link configurations"
     )
@@ -140,51 +223,6 @@ class OSPFArea(BaseModel):
     class Config:
         """Pydantic model configuration."""
         use_enum_values = True
-
-
-class OSPFInterfaceConfig(BaseModel):
-    """OSPF interface-level configuration.
-
-    This is embedded within InterfaceConfig but also defined here
-    for reference and potential standalone use.
-    """
-
-    process_id: int | str = Field(..., description="OSPF process ID")
-    area_id: str = Field(..., description="OSPF area ID")
-    cost: int | None = Field(default=None, description="Interface cost override")
-    priority: int | None = Field(
-        default=None, description="Router priority for DR/BDR election"
-    )
-    hello_interval: int | None = Field(
-        default=None, description="Hello interval (seconds)"
-    )
-    dead_interval: int | None = Field(
-        default=None, description="Dead interval (seconds)"
-    )
-    retransmit_interval: int | None = Field(
-        default=None, description="Retransmit interval (seconds)"
-    )
-    transmit_delay: int | None = Field(
-        default=None, description="Transmit delay (seconds)"
-    )
-    network_type: str | None = Field(
-        default=None,
-        description="Network type ('point-to-point', 'broadcast', 'non-broadcast', 'point-to-multipoint')",
-    )
-    passive: bool = Field(default=False, description="Passive interface")
-    authentication: str | None = Field(
-        default=None, description="Authentication type ('message-digest', 'null')"
-    )
-    authentication_key: str | None = Field(
-        default=None, description="Authentication key (plain or simple)"
-    )
-    message_digest_keys: list[OSPFMDKey] = Field(
-        default_factory=list, description="Message-digest keys"
-    )
-    mtu_ignore: bool = Field(
-        default=False, description="Ignore MTU mismatch in DBD packets"
-    )
-    bfd: bool = Field(default=False, description="BFD enabled on this interface")
 
 
 class OSPFConfig(BaseConfigObject):

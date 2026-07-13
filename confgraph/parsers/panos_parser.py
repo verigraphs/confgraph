@@ -38,10 +38,11 @@ from confgraph.models.base import OSType, UnrecognizedBlock
 from confgraph.models.interface import InterfaceConfig, InterfaceType
 from confgraph.models.vrf import VRFConfig
 from confgraph.models.bgp import (
-    BGPConfig, BGPNeighbor, BGPPeerGroup, BGPRedistribute, BGPTimers,
+    BGPBestpathOptions, BGPConfig, BGPNeighbor, BGPPeerGroup, BGPRedistribute,
+    BGPTimers,
 )
 from confgraph.models.ospf import (
-    OSPFConfig, OSPFArea, OSPFAreaType, OSPFRedistribute,
+    OSPFConfig, OSPFArea, OSPFAreaType, OSPFInterfaceConfig, OSPFRedistribute,
 )
 from confgraph.models.route_map import (
     RouteMapConfig, RouteMapMatch, RouteMapSequence, RouteMapSet,
@@ -234,6 +235,15 @@ class PANOSParser(BaseParser):
                 object_id=f"vr_{name}",
                 source_os=self.os_type,
                 name=name,
+                # The interfaces ASSIGNED to this virtual-router. A member-list
+                # (<interface><member>ethernet1/1</member></interface>) that is a
+                # DIRECT child of the VR entry — not to be confused with the
+                # entry-keyed <interface><entry name="..."> lists that appear
+                # again under protocol/ospf/area (pan-os-python VirtualRouter,
+                # param "interface", vartype="member"). The VRF↔interface edge is
+                # the whole point of VRFConfig.interfaces on every other OS
+                # ([[CCR-0038]]).
+                interfaces=members(vr, "interface"),
                 raw_lines=[raw_xml(vr)],
             ))
         return vrfs
@@ -263,7 +273,9 @@ class PANOSParser(BaseParser):
                 vr_of_iface[m] = vr_name
 
         # OSPF per-interface settings live inside the AREA, not on the interface.
-        ospf_of_iface = self._ospf_interface_attrs()
+        # They are carried out of parse_ospf in OSPFArea.interface_settings and
+        # attributed here by BaseParser._backfill_ospf_interface_settings — one
+        # shared walk for every OS, not a private dict per parser ([[CCR-0038]]).
 
         ifaces: list[InterfaceConfig] = []
 
@@ -290,8 +302,6 @@ class PANOSParser(BaseParser):
             if mtu_str and mtu_str.isdigit():
                 mtu = int(mtu_str)
 
-            ospf = ospf_of_iface.get(name, {})
-
             return InterfaceConfig(
                 object_id=f"iface_{name}",
                 source_os=self.os_type,
@@ -304,9 +314,6 @@ class PANOSParser(BaseParser):
                 mtu=mtu,
                 zone=zone_of_iface.get(name),
                 virtual_router=vr_of_iface.get(name),
-                ospf_area=ospf.get("area"),
-                ospf_cost=ospf.get("cost"),
-                ospf_passive=bool(ospf.get("passive", False)),
                 raw_lines=[raw_xml(el)],
             )
 
@@ -523,6 +530,13 @@ class PANOSParser(BaseParser):
                 for proto in profiles.get(redist.get("name", ""), []):
                     redistribute.append(BGPRedistribute(protocol=proto, metric=metric))
 
+            # <routing-options> is a singleton container under <bgp> holding the
+            # process-wide knobs: med/always-compare-med and
+            # graceful-restart/enable, both yes|no (pan-os-python
+            # BgpRoutingOptions, param paths "med/always-compare-med" and
+            # "graceful-restart/enable"). Both are ordinary BGPConfig fields on
+            # every other OS; PAN-OS simply never read them ([[CCR-0038]]).
+            ropts = bgp_el.find("routing-options")
             bgp_list.append(BGPConfig(
                 object_id=f"bgp_{local_as}_{vr_name}",
                 source_os=self.os_type,
@@ -532,6 +546,17 @@ class PANOSParser(BaseParser):
                 neighbors=neighbors,
                 peer_groups=peer_groups,
                 redistribute=redistribute,
+                graceful_restart=(
+                    text_val(ropts, "graceful-restart/enable") == "yes"
+                ),
+                graceful_restart_stalepath_time=_safe_int(
+                    text_val(ropts, "graceful-restart/stale-route-time")
+                ),
+                bestpath_options=BGPBestpathOptions(
+                    always_compare_med=(
+                        text_val(ropts, "med/always-compare-med") == "yes"
+                    ),
+                ),
                 raw_lines=[raw_xml(bgp_el)],
             ))
 
@@ -654,31 +679,33 @@ class PANOSParser(BaseParser):
         "nssa": OSPFAreaType.NSSA,
     }
 
-    def _ospf_interface_attrs(self) -> dict[str, dict[str, object]]:
-        """interface name → its OSPF attributes, read from inside the AREA.
+    def _ospf_area_interface(self, iface_el: Element, area_id: str) -> OSPFInterfaceConfig:
+        """One ``<area><interface><entry name="ethernet1/2">`` → OSPFInterfaceConfig.
 
         PAN-OS has no `ip ospf cost` on the interface object: an interface joins
         OSPF by being an ``<entry>`` INSIDE an area, and its cost is the
-        ``<metric>`` on that entry (CCR-0035 #6).  parse_interfaces cannot find
-        it by looking at ``network/interface`` — it has to come here.
+        ``<metric>`` on that entry (CCR-0035 #6).  ``parse_interfaces`` cannot
+        find it by looking at ``network/interface`` — so it is carried out in the
+        model (``OSPFArea.interface_settings``) and attributed onto the
+        InterfaceConfig by ``BaseParser._backfill_ospf_interface_settings``,
+        which is the ONE place every OS does this ([[CCR-0038]] Theme 2).
+
+        ``<link-type>`` is element-name-as-value — ``<link-type><p2p/></link-type>``,
+        one of broadcast|p2p|p2mp (pan-os-python OspfAreaInterface,
+        path="link-type/{link_type}").
         """
-        attrs: dict[str, dict[str, object]] = {}
-        for vr in self._virtual_routers():
-            ospf_el = vr.find("protocol/ospf")
-            if ospf_el is None:
-                continue
-            for area_el in entries(ospf_el, "area"):
-                area_id = area_el.get("name", "")
-                for iface_el in entries(area_el, "interface"):
-                    name = iface_el.get("name", "")
-                    if not name:
-                        continue
-                    attrs[name] = {
-                        "area": area_id,
-                        "cost": _safe_int(text_val(iface_el, "metric")),
-                        "passive": text_val(iface_el, "passive") == "yes",
-                    }
-        return attrs
+        # NOTE no process_id: PAN-OS has no OSPF process concept. The `process_id=1`
+        # on the OSPFConfig below is confgraph's own placeholder, and asserting a
+        # placeholder onto an interface would be a fabricated value.
+        return OSPFInterfaceConfig(
+            name=iface_el.get("name", ""),
+            area_id=area_id,
+            cost=_safe_int(text_val(iface_el, "metric")),
+            priority=_safe_int(text_val(iface_el, "priority")),
+            hello_interval=_safe_int(text_val(iface_el, "hello-interval")),
+            network_type=_choice(iface_el, "link-type"),
+            passive=text_val(iface_el, "passive") == "yes",
+        )
 
     def parse_ospf(self) -> list[OSPFConfig]:
         ospf_list: list[OSPFConfig] = []
@@ -697,10 +724,14 @@ class PANOSParser(BaseParser):
             for area_el in entries(ospf_el, "area"):
                 area_id = area_el.get("name", "0")
                 area_ifaces: list[str] = []
+                iface_settings: dict[str, OSPFInterfaceConfig] = {}
                 for iface_el in entries(area_el, "interface"):
                     iface_name = iface_el.get("name", "")
                     if iface_name:
                         area_ifaces.append(iface_name)
+                        iface_settings[iface_name] = self._ospf_area_interface(
+                            iface_el, area_id
+                        )
 
                 # The area type is an ELEMENT NAME: <type><stub>…</stub></type>.
                 # PAN-OS has no `no-summary` keyword — a stub/NSSA area whose
@@ -730,6 +761,7 @@ class PANOSParser(BaseParser):
                     nssa_no_summary=(no_summary and kind == "nssa"),
                     default_cost=default_cost,
                     interfaces=area_ifaces,
+                    interface_settings=iface_settings,
                 ))
 
             redistrib: list[OSPFRedistribute] = []

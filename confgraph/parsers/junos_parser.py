@@ -41,7 +41,7 @@ from confgraph.models.bgp import (
     BGPTimers,
 )
 from confgraph.models.ospf import (
-    OSPFConfig, OSPFArea, OSPFAreaType, OSPFRedistribute,
+    OSPFConfig, OSPFArea, OSPFAreaType, OSPFInterfaceConfig, OSPFRedistribute,
 )
 from confgraph.models.acl import ACLConfig, ACLEntry
 from confgraph.models.static_route import StaticRoute
@@ -63,8 +63,6 @@ class JunOSParser(BaseParser):
         self._vrf_of_intf: dict[str, str] = {}
         self._is_set_style: bool = _is_set_style(config_text)
         self._config_lines: list[str] = config_text.splitlines()
-        # J7: populated by parse_ospf(); applied in parse() post-step
-        self._ospf_intf_attrs: dict[str, dict[str, Any]] = {}
         # 1b: populated by _parse_bgp_block(); maps peer_ip → local-address IP str
         self._bgp_local_addresses: dict[str, str] = {}
 
@@ -94,17 +92,16 @@ class JunOSParser(BaseParser):
         return []
 
     def parse(self) -> "ParsedConfig":
-        """Override to back-fill OSPF per-interface attrs and BGP update_source."""
+        """Override to back-fill BGP update_source.
+
+        OSPF per-interface attributes used to be back-filled here from a private
+        ``_ospf_intf_attrs`` dict. They now ride in the model
+        (``OSPFArea.interface_settings``) and are attributed by
+        ``BaseParser._backfill_ospf_interface_settings``, which every OS shares
+        ([[CCR-0038]] Theme 2).
+        """
         from confgraph.models.parsed_config import ParsedConfig
         pc = super().parse()
-
-        # J7: apply OSPF per-interface attributes collected during parse_ospf
-        if self._ospf_intf_attrs:
-            for intf in pc.interfaces:
-                attrs = self._ospf_intf_attrs.get(intf.name)
-                if attrs:
-                    for key, val in attrs.items():
-                        setattr(intf, key, val)
 
         # 1b: reverse-resolve BGP local-address IP → interface name.  JunOS names
         # an update source by ADDRESS; ``update_source`` names an INTERFACE, so
@@ -472,6 +469,11 @@ class JunOSParser(BaseParser):
                 route_target_both=rt_both,
                 route_map_import=policy_import,
                 route_map_export=policy_export,
+                # `description text;` is a leaf inside the instance body. Quoting
+                # is CONDITIONAL on the vendor's own rule ("if the text includes
+                # one or more spaces, enclose it in quotation marks"), so both
+                # renderings must parse — _str_val strips the quotes.
+                description=_str_val(vrf_data.get("description")) or None,
                 interfaces=intf_members,
             ))
 
@@ -1079,6 +1081,9 @@ class JunOSParser(BaseParser):
             _bgp_raw = self._raw_lines_for("routing-instances", vrf, "protocols", "bgp")
         else:
             _bgp_raw = self._raw_lines_for("protocols", "bgp")
+
+        gr_enabled, gr_restart_time = self._graceful_restart(bgp_data, vrf)
+
         return BGPConfig(
             object_id=f"bgp_{asn}" + (f"_vrf_{vrf}" if vrf else ""),
             raw_lines=_bgp_raw,
@@ -1090,7 +1095,58 @@ class JunOSParser(BaseParser):
             neighbors=neighbors,
             peer_groups=peer_groups,
             address_families=address_families,
+            graceful_restart=gr_enabled,
+            graceful_restart_restart_time=gr_restart_time,
         )
+
+    def _graceful_restart(
+        self, bgp_data: dict[str, Any], vrf: str | None
+    ) -> tuple[bool, int | None]:
+        """Is graceful restart ON for this BGP instance, and with what restart-time?
+
+        JunOS splits this across two hierarchies, and getting it wrong in either
+        direction reports the opposite of the truth:
+
+        * ``routing-options { graceful-restart; }`` is the GLOBAL ENABLE. Graceful
+          restart is **disabled by default**, and per the vendor "you cannot enable
+          graceful restart for specific protocols unless graceful restart is also
+          enabled globally".
+        * ``protocols { bgp { graceful-restart { … } } }`` can only MODIFY or
+          DISABLE it — ``graceful-restart { disable; }`` opts BGP out; ``restart-time``
+          tunes it. **A ``graceful-restart`` stanza under ``protocols bgp`` does not
+          turn graceful restart on.**
+
+        So a config carrying only the BGP stanza describes a device with GR OFF,
+        and reporting True for it would be a fabricated value. For a routing
+        instance the enable may also come from that instance's own
+        ``routing-options``.
+        """
+        hier = self._get_hierarchy()
+
+        ro: Any = hier.get("routing-options", {})
+        if vrf:
+            ri = hier.get("routing-instances", {})
+            inst = ri.get(vrf, {}) if isinstance(ri, dict) else {}
+            inst_ro = inst.get("routing-options", {}) if isinstance(inst, dict) else {}
+            # An instance-local enable, else the global one.
+            if isinstance(inst_ro, dict) and "graceful-restart" in inst_ro:
+                ro = inst_ro
+
+        if not isinstance(ro, dict) or "graceful-restart" not in ro:
+            return False, None
+        global_gr = ro.get("graceful-restart")
+        if isinstance(global_gr, dict) and "disable" in global_gr:
+            return False, None
+
+        gr = bgp_data.get("graceful-restart")
+        if isinstance(gr, dict) and "disable" in gr:
+            return False, None
+
+        restart_time = (
+            _int_or_none(_str_val(gr.get("restart-time")))
+            if isinstance(gr, dict) else None
+        )
+        return True, restart_time
 
     # ------------------------------------------------------------------
     # Static routes (Stage 8) — routing-options static
@@ -1264,48 +1320,64 @@ class JunOSParser(BaseParser):
                     if "default-lsa" in nssa_tokens:
                         nssa_dio = True
 
-                # J7: per-interface sub-attributes (back-fill onto InterfaceConfig in parse())
+                # J7 / CCR-0038 Theme 2: JunOS writes the per-interface OSPF
+                # settings INSIDE the area, where parse_interfaces cannot see
+                # them. They are carried out in the MODEL —
+                # OSPFArea.interface_settings — and attributed onto the
+                # InterfaceConfig of that name by the ONE shared walk,
+                # BaseParser._backfill_ospf_interface_settings. This used to be a
+                # private dict applied in a JunOS-only parse() override; PAN-OS
+                # had a second copy of the same idea and IOS-XR had none.
+                iface_settings: dict[str, OSPFInterfaceConfig] = {}
                 for intf_name, intf_ospf in intf_block.items():
                     if not isinstance(intf_ospf, dict) or not intf_ospf:
                         continue
-                    attrs: dict[str, Any] = {"ospf_area": str(area_id)}
+                    settings = OSPFInterfaceConfig(
+                        name=intf_name,
+                        area_id=str(area_id),
+                        # NOTE `metric` IS THE OSPF COST — JunOS has no `cost`
+                        # keyword (syntax-corpus junos/ospf.yaml: interface).
+                        cost=_int_val(intf_ospf.get("metric")),
+                        hello_interval=_int_val(intf_ospf.get("hello-interval")),
+                        dead_interval=_int_val(intf_ospf.get("dead-interval")),
+                        network_type=_str_val(intf_ospf.get("interface-type")),
+                        priority=_int_val(intf_ospf.get("priority")),
+                        passive="passive" in intf_ospf,
+                    )
                     if "passive" in intf_ospf:
-                        attrs["ospf_passive"] = True
                         passive_interfaces.append(intf_name)
-                    metric = _int_val(intf_ospf.get("metric"))
-                    if metric is not None:
-                        attrs["ospf_cost"] = metric
-                    hello = _int_val(intf_ospf.get("hello-interval"))
-                    if hello is not None:
-                        attrs["ospf_hello_interval"] = hello
-                    dead = _int_val(intf_ospf.get("dead-interval"))
-                    if dead is not None:
-                        attrs["ospf_dead_interval"] = dead
-                    intf_type_val = _str_val(intf_ospf.get("interface-type"))
-                    if intf_type_val:
-                        attrs["ospf_network_type"] = intf_type_val
-                    priority = _int_val(intf_ospf.get("priority"))
-                    if priority is not None:
-                        attrs["ospf_priority"] = priority
+
+                    # bfd-liveness-detection { minimum-interval 300; } — a BLOCK,
+                    # not a flag. Its timers are the interface's BFD timers.
+                    bfd_data = intf_ospf.get("bfd-liveness-detection")
+                    if isinstance(bfd_data, dict):
+                        settings.bfd = True
+                        settings.bfd_interval = _int_val(
+                            bfd_data.get("minimum-interval")
+                        )
+                        settings.bfd_min_rx = _int_val(
+                            bfd_data.get("minimum-receive-interval")
+                        )
+                        settings.bfd_multiplier = _int_val(bfd_data.get("multiplier"))
+
                     if "authentication" in intf_ospf:
                         auth_data = intf_ospf["authentication"]
-                        if isinstance(auth_data, dict):
-                            if "md5" in auth_data:
-                                attrs["ospf_authentication"] = "message-digest"
-                            elif "simple-password" in auth_data:
-                                attrs["ospf_authentication"] = "simple"
-                                attrs["ospf_authentication_key"] = _str_val(
-                                    auth_data.get("simple-password")
-                                )
-                            else:
-                                attrs["ospf_authentication"] = "simple"
+                        if isinstance(auth_data, dict) and "md5" in auth_data:
+                            settings.authentication = "message-digest"
+                        elif isinstance(auth_data, dict) and "simple-password" in auth_data:
+                            settings.authentication = "simple"
+                            settings.authentication_key = _str_val(
+                                auth_data.get("simple-password")
+                            )
                         else:
-                            attrs["ospf_authentication"] = "simple"
-                    self._ospf_intf_attrs[intf_name] = attrs
+                            settings.authentication = "simple"
+
+                    iface_settings[intf_name] = settings
 
                 areas.append(OSPFArea(
                     area_id=str(area_id),
                     interfaces=intf_names,
+                    interface_settings=iface_settings,
                     area_type=area_type,
                     stub_no_summary=stub_no_summary,
                     nssa_no_summary=nssa_no_summary,
@@ -1566,6 +1638,13 @@ class JunOSParser(BaseParser):
             source_os=self.os_type,
             line_numbers=[],
             servers=servers,
+            # JunOS names the NTP source by ADDRESS ("A valid IP address
+            # configured on one of the device's interfaces") — there is no
+            # `ntp source-interface` on JunOS. It therefore goes in
+            # source_address, never in source_interface: an address in a field
+            # named for an interface is the wrong-value defect [[CCR-0030]] is
+            # about.
+            source_address=_str_val(ntp_data.get("source-address")),
         )
 
     def parse_snmp(self) -> SNMPConfig | None:
@@ -1635,6 +1714,11 @@ class JunOSParser(BaseParser):
             source_os=self.os_type,
             line_numbers=[],
             hosts=hosts,
+            # A SIBLING of the `host` stanzas, not a child of one: the address
+            # "is recorded as the message source in messages sent to the remote
+            # machines specified in ALL host statements". An ADDRESS again, so
+            # source_address (see NTPConfig.source_address).
+            source_address=_str_val(syslog_data.get("source-address")),
         )
 
 

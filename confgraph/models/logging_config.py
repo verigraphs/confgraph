@@ -30,6 +30,15 @@ class SyslogConfig(BaseConfigObject):
     trap_level: str | None = Field(default=None, description="Minimum level for syslog trap")
     facility: str | None = Field(default=None, description="Syslog facility (e.g., local7)")
     source_interface: str | None = Field(default=None, description="Source interface for syslog packets")
+    source_address: str | None = Field(
+        default=None,
+        description=(
+            "Source ADDRESS for syslog packets. JunOS names the source by address "
+            "(`system syslog source-address 1.1.1.1`); IOS names it by interface "
+            "(`logging source-interface Loopback0`). Distinct concepts, distinct "
+            "fields — see NTPConfig.source_address."
+        ),
+    )
     origin_id: str | None = Field(default=None, description="Origin ID added to messages")
     timestamps_log: str | None = Field(default=None, description="Timestamp format for log messages")
     timestamps_debug: str | None = Field(default=None, description="Timestamp format for debug messages")

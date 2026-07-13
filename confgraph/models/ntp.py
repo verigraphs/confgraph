@@ -32,6 +32,17 @@ class NTPConfig(BaseConfigObject):
     servers: list[NTPServer] = Field(default_factory=list, description="NTP servers")
     peers: list[NTPServer] = Field(default_factory=list, description="NTP peers")
     source_interface: str | None = Field(default=None, description="Source interface for NTP packets")
+    source_address: str | None = Field(
+        default=None,
+        description=(
+            "Source ADDRESS for NTP packets. JunOS names the source by address "
+            "(`system ntp source-address 1.1.1.1`), where IOS/NX-OS name it by "
+            "interface (`ntp source-interface Loopback0`). These are different "
+            "things and must not share a field — an address written into "
+            "source_interface is exactly the wrong-value defect [[CCR-0030]] "
+            "covers."
+        ),
+    )
     authenticate: bool = Field(default=False, description="NTP authentication enabled")
     authentication_keys: list[NTPAuthKey] = Field(default_factory=list, description="Authentication keys")
     trusted_keys: list[int] = Field(default_factory=list, description="Trusted key IDs")
