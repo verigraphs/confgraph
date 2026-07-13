@@ -11,13 +11,92 @@ Import from here, not from confgraph.cli.
 from __future__ import annotations
 
 import csv
+import importlib
 import os
 import re
 import warnings
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Mapping
 
 from confgraph.models.base import OSType
+
+# ---------------------------------------------------------------------------
+# Public: parser registry
+# ---------------------------------------------------------------------------
+#
+# One entry per OS. An entry owns BOTH the parser class and the file extensions
+# that OS's configs arrive in, so the two can never drift apart: config
+# discovery derives its accepted extensions from this table (see
+# ``config_extensions``) rather than from a literal tuple maintained elsewhere.
+# Registering a seventh parser is one new entry — its file type is discoverable
+# by construction.
+
+# Extensions used by the CLI-style (plain-text) OSes. "" matches a file with no
+# extension at all (e.g. ``configs/r1``).
+TEXT_CONFIG_EXTENSIONS: tuple[str, ...] = (".cfg", ".conf", ".txt", "")
+
+
+@dataclass(frozen=True)
+class ParserRegistration:
+    """How one OS is parsed and what its config files are called on disk."""
+
+    os_type: OSType
+    module: str
+    class_name: str
+    extensions: tuple[str, ...] = TEXT_CONFIG_EXTENSIONS
+
+    def parser_class(self) -> type:
+        """Import and return the parser class (lazy — parsers are heavy)."""
+        return getattr(importlib.import_module(self.module), self.class_name)
+
+
+PARSER_REGISTRY: dict[OSType, ParserRegistration] = {
+    r.os_type: r
+    for r in (
+        ParserRegistration(OSType.IOS, "confgraph.parsers.ios_parser", "IOSParser"),
+        ParserRegistration(OSType.IOS_XE, "confgraph.parsers.ios_parser", "IOSParser"),
+        ParserRegistration(OSType.IOS_XR, "confgraph.parsers.iosxr_parser", "IOSXRParser"),
+        ParserRegistration(OSType.NXOS, "confgraph.parsers.nxos_parser", "NXOSParser"),
+        ParserRegistration(OSType.EOS, "confgraph.parsers.eos_parser", "EOSParser"),
+        ParserRegistration(OSType.JUNOS, "confgraph.parsers.junos_parser", "JunOSParser"),
+        # PAN-OS exports an XML document, not a CLI-style text config.
+        ParserRegistration(
+            OSType.PANOS, "confgraph.parsers.panos_parser", "PANOSParser",
+            extensions=(".xml",) + TEXT_CONFIG_EXTENSIONS,
+        ),
+    )
+}
+
+
+def parser_for(os_type: OSType) -> type:
+    """Return the parser class registered for *os_type*.
+
+    Raises:
+        KeyError: if no parser is registered for *os_type*.
+    """
+    return PARSER_REGISTRY[os_type].parser_class()
+
+
+def config_extensions(os_type: OSType | None = None) -> tuple[str, ...]:
+    """Return the config-file extensions discovery should accept.
+
+    With *os_type*: that OS's extensions, most specific first.
+    Without: the union across every registered parser, de-duplicated and
+    order-stable. This is the *only* definition of "a file confgraph can read" —
+    nothing else may hard-code an extension tuple.
+    """
+    if os_type is not None:
+        reg = PARSER_REGISTRY.get(os_type)
+        if reg is not None:
+            return reg.extensions
+    ordered: list[str] = []
+    for reg in PARSER_REGISTRY.values():
+        for ext in reg.extensions:
+            if ext not in ordered:
+                ordered.append(ext)
+    return tuple(ordered)
+
 
 # ---------------------------------------------------------------------------
 # Public: OS alias map
@@ -42,6 +121,102 @@ OS_COLS: frozenset[str] = frozenset({"os_type", "ostype", "os-type"})
 # Private aliases for internal use
 _DEVICE_COLS = DEVICE_COLS
 _OS_COLS = OS_COLS
+
+
+def as_os_type(os_type: str | OSType | None) -> OSType | None:
+    """Normalize an os_type string ('nx-os', 'iosxr', …) to an ``OSType``.
+
+    Returns None when *os_type* is falsy or unrecognized.
+    """
+    if os_type is None or os_type == "":
+        return None
+    if isinstance(os_type, OSType):
+        return os_type
+    try:
+        return OSType(OS_ALIASES.get(os_type.lower(), os_type.lower()))
+    except ValueError:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Public: config discovery
+# ---------------------------------------------------------------------------
+
+@dataclass
+class DiscoveredConfigs:
+    """What a config directory scan found — and, explicitly, what it did not.
+
+    ``configs``  hostname → config file, for every inventory device with a file.
+    ``missing``  (hostname, [filenames searched]) for every inventory device
+                 with no file. An absent device is a *reported* absence.
+    ``skipped``  (path, reason) for every file in the directory that was not
+                 used: unreadable extension, or no inventory device claims it.
+
+    The three states used to be one silence. Callers are expected to report
+    ``missing`` and ``skipped`` — see ``confgraph.cli.cmd_topology``.
+    """
+
+    configs: dict[str, Path] = field(default_factory=dict)
+    missing: list[tuple[str, list[str]]] = field(default_factory=list)
+    skipped: list[tuple[Path, str]] = field(default_factory=list)
+
+
+def discover_device_configs(
+    configs_dir: Path,
+    inventory: Mapping[str, str | OSType],
+) -> DiscoveredConfigs:
+    """Locate one config file per inventory device inside *configs_dir*.
+
+    For each device the candidate filenames are ``<hostname><ext>`` for every
+    extension in ``config_extensions()`` — the device's own OS extensions first
+    (so ``fw1.xml`` is found for a PAN-OS box), then the rest of the registered
+    set. The extension only *locates* the file; the inventory's os_type decides
+    how it is parsed.
+
+    Nothing here reads or parses a file; it only reports what is there.
+    """
+    result = DiscoveredConfigs()
+    all_extensions = config_extensions()
+    claimed: set[Path] = set()
+
+    for hostname, os_type in inventory.items():
+        os_enum = as_os_type(os_type)
+        preferred = config_extensions(os_enum)
+        ordered_exts = list(preferred) + [e for e in all_extensions if e not in preferred]
+
+        searched: list[str] = []
+        for ext in ordered_exts:
+            candidate = configs_dir / f"{hostname}{ext}"
+            searched.append(candidate.name)
+            if candidate.is_file():
+                result.configs[hostname] = candidate
+                claimed.add(candidate)
+                break
+        else:
+            result.missing.append((hostname, searched))
+
+    for path in sorted(configs_dir.iterdir()):
+        if not path.is_file() or path in claimed or path.name.startswith("."):
+            continue
+        used = result.configs.get(path.stem)
+        if path.suffix not in all_extensions:
+            reason = (
+                f"unsupported extension '{path.suffix}' (no registered parser reads it; "
+                f"accepted: {', '.join(e or '<no extension>' for e in all_extensions)})"
+            )
+        elif used is not None:
+            # The device IS in the inventory — a second file for it was shadowed by
+            # a higher-priority extension. Saying "no device named …" here would be
+            # a confidently wrong warning, which is worse than the silence T1 removed.
+            reason = (
+                f"a second config file for '{path.stem}', which was read from "
+                f"'{used.name}' instead"
+            )
+        else:
+            reason = f"no device named '{path.stem}' in the inventory"
+        result.skipped.append((path, reason))
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -219,23 +394,10 @@ def load_and_parse(
                     err=True,
                 )
 
-    if detected == OSType.PANOS:
-        from confgraph.parsers.panos_parser import PANOSParser
-        parsed = PANOSParser(text).parse()
-    elif detected == OSType.EOS:
-        from confgraph.parsers.eos_parser import EOSParser
-        parsed = EOSParser(text).parse()
-    elif detected == OSType.NXOS:
-        from confgraph.parsers.nxos_parser import NXOSParser
-        parsed = NXOSParser(text).parse()
-    elif detected == OSType.IOS_XR:
-        from confgraph.parsers.iosxr_parser import IOSXRParser
-        parsed = IOSXRParser(text).parse()
-    elif detected == OSType.JUNOS:
-        from confgraph.parsers.junos_parser import JunOSParser
-        parsed = JunOSParser(text).parse()
-    else:
-        from confgraph.parsers.ios_parser import IOSParser
-        parsed = IOSParser(text).parse()
+    # Dispatch through the registry — the same table config discovery reads its
+    # extensions from, so a registered parser is always both reachable and
+    # discoverable. IOS is the fallback for anything unregistered.
+    registration = PARSER_REGISTRY.get(detected) or PARSER_REGISTRY[OSType.IOS]
+    parsed = registration.parser_class()(text).parse()
 
     return parsed, detected

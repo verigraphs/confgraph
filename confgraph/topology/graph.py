@@ -16,12 +16,13 @@ The graph is consumed by:
 from __future__ import annotations
 
 import json
-from ipaddress import IPv4Network
-from typing import TYPE_CHECKING
+from dataclasses import dataclass
+from ipaddress import IPv4Address, IPv4Network
+from typing import TYPE_CHECKING, Any
 
 import networkx as nx
 
-from confgraph.utils.interface import canonical_to_display
+from confgraph.utils.interface import canonical_to_display, normalize_interface_name
 
 if TYPE_CHECKING:
     from confgraph.models.parsed_config import ParsedConfig
@@ -82,6 +83,29 @@ def _get_effective_policy(neighbor, bgp, direction: str) -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# BGP session endpoints
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _BGPEndpoint:
+    """One side of one BGP session: a single ``neighbor`` statement.
+
+    A session has two endpoints when both devices configure each other, and one
+    when only a single side does. ``local_ip`` is the address this device sources
+    the session from — it is what makes two sessions between the same pair of
+    devices distinguishable, and what lets the two endpoints of one session find
+    each other (A's ``local_ip`` is B's ``peer_ip`` and vice versa).
+    """
+
+    host: str
+    peer_host: str
+    peer_ip: IPv4Address
+    local_ip: IPv4Address | None
+    bgp: Any        # BGPInstance
+    neighbor: Any   # BGPNeighbor
+
+
+# ---------------------------------------------------------------------------
 # Builder
 # ---------------------------------------------------------------------------
 
@@ -105,6 +129,9 @@ class TopologyGraphBuilder:
     ) -> None:
         self._devices = devices
         self._physical = physical_topology or []
+        # Ambiguities found while building (e.g. one IP claimed by two devices).
+        # The CLI prints these to stderr; nothing here is resolved silently.
+        self.warnings: list[str] = []
 
     def build(self) -> nx.MultiGraph:
         """Return the topology graph.
@@ -173,109 +200,305 @@ class TopologyGraphBuilder:
     # BGP session edges
     # ------------------------------------------------------------------
 
-    def _add_bgp_edges(self, g: nx.MultiGraph) -> None:
-        """Add one edge per BGP session between known devices.
+    @staticmethod
+    def _global_interfaces(parsed: "ParsedConfig") -> list[Any]:
+        """The device's interfaces in the **global** routing table.
 
-        Uses the same IP-based peer resolution as the enterprise simulator:
-        match each neighbor's peer_ip against interface IPs of other devices.
-        Deduplicates so each session appears once regardless of which side
-        we encounter first.
+        A VRF-bound interface's address does not live in the global table, and
+        `_bgp_endpoints` only walks global-table BGP instances. Mixing the two is
+        how an address that is unique per routing table looks like a duplicate:
+        10.0.0.1 in VRF CUST-A and 10.0.0.1 in the global table are different
+        addresses, and only the latter can be a global-table BGP peer.
         """
-        from ipaddress import IPv4Address
+        return [iface for iface in parsed.interfaces if iface.vrf is None]
 
-        # Build ip → hostname lookup
-        ip_to_host: dict[IPv4Address, str] = {}
+    def _device_ips(self, hostname: str) -> set[IPv4Address]:
+        """Every global-table IPv4 address configured on *hostname*."""
+        ips: set[IPv4Address] = set()
+        parsed = self._devices.get(hostname)
+        if parsed is None:
+            return ips
+        for iface in self._global_interfaces(parsed):
+            for addr in (iface.ip_address, *iface.secondary_ips):
+                if addr is not None:
+                    ips.add(addr.ip)
+        return ips
+
+    def _ip_owners(self) -> dict[IPv4Address, list[str]]:
+        """global-table address → every device that configures it.
+
+        A list, not a single hostname: two devices claiming one global-table
+        address is a broken estate, and quietly picking a winner is how a session
+        ends up attached to the wrong device. See ``_resolve_peer_host``.
+        """
+        owners: dict[IPv4Address, list[str]] = {}
+        for hostname in self._devices:
+            for ip in sorted(self._device_ips(hostname)):
+                hosts = owners.setdefault(ip, [])
+                if hostname not in hosts:
+                    hosts.append(hostname)
+        return owners
+
+    def _global_asn(self, hostname: str) -> int | None:
+        """The device's ASN in the global routing table (VRF instances ignored)."""
+        parsed = self._devices.get(hostname)
+        if parsed is None:
+            return None
+        for bgp in parsed.bgp_instances:
+            if bgp.vrf is None:
+                return bgp.asn
+        return None
+
+    def _resolve_peer_host(
+        self,
+        owners: dict[IPv4Address, list[str]],
+        peer_ip: IPv4Address,
+        self_host: str,
+        remote_as: Any,
+    ) -> str | None:
+        """Return the device that owns *peer_ip*, or None if that is not knowable.
+
+        Overlapping addressing across pods/tenants is routine, so one address can
+        have several owners. The neighbor's ``remote-as`` is then **evidence**, not
+        a tiebreak: a BGP peer's local ASN must equal the remote-as configured for
+        it, so when exactly one candidate's ASN matches, the config has identified
+        the peer and there is nothing ambiguous to report.
+
+        When the ASN does *not* single out one candidate — every device sharing one
+        ASN (the ordinary iBGP estate), or a peer-group member whose ``remote_as``
+        is the string ``'inherited'`` — the config alone cannot say which device is
+        meant. The session is then **declined and reported**, never guessed. An
+        earlier revision fell back to ``sorted(candidates)[0]``; that hands the
+        session to whichever hostname sorts first, which is not evidence at all.
+
+        None therefore means: no device owns the address (an outside peer), or the
+        owner is genuinely unidentifiable — and the latter is always warned about.
+        """
+        candidates = [h for h in owners.get(peer_ip, []) if h != self_host]
+        if not candidates:
+            return None
+        if len(candidates) == 1:
+            return candidates[0]
+
+        # `remote_as` is an int only when the neighbor states one; it is 'inherited'
+        # for a peer-group member and can be 'internal'/'external' elsewhere. A
+        # string can never equal a parsed ASN, and must never appear to.
+        if isinstance(remote_as, int) and not isinstance(remote_as, bool):
+            matching = [h for h in candidates if self._global_asn(h) == remote_as]
+            if len(matching) == 1:
+                return matching[0]
+
+        message = (
+            f"Address {peer_ip} is configured in the global table of more than one "
+            f"device ({', '.join(sorted(candidates))}) — the BGP peer it names is "
+            f"ambiguous, so '{self_host}'s session to it is omitted from the graph."
+        )
+        if message not in self.warnings:
+            self.warnings.append(message)
+        return None
+
+    def _resolve_local_ip(
+        self,
+        parsed: "ParsedConfig",
+        neighbor: Any,
+    ) -> IPv4Address | None:
+        """The address this device sources the session from.
+
+        1. the ``update-source`` interface's address, when configured;
+        2. otherwise the address of the interface directly connected to the peer.
+
+        Global-table interfaces only — a global-table session cannot be sourced
+        from a VRF-bound address. Returns None when neither applies (the session
+        then cannot be paired with its far side by address, and is keyed
+        directionally instead).
+        """
+        interfaces = self._global_interfaces(parsed)
+
+        if neighbor.update_source:
+            want = normalize_interface_name(neighbor.update_source)
+            for iface in interfaces:
+                if normalize_interface_name(iface.name) == want and iface.ip_address:
+                    return iface.ip_address.ip
+
+        for iface in interfaces:
+            for addr in (iface.ip_address, *iface.secondary_ips):
+                if addr is not None and neighbor.peer_ip in addr.network:
+                    return addr.ip
+        return None
+
+    def _bgp_endpoints(self) -> list[_BGPEndpoint]:
+        """Every configured BGP neighbor statement that points at a known device."""
+        owners = self._ip_owners()
+        endpoints: list[_BGPEndpoint] = []
+
         for hostname, parsed in self._devices.items():
-            for iface in parsed.interfaces:
-                if iface.ip_address:
-                    ip_to_host[iface.ip_address.ip] = hostname
-
-        seen: set[frozenset] = set()
-
-        for hostname_a, parsed_a in self._devices.items():
-            for bgp in parsed_a.bgp_instances:
+            for bgp in parsed.bgp_instances:
                 if bgp.vrf is not None:
                     continue  # global table only
-                asn_a = bgp.asn
-
                 for neighbor in bgp.neighbors:
                     peer_ip = neighbor.peer_ip
                     if not isinstance(peer_ip, IPv4Address):
                         continue
-                    hostname_b = ip_to_host.get(peer_ip)
-                    if hostname_b is None or hostname_b == hostname_a:
-                        continue
-
-                    session_key = frozenset([hostname_a, hostname_b])
-                    if session_key in seen:
-                        continue
-                    seen.add(session_key)
-
-                    parsed_b = self._devices[hostname_b]
-                    asn_b: int | None = None
-                    for bgp_b in parsed_b.bgp_instances:
-                        if bgp_b.vrf is None:
-                            asn_b = bgp_b.asn
-                            break
-
-                    session_type = "iBGP" if asn_a == asn_b else "eBGP"
-                    color = "#3b82f6" if session_type == "iBGP" else "#f59e0b"
-
-                    # Effective policies — capture all four directions
-                    rm_out_a = _get_effective_policy(neighbor, bgp, "out")
-                    rm_in_a = _get_effective_policy(neighbor, bgp, "in")
-
-                    # Find the corresponding neighbor on B's side
-                    rm_out_b: str | None = None
-                    rm_in_b: str | None = None
-                    ips_a = {
-                        iface.ip_address.ip
-                        for iface in parsed_a.interfaces
-                        if iface.ip_address
-                    }
-                    for bgp_b in parsed_b.bgp_instances:
-                        if bgp_b.vrf is not None:
-                            continue
-                        for nbr_b in bgp_b.neighbors:
-                            if nbr_b.peer_ip and nbr_b.peer_ip in ips_a:
-                                rm_in_b = _get_effective_policy(nbr_b, bgp_b, "in")
-                                rm_out_b = _get_effective_policy(nbr_b, bgp_b, "out")
-                                break
-
-                    # Build label: show policies for both directions
-                    policy_parts = []
-                    # A→B: A's outbound and B's inbound
-                    if rm_out_a:
-                        policy_parts.append(f"{hostname_a}→out:{rm_out_a}")
-                    if rm_in_b:
-                        policy_parts.append(f"{hostname_b}←in:{rm_in_b}")
-                    # B→A: B's outbound and A's inbound
-                    if rm_out_b:
-                        policy_parts.append(f"{hostname_b}→out:{rm_out_b}")
-                    if rm_in_a:
-                        policy_parts.append(f"{hostname_a}←in:{rm_in_a}")
-                    policy_str = ", ".join(policy_parts)
-
-                    label = session_type
-                    if neighbor.description:
-                        label += f" — {neighbor.description}"
-                    if policy_str:
-                        label += f" [{policy_str}]"
-
-                    g.add_edge(
-                        hostname_a,
-                        hostname_b,
-                        edge_type="bgp",
-                        session_type=session_type,
-                        label=label,
-                        description=neighbor.description or "",
-                        route_map_out_a=rm_out_a or "",
-                        route_map_in_a=rm_in_a or "",
-                        route_map_out_b=rm_out_b or "",
-                        route_map_in_b=rm_in_b or "",
-                        color=color,
-                        style="dashed",
+                    peer_host = self._resolve_peer_host(
+                        owners, peer_ip, hostname, neighbor.remote_as
                     )
+                    if peer_host is None:
+                        continue
+                    endpoints.append(_BGPEndpoint(
+                        host=hostname,
+                        peer_host=peer_host,
+                        peer_ip=peer_ip,
+                        local_ip=self._resolve_local_ip(parsed, neighbor),
+                        bgp=bgp,
+                        neighbor=neighbor,
+                    ))
+        return endpoints
+
+    @staticmethod
+    def _session_key(ep: _BGPEndpoint) -> Any:
+        """The identity of the session this endpoint belongs to.
+
+        Both the unordered **device** pair and the unordered **address** pair: an
+        address pair alone is not unique across an estate (two pods numbered
+        10.0.0.1 ↔ 10.0.0.2 are two sessions, not one), and a device pair alone is
+        exactly the coarse key this CCR exists to remove. Both halves are
+        symmetric, so the two sides of one session derive the same key.
+        """
+        return (
+            frozenset({ep.host, ep.peer_host}),
+            frozenset({ep.local_ip, ep.peer_ip}),
+        )
+
+    def _group_sessions(
+        self, endpoints: list[_BGPEndpoint]
+    ) -> list[list[_BGPEndpoint]]:
+        """Group endpoints into sessions — one group per session, 1 or 2 endpoints.
+
+        Two sessions between the same two devices (different source interfaces)
+        are two distinct groups; the same session seen from both ends is one.
+        """
+        sessions: dict[Any, list[_BGPEndpoint]] = {}
+        deferred: list[_BGPEndpoint] = []
+
+        for ep in endpoints:
+            if ep.local_ip is None:
+                deferred.append(ep)
+                continue
+            sessions.setdefault(self._session_key(ep), []).append(ep)
+
+        # Endpoints whose local address could not be determined: pair them with a
+        # far-side endpoint that points back at this device from the address we
+        # point at. Failing that, they stand alone as a one-sided session.
+        for ep in deferred:
+            local_ips = self._device_ips(ep.host)
+            paired_key = None
+            for key, members in sessions.items():
+                if len(members) != 1:
+                    continue
+                other = members[0]
+                if other.host != ep.peer_host or other.peer_ip not in local_ips:
+                    continue
+                # Same session if the far side sources it from the address we
+                # point at — or, when its local address is unknown too, if the
+                # address we point at is one of its own.
+                if other.local_ip == ep.peer_ip or (
+                    other.local_ip is None
+                    and ep.peer_ip in self._device_ips(other.host)
+                ):
+                    paired_key = key
+                    break
+            if paired_key is not None:
+                sessions[paired_key].append(ep)
+            else:
+                sessions.setdefault(
+                    ("unpaired", ep.host, ep.peer_host, ep.peer_ip), []
+                ).append(ep)
+
+        return list(sessions.values())
+
+    def _add_bgp_edges(self, g: nx.MultiGraph) -> None:
+        """Add one edge per BGP **session** between known devices.
+
+        Peers are resolved by matching each neighbor's ``peer_ip`` against the
+        interface addresses of the other devices. Parallel sessions between the
+        same pair of devices (e.g. a loopback-sourced iBGP session alongside a
+        directly-connected one) are distinct sessions and become distinct edges,
+        each carrying its own addresses, description and route-maps — which is
+        what the MultiGraph is for.
+        """
+        for members in self._group_sessions(self._bgp_endpoints()):
+            ep_a = members[0]
+            ep_b = next((m for m in members[1:] if m.host != ep_a.host), None)
+
+            host_a = ep_a.host
+            host_b = ep_b.host if ep_b is not None else ep_a.peer_host
+            if host_a not in g or host_b not in g:
+                continue
+
+            asn_a = ep_a.bgp.asn
+            asn_b = ep_b.bgp.asn if ep_b is not None else self._global_asn(host_b)
+            session_type = "iBGP" if asn_a == asn_b else "eBGP"
+            color = "#3b82f6" if session_type == "iBGP" else "#f59e0b"
+
+            # Effective policies — each side's own neighbor statement for THIS
+            # session, not the first neighbor that happens to point at the device.
+            rm_out_a = _get_effective_policy(ep_a.neighbor, ep_a.bgp, "out")
+            rm_in_a = _get_effective_policy(ep_a.neighbor, ep_a.bgp, "in")
+            rm_out_b = (
+                _get_effective_policy(ep_b.neighbor, ep_b.bgp, "out") if ep_b else None
+            )
+            rm_in_b = (
+                _get_effective_policy(ep_b.neighbor, ep_b.bgp, "in") if ep_b else None
+            )
+
+            # Session endpoint addresses. B's local address is known even when B
+            # does not configure the session back: it is what A points at.
+            local_ip_a = ep_a.local_ip
+            local_ip_b = ep_b.local_ip if ep_b is not None else None
+            if local_ip_b is None:
+                local_ip_b = ep_a.peer_ip
+            if local_ip_a is None and ep_b is not None:
+                local_ip_a = ep_b.peer_ip
+
+            description = ep_a.neighbor.description or (
+                ep_b.neighbor.description if ep_b is not None else None
+            )
+
+            policy_parts = []
+            if rm_out_a:
+                policy_parts.append(f"{host_a}→out:{rm_out_a}")
+            if rm_in_b:
+                policy_parts.append(f"{host_b}←in:{rm_in_b}")
+            if rm_out_b:
+                policy_parts.append(f"{host_b}→out:{rm_out_b}")
+            if rm_in_a:
+                policy_parts.append(f"{host_a}←in:{rm_in_a}")
+
+            addr_pair = (
+                f"{local_ip_a} ↔ {local_ip_b}" if local_ip_a else f"→ {local_ip_b}"
+            )
+            label = f"{session_type} {addr_pair}"
+            if description:
+                label += f" — {description}"
+            if policy_parts:
+                label += f" [{', '.join(policy_parts)}]"
+
+            g.add_edge(
+                host_a,
+                host_b,
+                edge_type="bgp",
+                session_type=session_type,
+                label=label,
+                description=description or "",
+                local_ip_a=str(local_ip_a) if local_ip_a else "",
+                local_ip_b=str(local_ip_b) if local_ip_b else "",
+                route_map_out_a=rm_out_a or "",
+                route_map_in_a=rm_in_a or "",
+                route_map_out_b=rm_out_b or "",
+                route_map_in_b=rm_in_b or "",
+                color=color,
+                style="dashed",
+            )
 
     # ------------------------------------------------------------------
     # IGP adjacency edges

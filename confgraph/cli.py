@@ -269,6 +269,7 @@ def cmd_topology(
     a JSON file for use with the enterprise simulator (--json).
     """
     import csv as _csv
+    from confgraph.loader import discover_device_configs
     from confgraph.topology.graph import TopologyGraphBuilder
     from confgraph.topology.exporters import export_topology_html, export_topology_json
     from confgraph.topology.ingest import load_physical_topology
@@ -296,19 +297,40 @@ def cmd_topology(
 
     click.echo(f"Loaded {len(inventory)} devices from inventory.", err=True)
 
+    # --- Discover device configs ---
+    # Accepted extensions come from the parser registry (confgraph.loader), not
+    # from a literal tuple here: a registered parser's file type is discoverable
+    # by construction. Everything the scan does *not* use is reported, never
+    # silently dropped.
+    discovery = discover_device_configs(configs_dir, inventory)
+
+    for hostname, searched in discovery.missing:
+        click.echo(
+            f"  Warning: No config file found for '{hostname}' in {configs_dir} "
+            f"(searched: {', '.join(searched)}) — device omitted from the topology.",
+            err=True,
+        )
+    for path, reason in discovery.skipped:
+        click.echo(f"  Warning: Ignoring '{path.name}' — {reason}.", err=True)
+
     # --- Parse all device configs ---
     devices: dict = {}
-    for hostname, os_type in inventory.items():
-        for ext in (".txt", ".cfg", ".conf", ""):
-            cfg_file = configs_dir / f"{hostname}{ext}"
-            if cfg_file.exists():
-                try:
-                    parsed, _ = _load_and_parse(cfg_file, os_type)
-                    devices[hostname] = parsed
-                    click.echo(f"  Parsed: {hostname} ({os_type})", err=True)
-                except Exception as exc:
-                    click.echo(f"  Warning: Could not parse {cfg_file.name}: {exc}", err=True)
-                break
+    for hostname, cfg_file in discovery.configs.items():
+        os_type = inventory[hostname]
+        try:
+            parsed, _ = load_and_parse(cfg_file, os_type)
+        except OSError as exc:
+            click.echo(
+                f"  Warning: Skipping unreadable config file '{cfg_file.name}' "
+                f"for '{hostname}': {exc}",
+                err=True,
+            )
+            continue
+        except Exception as exc:
+            click.echo(f"  Warning: Could not parse {cfg_file.name}: {exc}", err=True)
+            continue
+        devices[hostname] = parsed
+        click.echo(f"  Parsed: {hostname} ({os_type}) from {cfg_file.name}", err=True)
 
     if not devices:
         click.echo("Error: no device configs could be parsed.", err=True)
@@ -329,7 +351,10 @@ def cmd_topology(
             click.echo(f"  Warning: Could not load physical topology: {exc}", err=True)
 
     # --- Build graph ---
-    g = TopologyGraphBuilder(devices, physical_topology=physical).build()
+    builder = TopologyGraphBuilder(devices, physical_topology=physical)
+    g = builder.build()
+    for message in builder.warnings:
+        click.echo(f"  Warning: {message}", err=True)
     click.echo(
         f"  Graph: {g.number_of_nodes()} devices, {g.number_of_edges()} edges",
         err=True,
