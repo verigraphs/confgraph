@@ -103,6 +103,10 @@ class TestBoundary:
             "secondary_ips",
             "ipv6_addresses",
             "helper_addresses",
+            # CCR-0044: EOS VARP. A device emits one "ip virtual-router address
+            # <ip>" line PER address, so it is a per-member list of the same
+            # shape as helper_addresses, not a scalar.
+            "varp_addresses",
             "nhrp_nhs",
             "nhrp_map",
             "igmp_join_groups",
