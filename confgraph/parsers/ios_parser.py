@@ -6102,6 +6102,33 @@ class IOSParser(BaseParser):
 
         return peer_groups
 
+    # OSPF area-body scalar vocabulary. One row per setting; the regex's `val`
+    # group is the value. THE table for "the (N+1)th OSPF area scalar" — adding one
+    # is a row here, and both dialects that read an area body pick it up.
+    #
+    # The two dialects differ only in how the body reaches this table:
+    #   IOS / NX-OS / EOS  emit a one-liner  →  `area 1 default-cost 10`
+    #                                            (the tail after the area id)
+    #   IOS-XR             emits a block     →  `area 1` / ` default-cost 10`
+    #                                            (each child line of the block)
+    # Same keyword, same field, one extraction (CCR-0044 established the field on
+    # the first three; CCR-0046 brought IOS-XR into it).
+    _OSPF_AREA_SCALAR_PATTERNS: tuple[tuple[str, str, type], ...] = (
+        ("default_cost", r"\bdefault-cost\s+(?P<val>\d+)", int),
+    )
+
+    def _apply_ospf_area_scalar(self, area_data: dict, command: str) -> None:
+        """Apply one OSPF area-body command to an area dict, in place.
+
+        ``command`` is the IOS one-liner's tail (``default-cost 10`` out of
+        ``area 1 default-cost 10``) or one child line of the IOS-XR ``area``
+        block — the two spell the body identically once the area id is stripped.
+        """
+        for field, pattern, cast in self._OSPF_AREA_SCALAR_PATTERNS:
+            m = re.search(pattern, command)
+            if m:
+                area_data[field] = cast(m.group("val"))
+
     def _parse_ospf_areas(self, ospf_obj) -> list[OSPFArea]:
         """Parse OSPF area configurations."""
         areas = []
@@ -6134,16 +6161,12 @@ class IOSParser(BaseParser):
                     "filter_list_out": None,
                 }
 
-            # "area X default-cost N" — the cost of the default route this ABR
-            # injects into a stub/NSSA area. Read before the type dispatch below
-            # because the device emits it on its own line ("area 1 stub
-            # no-summary" / "area 1 default-cost 10") but the keyword is also
-            # legal as a suffix on the type line, and either way it is the same
-            # field. Cisco IOS, NX-OS and EOS all spell it identically, so the
-            # one branch serves all three (CCR-0044).
-            dc_match = re.search(r"\bdefault-cost\s+(\d+)", command)
-            if dc_match:
-                area_dict[area_id]["default_cost"] = int(dc_match.group(1))
+            # The area body vocabulary — shared with IOS-XR, which spells the same
+            # settings as a nested block (CCR-0046). Read before the type dispatch
+            # below because the device emits default-cost on its own line ("area 1
+            # stub no-summary" / "area 1 default-cost 10") but the keyword is also
+            # legal as a suffix on the type line, and either way it is the same field.
+            self._apply_ospf_area_scalar(area_dict[area_id], command)
 
             if "nssa" in command:
                 if "no-summary" in command:
@@ -8708,6 +8731,13 @@ class IOSParser(BaseParser):
         isis_objs = parse.find_objects(r"^router\s+isis\s*(\S*)")
 
         for isis_obj in isis_objs:
+            # CCR-0046: IOS-XR emits the instance's own attributes (metric-style,
+            # redistribute, …) one level deeper, inside `address-family ipv4
+            # unicast`, where every direct-child extractor below would miss them.
+            # `_nested_block` is the identity on IOS/NX-OS/EOS — this line changes
+            # nothing there — and an AF-transparent view on IOS-XR.
+            isis_obj = self._nested_block(isis_obj)
+
             match = re.search(r"^router\s+isis\s*(\S*)$", isis_obj.text)
             if match:
                 tag = match.group(1) if match.group(1) else None
@@ -8821,8 +8851,16 @@ class IOSParser(BaseParser):
                         if pid_match:
                             process_id = int(pid_match.group(1))
 
-                    # Extract route-map
-                    rm_match = re.search(r"route-map\s+(\S+)", remaining)
+                    # Extract the applied policy. One vocabulary, two dialects:
+                    # IOS/NX-OS/EOS emit `route-map <name>`, IOS-XR emits
+                    # `route-policy <name>` for the same thing — the shared BGP
+                    # redistribute helper already reads both (CCR-0032), and this
+                    # walk did not, so an IOS-XR ISIS redistribute came back with
+                    # route_map=None even once the statement itself was found
+                    # (CCR-0046 row 2: parsing the statement but dropping its policy
+                    # is still a silent gap, and a `len(redistribute) >= 1` check
+                    # cannot see it).
+                    rm_match = re.search(r"route-(?:map|policy)\s+(\S+)", remaining)
                     if rm_match:
                         route_map = rm_match.group(1)
 

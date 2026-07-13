@@ -871,6 +871,25 @@ class BaseParser(ABC):
 
     # Helper methods for common parsing tasks
 
+    def _nested_block(self, obj: Any) -> Any:
+        """Return the view of ``obj`` whose children the extractors should read.
+
+        ``find_child_objects`` searches an object's DIRECT children only
+        (ciscoconfparse2 defaults ``recurse=False``).  That is exactly right for
+        the IOS family, which emits an instance's attributes as direct children
+        of the instance's block.
+
+        IOS-XR does not: it emits them one level deeper, inside an
+        ``address-family`` sub-block, so every direct-child extractor stops at
+        the door of the container and reads nothing inside it ([[CCR-0046]]).
+        IOS-XR therefore overrides this seam to hand back an AF-transparent view
+        of the block.
+
+        Base implementation is the identity — every other parser sees the block
+        itself and is bit-for-bit unaffected.
+        """
+        return obj
+
     def _get_raw_lines_and_line_numbers(self, obj: Any) -> tuple[list[str], list[int]]:
         """Extract raw config lines and line numbers from a config object.
 

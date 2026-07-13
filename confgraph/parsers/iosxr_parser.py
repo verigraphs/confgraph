@@ -66,6 +66,115 @@ _IOSXR_KNOWN_PATTERNS: list[str] = [
 ]
 
 
+# CCR-0046. Any IOS-XR address-family sub-block header: `address-family ipv4
+# unicast`, `address-family ipv6 unicast`, `address-family ipv4 multicast`…
+_AF_HEADER_RE = re.compile(r"^\s*address-family\s+\S+")
+
+# …and the ONE address family whose contents may be attributed to the enclosing
+# object.  See _AFTransparentBlock: the model's IS-IS fields (`metric_style`,
+# `ISISInterface.metric`) have no address-family dimension, so they mean IPv4
+# unicast and nothing else.  A value from any other AF has no home and must not
+# be attributed to them.
+_AF_SPLICE_RE = re.compile(r"^\s*address-family\s+ipv4\s+unicast\b")
+
+
+class _AFTransparentBlock:
+    """A read-through view of an IOS-XR block that reads *through* its
+    ``address-family ipv4 unicast`` sub-block — and only that one.
+
+    IOS-XR nests one level deeper than the rest of the Cisco family.  An
+    attribute *of the enclosing object* is emitted INSIDE an
+    ``address-family <afi> <safi>`` sub-block rather than as a direct child of
+    the block that owns it::
+
+        router isis CORE
+         address-family ipv4 unicast
+          metric-style wide                   <- an attribute of the INSTANCE
+          redistribute bgp 65000 route-policy RP-BGP-IN
+         interface GigabitEthernet0/0/0/0
+          address-family ipv4 unicast
+           metric 10                          <- an attribute of the INTERFACE
+
+    Every extractor in the IOS family reads *direct* children —
+    ``find_child_objects`` defaults to ``recurse=False`` — so on IOS-XR they all
+    stop at the door of the AF block and see nothing inside it.  That single
+    mechanism is why ``metric_style``, ``redistribute`` and the per-interface
+    ``metric`` were all ``None``/empty on every IOS-XR device ([[CCR-0046]]).
+
+    **Only IPv4 unicast is spliced, and that is the whole point.**  ``ISISConfig``
+    and ``ISISInterface`` have no address-family dimension: their ``metric_style``
+    and ``metric`` are single-valued, and every consumer reads them as the
+    device's IPv4 values.  A dual-stack IS-IS instance carries *two* answers::
+
+        router isis BACKBONE
+         address-family ipv6 unicast
+          metric-style narrow                 <- IPv6's answer
+         address-family ipv4 unicast
+          metric-style wide                   <- IPv4's answer
+
+    Splicing both would merge them into one field and let **whichever the vendor
+    happened to write first** win — handing a consumer IPv6's answer to an IPv4
+    question, silently, and with no way to tell.  Being wrong beats being absent
+    only in the sense that it is worse.  So:
+
+    * dual-stack  → the IPv4 values, deterministically, whatever the block order;
+    * IPv4-only   → the IPv4 values;
+    * IPv6-only   → **nothing**.  The model cannot represent it, so it says so by
+      leaving the field ``None`` rather than presenting IPv6 numbers as IPv4 ones.
+      A loud absence is the honest answer when there is no home for the value.
+
+    This is the same rule that keeps the view off BGP neighbor blocks (below), and
+    the AF dimension the model is missing is its own CCR, not a thing to fake here.
+
+    The view is strictly ADDITIVE: every direct child is still returned, and the
+    IPv4-unicast AF's contents are hoisted alongside them.  Non-IPv4 AF *headers*
+    are still visible (they are containers, which no extractor reads as an
+    attribute); only their contents are withheld.  ``text``, ``linenum``,
+    ``children`` and ``all_children`` are forwarded to the wrapped object
+    untouched, so raw-line capture, line numbers and change-IR provenance are
+    bit-for-bit unchanged.  ``recurse=True`` is forwarded as well.
+
+    Deliberately NOT applied to BGP neighbor blocks: there the AF sub-block is a
+    real object (``BGPNeighborAF``), and flattening an AF-scoped policy up onto
+    the neighbor would assert it for every address family.  That value's home is
+    [[CCR-0045]]'s question, not this view's to answer.
+    """
+
+    __slots__ = ("_obj",)
+
+    def __init__(self, obj) -> None:
+        self._obj = obj
+
+    @staticmethod
+    def _effective_children(obj) -> list:
+        """Direct children, plus the contents of the ``ipv4 unicast`` AF sub-block.
+
+        Additive by construction: every direct child is kept, and only the
+        IPv4-unicast AF is descended into (recursively).  An ``ipv6 unicast`` /
+        ``ipv4 multicast`` / ``vpnv4`` block therefore contributes its header and
+        nothing else — its contents have no home in a model whose IS-IS fields
+        carry no address-family dimension, and attributing them to those fields
+        would be a confident wrong answer where ``None`` is the honest one.
+        """
+        out: list = []
+        for child in obj.children:
+            out.append(child)
+            if _AF_SPLICE_RE.match(child.text):
+                out.extend(_AFTransparentBlock._effective_children(child))
+        return out
+
+    def find_child_objects(self, regex, recurse: bool = False, reverse: bool = False) -> list:
+        if recurse:
+            return self._obj.find_child_objects(regex, recurse=True, reverse=reverse)
+        matches = [c for c in self._effective_children(self._obj) if c.re_search(regex)]
+        if reverse:
+            matches.reverse()
+        return matches
+
+    def __getattr__(self, name):
+        return getattr(self._obj, name)
+
+
 class IOSXRParser(IOSParser):
     """Parser for Cisco IOS-XR configurations.
 
@@ -129,6 +238,17 @@ class IOSXRParser(IOSParser):
         self.syntax = "iosxr"
         self.parse_obj = None  # Force re-creation with new syntax
         self._bgp_vrf_rd: dict[str, str] = {}  # VRF name → RD from BGP block (X6)
+
+    # -----------------------------------------------------------------------
+    # Nested-block descent (CCR-0046)
+    # -----------------------------------------------------------------------
+
+    def _nested_block(self, obj):
+        """IOS-XR reads an object's attributes *through* its ``address-family``
+        sub-blocks — see ``_AFTransparentBlock``.  This is the one override that
+        turns the whole IOS-family extractor set into an AF-aware one.
+        """
+        return _AFTransparentBlock(obj)
 
     # -----------------------------------------------------------------------
     # VRFs — "vrf NAME" with nested import/export route-target blocks
@@ -482,11 +602,31 @@ class IOSXRParser(IOSParser):
             "send_community": False,
             "route_reflector_client": False,
             "default_originate_route_map": None,
+            "maximum_prefix": None,
+            "maximum_prefix_threshold": None,
+            "maximum_prefix_warning_only": False,
         }
 
         for policy_child in af_child.all_children:
             cmd = policy_child.text.strip()
-            if cmd.startswith("route-policy ") and cmd.endswith(" in"):
+            if cmd.startswith("maximum-prefix "):
+                # CCR-0046 row 4. `maximum-prefix <limit> [<threshold-pct>]
+                # [warning-only | restart <n> | discard-extra-paths]`.  IOS-XR
+                # scopes the prefix limit PER ADDRESS-FAMILY — it is emitted inside
+                # `neighbor X / address-family ipv4 unicast` and a neighbor can
+                # carry a different limit per AF — so it lands on the BGPNeighborAF,
+                # which is where the model already has a home for it.  It is
+                # deliberately NOT copied up onto BGPNeighbor.maximum_prefix:
+                # promoting an AF-scoped value to the neighbor would assert one
+                # AF's limit for all of them.  That promotion is [[CCR-0045]]'s
+                # question, not this one's.
+                mp = re.match(r"maximum-prefix\s+(\d+)(?:\s+(\d+))?", cmd)
+                if mp:
+                    af_data["maximum_prefix"] = int(mp.group(1))
+                    if mp.group(2):
+                        af_data["maximum_prefix_threshold"] = int(mp.group(2))
+                    af_data["maximum_prefix_warning_only"] = "warning-only" in cmd
+            elif cmd.startswith("route-policy ") and cmd.endswith(" in"):
                 af_data["route_map_in"] = cmd[len("route-policy "):-3].strip()
             elif cmd.startswith("route-policy ") and cmd.endswith(" out"):
                 af_data["route_map_out"] = cmd[len("route-policy "):-4].strip()
@@ -881,6 +1021,7 @@ class IOSXRParser(IOSParser):
                     "nssa_no_summary": False,
                     "nssa_default_information_originate": False,
                     "nssa_default_information_originate_always": False,
+                    "default_cost": None,
                     "authentication": None,
                     "ranges": [],
                     "virtual_links": [],
@@ -889,6 +1030,17 @@ class IOSXRParser(IOSParser):
                     "filter_list_in": None,
                     "filter_list_out": None,
                 }
+
+            # CCR-0046 row 5. IOS-XR spells the area body as a nested block —
+            # `area 1` / `default-cost 10` — where IOS/NX-OS/EOS emit the one-liner
+            # `area 1 default-cost 10`. CCR-0044 added the field and the extraction
+            # for the one-liner and reached three of four OSes; the body vocabulary
+            # is the same table (IOSParser._OSPF_AREA_SCALAR_PATTERNS), it just has
+            # to be fed the block's child lines instead of the command tail.
+            # Direct children only: an `area N > interface X` sub-block has its own
+            # body (`cost 100`), which belongs to the interface, not the area.
+            for body_child in area_child.children:
+                self._apply_ospf_area_scalar(area_dict[area_id], body_child.text.strip())
 
             # Area type
             for prop_child in area_child.find_child_objects(r"^\s+nssa"):
@@ -1321,8 +1473,53 @@ class IOSXRParser(IOSParser):
     # Community-lists — "community-set NAME" ... "end-set"
     # -----------------------------------------------------------------------
 
+    def _parse_iosxr_set_members(self, set_obj) -> list[str]:
+        """Members of an IOS-XR ``community-set``/``extcommunity-set`` block, in order.
+
+        The RPL member separator is the **comma**, and a newline after a comma is
+        *optional* — the config guide states that one or more new lines **can**
+        follow a comma separator in a named AS-path set, community set, extended
+        community set or prefix set.  A member line may therefore carry one member
+        or several, and the emitted layout (indent width, members per line) is not
+        established by any readable source.  Splitting each body line on commas is
+        correct under **either** layout and assumes nothing (CCR-0046 row 8).
+
+        ``end-set`` is the block terminator, not a member.
+
+        Deliberately not shared with ``prefix-set``/``as-path-set``: those already
+        emit one entry per member, and an as-path member is a regex that may itself
+        contain a comma, which this split would corrupt.
+        """
+        members: list[str] = []
+        for child in set_obj.all_children:
+            text = child.text.strip()
+            if not text or text == "end-set":
+                continue
+            for member in text.split(","):
+                member = member.strip()
+                if member and member != "end-set":
+                    members.append(member)
+        return members
+
     def parse_community_lists(self) -> list[CommunityListConfig]:
-        """Parse IOS-XR community-set blocks and map to CommunityListConfig."""
+        """Parse IOS-XR community-set blocks and map to CommunityListConfig.
+
+        CCR-0046 row 8 — **one entry per member**, not one entry holding every
+        member.  In this model a ``CommunityListEntry`` is one *clause*: the IOS
+        parser builds it from a single ``ip community-list standard X permit A B``
+        line, where a route must carry **A and B** to match.  ``communities`` on one
+        entry is therefore a conjunction.
+
+        An IOS-XR ``community-set`` asserts no such thing.  Its members are a plain
+        list of specifications; the quantifier lives at the *use* site — under
+        ``community matches-any`` a route carrying any ONE member matches, under
+        ``matches-every`` all of them must.  Collapsing the members into a single
+        entry states a conjunction the device never wrote, and makes
+        ``len(entries)`` mean "1" on IOS-XR where it means "number of alternatives"
+        on IOS/NX-OS/EOS — the same set, two different answers, depending on who
+        wrote the config.  One entry per member keeps the members, their count and
+        their independence.
+        """
         community_lists: list[CommunityListConfig] = []
         parse = self._get_parse_obj()
 
@@ -1333,18 +1530,10 @@ class IOSXRParser(IOSParser):
                 continue
 
             raw_lines, line_numbers = self._get_raw_lines_and_line_numbers(cs_obj)
-            entries: list[CommunityListEntry] = []
-
-            all_communities: list[str] = []
-            for child in cs_obj.all_children:
-                text = child.text.strip().rstrip(",")
-                if not text or text in ("end-set",):
-                    continue
-                # Each line may be a community value like "65000:100"
-                all_communities.append(text)
-
-            if all_communities:
-                entries.append(CommunityListEntry(action="permit", communities=all_communities))
+            entries: list[CommunityListEntry] = [
+                CommunityListEntry(action="permit", communities=[member])
+                for member in self._parse_iosxr_set_members(cs_obj)
+            ]
 
             community_lists.append(
                 CommunityListConfig(
@@ -1366,15 +1555,12 @@ class IOSXRParser(IOSParser):
                 continue
             ecs_name = m.group(1)
             raw_lines, line_numbers = self._get_raw_lines_and_line_numbers(ecs_obj)
-            all_communities = []
-            for child in ecs_obj.all_children:
-                text = child.text.strip().rstrip(",")
-                if not text or text in ("end-set",):
-                    continue
-                all_communities.append(text)
-            entries = []
-            if all_communities:
-                entries.append(CommunityListEntry(action="permit", communities=all_communities))
+            # Same block shape, same member walk, same one-entry-per-member rule as
+            # community-set above — an extcommunity-set is a list of members too.
+            entries = [
+                CommunityListEntry(action="permit", communities=[member])
+                for member in self._parse_iosxr_set_members(ecs_obj)
+            ]
             community_lists.append(
                 CommunityListConfig(
                     object_id=f"community_list_{ecs_name}",
@@ -1458,6 +1644,111 @@ class IOSXRParser(IOSParser):
     # Static routes — "router static" block
     # -----------------------------------------------------------------------
 
+    # The keyword modifiers an IOS-XR static route can carry after its positional
+    # next-hop(s) and distance. THE table for "the (N+1)th static-route modifier".
+    # Every one of them must be listed even when it has no home in the model, because
+    # the walk uses this set to know where the positional part ENDS and where a
+    # free-text `description` STOPS.
+    _STATIC_ROUTE_KEYWORDS: frozenset[str] = frozenset({
+        "tag", "permanent", "vrflabel", "tunnel-id", "description", "track", "metric",
+    })
+
+    def _parse_iosxr_static_route_line(self, text: str) -> dict | None:
+        """One emitted IOS-XR static-route line → ``StaticRoute`` field values.
+
+        The emitted grammar (CCR-0046 rows 6-7) is::
+
+            <prefix> [vrf <vrf>] [<interface>] [<ip>] [<distance>] [tag <n>]
+                     [permanent] [vrflabel <n>] [tunnel-id <n>]
+                     [description <text>] [track <name>] [metric <n>]
+
+        Positionals first, then keyword modifiers.  Three things a naive walk gets
+        wrong, and this one does not:
+
+        * A **fully specified** route carries BOTH an output interface and a
+          next-hop IP, and the device emits the interface FIRST
+          (``10.0.0.0/8 GigabitEthernet0/0/0/0 172.16.1.2 200``).  Reading only the
+          first token after the prefix drops the next hop and then mistakes the IP
+          for the distance.
+        * The administrative **distance is a bare positional integer** — while
+          ``metric`` and ``tag`` carry their keywords.  A walk that treats every
+          trailing integer alike misreads both directions.
+        * ``description`` is free text, so it runs to the next KEYWORD, not to the
+          next token.
+
+        Returns None when the line is not a route (a ``!``, a nested block header,
+        a ``no …`` withdrawal).
+        """
+        m = re.match(r"^(\d+\.\d+\.\d+\.\d+/\d+)\s+(.*)$", text)
+        if not m:
+            return None
+        try:
+            destination = IPv4Network(m.group(1), strict=False)
+        except ValueError:
+            return None
+
+        tokens = m.group(2).split()
+        data: dict = {
+            "destination": destination,
+            "next_hop": None,
+            "next_hop_interface": None,
+            "distance": 1,
+            "tag": None,
+            "name": None,      # the model spells a route's description `name`
+            "metric": None,
+            "permanent": False,
+        }
+
+        i = 0
+        # A leading `vrf <name>` here is the next hop's DESTINATION vrf (route
+        # leaking), not the vrf the route lives in — that one comes from the
+        # enclosing block. Not modelled; step over both tokens so it cannot be
+        # mistaken for an interface name.
+        if len(tokens) > 1 and tokens[0] == "vrf":
+            i = 2
+
+        # Positional: interface, next-hop IP, administrative distance — in any
+        # combination, in emitted order.
+        while i < len(tokens) and tokens[i] not in self._STATIC_ROUTE_KEYWORDS:
+            token = tokens[i]
+            if token.isdigit():
+                data["distance"] = int(token)
+            else:
+                try:
+                    data["next_hop"] = IPv4Address(token)
+                except ValueError:
+                    if data["next_hop_interface"] is None:
+                        data["next_hop_interface"] = token
+            i += 1
+
+        # Keyword modifiers.
+        while i < len(tokens):
+            keyword = tokens[i]
+            i += 1
+            if keyword == "permanent":
+                data["permanent"] = True
+            elif keyword == "description":
+                words: list[str] = []
+                while i < len(tokens) and tokens[i] not in self._STATIC_ROUTE_KEYWORDS:
+                    words.append(tokens[i])
+                    i += 1
+                if words:
+                    data["name"] = " ".join(words)
+            elif keyword in ("tag", "metric"):
+                if i < len(tokens) and tokens[i].isdigit():
+                    data[keyword] = int(tokens[i])
+                    i += 1
+            else:
+                # `track <name>` / `vrflabel <n>` / `tunnel-id <n>`: consume the
+                # operand so it cannot be read as another modifier. IOS-XR's track
+                # operand is an object NAME (a string); StaticRoute.track is an int
+                # (the IOS object number), so it has no honest home here and is
+                # deliberately not stored rather than coerced.
+                if i < len(tokens) and tokens[i] not in self._STATIC_ROUTE_KEYWORDS:
+                    i += 1
+
+        return data
+
     def parse_static_routes(self) -> list[StaticRoute]:
         """Parse IOS-XR static routes from ``router static`` block.
 
@@ -1467,10 +1758,15 @@ class IOSXRParser(IOSParser):
              address-family ipv4 unicast
               0.0.0.0/0 192.168.1.1
               10.0.0.0/8 Null0 200
+              192.168.0.0/16 Null0 tag 666
+              10.200.0.0/16 172.16.1.2 200 description BACKUP-ROUTE
              !
              vrf MGMT
               address-family ipv4 unicast
                0.0.0.0/0 10.100.100.1
+
+        The line grammar — including the trailing modifiers that carry ``tag`` and
+        ``description`` — is ``_parse_iosxr_static_route_line``.
         """
         static_routes = []
         parse = self._get_parse_obj()
@@ -1481,36 +1777,19 @@ class IOSXRParser(IOSParser):
 
             def _extract_routes(af_obj, vrf: str | None) -> None:
                 for route_child in af_obj.all_children:
-                    text = route_child.text.strip()
-                    m = re.match(r"^(\d+\.\d+\.\d+\.\d+/\d+)\s+(\S+)(.*)", text)
-                    if not m:
+                    data = self._parse_iosxr_static_route_line(route_child.text.strip())
+                    if data is None:
                         continue
-                    prefix_str, next_hop_str = m.group(1), m.group(2)
-                    remaining = m.group(3).strip()
-                    try:
-                        destination = IPv4Network(prefix_str, strict=False)
-                    except ValueError:
-                        continue
-                    next_hop = None
-                    next_hop_interface = None
-                    try:
-                        next_hop = IPv4Address(next_hop_str)
-                    except ValueError:
-                        next_hop_interface = next_hop_str
-                    distance = 1
-                    parts = remaining.split()
-                    if parts and parts[0].isdigit():
-                        distance = int(parts[0])
+                    # Object identity keeps the emitted next hop: the interface when
+                    # the route names one (it is emitted first), else the IP.
+                    next_hop_str = data["next_hop_interface"] or data["next_hop"]
                     static_routes.append(StaticRoute(
-                        object_id=f"static_route_{destination}_{next_hop_str}",
+                        object_id=f"static_route_{data['destination']}_{next_hop_str}",
                         raw_lines=raw_lines,
                         source_os=self.os_type,
                         line_numbers=line_numbers,
-                        destination=destination,
-                        next_hop=next_hop,
-                        next_hop_interface=next_hop_interface,
-                        distance=distance,
                         vrf=vrf,
+                        **data,
                     ))
 
             # Global routes
@@ -1739,6 +2018,14 @@ class IOSXRParser(IOSParser):
                 intf_name = self._extract_match(intf_child.text, r"^\s+interface\s+(\S+)")
                 if not intf_name:
                     continue
+
+                # CCR-0046: an IS-IS interface's metric is emitted inside the
+                # interface's own `address-family ipv4 unicast` sub-block, so the
+                # direct-child lookups below read the container and found nothing.
+                # The AF-transparent view makes them read through it.  `passive`
+                # and `point-to-point` sit directly under the interface and are
+                # still seen — the view adds the AF's children, it removes nothing.
+                intf_child = self._nested_block(intf_child)
 
                 # Global metric: metric N  (no level qualifier)
                 isis_metric: int | None = None
