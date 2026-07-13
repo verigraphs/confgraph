@@ -453,6 +453,7 @@ _IFACE_MEMBER_KEYS: dict[str, "Callable[[Any], str] | None"] = {
     "secondary_ips": None,
     "ipv6_addresses": None,
     "helper_addresses": None,
+    "varp_addresses": None,
     "nhrp_nhs": None,
     "nhrp_map": None,
     "igmp_join_groups": None,
@@ -490,8 +491,11 @@ IFACE_MEMBER_REMOVAL_FIELDS: dict[str, str] = {
 @_lru_cache(maxsize=1)
 def interface_member_fields() -> frozenset[str]:
     """Family-8e boundary: InterfaceConfig collection fields with per-member
-    native SET ops (CCR Appendix X) — the 10 ``_IFACE_MEMBER_KEYS`` lists
-    plus the ``ospf_message_digest_keys`` dict.  Together with families 1
+    native SET ops (CCR Appendix X) — the 11 ``_IFACE_MEMBER_KEYS`` lists
+    (``varp_addresses`` joined in CCR-0044: EOS emits one
+    ``ip virtual-router address <ip>`` line per address, the same per-member
+    shape as ``helper_addresses``) plus the ``ospf_message_digest_keys`` dict.
+    Together with families 1
     and 2 this completes the interface container: every non-provenance
     InterfaceConfig field is native-emitting on the IOS-family parsers.
     """

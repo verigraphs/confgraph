@@ -426,6 +426,16 @@ class InterfaceConfig(BaseConfigObject):
     bfd_multiplier: int | None = Field(default=None, description="BFD detection multiplier")
     bfd_template: str | None = Field(default=None, description="BFD template name applied to this interface")
 
+    # VARP (Arista) — the virtual gateway address(es) shared by an SVI across
+    # MLAG peers; EOS's alternative to HSRP/VRRP, so it is neither of those and
+    # is NOT the PAN-OS `virtual_router` field below (a routing-instance name).
+    # A device emits one `ip virtual-router address <ip>` line PER address, so
+    # this is a list (syntax-corpus/eos/interfaces.yaml: ip-virtual-router-address).
+    varp_addresses: list[IPv4Address] = Field(
+        default_factory=list,
+        description="Arista VARP virtual gateway addresses (ip virtual-router address)",
+    )
+
     # IGMP per-interface
     igmp_version: int | None = Field(default=None, description="IGMP version (1, 2, 3)")
     igmp_query_interval: int | None = Field(default=None, description="IGMP query interval (seconds)")

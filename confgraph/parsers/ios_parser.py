@@ -407,6 +407,33 @@ class IOSParser(BaseParser):
         r"^ip\s+sla\s+monitor\s+(?P<id>\d+)$",
     )
 
+    # "enable BFD on every interface in this OSPF process". IOS spells it
+    # "bfd all-interfaces"; EOS extends this set with its own "bfd default".
+    _OSPF_BFD_ALL_PATTERNS = PatternSet(
+        r"^\s+bfd\s+all-interfaces\b",
+    )
+
+    # Interface BFD timers. IOS/NX-OS emit "min_rx" (underscore); EOS emits
+    # "min-rx" (hyphen) and appends its spelling to this set.
+    _IFACE_BFD_PATTERNS = PatternSet(
+        r"^\s+bfd\s+interval\s+(?P<interval>\d+)\s+min_rx\s+(?P<min_rx>\d+)"
+        r"\s+multiplier\s+(?P<multiplier>\d+)",
+    )
+
+    # Banner renderings, tried in order. ``{type}`` is the banner type; each
+    # pattern must expose a ``text`` group. Not a PatternSet because the banner
+    # type is templated in and the search runs over the whole config text (a
+    # banner body is multi-line and is not a ciscoconfparse child block).
+    #
+    # IOS puts a delimiter character on the header line and repeats it to close:
+    # ``banner motd ^CAuthorized^C``. The delimiter must be on the header line
+    # ([ \t] — never \s, which would let the "delimiter" be the first character
+    # of the *body* on the next line and truncate an EOS banner at whatever
+    # character happened to recur). EOS adds its own bare-header form below.
+    _BANNER_PATTERNS: tuple[str, ...] = (
+        r"^banner[ \t]+{type}[ \t]+(?P<delim>\S)(?P<text>.*?)(?P=delim)",
+    )
+
     # BGP neighbor/peer-group verb aliases: an OS-native spelling rewritten to
     # its canonical twin before the shared command dispatch (alias-normalization
     # ahead of matching). Subclasses extend (e.g. EOS maximum-routes).
@@ -420,6 +447,45 @@ class IOSParser(BaseParser):
             if command == native or command.startswith(native + " "):
                 return canonical + command[len(native):]
         return command
+
+    def _bgp_neighbor_commands(self, bgp_obj) -> list[tuple[str, str]]:
+        """Every ``neighbor <target> <command>`` line under *bgp_obj*, in config
+        order, as ``(target, canonical_command)`` pairs.
+
+        This is the single entry point into the Cisco-family neighbor walk, and
+        the *only* place an OS dialect is allowed to differ: the command verb is
+        put through ``_apply_bgp_cmd_alias`` here, so every consumer downstream
+        (``_parse_bgp_neighbors``, ``_parse_bgp_peer_groups``, peer-group
+        detection) sees one canonical spelling. A dialect declares itself with a
+        dict entry in ``_BGP_CMD_ALIASES`` — e.g. EOS's two-word
+        ``peer group`` → ``peer-group`` — and thereby inherits every neighbor
+        command this family understands, present and future. Forking the walk to
+        translate one token is what produced CCR-0044.
+        """
+        pairs: list[tuple[str, str]] = []
+        for child in bgp_obj.find_child_objects(r"^\s+neighbor\s+(\S+)\s+"):
+            match = re.search(r"^\s+neighbor\s+(\S+)\s+(.+)", child.text)
+            if not match:
+                continue
+            pairs.append(
+                (match.group(1), self._apply_bgp_cmd_alias(match.group(2).strip()))
+            )
+        return pairs
+
+    def _bgp_peer_group_names(self, bgp_obj) -> list[str]:
+        """Names declared as peer-groups, in config order.
+
+        Canonically ``neighbor <NAME> peer-group`` with no argument; EOS's
+        ``neighbor <NAME> peer group`` reaches this as the same canonical
+        command via ``_BGP_CMD_ALIASES``.
+        """
+        return list(
+            dict.fromkeys(
+                target
+                for target, command in self._bgp_neighbor_commands(bgp_obj)
+                if command == "peer-group"
+            )
+        )
 
     def __init__(self, config_text: str, os_type: OSType = OSType.IOS):
         """Initialize IOS parser.
@@ -519,24 +585,23 @@ class IOSParser(BaseParser):
     def _parse_iface_bfd(self, intf_obj) -> tuple[int | None, int | None, int | None, str | None]:
         """Return (bfd_interval, bfd_min_rx, bfd_multiplier, bfd_template) for an interface.
 
-        IOS / EOS / NX-OS syntax::
+        IOS / NX-OS syntax::
 
             bfd interval 300 min_rx 300 multiplier 3
             bfd template MY-TEMPLATE
 
-        Override this in platform-specific subclasses for different syntax.
+        The ``min_rx`` / ``min-rx`` spelling differs by OS, so the accepted
+        renderings live in ``_IFACE_BFD_PATTERNS``; a dialect appends its own
+        rather than overriding this method (EOS emits the hyphen).
         """
         bfd_interval = bfd_min_rx = bfd_multiplier = bfd_template = None
         bfd_ch = intf_obj.find_child_objects(r"^\s+bfd\s+interval\s+")
         if bfd_ch:
-            m = re.match(
-                r"^\s+bfd\s+interval\s+(\d+)\s+min_rx\s+(\d+)\s+multiplier\s+(\d+)",
-                bfd_ch[-1].text,
-            )
+            m = self._IFACE_BFD_PATTERNS.match(bfd_ch[-1].text)
             if m:
-                bfd_interval = int(m.group(1))
-                bfd_min_rx = int(m.group(2))
-                bfd_multiplier = int(m.group(3))
+                bfd_interval = int(m.group("interval"))
+                bfd_min_rx = int(m.group("min_rx"))
+                bfd_multiplier = int(m.group("multiplier"))
         tmpl_ch = intf_obj.find_child_objects(r"^\s+bfd\s+template\s+")
         if tmpl_ch:
             v = self._extract_match(tmpl_ch[-1].text, r"^\s+bfd\s+template\s+(\S+)")
@@ -1679,6 +1744,10 @@ class IOSParser(BaseParser):
         ),
         "helper_addresses": lambda v: (
             rf"^\s+ip\s+helper-address\s+{re.escape(str(v))}\s*$"
+        ),
+        # EOS VARP — one emitted line per address, like helper-address
+        "varp_addresses": lambda v: (
+            rf"^\s+ip\s+virtual-router\s+address\s+{re.escape(str(v))}\s*$"
         ),
         "nhrp_nhs": lambda v: rf"^\s+ip\s+nhrp\s+nhs\s+{re.escape(str(v))}\b",
         "nhrp_map": lambda v: rf"^\s+ip\s+nhrp\s+map\s+{re.escape(str(v))}\s*$",
@@ -3273,11 +3342,14 @@ class IOSParser(BaseParser):
 
         # Area scalars → SET (…, "area", aid, "scalar", field).  Parser-absence
         # == model default for EVERY OSPFArea field (audited in Appendix P.1 —
-        # no Finding-2-class trap; ``nssa_translate``/``default_cost`` are
-        # unparsed → never non-default at IOS/NX-OS, listed for the state-walk
-        # model mirror).  ``area_type`` compares against the NORMAL enum (the
-        # runtime value is the plain string — ``use_enum_values`` — and
-        # OSPFAreaType is a str Enum, so the comparison is spelling-exact).
+        # no Finding-2-class trap; ``nssa_translate`` is unparsed → never
+        # non-default at IOS/NX-OS, listed for the state-walk model mirror.
+        # ``default_cost`` became parsed in CCR-0044 and is emitted like any
+        # other area scalar — its parser-absence default (None) still equals the
+        # model default, so the walk is unaffected).  ``area_type`` compares
+        # against the NORMAL enum (the runtime value is the plain string —
+        # ``use_enum_values`` — and OSPFAreaType is a str Enum, so the
+        # comparison is spelling-exact).
         _OSPF_AREA_SCALARS = (
             ("area_type", OSPFAreaType.NORMAL),
             ("stub_no_summary", False),
@@ -4857,8 +4929,11 @@ class IOSParser(BaseParser):
             if not graceful_restart:
                 graceful_restart = len(ospf_obj.find_child_objects(r"^\s+nsf\b")) > 0
 
-            # BFD all-interfaces
-            bfd_all = len(ospf_obj.find_child_objects(r"^\s+bfd\s+all-interfaces")) > 0
+            # BFD on all interfaces of the process — every accepted spelling
+            # (IOS "bfd all-interfaces", EOS "bfd default").
+            bfd_all = len(
+                ospf_obj.find_child_objects(self._OSPF_BFD_ALL_PATTERNS.union)
+            ) > 0
 
             # ---------------------------------------------------------------
             # WI-DB2 (CCR Appendix AD): the four deferred family-6 withdrawal
@@ -5775,28 +5850,16 @@ class IOSParser(BaseParser):
     def _parse_bgp_neighbors(self, bgp_obj) -> list[BGPNeighbor]:
         """Parse BGP neighbors."""
         neighbors = []
-        neighbor_children = bgp_obj.find_child_objects(r"^\s+neighbor\s+(\S+)\s+")
 
-        # First, find all peer-group names
-        peer_group_names = set()
-        for child in neighbor_children:
-            match = re.search(r"^\s+neighbor\s+(\S+)\s+peer-group\s*$", child.text)
-            if match:
-                peer_group_names.add(match.group(1))
+        # Peer-group names first, so their attribute lines are not mistaken for
+        # neighbors. Both walks read the same canonicalised command stream.
+        peer_group_names = set(self._bgp_peer_group_names(bgp_obj))
 
         # Group by neighbor IP
         neighbor_dict: dict[str, dict] = {}
 
-        for neighbor_child in neighbor_children:
-            match = re.search(r"^\s+neighbor\s+(\S+)\s+(.+)", neighbor_child.text)
-            if not match:
-                continue
-
-            peer_ip_str = match.group(1)
-            command = self._apply_bgp_cmd_alias(match.group(2))
-
-            # Skip peer-group definition lines (neighbor GROUPNAME peer-group)
-            # These are already captured in peer_group_names set
+        for peer_ip_str, command in self._bgp_neighbor_commands(bgp_obj):
+            # Skip peer-group definition/attribute lines (neighbor GROUPNAME ...)
             if peer_ip_str in peer_group_names:
                 continue
 
@@ -5970,21 +6033,24 @@ class IOSParser(BaseParser):
         return neighbors
 
     def _parse_bgp_peer_groups(self, bgp_obj) -> list[BGPPeerGroup]:
-        """Parse BGP peer-groups."""
+        """Parse BGP peer-groups.
+
+        Reads the same canonicalised ``neighbor`` command stream as
+        ``_parse_bgp_neighbors``, so a dialect's verb aliases (EOS
+        ``maximum-routes``, EOS two-word ``peer group``) apply to peer-group
+        attribute lines exactly as they do to neighbor lines.
+        """
         peer_groups = []
-        pg_children = bgp_obj.find_child_objects(r"^\s+neighbor\s+(\S+)\s+peer-group\s*$")
+        commands = self._bgp_neighbor_commands(bgp_obj)
 
-        for pg_child in pg_children:
-            pg_name = self._extract_match(pg_child.text, r"^\s+neighbor\s+(\S+)\s+peer-group\s*$")
-            if not pg_name:
-                continue
-
+        for pg_name in self._bgp_peer_group_names(bgp_obj):
             pg_data = _default_pg_data(pg_name)
 
-            for pg_config_child in bgp_obj.find_child_objects(rf"^\s+neighbor\s+{re.escape(pg_name)}\s+"):
-                match = re.search(rf"^\s+neighbor\s+{re.escape(pg_name)}\s+(.+)", pg_config_child.text)
-                if match:
-                    apply_peer_group_command(pg_data, match.group(1))
+            for target, command in commands:
+                if target == pg_name:
+                    # The bare "peer-group" declaration line carries no
+                    # attribute; apply_peer_group_command ignores it.
+                    apply_peer_group_command(pg_data, command)
 
             peer_groups.append(BGPPeerGroup(**pg_data))
 
@@ -6014,12 +6080,24 @@ class IOSParser(BaseParser):
                     "nssa_no_summary": False,
                     "nssa_default_information_originate": False,
                     "nssa_default_information_originate_always": False,
+                    "default_cost": None,
                     "authentication": None,
                     "ranges": [],
                     "virtual_links": [],
                     "filter_list_in": None,
                     "filter_list_out": None,
                 }
+
+            # "area X default-cost N" — the cost of the default route this ABR
+            # injects into a stub/NSSA area. Read before the type dispatch below
+            # because the device emits it on its own line ("area 1 stub
+            # no-summary" / "area 1 default-cost 10") but the keyword is also
+            # legal as a suffix on the type line, and either way it is the same
+            # field. Cisco IOS, NX-OS and EOS all spell it identically, so the
+            # one branch serves all three (CCR-0044).
+            dc_match = re.search(r"\bdefault-cost\s+(\d+)", command)
+            if dc_match:
+                area_dict[area_id]["default_cost"] = int(dc_match.group(1))
 
             if "nssa" in command:
                 if "no-summary" in command:
@@ -9699,12 +9777,19 @@ class IOSParser(BaseParser):
         }
         found_any = False
         for banner_type in banner_types:
-            # Match: banner <type> <delim><text><delim>
-            pattern = rf"^banner\s+{banner_type}\s+(\S)(.*?)\1"
-            m = re.search(pattern, self.config_text, re.MULTILINE | re.DOTALL)
-            if m:
-                banner_types[banner_type] = m.group(2).strip()
-                found_any = True
+            # Try each accepted banner rendering in order (see
+            # _BANNER_PATTERNS): IOS delimits with a character on the header
+            # line, EOS emits a bare header and closes with a literal EOF line.
+            for template in self._BANNER_PATTERNS:
+                m = re.search(
+                    template.format(type=banner_type),
+                    self.config_text,
+                    re.MULTILINE | re.DOTALL,
+                )
+                if m:
+                    banner_types[banner_type] = m.group("text").strip()
+                    found_any = True
+                    break
 
         if not found_any:
             return None

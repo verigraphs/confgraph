@@ -4,9 +4,9 @@ import re
 from ipaddress import IPv4Address, IPv4Interface, IPv4Network, IPv6Address, IPv6Interface, IPv6Network
 
 from confgraph.parsers.ios_parser import IOSParser
-from confgraph.parsers.base import PatternSet, _BASE_KNOWN_PATTERNS, _BASE_BEST_GUESS_KEYWORDS, _default_pg_data, apply_peer_group_command
+from confgraph.parsers.base import PatternSet, _BASE_KNOWN_PATTERNS, _BASE_BEST_GUESS_KEYWORDS
 from confgraph.models.base import OSType
-from confgraph.models.bgp import BGPAddressFamily, BGPConfig, BGPNeighbor, BGPPeerGroup
+from confgraph.models.bgp import BGPAddressFamily, BGPConfig
 from confgraph.models.vrf import VRFConfig
 from confgraph.models.prefix_list import PrefixListConfig, PrefixListEntry
 from confgraph.models.static_route import StaticRoute
@@ -84,9 +84,51 @@ class EOSParser(IOSParser):
         r"^vrf\s+definition\s+(?P<name>\S+)",
     )
 
-    # BGP neighbor verb alias: EOS-native "maximum-routes" == IOS
-    # "maximum-prefix" (one dict entry — alias-normalization ahead of dispatch).
-    _BGP_CMD_ALIASES = {"maximum-routes": "maximum-prefix"}
+    # OSPF process-wide BFD. BOTH spellings are Arista's, by version: EOS emits
+    # "bfd all-interfaces" before 4.23 and "bfd default" from 4.23 on
+    # (syntax-corpus/eos/ospf.yaml: bfd-default, versions.introduced 4.23).
+    # Extending the parent set — rather than overriding the OSPF walk — is what
+    # makes an EOS parser accept both without IOS accepting "bfd default".
+    _OSPF_BFD_ALL_PATTERNS = IOSParser._OSPF_BFD_ALL_PATTERNS.extended(
+        r"^\s+bfd\s+default\s*$",
+    )
+
+    # Interface BFD timers. Again BOTH spellings are Arista's and the difference
+    # is EOS version, not vendor: EOS-4.13 emits "min_rx" (underscore, the same
+    # as IOS/NX-OS) while modern EOS renders "min-rx" (hyphen)
+    # (syntax-corpus/eos/bfd.yaml: bfd-interval-min-rx-multiplier). The parent
+    # pattern carries the underscore, so EOS reads both.
+    _IFACE_BFD_PATTERNS = IOSParser._IFACE_BFD_PATTERNS.extended(
+        r"^\s+bfd\s+interval\s+(?P<interval>\d+)\s+min-rx\s+(?P<min_rx>\d+)"
+        r"\s+multiplier\s+(?P<multiplier>\d+)",
+    )
+
+    # Banners. EOS emits a BARE "banner motd" header — no delimiter character —
+    # then the body, then a line containing the literal "EOF"
+    # (syntax-corpus/eos/system.yaml: banner-motd). The body may contain "!",
+    # so only the EOF line ends it. The inherited IOS delimiter form stays first
+    # in the set: EOS accepts it, and the two are disjoint (IOS requires the
+    # delimiter on the header line, EOS requires the header line to end there).
+    _BANNER_PATTERNS: tuple[str, ...] = IOSParser._BANNER_PATTERNS + (
+        r"^banner[ \t]+{type}[ \t]*\n(?P<text>.*?)\n[ \t]*EOF[ \t]*$",
+    )
+
+    # BGP neighbor/peer-group verb aliases. These two dict entries are the
+    # *entire* EOS dialect of the Cisco-family neighbor walk (CCR-0044):
+    #
+    #   "maximum-routes"  — EOS-native spelling of IOS "maximum-prefix"
+    #   "peer group"      — EOS emits two words where IOS emits "peer-group"
+    #
+    # Everything else (route-map / prefix-list / timers / local-as / password /
+    # send-community / …) is spelled identically to IOS, so EOS runs the shared
+    # walk in IOSParser._parse_bgp_neighbors and inherits every command that
+    # walk learns. EOS used to fork the walk to translate "peer group"; the fork
+    # then never learned the policy commands, and BGP neighbor policy silently
+    # never reached the model.
+    _BGP_CMD_ALIASES = {
+        "maximum-routes": "maximum-prefix",
+        "peer group": "peer-group",
+    }
 
     def __init__(self, config_text: str):
         """Initialize EOS parser.
@@ -166,6 +208,26 @@ class EOSParser(IOSParser):
                 )
                 if am:
                     intf_cfg.ospf_area = am.group(1)
+
+            # VARP: "ip virtual-router address <ip>". A device emits ONE LINE
+            # PER ADDRESS, so accumulate rather than overwrite
+            # (syntax-corpus/eos/interfaces.yaml: ip-virtual-router-address).
+            # This is EOS's anycast-gateway concept — not HSRP, not VRRP, and
+            # not the PAN-OS `virtual_router` field (a routing-instance name).
+            for varp_child in intf_obj.find_child_objects(
+                r"^\s+ip\s+virtual-router\s+address\s+"
+            ):
+                vm = re.search(
+                    r"^\s+ip\s+virtual-router\s+address\s+(\S+)", varp_child.text
+                )
+                if not vm:
+                    continue
+                try:
+                    addr = IPv4Address(vm.group(1))
+                except ValueError:
+                    continue
+                if addr not in intf_cfg.varp_addresses:
+                    intf_cfg.varp_addresses.append(addr)
 
         return interfaces
 
@@ -824,197 +886,10 @@ class EOSParser(IOSParser):
         return as_path_lists
 
     # -------------------------------------------------------------------
-    # BGP — EOS "peer group" (two words) support
+    # BGP — EOS "peer group" (two words) is a verb alias, not a fork.
+    # See _BGP_CMD_ALIASES above: _parse_bgp_neighbors and
+    # _parse_bgp_peer_groups are inherited from IOSParser unchanged.
     # -------------------------------------------------------------------
-
-    def _parse_bgp_peer_groups(self, bgp_obj) -> list[BGPPeerGroup]:
-        """Parse BGP peer-groups for EOS.
-
-        EOS uses ``neighbor NAME peer group`` (two words) instead of IOS
-        ``neighbor NAME peer-group`` (hyphen).
-        """
-        # IOS hyphenated form
-        peer_groups = super()._parse_bgp_peer_groups(bgp_obj)
-        seen = {pg.name for pg in peer_groups}
-
-        # EOS two-word form: "neighbor NAME peer group"
-        pg_children = bgp_obj.find_child_objects(
-            r"^\s+neighbor\s+(\S+)\s+peer\s+group\s*$"
-        )
-        for pg_child in pg_children:
-            pg_name = self._extract_match(
-                pg_child.text, r"^\s+neighbor\s+(\S+)\s+peer\s+group\s*$"
-            )
-            if not pg_name or pg_name in seen:
-                continue
-            seen.add(pg_name)
-
-            pg_data = _default_pg_data(pg_name)
-            for config_child in bgp_obj.find_child_objects(
-                rf"^\s+neighbor\s+{re.escape(pg_name)}\s+"
-            ):
-                m = re.search(
-                    rf"^\s+neighbor\s+{re.escape(pg_name)}\s+(.+)",
-                    config_child.text,
-                )
-                if m:
-                    cmd = m.group(1)
-                    # Skip the "peer group" definition line itself
-                    if cmd.strip() == "peer group":
-                        continue
-                    apply_peer_group_command(pg_data, cmd)
-
-            peer_groups.append(BGPPeerGroup(**pg_data))
-
-        return peer_groups
-
-    def _parse_bgp_neighbors(self, bgp_obj) -> list[BGPNeighbor]:
-        """Parse BGP neighbors for EOS.
-
-        Handles the two-word ``peer group NAME`` form in addition to IOS
-        ``peer-group NAME`` (hyphen).
-        """
-        # Let IOS handle what it can (hyphenated peer-group, inline remote-as)
-        neighbors = super()._parse_bgp_neighbors(bgp_obj)
-        existing_ips = {str(n.peer_ip) for n in neighbors}
-
-        # Build the set of EOS peer-group names (two-word form)
-        eos_pg_names = set()
-        for child in bgp_obj.find_child_objects(r"^\s+neighbor\s+(\S+)\s+peer\s+group\s*$"):
-            m = re.search(r"^\s+neighbor\s+(\S+)\s+peer\s+group\s*$", child.text)
-            if m:
-                eos_pg_names.add(m.group(1))
-
-        # Find neighbors that use "peer group NAME" (two words)
-        neighbor_children = bgp_obj.find_child_objects(r"^\s+neighbor\s+(\S+)\s+")
-        neighbor_dict: dict[str, dict] = {}
-
-        for child in neighbor_children:
-            m = re.search(r"^\s+neighbor\s+(\S+)\s+(.+)", child.text)
-            if not m:
-                continue
-
-            peer_ip_str = m.group(1)
-            command = m.group(2)
-
-            # Skip peer-group definition lines
-            if peer_ip_str in eos_pg_names:
-                continue
-
-            # Skip neighbors already captured by super()
-            if peer_ip_str in existing_ips:
-                # But still check if this line has "peer group" to patch
-                if command.startswith("peer group "):
-                    pg_name = command.replace("peer group ", "").strip()
-                    for n in neighbors:
-                        if str(n.peer_ip) == peer_ip_str and n.peer_group is None:
-                            n.peer_group = pg_name
-                continue
-
-            # New neighbor not captured by super()
-            if peer_ip_str not in neighbor_dict:
-                neighbor_dict[peer_ip_str] = {
-                    "peer_ip": peer_ip_str,
-                    "remote_as": None,
-                    "peer_group": None,
-                    "description": None,
-                    "update_source": None,
-                    "ebgp_multihop": None,
-                    "password": None,
-                    "password_encryption_type": None,
-                    "route_map_in": None,
-                    "route_map_out": None,
-                    "prefix_list_in": None,
-                    "prefix_list_out": None,
-                    "filter_list_in": None,
-                    "filter_list_out": None,
-                    "maximum_prefix": None,
-                    "next_hop_self": False,
-                    "route_reflector_client": False,
-                    "send_community": None,
-                    "fall_over_bfd": False,
-                    "shutdown": False,
-                    "disable_connected_check": False,
-                    "timers": None,
-                    "local_as": None,
-                    "local_as_no_prepend": False,
-                    "local_as_replace_as": False,
-                }
-
-            if command.startswith("peer group "):
-                neighbor_dict[peer_ip_str]["peer_group"] = command.replace("peer group ", "").strip()
-            elif command.startswith("remote-as "):
-                as_str = command.replace("remote-as ", "").strip()
-                try:
-                    neighbor_dict[peer_ip_str]["remote_as"] = int(as_str)
-                except ValueError:
-                    neighbor_dict[peer_ip_str]["remote_as"] = as_str
-            elif command.startswith("description "):
-                neighbor_dict[peer_ip_str]["description"] = command.replace("description ", "").strip()
-            elif command.startswith("update-source "):
-                neighbor_dict[peer_ip_str]["update_source"] = command.replace("update-source ", "").strip()
-            elif command.startswith("password "):
-                # EOS previously had no password branch here, dropping the key
-                # entirely for peer-group-form neighbors. Use the shared
-                # extractor inherited from IOSParser (CCR-0030 bug 4).
-                key, enc = self._split_bgp_password(command[len("password "):])
-                neighbor_dict[peer_ip_str]["password"] = key
-                neighbor_dict[peer_ip_str]["password_encryption_type"] = enc
-            elif command == "shutdown":
-                neighbor_dict[peer_ip_str]["shutdown"] = True
-
-        # Create BGPNeighbor objects for EOS-specific neighbors
-        from ipaddress import IPv6Address
-        for peer_ip_str, ndata in neighbor_dict.items():
-            try:
-                peer_ip = IPv4Address(peer_ip_str)
-            except ValueError:
-                try:
-                    peer_ip = IPv6Address(peer_ip_str)
-                except ValueError:
-                    continue
-
-            # Same guard as IOS: skip if no remote-as and no peer-group
-            if (
-                ndata["remote_as"] is None
-                and ndata["peer_group"] is None
-                and not ndata.get("shutdown", False)
-            ):
-                continue
-
-            remote_as = ndata["remote_as"] if ndata["remote_as"] is not None else "inherited"
-
-            neighbors.append(
-                BGPNeighbor(
-                    peer_ip=peer_ip,
-                    remote_as=remote_as,
-                    peer_group=ndata["peer_group"],
-                    description=ndata["description"],
-                    update_source=ndata["update_source"],
-                    ebgp_multihop=ndata["ebgp_multihop"],
-                    password=ndata["password"],
-                    password_encryption_type=ndata["password_encryption_type"],
-                    route_map_in=ndata["route_map_in"],
-                    route_map_out=ndata["route_map_out"],
-                    prefix_list_in=ndata["prefix_list_in"],
-                    prefix_list_out=ndata["prefix_list_out"],
-                    filter_list_in=ndata["filter_list_in"],
-                    filter_list_out=ndata["filter_list_out"],
-                    maximum_prefix=ndata["maximum_prefix"],
-                    next_hop_self=ndata["next_hop_self"],
-                    route_reflector_client=ndata["route_reflector_client"],
-                    send_community=ndata["send_community"],
-                    fall_over_bfd=ndata["fall_over_bfd"],
-                    shutdown=ndata["shutdown"],
-                    disable_connected_check=ndata["disable_connected_check"],
-                    timers=ndata["timers"],
-                    local_as=ndata["local_as"],
-                    local_as_no_prepend=ndata["local_as_no_prepend"],
-                    local_as_replace_as=ndata["local_as_replace_as"],
-                )
-            )
-
-        return neighbors
 
     def _parse_bgp_vrf_instances(self, bgp_obj, asn: int) -> list[BGPConfig]:
         """Parse VRF-specific BGP instances (``router bgp`` → ``vrf NAME`` block).
@@ -1260,23 +1135,53 @@ class EOSParser(IOSParser):
     # -----------------------------------------------------------------------
 
     def parse_bfd(self):
-        """Parse BFD global configuration from EOS.
+        """Parse EOS global BFD.
 
-        EOS uses ``bfd slow-timer N`` (singular — no trailing ``s``) as the
-        only global BFD knob.  BFD timers are otherwise per-interface.
-        IOS-style ``bfd-template`` does not exist in EOS::
+        Two renderings, both accepted, because both are Arista's — the
+        difference is EOS version, not vendor (syntax-corpus/eos/bfd.yaml:
+        router-bfd). Modern EOS nests global BFD under a ``router bfd`` block;
+        EOS-4.13 emits the knobs flat at global level with no block at all.
+
+        **Block form** — ``router bfd``, whose children do NOT repeat the word
+        ``bfd`` (syntax-corpus/eos/bfd.yaml: router-bfd, slow-timer)::
+
+            router bfd
+               interval 900 min-rx 900 multiplier 50 default
+               slow-timer 5000
+
+        **Flat form** — the singular ``bfd slow-timer <ms>`` global line::
 
             bfd slow-timer 2000
+
+        Reading only the flat form is why this method never fired on a modern
+        EOS config; reading only the block form would drop a 4.13 one. A parser
+        that must ingest whatever a fleet actually runs reads both.
+
+        IOS-style ``bfd-template`` does not exist in EOS; per-interface timers
+        (``bfd interval N min-rx N multiplier N``) are read by the inherited
+        interface walk.
         """
         from confgraph.models.bfd import BFDConfig
 
         parse = self._get_parse_obj()
-        slow_timers = None
-        raw_lines = []
-        line_numbers = []
+        slow_timers: int | None = None
+        raw_lines: list[str] = []
+        line_numbers: list[int] = []
 
-        # EOS uses "bfd slow-timer N" (singular), not "bfd slow-timers N"
-        for obj in parse.find_objects(r"^bfd\s+slow-timer\b"):
+        # Block form: "router bfd" + indented children
+        for bfd_obj in parse.find_objects(r"^router\s+bfd\s*$"):
+            raw_lines.append(bfd_obj.text)
+            line_numbers.append(bfd_obj.linenum)
+            for child in bfd_obj.children:
+                raw_lines.append(child.text)
+                line_numbers.append(child.linenum)
+                v = self._extract_match(child.text, r"^\s+slow-timer\s+(\d+)")
+                if v:
+                    slow_timers = int(v)
+
+        # Flat form: "bfd slow-timer <ms>" (singular — never IOS's plural
+        # "slow-timers", which EOS does not accept)
+        for obj in parse.find_objects(r"^bfd\s+slow-timer\s+\d+"):
             raw_lines.append(obj.text)
             line_numbers.append(obj.linenum)
             v = self._extract_match(obj.text, r"^bfd\s+slow-timer\s+(\d+)")
