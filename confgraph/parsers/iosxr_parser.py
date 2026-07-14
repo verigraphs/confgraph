@@ -237,7 +237,6 @@ class IOSXRParser(IOSParser):
         super().__init__(config_text, os_type=OSType.IOS_XR)
         self.syntax = "iosxr"
         self.parse_obj = None  # Force re-creation with new syntax
-        self._bgp_vrf_rd: dict[str, str] = {}  # VRF name → RD from BGP block (X6)
 
     # -----------------------------------------------------------------------
     # Nested-block descent (CCR-0046)
@@ -677,9 +676,10 @@ class IOSXRParser(IOSParser):
         """Parse VRF-specific BGP instances (``router bgp`` → ``vrf NAME`` block).
 
         Delegates to the shared block-form traversal ``_parse_bgp_vrf_blocks``
-        (CCR-0032). That helper descends via ``_iter_router_vrf_blocks``, reads
-        the RD (recorded in ``self._bgp_vrf_rd`` for VRFConfig back-fill and set
-        on ``BGPConfig.rd``), and delegates neighbors to this class's
+        (CCR-0032). That helper descends via ``_iter_router_vrf_blocks``, reads the
+        RD and any route-targets onto ``BGPConfig`` (from where the shared
+        ``BaseParser._backfill_vrf_rd_rt`` walk attributes them to the VRFConfig —
+        [[CCR-0059]]), and delegates neighbors to this class's
         ``_parse_bgp_neighbors`` — the same block-form neighbor parser used for
         the global instance, so the two paths can no longer diverge.
         """
@@ -2578,29 +2578,17 @@ class IOSXRParser(IOSParser):
         return tombstones
 
     # -------------------------------------------------------------------
-    # parse() override — X4: back-fill OSPF interface fields,
-    #                    X6: populate VRF RD from BGP VRF block
+    # X4 (back-fill ospf_area / ospf_process_id from OSPFArea.interfaces) is GONE:
+    # it was the IOS-XR copy of a back-fill that JunOS and PAN-OS each had their own
+    # copy of, and it carried only membership — never the cost, network type or BFD
+    # sitting one level deeper, inside the interface block. All four now run through
+    # the model (OSPFArea.interface_settings) and the one shared walk,
+    # BaseParser._backfill_ospf_interface_settings ([[CCR-0038]] Theme 2).
+    #
+    # X6 (populate VRF RD from the BGP VRF block — IOS-XR puts RD under "router bgp /
+    # vrf NAME / rd X:Y", not under "vrf NAME") is GONE for the same reason: it was
+    # the IOS-XR copy of a back-fill EOS needed too, and it carried only the RD, never
+    # the route-targets sitting in the same block. Both now run through the model
+    # (BGPConfig.rd / .route_target_*) and the one shared walk,
+    # BaseParser._backfill_vrf_rd_rt ([[CCR-0059]]).  Hence: no parse() override.
     # -------------------------------------------------------------------
-
-    def parse(self) -> "ParsedConfig":
-        """Override to post-process parsed data for IOS-XR consistency fixes."""
-        from confgraph.models.parsed_config import ParsedConfig
-
-        pc = super().parse()
-
-        # X4 (back-fill ospf_area / ospf_process_id from OSPFArea.interfaces) is
-        # GONE: it was the IOS-XR copy of a back-fill that JunOS and PAN-OS each
-        # had their own copy of, and it carried only membership — never the cost,
-        # network type or BFD sitting one level deeper, inside the interface block.
-        # All four now run through the model (OSPFArea.interface_settings) and the
-        # one shared walk, BaseParser._backfill_ospf_interface_settings
-        # ([[CCR-0038]] Theme 2).
-
-        # X6: populate VRF RD from BGP VRF block (IOS-XR puts RD under
-        # "router bgp / vrf NAME / rd X:Y", not under "vrf NAME").
-        if self._bgp_vrf_rd and pc.vrfs:
-            for vrf in pc.vrfs:
-                if vrf.rd is None and vrf.name in self._bgp_vrf_rd:
-                    vrf.rd = self._bgp_vrf_rd[vrf.name]
-
-        return pc

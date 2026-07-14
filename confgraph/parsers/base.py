@@ -769,6 +769,10 @@ class BaseParser(ABC):
         # OS — see _backfill_ospf_interface_settings.
         self._backfill_ospf_interface_settings(pc)
 
+        # CCR-0059: attribute a VRF's RD / route-targets written inside the BGP
+        # process back onto the VRFConfig they name. One shared walk for every OS.
+        self._backfill_vrf_rd_rt(pc)
+
         # Change-IR Phase 3: native op emission for migrated command
         # families (CCR change_ir_proposal_operations.md, Appendix D).
         # Runs LAST so op values reflect the final parsed state (all
@@ -859,6 +863,60 @@ class BaseParser(ABC):
                         if current is not None and current is not False:
                             continue
                         setattr(intf, dst_field, value)
+
+    # BGPConfig field → VRFConfig field. THE table for CCR-0059: attributing the
+    # (N+1)th VRF attribute that a vendor declares inside the BGP process is one row
+    # here, not one parse() override per OS.
+    _BGP_VRF_BACKFILL: tuple[tuple[str, str], ...] = (
+        ("rd",                   "rd"),
+        ("route_target_import",  "route_target_import"),
+        ("route_target_export",  "route_target_export"),
+        ("route_target_both",    "route_target_both"),
+    )
+
+    def _backfill_vrf_rd_rt(self, pc: ParsedConfig) -> None:
+        """Carry RD / route-targets declared under ``router bgp`` out to ``VRFConfig``.
+
+        Vendors disagree about which block owns a VRF's L3VPN identity. IOS-XE and
+        NX-OS declare RD and route-targets in the VRF definition (``vrf definition`` /
+        ``vrf context``). **EOS prints them only inside ``router bgp <asn> > vrf NAME``**
+        — its ``vrf instance`` block carries the name and a description and nothing
+        else (device capture, Arista cEOS 4.36.1F). IOS-XR splits the difference: RD
+        under BGP, route-targets under the VRF's address-family.
+
+        ``VRFConfig.rd`` / ``.route_target_*`` is the universal home either way: a
+        consumer asking a VRF which route-targets it imports must not have to know
+        which vendor wrote the config, and must not read ``[]`` and be unable to tell
+        "no route-targets" from "this parser looked in the wrong block"
+        ([[CCR-0059]], the same argument as [[CCR-0038]] Theme 2 for OSPF).
+
+        So the parsers record what the BGP VRF block declared on the ``BGPConfig`` —
+        a MODEL field, not a private per-parser dict — and this one shared walk
+        attributes it onto the ``VRFConfig`` of that name. It replaces IOS-XR's
+        ``_bgp_vrf_rd`` side-channel and its private ``parse()`` back-fill.
+
+        **A value the VRF block itself declared always wins**, and is never appended
+        to: the walk writes only where the VRF still holds the model default. So on
+        IOS-XE / NX-OS it is a no-op, and a VRF configured in both places keeps the
+        VRF block's own answer.
+        """
+        if not pc.vrfs or not pc.bgp_instances:
+            return
+
+        vrf_by_name = {v.name: v for v in pc.vrfs}
+        for bgp in pc.bgp_instances:
+            if not bgp.vrf:
+                continue  # the global instance declares no VRF identity
+            vrf = vrf_by_name.get(bgp.vrf)
+            if vrf is None:
+                continue
+            for src_field, dst_field in self._BGP_VRF_BACKFILL:
+                value = getattr(bgp, src_field, None)
+                if value is None or value == []:
+                    continue  # the BGP block said nothing — never overwrite with a blank
+                if getattr(vrf, dst_field, None):
+                    continue  # the VRF block already answered — it wins
+                setattr(vrf, dst_field, value)
 
     def _attach_native_change_ops(self, pc: ParsedConfig) -> None:
         """Hook: populate ``pc.native_change_ops`` for migrated families.

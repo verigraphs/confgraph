@@ -6,8 +6,7 @@ from ipaddress import IPv4Address, IPv4Interface, IPv4Network, IPv6Address, IPv6
 from confgraph.parsers.ios_parser import IOSParser
 from confgraph.parsers.base import PatternSet, _BASE_KNOWN_PATTERNS, _BASE_BEST_GUESS_KEYWORDS
 from confgraph.models.base import OSType
-from confgraph.models.bgp import BGPAddressFamily, BGPConfig
-from confgraph.models.vrf import VRFConfig
+from confgraph.models.bgp import BGPConfig
 from confgraph.models.prefix_list import PrefixListConfig, PrefixListEntry
 from confgraph.models.static_route import StaticRoute
 from confgraph.models.acl import ACLConfig, ACLEntry
@@ -17,7 +16,6 @@ from confgraph.models.community_list import (
     ASPathListConfig,
     ASPathListEntry,
 )
-from confgraph.models.isis import ISISConfig, ISISRedistribute
 
 
 class EOSParser(IOSParser):
@@ -101,6 +99,41 @@ class EOSParser(IOSParser):
     _IFACE_BFD_PATTERNS = IOSParser._IFACE_BFD_PATTERNS.extended(
         r"^\s+bfd\s+interval\s+(?P<interval>\d+)\s+min-rx\s+(?P<min_rx>\d+)"
         r"\s+multiplier\s+(?P<multiplier>\d+)",
+    )
+
+    # Interface PIM mode. EOS spells it "pim ipv4 sparse-mode" — the address family
+    # is a keyword IN the command, where IOS puts "ip" (device capture, cEOS 4.36.1F).
+    #
+    # sparse-mode ONLY. On the device, `pim ipv4 bidirectional` and
+    # `pim ipv4 border-router` are additional flags that COEXIST with
+    # `pim ipv4 sparse-mode` on the same interface (all three emitted together), so a
+    # lenient `pim ipv4 (?P<mode>\S+)` would report a PIM mode of "border-router"; and
+    # `pim ipv4 dense-mode` is rejected outright — EOS has no dense mode.
+    _IFACE_PIM_MODE_PATTERNS = IOSParser._IFACE_PIM_MODE_PATTERNS.extended(
+        r"^\s+pim\s+ipv4\s+(?P<mode>sparse-mode)\b",
+    )
+
+    # Syslog server. EOS names the VRF BEFORE the host — "logging vrf MGMT host
+    # 10.0.0.21" — where IOS-XE trails it after the address. Both dialects expose the
+    # same `addr` / `vrf` groups, so the shared parse_syslog walk reads either. This
+    # entry must come BEFORE nothing and AFTER everything: the inherited patterns
+    # cannot match a line whose first token after `logging` is `vrf`, so appending is
+    # safe (device capture, cEOS 4.36.1F).
+    _SYSLOG_HOST_PATTERNS = IOSParser._SYSLOG_HOST_PATTERNS.extended(
+        r"^logging\s+vrf\s+(?P<vrf>\S+)\s+host\s+(?P<addr>\S+)(?P<rest>.*)$",
+    )
+
+    # DNS domain. EOS emits "dns domain example.com"; it has no "ip domain-name"
+    # (the device rejects it). The name-server line IS the IOS spelling — EOS just
+    # always qualifies it with a VRF ("ip name-server vrf default 8.8.8.8"), which
+    # the inherited walk already strips.
+    _DNS_DOMAIN_PATTERNS = IOSParser._DNS_DOMAIN_PATTERNS.extended(
+        r"^dns\s+domain\s+(?P<domain>\S+)",
+    )
+
+    # Interface → IS-IS membership. EOS: "isis enable CORE" (IOS: "ip router isis").
+    _ISIS_IFACE_ENABLE_PATTERNS = IOSParser._ISIS_IFACE_ENABLE_PATTERNS.extended(
+        r"^\s+isis\s+enable\s+(?P<tag>\S+)",
     )
 
     # Banners. EOS emits a BARE "banner motd" header — no delimiter character —
@@ -231,75 +264,19 @@ class EOSParser(IOSParser):
 
         return interfaces
 
-    def parse_vrfs(self) -> list[VRFConfig]:
-        """Parse VRF configurations for EOS.
-
-        EOS uses "vrf instance NAME" instead of "vrf definition NAME".
-        """
-        vrfs = []
-        parse = self._get_parse_obj()
-
-        # EOS-native "vrf instance" plus legacy "vrf definition" (one entry each
-        # in _VRF_HEADER_PATTERNS). Both bodies expose rd / route-target alike.
-        vrf_objs = parse.find_objects(self._VRF_HEADER_PATTERNS.union)
-        for vrf_obj in vrf_objs:
-            hdr = self._VRF_HEADER_PATTERNS.match(vrf_obj.text)
-            vrf_name = hdr.group("name") if hdr else None
-            if not vrf_name:
-                continue
-
-            raw_lines, line_numbers = self._get_raw_lines_and_line_numbers(vrf_obj)
-
-            # Extract RD
-            rd = None
-            rd_children = vrf_obj.find_child_objects(r"^\s+rd\s+(\S+)")
-            if rd_children:
-                rd = self._extract_match(rd_children[0].text, r"^\s+rd\s+(\S+)")
-
-            # Extract route-targets (EOS uses EVPN route-targets)
-            rt_import = []
-            rt_export = []
-            rt_both = []
-
-            for child in vrf_obj.children:
-                # EOS: route-target import evpn 65000:100
-                if "route-target" in child.text and "import" in child.text:
-                    rt_val = self._extract_match(child.text, r"route-target\s+import\s+(?:evpn\s+)?(\S+)")
-                    if rt_val:
-                        rt_import.append(rt_val)
-                elif "route-target" in child.text and "export" in child.text:
-                    rt_val = self._extract_match(child.text, r"route-target\s+export\s+(?:evpn\s+)?(\S+)")
-                    if rt_val:
-                        rt_export.append(rt_val)
-                elif re.search(r"route-target\s+both\s+", child.text):
-                    rt_val = self._extract_match(child.text, r"route-target\s+both\s+(?:evpn\s+)?(\S+)")
-                    if rt_val:
-                        rt_both.append(rt_val)
-
-            # description / route-map import / route-map export — the shared VRF
-            # body vocabulary on IOSParser (CCR-0038 Theme 1). EOS adds no
-            # dialect of its own here; it simply stopped re-implementing the
-            # walk, and thereby inherited `description`.
-            scalars: dict = {}
-            for child in vrf_obj.children:
-                self._apply_vrf_body_line(scalars, child.text.strip())
-
-            vrfs.append(
-                VRFConfig(
-                    object_id=f"vrf_{vrf_name}",
-                    raw_lines=raw_lines,
-                    source_os=self.os_type,
-                    line_numbers=line_numbers,
-                    name=vrf_name,
-                    rd=rd,
-                    route_target_import=rt_import,
-                    route_target_export=rt_export,
-                    route_target_both=rt_both,
-                    **scalars,
-                )
-            )
-
-        return vrfs
+    # VRFs — no override. The header spelling ("vrf instance") is data
+    # (_VRF_HEADER_PATTERNS above) and the body vocabulary — description, rd,
+    # route-target, route-map import/export — is the shared one in
+    # IOSParser.parse_vrfs (_apply_vrf_body_line + _apply_route_target_line).
+    #
+    # This method used to be a fork that re-implemented rd and route-target
+    # extraction from the `vrf instance` block. On a REAL Arista switch that block
+    # contains neither: `rd` and `route-target import|export` are printed inside
+    # `router bgp <asn> > vrf NAME`, and are read from there by the shared
+    # _parse_bgp_vrf_blocks and attributed back onto the VRFConfig by the shared
+    # BaseParser._backfill_vrf_rd_rt ([[CCR-0059]], device capture cEOS 4.36.1F).
+    # The fork was reading a block the device never writes into — and scoring 100%
+    # against a hand-written fixture that humored it.
 
     def parse_prefix_lists(self) -> list[PrefixListConfig]:
         """Parse prefix-list configurations for EOS.
@@ -896,233 +873,60 @@ class EOSParser(IOSParser):
         """
         return self._parse_bgp_vrf_blocks(bgp_obj, asn)
 
-    def _parse_bgp_address_families(self, bgp_obj) -> list[BGPAddressFamily]:
-        """Parse BGP address-families for EOS.
+    # EOS's process-level ``maximum-paths`` is a process-wide multipath limit — it
+    # applies to every address-family, not only the implicit IPv4-unicast one (which
+    # is where a process-level ``aggregate-address`` belongs).
+    _BGP_PROCESS_LEVEL_AF_FANOUT = ("maximum_paths", "maximum_paths_ibgp")
 
-        EOS places ``maximum-paths`` at the global ``router bgp`` level rather
-        than inside individual ``address-family`` blocks.  The parent method
-        handles AF-level networks/redistribute/aggregate; this override reads
-        global max-paths and stamps them onto every AF that doesn't have its
-        own value.  When no AFs are configured but global max-paths are set,
-        a synthetic ipv4 unicast AF is created to carry them.
+    def _parse_bgp_process_level_af_settings(self, bgp_obj) -> dict:
+        """AF-scoped BGP settings EOS prints at the ``router bgp`` process level.
+
+        EOS emits BOTH ``maximum-paths 8 ecmp 8`` AND ``aggregate-address …``
+        outside any ``address-family`` block, as direct children of ``router bgp``
+        (device capture, cEOS 4.36.1F). They belong to the IPv4-unicast family; the
+        shared ``_merge_bgp_process_level_af_settings`` puts them there.
+
+        This used to be a whole-method override of ``_parse_bgp_address_families``
+        that grafted on max-paths. Being a fork, it never learned the OTHER setting
+        EOS emits in the same position, so a real Arista switch parsed **zero** BGP
+        aggregates ([[CCR-0059]]). Placement is now DATA — this dict — and the walk
+        that consumes it is shared.
         """
-        address_families = super()._parse_bgp_address_families(bgp_obj)
+        settings = super()._parse_bgp_process_level_af_settings(bgp_obj)
 
-        # EOS: maximum-paths N  (global, eBGP)
-        global_mp: int | None = None
+        # EOS: maximum-paths N [ecmp N]  (global, eBGP)
         mp_ch = bgp_obj.find_child_objects(r"^\s+maximum-paths\s+(?!ibgp)(\d+)")
         if mp_ch:
             v = self._extract_match(mp_ch[0].text, r"^\s+maximum-paths\s+(\d+)")
             if v:
-                global_mp = int(v)
+                settings["maximum_paths"] = int(v)
 
         # EOS: maximum-paths ibgp N  (global)
-        global_mp_ibgp: int | None = None
         mp_ibgp_ch = bgp_obj.find_child_objects(r"^\s+maximum-paths\s+ibgp\s+(\d+)")
         if mp_ibgp_ch:
             v = self._extract_match(mp_ibgp_ch[0].text, r"^\s+maximum-paths\s+ibgp\s+(\d+)")
             if v:
-                global_mp_ibgp = int(v)
+                settings["maximum_paths_ibgp"] = int(v)
 
-        if global_mp is None and global_mp_ibgp is None:
-            return address_families
+        return settings
 
-        if address_families:
-            for af in address_families:
-                if af.maximum_paths is None and global_mp is not None:
-                    af.maximum_paths = global_mp
-                if af.maximum_paths_ibgp is None and global_mp_ibgp is not None:
-                    af.maximum_paths_ibgp = global_mp_ibgp
-        else:
-            # No AF blocks configured — synthesize ipv4 unicast to carry max-paths
-            address_families.append(BGPAddressFamily(
-                afi="ipv4",
-                safi="unicast",
-                vrf=None,
-                maximum_paths=global_mp,
-                maximum_paths_ibgp=global_mp_ibgp,
-            ))
-
-        return address_families
-
-    def parse_isis(self) -> list[ISISConfig]:
-        """Parse IS-IS configurations for EOS.
-
-        EOS IS-IS syntax:
-        router isis <instance-name>
-           net <NET>
-           is-type level-1|level-2|level-1-2
-           address-family ipv4 unicast
-        """
-        isis_instances = []
-        parse = self._get_parse_obj()
-
-        # Find all IS-IS router configs
-        isis_objs = parse.find_objects(r"^router\s+isis\s+")
-
-        for isis_obj in isis_objs:
-            match = re.search(r"^router\s+isis\s+(\S+)$", isis_obj.text)
-            if not match:
-                continue
-
-            tag = match.group(1)
-
-            raw_lines, line_numbers = self._get_raw_lines_and_line_numbers(isis_obj)
-
-            # NET addresses
-            net = []
-            net_children = isis_obj.find_child_objects(r"^\s+net\s+(\S+)")
-            for net_child in net_children:
-                net_addr = self._extract_match(net_child.text, r"^\s+net\s+(\S+)")
-                if net_addr:
-                    net.append(net_addr)
-
-            # IS type
-            is_type = None
-            is_type_children = isis_obj.find_child_objects(r"^\s+is-type\s+(\S+)")
-            if is_type_children:
-                is_type = self._extract_match(is_type_children[0].text, r"^\s+is-type\s+(\S+)")
-
-            # Metric style (EOS default is wide)
-            metric_style = None
-            metric_children = isis_obj.find_child_objects(r"^\s+metric-style\s+(\S+)")
-            if metric_children:
-                metric_style = self._extract_match(metric_children[0].text, r"^\s+metric-style\s+(\S+)")
-
-            # Log adjacency changes
-            log_adjacency_changes = len(isis_obj.find_child_objects(r"^\s+log-adjacency-changes")) > 0
-
-            # Passive interface default
-            passive_interface_default = len(
-                isis_obj.find_child_objects(r"^\s+passive-interface\s+default")
-            ) > 0
-
-            # Passive interfaces
-            passive_interfaces = []
-            passive_intf_children = isis_obj.find_child_objects(r"^\s+passive-interface\s+(\S+)")
-            for passive_child in passive_intf_children:
-                if "default" not in passive_child.text:
-                    intf_name = self._extract_match(passive_child.text, r"^\s+passive-interface\s+(\S+)")
-                    if intf_name:
-                        passive_interfaces.append(intf_name)
-
-            # Non-passive interfaces
-            non_passive_interfaces = []
-            non_passive_children = isis_obj.find_child_objects(r"^\s+no\s+passive-interface\s+(\S+)")
-            for non_passive_child in non_passive_children:
-                intf_name = self._extract_match(non_passive_child.text, r"^\s+no\s+passive-interface\s+(\S+)")
-                if intf_name:
-                    non_passive_interfaces.append(intf_name)
-
-            # Parse redistribution (EOS uses address-family context)
-            redistribute = []
-            # Look for redistribute statements (can be at top level or in address-family)
-            redist_children = isis_obj.find_child_objects(r"^\s+redistribute\s+(\S+)")
-            for redist_child in redist_children:
-                match = re.search(r"^\s+redistribute\s+(\S+)(.+)?", redist_child.text)
-                if match:
-                    protocol = match.group(1)
-                    remaining = match.group(2).strip() if match.group(2) else ""
-
-                    process_id = None
-                    route_map = None
-                    metric = None
-                    metric_type = None
-                    level = None
-
-                    # Extract process ID — only for protocols that carry one,
-                    # and only as the leading positional token.
-                    if protocol in ("ospf", "eigrp", "bgp"):
-                        pid_match = re.match(r"(\d+)", remaining)
-                        if pid_match:
-                            process_id = int(pid_match.group(1))
-
-                    # Extract route-map
-                    rm_match = re.search(r"route-map\s+(\S+)", remaining)
-                    if rm_match:
-                        route_map = rm_match.group(1)
-
-                    # Extract metric
-                    metric_match = re.search(r"metric\s+(\d+)", remaining)
-                    if metric_match:
-                        metric = int(metric_match.group(1))
-
-                    # Extract metric-type (EOS uses internal/external)
-                    if "metric-type internal" in remaining:
-                        metric_type = "internal"
-                    elif "metric-type external" in remaining:
-                        metric_type = "external"
-
-                    # Extract level
-                    if "level-1" in remaining:
-                        level = "level-1"
-                    elif "level-2" in remaining:
-                        level = "level-2"
-                    elif "level-1-2" in remaining:
-                        level = "level-1-2"
-
-                    redistribute.append(
-                        ISISRedistribute(
-                            protocol=protocol,
-                            process_id=process_id,
-                            route_map=route_map,
-                            metric=metric,
-                            metric_type=metric_type,
-                            level=level,
-                        )
-                    )
-
-            # Authentication (EOS supports various auth modes)
-            authentication_mode = None
-            authentication_key = None
-            auth_children = isis_obj.find_child_objects(r"^\s+authentication\s+mode\s+(\S+)")
-            if auth_children:
-                authentication_mode = self._extract_match(auth_children[0].text, r"^\s+authentication\s+mode\s+(\S+)")
-
-            auth_key_children = isis_obj.find_child_objects(r"^\s+authentication\s+key\s+(\S+)")
-            if auth_key_children:
-                authentication_key = self._extract_match(auth_key_children[0].text, r"^\s+authentication\s+key\s+(\S+)")
-
-            # Timers
-            max_lsp_lifetime = None
-            lsp_lifetime_children = isis_obj.find_child_objects(r"^\s+max-lsp-lifetime\s+(\d+)")
-            if lsp_lifetime_children:
-                max_lsp_lifetime = int(self._extract_match(lsp_lifetime_children[0].text, r"^\s+max-lsp-lifetime\s+(\d+)"))
-
-            lsp_refresh_interval = None
-            lsp_refresh_children = isis_obj.find_child_objects(r"^\s+lsp-refresh-interval\s+(\d+)")
-            if lsp_refresh_children:
-                lsp_refresh_interval = int(self._extract_match(lsp_refresh_children[0].text, r"^\s+lsp-refresh-interval\s+(\d+)"))
-
-            spf_interval = None
-            spf_children = isis_obj.find_child_objects(r"^\s+spf-interval\s+(\d+)")
-            if spf_children:
-                spf_interval = int(self._extract_match(spf_children[0].text, r"^\s+spf-interval\s+(\d+)"))
-
-            isis_instances.append(
-                ISISConfig(
-                    object_id=f"isis_{tag}",
-                    raw_lines=raw_lines,
-                    source_os=self.os_type,
-                    line_numbers=line_numbers,
-                    tag=tag,
-                    net=net,
-                    is_type=is_type,
-                    metric_style=metric_style,
-                    log_adjacency_changes=log_adjacency_changes,
-                    passive_interface_default=passive_interface_default,
-                    passive_interfaces=passive_interfaces,
-                    non_passive_interfaces=non_passive_interfaces,
-                    redistribute=redistribute,
-                    authentication_mode=authentication_mode,
-                    authentication_key=authentication_key,
-                    max_lsp_lifetime=max_lsp_lifetime,
-                    lsp_refresh_interval=lsp_refresh_interval,
-                    spf_interval=spf_interval,
-                )
-            )
-
-        return isis_instances
+    # IS-IS — no override. The instance body (net / is-type / redistribute /
+    # log-adjacency-changes / timers) is spelled identically to IOS, and EOS's two
+    # real dialects are DATA:
+    #
+    #   * interface membership — "isis enable CORE", vs IOS "ip router isis CORE"
+    #     (_ISIS_IFACE_ENABLE_PATTERNS above);
+    #   * WHERE passive lives — EOS has no `passive-interface` under `router isis`
+    #     (the device REJECTS it); an interface declares itself with `isis passive`,
+    #     which the shared interface walk in IOSParser.parse_isis already reads into
+    #     ISISInterface.passive and back-fills into ISISConfig.passive_interfaces.
+    #
+    # This method used to be a fork, and being a fork it looked for passive
+    # interfaces only at the process level — the one place EOS cannot put them — so
+    # `passive_interfaces` came back empty from a switch that had passive interfaces
+    # ([[CCR-0059]], device capture cEOS 4.36.1F). Dropping the fork also inherits
+    # `default-information originate`, the ISIS interface list and the `no net`
+    # withdrawal ops, none of which the fork had ever learned.
 
     # -----------------------------------------------------------------------
     # BFD — "bfd slow-timer N" (singular, unlike IOS "bfd slow-timers")
@@ -1282,6 +1086,116 @@ class EOSParser(IOSParser):
                 dns.lookup_enabled = False
 
         return dns
+
+    # -------------------------------------------------------------------
+    # Multicast / PIM — EOS states them as BLOCKS, not as global lines
+    # -------------------------------------------------------------------
+
+    #: EOS ``rp address`` line. Verified against the device, which accepts and emits
+    #: every one of these forms (cEOS 4.36.1F, 2026-07-14)::
+    #:
+    #:     rp address 1.1.1.1 239.0.0.0/8
+    #:     rp address 2.2.2.2 access-list ACL_MGMT
+    #:     rp address 3.3.3.3 priority 10
+    #:     rp address 4.4.4.4 override
+    #:     rp address 5.5.5.5 239.1.0.0/16 priority 20
+    #:
+    #: The groups an RP serves are named by PREFIX or by ACL, and the two are
+    #: different fields — writing a prefix into ``acl`` would be the CCR-0030
+    #: wrong-field read (a consumer resolving it against ACLConfig would dangle).
+    _PIM_RP_PATTERN = re.compile(
+        r"^rp\s+address\s+(?P<rp>\d+\.\d+\.\d+\.\d+)"
+        r"(?:\s+(?P<group>\d+\.\d+\.\d+\.\d+/\d+))?"
+        r"(?:\s+access-list\s+(?P<acl>\S+))?"
+        r"(?P<rest>.*)$"
+    )
+
+    def parse_multicast(self):
+        """Parse EOS multicast: ``router multicast`` and ``router pim sparse-mode``.
+
+        EOS does not have IOS's flat ``ip multicast-routing`` / ``ip pim rp-address``
+        global lines — it rejects them. It states both as blocks, with the address
+        family as an intermediate level (device capture, cEOS 4.36.1F)::
+
+            router multicast
+               ipv4
+                  routing
+            !
+            router pim sparse-mode
+               ipv4
+                  rp address 1.1.1.1 239.0.0.0/8
+
+        The inherited IOS walk finds none of that and returned ``None``: on a real
+        Arista switch confgraph reported NO multicast configuration at all, while the
+        coverage fixture — which had been hand-written in IOS syntax the device
+        rejects — scored it green ([[CCR-0059]]).
+
+        Any flat lines the inherited walk *does* find are kept and merged, so a
+        hybrid config loses nothing.
+        """
+        from confgraph.models.multicast import MulticastConfig, PIMRPAddress
+
+        multicast = super().parse_multicast()
+
+        parse = self._get_parse_obj()
+        raw_lines: list[str] = []
+        line_numbers: list[int] = []
+        routing_enabled = False
+        rp_addresses: list[PIMRPAddress] = []
+
+        # "router multicast" → "ipv4" → "routing"
+        for mc_obj in parse.find_objects(r"^router\s+multicast\s*$"):
+            raw_lines.append(mc_obj.text)
+            line_numbers.append(mc_obj.linenum)
+            for child in mc_obj.all_children:
+                raw_lines.append(child.text)
+                line_numbers.append(child.linenum)
+                if re.match(r"^\s+routing\s*$", child.text):
+                    routing_enabled = True
+
+        # "router pim sparse-mode" → "ipv4" → "rp address …"
+        for pim_obj in parse.find_objects(r"^router\s+pim\s+sparse-mode\s*$"):
+            raw_lines.append(pim_obj.text)
+            line_numbers.append(pim_obj.linenum)
+            for child in pim_obj.all_children:
+                raw_lines.append(child.text)
+                line_numbers.append(child.linenum)
+                m = self._PIM_RP_PATTERN.match(child.text.strip())
+                if not m:
+                    continue
+                try:
+                    rp_addr = IPv4Address(m.group("rp"))
+                except ValueError:
+                    continue
+                rest = m.group("rest") or ""
+                rp_addresses.append(PIMRPAddress(
+                    rp_address=rp_addr,
+                    group_range=m.group("group"),
+                    acl=m.group("acl"),
+                    override="override" in rest,
+                    bidir=False,   # EOS states bidirectional per-interface, not per-RP
+                ))
+
+        if not raw_lines:
+            return multicast
+
+        if multicast is None:
+            return MulticastConfig(
+                object_id="multicast",
+                raw_lines=raw_lines,
+                source_os=self.os_type,
+                line_numbers=line_numbers,
+                multicast_routing_enabled=routing_enabled,
+                pim_rp_addresses=rp_addresses,
+            )
+
+        multicast.raw_lines.extend(raw_lines)
+        multicast.line_numbers.extend(line_numbers)
+        multicast.multicast_routing_enabled = (
+            multicast.multicast_routing_enabled or routing_enabled
+        )
+        multicast.pim_rp_addresses.extend(rp_addresses)
+        return multicast
 
     # -------------------------------------------------------------------
     # VXLAN

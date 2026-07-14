@@ -395,6 +395,47 @@ class IOSParser(BaseParser):
                 vrf_data[field] = m.group("val").strip().strip('"')
                 return
 
+    # Route-target vocabulary — ONE spelling table for every BLOCK a route-target
+    # line can appear in. It appears in at least three of them, and the vendors do
+    # not agree on which: IOS-XE nests it under `vrf definition > address-family`,
+    # NX-OS under `vrf context > address-family`, and EOS prints it under
+    # `router bgp <asn> > vrf NAME` and nowhere else (device capture, cEOS 4.36.1F).
+    # The BLOCK differs per OS; the LINE does not. Four hand-rolled copies of this
+    # line grammar is how EOS ended up reading route-targets from the one block its
+    # device never writes them in.
+    _ROUTE_TARGET_PATTERNS = PatternSet(
+        # `evpn` appears as a keyword between the direction and the value on EOS
+        # ("route-target import evpn 65000:100"); NX-OS instead trails it
+        # ("route-target both auto evpn"), which is why nothing is anchored at $.
+        r"^route-target\s+(?P<dir>import|export|both)\s+(?:evpn\s+)?(?P<val>\S+)",
+    )
+
+    #: The three VRFConfig / BGPConfig fields ``_apply_route_target_line`` fills.
+    _ROUTE_TARGET_FIELDS = (
+        "route_target_import",
+        "route_target_export",
+        "route_target_both",
+    )
+
+    def _new_route_target_dict(self) -> dict[str, list[str]]:
+        """A fresh ``{route_target_import: [], …}`` accumulator (kwargs-ready)."""
+        return {field: [] for field in self._ROUTE_TARGET_FIELDS}
+
+    def _apply_route_target_line(self, rts: dict[str, list[str]], text: str) -> bool:
+        """Fold ONE ``route-target …`` body line into *rts*.
+
+        Returns True when *text* was a route-target line (so the caller can stop
+        classifying it). Duplicates are collapsed: a device may print the same RT
+        under both an ipv4 and an ipv6 address-family of the same VRF.
+        """
+        m = self._ROUTE_TARGET_PATTERNS.match(text)
+        if not m:
+            return False
+        values = rts.setdefault(f"route_target_{m.group('dir')}", [])
+        if m.group("val") not in values:
+            values.append(m.group("val"))
+        return True
+
     # Static route line. Traditional "DEST MASK NH" and CIDR "DEST/PLEN NH"
     # (NX-OS global routes reach this by inheritance).
     _STATIC_ROUTE_PATTERNS = PatternSet(
@@ -470,6 +511,46 @@ class IOSParser(BaseParser):
     _IFACE_BFD_PATTERNS = PatternSet(
         r"^\s+bfd\s+interval\s+(?P<interval>\d+)\s+min_rx\s+(?P<min_rx>\d+)"
         r"\s+multiplier\s+(?P<multiplier>\d+)",
+    )
+
+    # Interface PIM **mode**. IOS/NX-OS say "ip pim sparse-mode"; EOS says
+    # "pim ipv4 sparse-mode" and appends its spelling to this set.
+    #
+    # Only the mode line belongs here. On EOS, `pim ipv4 bidirectional` and
+    # `pim ipv4 border-router` are additional FLAGS that coexist with
+    # `pim ipv4 sparse-mode` on the same interface — verified on the device, which
+    # emits all three together — so a lenient `pim ipv4 (?P<mode>\S+)` would report a
+    # PIM mode of "border-router". EOS also has no dense-mode at all: the device
+    # rejects `pim ipv4 dense-mode` outright.
+    _IFACE_PIM_MODE_PATTERNS = PatternSet(
+        r"^\s+ip\s+pim\s+(?P<mode>sparse-mode|dense-mode|sparse-dense-mode)\b",
+    )
+
+    # Syslog server line. Every dialect exposes the same three groups: `addr`,
+    # optional `vrf`, and `rest` (transport / port / severity).
+    #
+    # IOS-XE names the VRF AFTER the host ("logging host 10.0.0.21 vrf MGMT") and
+    # that trailing form is read out of `rest`. EOS names it BEFORE
+    # ("logging vrf MGMT host 10.0.0.21") — a dialect the old single regex could not
+    # match at all, so on a real Arista switch the VRF-scoped syslog server simply
+    # vanished and only the global one was reported (device capture, cEOS 4.36.1F).
+    # EOS appends its spelling to this set.
+    _SYSLOG_HOST_PATTERNS = PatternSet(
+        r"^logging\s+host\s+(?P<addr>\S+)(?P<rest>.*)$",
+        r"^logging\s+(?P<addr>\d+\.\d+\.\d+\.\d+)(?P<rest>.*)$",
+    )
+
+    # DNS domain name. IOS: "ip domain name X" / "ip domain-name X".
+    # IOS-XR: "domain name X". EOS: "dns domain X" (appended by EOSParser).
+    _DNS_DOMAIN_PATTERNS = PatternSet(
+        r"^(?:ip\s+)?domain(?:-|\s+)name\s+(?P<domain>\S+)",
+    )
+
+    # Interface → IS-IS instance membership. IOS/NX-OS: "ip router isis [TAG]".
+    # EOS: "isis enable TAG" (appended by EOSParser). The `tag` group is the
+    # instance name and may be empty (IOS's tagless default instance).
+    _ISIS_IFACE_ENABLE_PATTERNS = PatternSet(
+        r"^\s+ip\s+router\s+isis\s*(?P<tag>\S*)",
     )
 
     # Banner renderings, tried in order. ``{type}`` is the banner type; each
@@ -587,29 +668,16 @@ class IOSParser(BaseParser):
             # Extract route-targets and route-maps. On IOS these live nested
             # under ``address-family ipv4`` / ``ipv6``, so walk all_children
             # (recursive) rather than only direct children.
-            rt_import = []
-            rt_export = []
-            rt_both = []
+            rts = self._new_route_target_dict()
             scalars: dict = {}
 
             for child in vrf_obj.all_children:
                 text = child.text.strip()
-                if text.startswith("route-target export "):
-                    rt_val = self._extract_match(text, r"route-target\s+export\s+(\S+)")
-                    if rt_val and rt_val not in rt_export:
-                        rt_export.append(rt_val)
-                elif text.startswith("route-target import "):
-                    rt_val = self._extract_match(text, r"route-target\s+import\s+(\S+)")
-                    if rt_val and rt_val not in rt_import:
-                        rt_import.append(rt_val)
-                elif text.startswith("route-target both "):
-                    rt_val = self._extract_match(text, r"route-target\s+both\s+(\S+)")
-                    if rt_val and rt_val not in rt_both:
-                        rt_both.append(rt_val)
-                else:
-                    # description / route-map import / route-map export and every
-                    # future VRF body command — one shared vocabulary (Theme 1).
-                    self._apply_vrf_body_line(scalars, text)
+                if self._apply_route_target_line(rts, text):
+                    continue
+                # description / route-map import / route-map export and every
+                # future VRF body command — one shared vocabulary (Theme 1).
+                self._apply_vrf_body_line(scalars, text)
 
             vrfs.append(
                 VRFConfig(
@@ -619,9 +687,7 @@ class IOSParser(BaseParser):
                     line_numbers=line_numbers,
                     name=vrf_name,
                     rd=rd,
-                    route_target_import=rt_import,
-                    route_target_export=rt_export,
-                    route_target_both=rt_both,
+                    **rts,
                     **scalars,
                 )
             )
@@ -1375,13 +1441,16 @@ class IOSParser(BaseParser):
                     intf_name, "mpls_ip", no_mpls[-1],
                 )
 
-            # PIM per-interface
+            # PIM per-interface. The MODE line only — its dialects are in
+            # _IFACE_PIM_MODE_PATTERNS (EOS spells it "pim ipv4 sparse-mode"), and
+            # last-line-wins, as the CLI merges.
             pim_mode = None
-            pim_ch = intf_obj.find_child_objects(r"^\s+ip\s+pim\s+")
-            if pim_ch:
-                pm = re.match(r"^\s+ip\s+pim\s+(sparse-mode|dense-mode|sparse-dense-mode)", pim_ch[-1].text)
+            for pim_child in intf_obj.find_child_objects(
+                self._IFACE_PIM_MODE_PATTERNS.union
+            ):
+                pm = self._IFACE_PIM_MODE_PATTERNS.match(pim_child.text)
                 if pm:
-                    pim_mode = pm.group(1)
+                    pim_mode = pm.group("mode")
             pim_dr_priority = None
             pdr_ch = intf_obj.find_child_objects(r"^\s+ip\s+pim\s+dr-priority\s+(\d+)")
             if pdr_ch:
@@ -6482,10 +6551,19 @@ class IOSParser(BaseParser):
     def _parse_bgp_aggregate_stmts(self, config_objs) -> list["BGPAggregate"]:
         """Parse ``aggregate-address`` statements from config-line objects.
 
-        Shared entry point (CCR-0032) used by the IOS-XR AF parser. Accepts the
-        dotted-mask IOS form and the classless ``prefix/len`` form (IOS-XR); the
-        optional-mask group matches only a dotted mask, so ``summary-only`` is
-        never mis-read as the mask.
+        THE aggregate-address line parser for the whole IOS family — the AF walk,
+        the IOS-XR AF walk and the process-level walk all come through here, so the
+        line grammar is stated once.
+
+        Accepts the dotted-mask IOS form (``10.0.0.0 255.0.0.0 …``) and the classless
+        ``prefix/len`` form (IOS-XR, NX-OS, EOS).  The optional-mask group matches
+        **only a dotted quad**, which is what makes the trailing keywords
+        order-independent: a device decides that order, not us, and Arista emits
+        ``as-set summary-only`` for the ``summary-only as-set`` an operator types
+        (device capture, cEOS 4.36.1F).  The copy of this grammar that used to live
+        inline in ``_parse_bgp_address_families`` had ``(?:\\s+(\\S+))?`` for the mask,
+        so on a CIDR prefix it swallowed the FIRST keyword into the mask group and
+        read ``as-set`` as ``False`` whenever ``as-set`` came first.
         """
         from confgraph.models.bgp import BGPAggregate
 
@@ -6509,16 +6587,99 @@ class IOSParser(BaseParser):
                     prefix = IPv4Network(prefix_str, strict=False)
             except ValueError:
                 continue
-            rm = re.search(r"\broute-(?:map|policy)\s+(\S+)", remaining)
+
+            def _map(kind: str) -> str | None:
+                mm = re.search(rf"\b{kind}\s+(\S+)", remaining)
+                return mm.group(1) if mm else None
+
             aggregates.append(
                 BGPAggregate(
                     prefix=prefix,
                     summary_only="summary-only" in remaining,
                     as_set="as-set" in remaining,
-                    route_map=rm.group(1) if rm else None,
+                    route_map=(
+                        _map("route-map") or _map("route-policy")
+                    ),
+                    attribute_map=_map("attribute-map"),
+                    advertise_map=_map("advertise-map"),
+                    suppress_map=_map("suppress-map"),
                 )
             )
         return aggregates
+
+    def _parse_bgp_process_level_af_settings(self, bgp_obj) -> dict:
+        """AF-scoped BGP settings that this dialect emits at the PROCESS level.
+
+        Some devices print settings that belong to an address-family OUTSIDE any
+        ``address-family`` block, as direct children of ``router bgp <asn>``, where
+        they mean "the IPv4-unicast family".  Classic IOS does this for
+        ``aggregate-address``; Arista EOS does it for ``aggregate-address`` **and**
+        ``maximum-paths`` (device capture, cEOS 4.36.1F).
+
+        Returning them as ``{BGPAddressFamily field: value}`` keeps the placement a
+        piece of DATA that a subclass extends, instead of a second AF walk that a
+        subclass forks — EOS used to override ``_parse_bgp_address_families`` whole to
+        graft on its ``maximum-paths``, and the override never learned about
+        aggregates, so on a real Arista switch confgraph reported **zero** BGP
+        aggregates while scoring 100% against a fixture that put them in the AF block
+        no Arista device prints them in [[CCR-0059]].
+
+        Direct children only: an ``aggregate-address`` inside an AF block belongs to
+        THAT family and is read by the AF walk.
+        """
+        return {
+            "aggregate_addresses": self._parse_bgp_aggregate_stmts(
+                [c for c in bgp_obj.children
+                 if re.match(r"^\s+aggregate-address\s+\S+", c.text)]
+            ),
+        }
+
+    #: Process-level settings whose scope is EVERY address-family, not just the
+    #: implicit IPv4-unicast one. EOS's ``maximum-paths`` is a process-wide multipath
+    #: limit and applies to each family it configures; its ``aggregate-address`` is
+    #: IPv4-unicast. The scope differs per setting, so it is data, not a branch.
+    _BGP_PROCESS_LEVEL_AF_FANOUT: tuple[str, ...] = ()
+
+    def _merge_bgp_process_level_af_settings(
+        self, bgp_obj, address_families: list["BGPAddressFamily"]
+    ) -> list["BGPAddressFamily"]:
+        """Fold ``_parse_bgp_process_level_af_settings`` into the address-families.
+
+        Settings land on the IPv4-unicast family, except those listed in
+        ``_BGP_PROCESS_LEVEL_AF_FANOUT``, which land on every family.  A value the AF
+        block itself declared always wins; a process-level value only fills a field
+        the AF left at its model default.  When the device printed no
+        ``address-family`` block at all (classic IOS), the implicit IPv4-unicast
+        family is synthesized to carry them — otherwise the settings would have
+        nowhere in the model to live.
+        """
+        settings = {
+            field: value
+            for field, value in self._parse_bgp_process_level_af_settings(bgp_obj).items()
+            if value not in (None, [], {})
+        }
+        if not settings:
+            return address_families
+
+        target = next(
+            (af for af in address_families if af.afi == "ipv4" and af.safi == "unicast"),
+            None,
+        )
+        if target is None:
+            target = BGPAddressFamily(afi="ipv4", safi="unicast", vrf=None)
+            address_families.append(target)
+
+        for field, value in settings.items():
+            targets = (
+                address_families
+                if field in self._BGP_PROCESS_LEVEL_AF_FANOUT
+                else [target]
+            )
+            for af in targets:
+                if not getattr(af, field, None):  # None / [] / 0 → the AF said nothing
+                    setattr(af, field, value)
+
+        return address_families
 
     def _parse_bgp_address_families(self, bgp_obj) -> list[BGPAddressFamily]:
         """Parse BGP address-families (global, non-VRF)."""
@@ -6547,59 +6708,12 @@ class IOSParser(BaseParser):
                 af_child.find_child_objects(r"^\s+redistribute\s+(\S+)")
             )
 
-            # Parse aggregates
-            aggregates = []
-            agg_children = af_child.find_child_objects(r"^\s+aggregate-address\s+(\S+)")
-            for agg_child in agg_children:
-                match = re.search(
-                    r"^\s+aggregate-address\s+(\S+)(?:\s+(\S+))?(.+)?",
-                    agg_child.text,
-                )
-                if match:
-                    prefix_str = match.group(1)
-                    mask_or_len = match.group(2)
-                    remaining = match.group(3).strip() if match.group(3) else ""
-
-                    try:
-                        if mask_or_len and "." in mask_or_len:
-                            # IOS style with mask
-                            prefix = IPv4Network(f"{prefix_str}/{mask_or_len}", strict=False)
-                        else:
-                            prefix = IPv4Network(prefix_str, strict=False)
-
-                        summary_only = "summary-only" in remaining
-                        as_set = "as-set" in remaining
-
-                        route_map = None
-                        attribute_map = None
-                        advertise_map = None
-                        suppress_map = None
-                        rm = re.search(r"\broute-map\s+(\S+)", remaining)
-                        if rm:
-                            route_map = rm.group(1)
-                        am = re.search(r"\battribute-map\s+(\S+)", remaining)
-                        if am:
-                            attribute_map = am.group(1)
-                        adm = re.search(r"\badvertise-map\s+(\S+)", remaining)
-                        if adm:
-                            advertise_map = adm.group(1)
-                        sm = re.search(r"\bsuppress-map\s+(\S+)", remaining)
-                        if sm:
-                            suppress_map = sm.group(1)
-
-                        aggregates.append(
-                            BGPAggregate(
-                                prefix=prefix,
-                                summary_only=summary_only,
-                                as_set=as_set,
-                                route_map=route_map,
-                                attribute_map=attribute_map,
-                                advertise_map=advertise_map,
-                                suppress_map=suppress_map,
-                            )
-                        )
-                    except ValueError:
-                        pass
+            # Aggregates — through the ONE shared aggregate-address line parser
+            # (_parse_bgp_aggregate_stmts). The copy that used to sit here read
+            # `as-set summary-only` as as_set=False.
+            aggregates = self._parse_bgp_aggregate_stmts(
+                af_child.find_child_objects(r"^\s+aggregate-address\s+(\S+)")
+            )
 
             # Parse maximum-paths (eBGP) and maximum-paths ibgp
             maximum_paths = None
@@ -6657,7 +6771,11 @@ class IOSParser(BaseParser):
                 )
             )
 
-        return address_families
+        # AF-scoped settings the device printed at the PROCESS level (see
+        # _parse_bgp_process_level_af_settings) belong to the implicit ipv4-unicast
+        # family. One merge for every OS in the family; EOS extends the settings
+        # table rather than forking this walk.
+        return self._merge_bgp_process_level_af_settings(bgp_obj, address_families)
 
     def _apply_bgp_af_neighbor_policies(
         self,
@@ -6986,22 +7104,34 @@ class IOSParser(BaseParser):
         the polymorphic ``self._parse_bgp_neighbors(vrf_obj)`` so each OS's single
         neighbor traversal is reused — the NX-OS VRF neighbor drop was exactly a
         VRF path that had re-implemented (and diverged from) that traversal.
+
+        **RD and route-targets are read here, not only in ``parse_vrfs``.**  A VRF's
+        L3VPN identity is declared in whichever block the vendor chose: IOS-XE and
+        NX-OS put it in the VRF definition, EOS prints it ONLY inside
+        ``router bgp <asn> > vrf NAME`` (device capture, cEOS 4.36.1F — the
+        ``vrf instance`` block carries name and description and nothing else).  Both
+        are recorded on the ``BGPConfig`` and then attributed onto the ``VRFConfig``
+        by the one shared walk ``BaseParser._backfill_vrf_rd_rt``, so a consumer
+        asking a VRF for its route-targets never has to know which vendor wrote the
+        config [[CCR-0059]].
         """
         vrf_instances: list[BGPConfig] = []
 
         for vrf_name, vrf_obj in self._iter_router_vrf_blocks(bgp_obj):
             raw_lines, line_numbers = self._get_raw_lines_and_line_numbers(vrf_obj)
 
-            # RD — declared directly under the VRF block. Surface on the BGP
-            # instance (BGPConfig.rd) and record for any VRFConfig back-fill.
+            # RD — declared directly under the VRF block.
             rd = None
             rd_ch = vrf_obj.find_child_objects(r"^\s+rd\s+(\S+)")
             if rd_ch:
                 rd = self._extract_match(rd_ch[0].text, r"^\s+rd\s+(\S+)")
-                if rd is not None:
-                    bgp_vrf_rd = getattr(self, "_bgp_vrf_rd", None)
-                    if isinstance(bgp_vrf_rd, dict):
-                        bgp_vrf_rd[vrf_name] = rd
+
+            # Route-targets — the same line vocabulary as the VRF definition block
+            # (_ROUTE_TARGET_PATTERNS). all_children, because IOS-XR nests them one
+            # level deeper, under the VRF's own address-family.
+            rts = self._new_route_target_dict()
+            for child in vrf_obj.all_children:
+                self._apply_route_target_line(rts, child.text.strip())
 
             neighbors = self._parse_bgp_neighbors(vrf_obj)
 
@@ -7026,6 +7156,7 @@ class IOSParser(BaseParser):
                     peer_groups=[],
                     address_families=[],
                     redistribute=redistribute,
+                    **rts,
                 )
             )
 
@@ -8933,18 +9064,21 @@ class IOSParser(BaseParser):
             if spf_children:
                 spf_interval = int(self._extract_match(spf_children[0].text, r"^\s+spf-interval\s+(\d+)"))
 
-            # Per-interface IS-IS config — IOS stores this in the interface block.
-            # Scan all interfaces for "ip router isis [TAG]" membership, then collect
-            # isis metric / circuit-type / passive commands for this instance.
+            # Per-interface IS-IS config — the whole family stores this in the
+            # interface block. Membership spelling is the dialect
+            # (_ISIS_IFACE_ENABLE_PATTERNS: IOS "ip router isis [TAG]", EOS
+            # "isis enable TAG"); everything below it — metric, circuit-type,
+            # passive — is spelled identically on IOS, NX-OS and EOS.
             isis_interfaces: list[ISISInterface] = []
             for intf_obj in parse.find_objects(r"^interface\s+"):
                 # Check if this interface is in this IS-IS instance
-                isis_ref_ch = intf_obj.find_child_objects(r"^\s+ip\s+router\s+isis\s*(\S*)")
+                isis_ref_ch = intf_obj.find_child_objects(
+                    self._ISIS_IFACE_ENABLE_PATTERNS.union
+                )
                 if not isis_ref_ch:
                     continue
-                ref_tag = self._extract_match(
-                    isis_ref_ch[0].text, r"^\s+ip\s+router\s+isis\s*(\S*)"
-                ) or None
+                ref_m = self._ISIS_IFACE_ENABLE_PATTERNS.match(isis_ref_ch[0].text)
+                ref_tag = (ref_m.group("tag") if ref_m else None) or None
                 # Match: tagless "ip router isis" matches the default (tag=None) instance;
                 # named tag must match exactly.
                 if ref_tag != tag:
@@ -8996,6 +9130,19 @@ class IOSParser(BaseParser):
                     level_2_metric=isis_metric_l2,
                     passive=isis_passive,
                 ))
+
+            # An interface can be made passive from EITHER end of the config: the
+            # process names it (`passive-interface Loopback0`, the IOS spelling) or
+            # the interface declares itself (`isis passive`, which is the ONLY
+            # spelling EOS has — it rejects `passive-interface` under `router isis`
+            # outright, device capture cEOS 4.36.1F). `ISISConfig.passive_interfaces`
+            # is the universal home either way: a consumer asking which interfaces
+            # this IS-IS process floods on must not have to know which vendor wrote
+            # the config, and must not read `[]` and be unable to tell "none" from
+            # "this parser looked at the wrong end" ([[CCR-0059]]).
+            for isis_intf in isis_interfaces:
+                if isis_intf.passive and isis_intf.name not in passive_interfaces:
+                    passive_interfaces.append(isis_intf.name)
 
             isis_instances.append(
                 ISISConfig(
@@ -9772,25 +9919,28 @@ class IOSParser(BaseParser):
 
         for obj in log_objs:
             t = obj.text.strip()
-            if re.match(r"^logging\s+(host\s+)?\d+\.\d+\.\d+\.\d+", t) or re.match(r"^logging\s+host\s+", t):
-                m = re.match(r"^logging\s+(?:host\s+)?(\S+)(.*)", t)
-                if m:
-                    addr_str = m.group(1)
-                    rest = m.group(2)
-                    transport = self._extract_match(rest, r"\btransport\s+(tcp|udp|tls)")
-                    port = None
-                    pm = re.search(r"\bport\s+(\d+)", rest)
-                    if pm:
-                        port = int(pm.group(1))
-                    vrf = self._extract_match(rest, r"\bvrf\s+(\S+)")
+            host_m = self._SYSLOG_HOST_PATTERNS.match(t)
+            if host_m:
+                addr_str = host_m.group("addr")
+                rest = host_m.groupdict().get("rest") or ""
+                transport = self._extract_match(rest, r"\btransport\s+(tcp|udp|tls)")
+                port = None
+                pm = re.search(r"\bport\s+(\d+)", rest)
+                if pm:
+                    port = int(pm.group(1))
+                # The VRF may be named BEFORE the host (EOS) or after it (IOS-XE);
+                # whichever dialect matched puts it in the same `vrf` group.
+                vrf = host_m.groupdict().get("vrf") or self._extract_match(
+                    rest, r"\bvrf\s+(\S+)"
+                )
+                try:
+                    addr = IPv4Address(addr_str)
+                except Exception:
                     try:
-                        addr = IPv4Address(addr_str)
+                        addr = IPv6Address(addr_str)
                     except Exception:
-                        try:
-                            addr = IPv6Address(addr_str)
-                        except Exception:
-                            addr = addr_str
-                    hosts.append(LoggingHost(address=addr, transport=transport, port=port, vrf=vrf))
+                        addr = addr_str
+                hosts.append(LoggingHost(address=addr, transport=transport, port=port, vrf=vrf))
             elif re.match(r"^logging\s+buffered\s+", t):
                 m = re.match(r"^logging\s+buffered\s+(\d+)(?:\s+(\S+))?", t)
                 if m:
@@ -11236,9 +11386,14 @@ class IOSParser(BaseParser):
             no ip domain lookup
             domain name example.com             (IOS-XR, no "ip" prefix)
             domain name-server 8.8.8.8          (IOS-XR)
+            dns domain example.com              (EOS — see _DNS_DOMAIN_PATTERNS)
         """
         parse = self._get_parse_obj()
-        # IOS: "ip domain …" / IOS-XR: "domain …" (no ip prefix)
+        # The domain NAME line, in every dialect (_DNS_DOMAIN_PATTERNS). EOS spells
+        # it "dns domain example.com" — a line the old "^(?:ip\s+)?domain" scan could
+        # not even find, so a real Arista switch reported no DNS domain at all.
+        domain_name_objs = parse.find_objects(self._DNS_DOMAIN_PATTERNS.union)
+        # IOS: "ip domain list …" / IOS-XR: "domain list …"
         domain_objs = parse.find_objects(r"^(?:ip\s+)?domain")
         # IOS: "ip name-server" / IOS-XR: "domain name-server"
         ns_objs = parse.find_objects(r"^ip\s+name-server")
@@ -11246,7 +11401,10 @@ class IOSParser(BaseParser):
         no_ns_objs = parse.find_objects(r"^no\s+(?:ip\s+)?name-server")
         lookup_disabled = bool(parse.find_objects(r"^no\s+(?:ip\s+)?domain.lookup"))
 
-        if not domain_objs and not ns_objs and not xr_ns_objs and not no_ns_objs and not lookup_disabled:
+        if (
+            not domain_name_objs and not domain_objs and not ns_objs
+            and not xr_ns_objs and not no_ns_objs and not lookup_disabled
+        ):
             return None
 
         domain_name: str | None = None
@@ -11254,36 +11412,42 @@ class IOSParser(BaseParser):
         name_servers: list[str] = []
         raw_lines: list[str] = []
         line_numbers: list[int] = []
+        seen_lines: set[int] = set()
 
-        for obj in domain_objs:
+        def _record(obj) -> None:
+            if obj.linenum in seen_lines:
+                return
+            seen_lines.add(obj.linenum)
             raw_lines.append(obj.text)
             line_numbers.append(obj.linenum)
-            t = obj.text.strip()
-            # "ip domain name DOMAIN" / "ip domain-name DOMAIN" / "domain name DOMAIN"
-            m = re.match(r"^(?:ip\s+)?domain(?:-|\s+)name\s+(\S+)", t)
+
+        for obj in domain_name_objs:
+            _record(obj)
+            m = self._DNS_DOMAIN_PATTERNS.match(obj.text.strip())
             if m and domain_name is None:
-                domain_name = m.group(1)
-                continue
+                domain_name = m.group("domain")
+
+        for obj in domain_objs:
+            _record(obj)
+            t = obj.text.strip()
             # "ip domain list DOMAIN" / "domain list DOMAIN"
             m = re.match(r"^(?:ip\s+)?domain\s+list\s+(\S+)", t)
             if m:
                 domain_list.append(m.group(1))
 
         for obj in ns_objs:
-            raw_lines.append(obj.text)
-            line_numbers.append(obj.linenum)
+            _record(obj)
             # "ip name-server [vrf NAME] A B C ..." — multiple IPs on one line
             t = obj.text.strip()
             parts = re.split(r"\s+", t)[2:]  # skip "ip name-server"
-            # Strip optional "vrf <name>" prefix
+            # Strip optional "vrf <name>" prefix (EOS emits "vrf default")
             if len(parts) >= 2 and parts[0].lower() == "vrf":
                 parts = parts[2:]
             name_servers.extend(parts)
 
         # IOS-XR: "domain name-server <ip>" — one IP per line
         for obj in xr_ns_objs:
-            raw_lines.append(obj.text)
-            line_numbers.append(obj.linenum)
+            _record(obj)
             t = obj.text.strip()
             m = re.match(r"^domain\s+name-server\s+(\S+)", t)
             if m:

@@ -372,6 +372,24 @@ class BGPConfig(BaseConfigObject):
         default=None,
         description="Route-distinguisher declared inside the BGP VRF sub-block",
     )
+    # Route-targets declared inside the BGP VRF sub-block (`router bgp N > vrf X >
+    # route-target import|export …`). On EOS that is the ONLY place a device prints
+    # them — the `vrf instance` block carries just name/description — so these are
+    # not a duplicate of VRFConfig.route_target_*: they are where the L3VPN policy
+    # is *declared*, and BaseParser._backfill_vrf_rd_rt attributes them onto the
+    # VRFConfig so a consumer never has to know which vendor wrote the config.
+    route_target_import: list[str] = Field(
+        default_factory=list,
+        description="Route-target import values declared inside the BGP VRF sub-block",
+    )
+    route_target_export: list[str] = Field(
+        default_factory=list,
+        description="Route-target export values declared inside the BGP VRF sub-block",
+    )
+    route_target_both: list[str] = Field(
+        default_factory=list,
+        description="Route-target import+export values declared inside the BGP VRF sub-block",
+    )
     log_neighbor_changes: bool = Field(
         default=True, description="Log neighbor state changes"
     )

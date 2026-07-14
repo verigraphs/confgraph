@@ -10,6 +10,15 @@ class PIMRPAddress(BaseModel):
 
     rp_address: IPv4Address = Field(..., description="RP IP address")
     acl: str | None = Field(default=None, description="ACL defining groups served by this RP")
+    group_range: str | None = Field(
+        default=None,
+        description=(
+            "Group prefix served by this RP, when the device names the groups by PREFIX "
+            "rather than by ACL. EOS emits `rp address 1.1.1.1 239.0.0.0/8`. A prefix is "
+            "not an ACL name, and writing one into `acl` is the wrong-field read CCR-0030 "
+            "is about — a consumer resolving `acl` against ACLConfig would dangle."
+        ),
+    )
     override: bool = Field(default=False, description="Override auto-RP/BSR selection")
     bidir: bool = Field(default=False, description="Bidirectional PIM")
 
