@@ -91,6 +91,20 @@ class EOSParser(IOSParser):
         r"^\s+bfd\s+default\s*$",
     )
 
+    # BGP best-path tie-break. EOS spells the router-id tie-break
+    # ``bgp bestpath tie-break router-id`` where IOS spells it
+    # ``bgp bestpath compare-routerid`` — same concept (model field
+    # ``bestpath_options.compare_routerid``), different command word, and EOS
+    # REJECTS the IOS spelling (verified cEOS 4.36.1F, CCR-0061). Extend only
+    # that field's spelling tuple; the shared bestpath walk in IOSParser handles
+    # positive and negated forms. The spelling stays EOS-scoped — IOS / NX-OS /
+    # IOS-XR never see it — and the next vendor spelling is one more tuple entry.
+    _BGP_BESTPATH_SPELLINGS = {
+        **IOSParser._BGP_BESTPATH_SPELLINGS,
+        "compare_routerid": IOSParser._BGP_BESTPATH_SPELLINGS["compare_routerid"]
+        + (r"tie-break\s+router-id",),
+    }
+
     # Interface BFD timers. Again BOTH spellings are Arista's and the difference
     # is EOS version, not vendor: EOS-4.13 emits "min_rx" (underscore, the same
     # as IOS/NX-OS) while modern EOS renders "min-rx" (hyphen)

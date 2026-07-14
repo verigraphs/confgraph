@@ -4010,24 +4010,21 @@ class IOSParser(BaseParser):
                         _emit_scalar(fld, val, c.text.strip(), c.linenum)
 
             # Best-path options (nested sub-object) — state-derived (each option
-            # defaults False; True ⇒ the ``bgp bestpath …`` line was written).
+            # defaults False; True ⇒ a ``bgp bestpath …`` line was written).
+            # Source line resolved through the SAME spelling table the parser
+            # walks, so parse and emission cannot disagree on the wording (and an
+            # OS-specific spelling like EOS's ``tie-break router-id`` resolves
+            # here too).
             bp = bgp.bestpath_options
-            for opt, pat in (
-                ("as_path_ignore", r"^\s+bgp\s+bestpath\s+as-path\s+ignore"),
-                (
-                    "as_path_multipath_relax",
-                    r"^\s+bgp\s+bestpath\s+as-path\s+multipath-relax",
-                ),
-                ("compare_routerid", r"^\s+bgp\s+bestpath\s+compare-routerid"),
-                ("med_confed", r"^\s+bgp\s+bestpath\s+med\s+confed"),
-                (
-                    "med_missing_as_worst",
-                    r"^\s+bgp\s+bestpath\s+med\s+missing-as-worst",
-                ),
-                ("always_compare_med", r"^\s+bgp\s+bestpath\s+always-compare-med"),
-            ):
+            for opt, spellings in self._BGP_BESTPATH_SPELLINGS.items():
                 if getattr(bp, opt):
-                    sl, ln = _first_line(pat)
+                    sl, ln = "", -1
+                    for spelling in spellings:
+                        sl, ln = _first_line(
+                            rf"^\s+bgp\s+bestpath\s+{spelling}"
+                        )
+                        if ln != -1:
+                            break
                     ops.append(
                         ChangeOp(
                             verb=Verb.SET,
@@ -5745,28 +5742,48 @@ class IOSParser(BaseParser):
 
         return glbp_groups
 
+    # Best-path option field -> command-tail spellings (regex fragments that
+    # follow ``bgp bestpath ``).  This is the SINGLE source of truth for the
+    # bestpath family: both parsing (``_parse_bgp_bestpath_options``) and native
+    # ChangeOp emission (Family 5c-A block) walk it.  Each field defaults False;
+    # a positive line sets it True, a ``no`` line sets it False, through the one
+    # shared walk below — no per-field negation code.  An OS subclass extends a
+    # field's spelling tuple to add a vendor spelling (e.g. EOS spells
+    # compare-routerid ``bgp bestpath tie-break router-id``); adding a field or a
+    # vendor spelling is exactly one table entry.
+    _BGP_BESTPATH_SPELLINGS: dict[str, tuple[str, ...]] = {
+        "as_path_ignore": (r"as-path\s+ignore",),
+        "as_path_multipath_relax": (r"as-path\s+multipath-relax",),
+        "compare_routerid": (r"compare-routerid",),
+        "med_confed": (r"med\s+confed",),
+        "med_missing_as_worst": (r"med\s+missing-as-worst",),
+        "always_compare_med": (r"always-compare-med",),
+    }
+
     def _parse_bgp_bestpath_options(self, bgp_obj) -> BGPBestpathOptions:
-        """Parse BGP best-path options."""
-        return BGPBestpathOptions(
-            as_path_ignore=len(
-                bgp_obj.find_child_objects(r"^\s+bgp\s+bestpath\s+as-path\s+ignore")
-            ) > 0,
-            as_path_multipath_relax=len(
-                bgp_obj.find_child_objects(r"^\s+bgp\s+bestpath\s+as-path\s+multipath-relax")
-            ) > 0,
-            compare_routerid=len(
-                bgp_obj.find_child_objects(r"^\s+bgp\s+bestpath\s+compare-routerid")
-            ) > 0,
-            med_confed=len(
-                bgp_obj.find_child_objects(r"^\s+bgp\s+bestpath\s+med\s+confed")
-            ) > 0,
-            med_missing_as_worst=len(
-                bgp_obj.find_child_objects(r"^\s+bgp\s+bestpath\s+med\s+missing-as-worst")
-            ) > 0,
-            always_compare_med=len(
-                bgp_obj.find_child_objects(r"^\s+bgp\s+bestpath\s+always-compare-med")
-            ) > 0,
-        )
+        """Parse BGP best-path options via the shared spelling table.
+
+        Each option defaults False.  A positive ``bgp bestpath <spelling>`` line
+        sets it True; a ``no bgp bestpath <spelling>`` line sets it False (the
+        emitted negation for a default-ON member such as EOS's
+        ``no bgp bestpath as-path multipath-relax``).  One walk over
+        ``_BGP_BESTPATH_SPELLINGS`` covers every field and both polarities, so a
+        new field or an OS-specific spelling is a single table entry.
+        """
+        values: dict[str, bool] = {}
+        for field, spellings in self._BGP_BESTPATH_SPELLINGS.items():
+            result = False
+            for spelling in spellings:
+                if bgp_obj.find_child_objects(
+                    rf"^\s+bgp\s+bestpath\s+{spelling}"
+                ):
+                    result = True
+                if bgp_obj.find_child_objects(
+                    rf"^\s+no\s+bgp\s+bestpath\s+{spelling}"
+                ):
+                    result = False
+            values[field] = result
+        return BGPBestpathOptions(**values)
 
     # ------------------------------------------------------------------
     # BGP neighbor tombstone parser (universal field-reset pattern)
