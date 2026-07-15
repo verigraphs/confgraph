@@ -6,6 +6,7 @@ from ipaddress import IPv4Address, IPv4Interface, IPv4Network, IPv6Address, IPv6
 from confgraph.parsers.ios_parser import IOSParser
 from confgraph.parsers.base import PatternSet, _BASE_KNOWN_PATTERNS, _BASE_BEST_GUESS_KEYWORDS
 from confgraph.models.base import OSType
+from confgraph.models.line import LineType
 from confgraph.models.bgp import BGPConfig
 from confgraph.models.prefix_list import PrefixListConfig, PrefixListEntry
 from confgraph.models.static_route import StaticRoute
@@ -149,6 +150,33 @@ class EOSParser(IOSParser):
     _ISIS_IFACE_ENABLE_PATTERNS = IOSParser._ISIS_IFACE_ENABLE_PATTERNS.extended(
         r"^\s+isis\s+enable\s+(?P<tag>\S+)",
     )
+
+    # Line / session config. EOS has no numbered `line vty` block — the same
+    # concept (idle admin-session lifetime, and over which transport) is spelled
+    # as top-level `management ssh|console|telnet` blocks with an `idle-timeout
+    # <minutes>` child (verified cEOS 4.36.1F, CCR-0062). These four table
+    # extensions are the ENTIRE EOS dialect; the shared parse_lines walk in
+    # IOSParser is untouched (CCR-0038 built it; CCR-0044/0059 deleted EOS forks).
+    #
+    #   1. Header: match ONLY ssh|console|telnet, anchored `\s*$` so the sibling
+    #      `management api http-commands|gnmi|netconf` blocks are NOT swallowed.
+    #   2. console → CONSOLE inherited; ssh/telnet → the remote-session type (VTY).
+    #   3. idle-timeout is the exec-timeout child by another name (minutes only,
+    #      no seconds field).
+    #   4. ssh/telnet name the transport as the block, so the header keyword is
+    #      the transport_input value — EOS emits no `transport input` child here.
+    _LINE_HEADER_PATTERNS = IOSParser._LINE_HEADER_PATTERNS.extended(
+        r"^management\s+(?P<type>ssh|console|telnet)\s*$",
+    )
+    _LINE_TYPES = {
+        **IOSParser._LINE_TYPES,
+        "ssh": LineType.VTY,
+        "telnet": LineType.VTY,
+    }
+    _LINE_EXEC_TIMEOUT_PATTERNS = IOSParser._LINE_EXEC_TIMEOUT_PATTERNS.extended(
+        r"^\s+idle-timeout\s+(?P<minutes>\d+)",
+    )
+    _LINE_TRANSPORT_KEYWORDS = {"ssh", "telnet"}
 
     # Banners. EOS emits a BARE "banner motd" header — no delimiter character —
     # then the body, then a line containing the literal "EOF"

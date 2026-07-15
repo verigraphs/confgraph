@@ -500,6 +500,21 @@ class IOSParser(BaseParser):
         "tty": LineType.TTY,
     }
 
+    # Exec-timeout child spelling. IOS/NX-OS/IOS-XR write "exec-timeout <min> [sec]";
+    # a dialect with a different word for the same "idle session lifetime" child
+    # (EOS: "idle-timeout <min>") appends its spelling here rather than the walk
+    # growing a second regex. Every dialect exposes a `minutes` group; the optional
+    # `seconds` group is present only where the OS carries a seconds field.
+    _LINE_EXEC_TIMEOUT_PATTERNS = PatternSet(
+        r"^\s+exec-timeout\s+(?P<minutes>\d+)(?:\s+(?P<seconds>\d+))?",
+    )
+
+    # Header keywords that NAME their own transport (the block name IS the
+    # transport, with no `transport input` child). Empty in the Cisco family —
+    # IOS/NX-OS/IOS-XR carry transport on a child line. EOS names it as the block
+    # (`management ssh` / `management telnet`) and populates this set.
+    _LINE_TRANSPORT_KEYWORDS: set[str] = set()
+
     # "enable BFD on every interface in this OSPF process". IOS spells it
     # "bfd all-interfaces"; EOS extends this set with its own "bfd default".
     _OSPF_BFD_ALL_PATTERNS = PatternSet(
@@ -10082,14 +10097,20 @@ class IOSParser(BaseParser):
 
             raw_lines, line_numbers = self._get_raw_lines_and_line_numbers(line_obj)
 
-            # exec-timeout
+            # exec-timeout / idle-timeout — dialect data in
+            # _LINE_EXEC_TIMEOUT_PATTERNS. Dialects that carry a seconds field
+            # (the Cisco `exec-timeout <min> [sec]`) expose a `seconds` group and
+            # default it to 0 when the range is bare; a dialect that has no seconds
+            # concept (EOS `idle-timeout <min>`) omits the group and leaves it None.
             exec_timeout_minutes = exec_timeout_seconds = None
-            etc = line_obj.find_child_objects(r"^\s+exec-timeout\s+")
+            etc = line_obj.find_child_objects(self._LINE_EXEC_TIMEOUT_PATTERNS.union)
             if etc:
-                etm = re.match(r"^\s+exec-timeout\s+(\d+)(?:\s+(\d+))?", etc[0].text)
+                etm = self._LINE_EXEC_TIMEOUT_PATTERNS.match(etc[0].text)
                 if etm:
-                    exec_timeout_minutes = int(etm.group(1))
-                    exec_timeout_seconds = int(etm.group(2)) if etm.group(2) else 0
+                    gd = etm.groupdict()
+                    exec_timeout_minutes = int(gd["minutes"])
+                    if "seconds" in gd:
+                        exec_timeout_seconds = int(gd["seconds"]) if gd["seconds"] else 0
 
             logging_sync = bool(line_obj.find_child_objects(r"^\s+logging\s+synchronous"))
 
@@ -10100,6 +10121,11 @@ class IOSParser(BaseParser):
                 tim = re.match(r"^\s+transport\s+input\s+(.*)", tic[0].text)
                 if tim:
                     transport_input = tim.group(1).strip().split()
+            # A dialect whose header keyword IS the transport (EOS `management ssh`
+            # / `management telnet`) carries no `transport input` child; the block
+            # name is the transport. Empty keyword set in the Cisco family → no-op.
+            if raw_type in self._LINE_TRANSPORT_KEYWORDS:
+                transport_input = [raw_type]
 
             # transport output
             transport_output = []
