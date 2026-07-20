@@ -125,6 +125,7 @@ __all__ = [
     "is_native_bgp_op",
     "is_native_bgp_network_removal_op",
     "is_native_bgp_af_aggregate_removal_op",
+    "is_native_bgp_af_network_removal_op",
     "is_native_bgp_instance_create_op",
     "isis_interface_key",
     "isis_redistribute_key",
@@ -861,6 +862,38 @@ def is_native_bgp_af_aggregate_removal_op(op: "ChangeOp") -> bool:
     )
 
 
+def _is_bgp_af_network_removal(path: tuple[str, ...]) -> bool:
+    """True for the AF-scoped ops-only ``no network`` op path (CCR-0081).
+
+    ``("bgp_instance", asn, vrf, "af", afi, safi, afvrf, "network", <prefix>)``
+    — the NX-OS address-family-scoped spelling of ``no network``, a LIST_REMOVE
+    with NO legacy twin (the line is silently dropped by every legacy parser
+    today, mirroring the family-5b instance ``no network`` and the family-5c-B.1
+    AF ``no aggregate-address`` discipline).  The singular ``bgp_instance`` head
+    distinguishes it from the positive AF-network SET (``bgp_instances``).
+    """
+    return (
+        len(path) == 9
+        and path[0] == "bgp_instance"
+        and path[3] == "af"
+        and path[7] == "network"
+    )
+
+
+def is_native_bgp_af_network_removal_op(op: "ChangeOp") -> bool:
+    """True iff *op* is the AF-scoped ops-only ``no network`` removal op.
+
+    Consumed by :func:`encode_legacy` to emit NOTHING (no legacy twin), so ops
+    mode gains the NX-OS AF-scoped route-withdrawal capability legacy cannot see
+    while legacy-mode artifacts stay byte-identical.
+    """
+    return (
+        getattr(op, "origin", "derived") == "native"
+        and op.verb is Verb.LIST_REMOVE
+        and _is_bgp_af_network_removal(op.path)
+    )
+
+
 def is_native_bgp_instance_create_op(op: "ChangeOp") -> bool:
     """True iff *op* is the family-5c-B.2 whole-instance CREATE op.
 
@@ -1054,7 +1087,11 @@ def is_native_bgp_op(op: "ChangeOp") -> bool:
             and path[4] == "neighbor"
         )
     if op.verb is Verb.LIST_REMOVE:
-        return _is_bgp_network_removal(path) or _is_bgp_af_aggregate_removal(path)
+        return (
+            _is_bgp_network_removal(path)
+            or _is_bgp_af_aggregate_removal(path)
+            or _is_bgp_af_network_removal(path)
+        )
     return False
 
 
@@ -2959,7 +2996,11 @@ def encode_legacy(ops: ChangeSet) -> LegacyArtifacts:
         # ``no aggregate-address``: NO legacy twin (both lines are silently
         # dropped by every legacy parser today) — emit nothing so legacy-mode
         # artifacts stay byte-identical.
-        if is_native_bgp_network_removal_op(op) or is_native_bgp_af_aggregate_removal_op(op):
+        if (
+            is_native_bgp_network_removal_op(op)
+            or is_native_bgp_af_aggregate_removal_op(op)
+            or is_native_bgp_af_network_removal_op(op)
+        ):
             continue
         # Family-6a ops-only ``no net`` (CCR Appendix M): NO legacy twin (the
         # bare ``no net`` line is silently dropped by every legacy parser today)
