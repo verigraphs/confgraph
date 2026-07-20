@@ -395,7 +395,17 @@ def test_eos_rp_address_group_prefix_and_acl_are_different_fields():
 
 
 def test_ios_flat_multicast_lines_are_unchanged():
-    """Lines as committed in `_work/ios_full.cfg`."""
+    """Lines as committed in `_work/ios_full.cfg`.
+
+    UPDATED by CCR-0085. The fixture line uses the `group-list` keyword, which is
+    NX-OS-specific — classic IOS/IOS-XE has NO `group-list` keyword in
+    `ip pim rp-address` (the ACL is a bare trailing token; Cisco IOS IP Multicast
+    Command Reference, `ip pim rp-address`). CCR-0085 makes the shared parser
+    keyword-aware: `group-list <token>` is a group selector and lands in
+    `group_range` on every OS, so this (non-device-emitted) IOS line now reads
+    `group_range='ACL_MGMT'`, not `acl`. The genuine IOS bare-acl form is asserted
+    unchanged below. Follow-up: `_work/ios_full.cfg` should use the bare-acl form.
+    """
     p = IOSParser("""
 ip multicast-routing
 ip pim rp-address 1.1.1.1 group-list ACL_MGMT
@@ -404,6 +414,12 @@ ip pim ssm default
     assert p.multicast.multicast_routing_enabled is True
     rp = p.multicast.pim_rp_addresses[0]
     assert str(rp.rp_address) == "1.1.1.1"
-    assert rp.acl == "ACL_MGMT"
-    # The new field is EOS's; IOS names the groups by ACL and leaves it None.
-    assert rp.group_range is None
+    # group-list keyword -> group_range (CCR-0085), even for this non-device IOS line.
+    assert rp.group_range == "ACL_MGMT"
+    assert rp.acl is None
+
+    # The DEVICE-EMITTED IOS form is a BARE access-list token -> acl, unchanged:
+    p2 = IOSParser("ip pim rp-address 2.2.2.2 SM_ACL\n").parse()
+    rp2 = p2.multicast.pim_rp_addresses[0]
+    assert rp2.acl == "SM_ACL"
+    assert rp2.group_range is None
