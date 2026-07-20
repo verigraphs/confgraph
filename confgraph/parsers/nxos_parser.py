@@ -286,6 +286,17 @@ class NXOSParser(IOSParser):
                     except ValueError:
                         pass
 
+            # NX-OS STP portfast spelling: "spanning-tree port type edge"
+            # (and "... edge trunk") is Cisco's NX-OS rename of IOS
+            # "spanning-tree portfast"; "... normal" is the explicit non-edge
+            # designation. IOSParser.parse_interfaces (the super() call above)
+            # only knows the IOS "spanning-tree portfast" spelling, so map the
+            # NX-OS spelling onto the same InterfaceConfig.stp_portfast field.
+            if intf_obj.find_child_objects(r"^\s+spanning-tree\s+port\s+type\s+edge\b"):
+                intf_cfg.stp_portfast = True
+            elif intf_obj.find_child_objects(r"^\s+spanning-tree\s+port\s+type\s+normal\b"):
+                intf_cfg.stp_portfast = False
+
             # VPC per-interface: "vpc <id>" or "vpc peer-link"
             vpc_ch = intf_obj.find_child_objects(r"^\s+vpc\s+(\d+)\s*$")
             if vpc_ch:
