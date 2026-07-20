@@ -1038,6 +1038,15 @@ def apply_peer_group_command(pg_data: dict, command: str) -> None:
     elif command == "next-hop-self":
         pg_data["next_hop_self"] = True
 
+    elif command.startswith("default-originate"):
+        # `default-originate` (unconditional) OR
+        # `default-originate route-map RM` (conditional). The boolean is set in
+        # BOTH cases; the route-map is recorded only for the conditional form.
+        pg_data["default_originate"] = True
+        dm = _re.search(r"route-map\s+(\S+)", command)
+        if dm:
+            pg_data["default_originate_route_map"] = dm.group(1)
+
     elif command == "route-reflector-client":
         pg_data["route_reflector_client"] = True
 
@@ -1139,6 +1148,8 @@ def _default_pg_data(name: str) -> dict:
         "next_hop_self": False,
         "route_reflector_client": False,
         "send_community": False,
+        "default_originate": False,
+        "default_originate_route_map": None,
         "route_map_in": None,
         "route_map_out": None,
         "prefix_list_in": None,

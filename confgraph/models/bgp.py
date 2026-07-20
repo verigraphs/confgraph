@@ -225,6 +225,13 @@ class BGPNeighbor(BaseModel):
     disable_connected_check: bool = Field(
         default=False, description="Disable connected check for EBGP"
     )
+    default_originate: bool = Field(
+        default=False, description="Originate default route to this neighbor"
+    )
+    default_originate_route_map: str | None = Field(
+        default=None,
+        description="Route-map for default-originate (references RouteMapConfig)",
+    )
     address_families: list[BGPNeighborAF] = Field(
         default_factory=list,
         description="Address-family specific configurations",
@@ -293,6 +300,13 @@ class BGPPeerGroup(BaseModel):
     )
     disable_connected_check: bool = Field(
         default=False, description="Disable connected check for EBGP"
+    )
+    default_originate: bool = Field(
+        default=False, description="Originate default route to peers in this group"
+    )
+    default_originate_route_map: str | None = Field(
+        default=None,
+        description="Route-map for default-originate (references RouteMapConfig)",
     )
     local_as: int | None = Field(
         default=None, description="Local AS number for this peer-group"
