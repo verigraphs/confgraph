@@ -9227,23 +9227,36 @@ class IOSParser(BaseParser):
         self._pending_eigrp_negation_tombstones = []
 
         for eigrp_obj in parse.find_objects(r"^router\s+eigrp\s+"):
+            # CCR-0067: NX-OS nests a named EIGRP instance's attributes
+            # (autonomous-system, redistribute, …) inside `address-family ipv4
+            # unicast`, where the direct-child extractors below would miss them.
+            # Same seam as router-isis: `_nested_block` is the identity on
+            # IOS/EOS (classic flat EIGRP unchanged) and an ipv4-unicast
+            # AF-transparent view on NX-OS/IOS-XR.
+            eigrp_obj = self._nested_block(eigrp_obj)
             m = re.match(r"^router\s+eigrp\s+(\S+)", eigrp_obj.text)
             if not m:
                 continue
             as_number_str = m.group(1)
+            name = None
             try:
                 as_number = int(as_number_str)
             except ValueError:
-                # Named-mode EIGRP: "router eigrp NAME" — the real AS is
-                # under "address-family ipv4 unicast autonomous-system N"
-                as_number = as_number_str
-                af_ch = eigrp_obj.find_child_objects(
+                # Named-mode EIGRP: "router eigrp NAME" — NAME is the process
+                # tag; the real ASN is `autonomous-system N`.  IOS puts it ON the
+                # AF header line (`address-family ipv4 unicast autonomous-system
+                # N`); NX-OS nests it as a child of the AF block (surfaced as a
+                # direct child by the AF-transparent view above).  Try both.
+                name = as_number_str
+                as_number = as_number_str  # fallback if the ASN is absent
+                as_ch = eigrp_obj.find_child_objects(
                     r"^\s+address-family\s+ipv4.*autonomous-system\s+(\d+)"
+                ) or eigrp_obj.find_child_objects(
+                    r"^\s+autonomous-system\s+(\d+)"
                 )
-                if af_ch:
+                if as_ch:
                     as_val = self._extract_match(
-                        af_ch[0].text,
-                        r"autonomous-system\s+(\d+)",
+                        as_ch[0].text, r"autonomous-system\s+(\d+)"
                     )
                     if as_val:
                         as_number = int(as_val)
@@ -9537,6 +9550,7 @@ class IOSParser(BaseParser):
                 source_os=self.os_type,
                 line_numbers=line_numbers,
                 as_number=as_number,
+                name=name,
                 router_id=router_id,
                 networks=networks,
                 passive_interface_default=passive_default,
