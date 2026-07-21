@@ -45,6 +45,11 @@ class EIGRPConfig(BaseConfigObject):
     """EIGRP process configuration."""
 
     as_number: int | str = Field(..., description="EIGRP autonomous system number")
+    name: str | None = Field(
+        default=None,
+        description="EIGRP process tag/name (named-mode `router eigrp NAME`); "
+        "None for classic numeric-AS mode. The real ASN is in `as_number`.",
+    )
     router_id: IPv4Address | None = Field(default=None, description="EIGRP router ID")
     networks: list[EIGRPNetwork] = Field(default_factory=list, description="Network statements")
     passive_interface_default: bool = Field(default=False, description="All interfaces passive by default")

@@ -16,6 +16,7 @@ from confgraph.models.ospf import OSPFConfig
 from confgraph.models.static_route import StaticRoute
 from confgraph.parsers.base import _BASE_KNOWN_PATTERNS, apply_peer_group_command, _default_pg_data
 from confgraph.parsers.ios_parser import IOSParser
+from confgraph.parsers.iosxr_parser import _AFTransparentBlock
 
 
 # NX-OS top-level patterns differ from IOS: "vrf context" instead of "vrf definition"
@@ -91,6 +92,22 @@ class NXOSParser(IOSParser):
         # Re-initialize with nxos syntax for CiscoConfParse
         self.syntax = "nxos"
         self.parse_obj = None  # Force re-creation with new syntax
+
+    def _nested_block(self, obj):
+        """AF-transparent view for NX-OS routing blocks (CCR-0067).
+
+        NX-OS nests a routing instance's own attributes one level deeper, inside
+        ``address-family ipv4 unicast`` — exactly as IOS-XR does — so the shared
+        ``parse_isis`` direct-child extractors (``redistribute``,
+        ``default-information originate``, …) stop at the AF door and read nothing.
+        Reuse IOS-XR's ``_AFTransparentBlock`` (the SAME splice, single source):
+        it hoists ONLY the ``ipv4 unicast`` AF's contents alongside the direct
+        children. That reads the instance-level IPv4 values on a dual-stack device
+        deterministically and withholds the IPv6 AF (whose values have no home
+        until IS-IS gains an address-family dimension — CCR-0049's guard, not this
+        seam's to fake). On a flat (no-AF) NX-OS instance the view is the identity.
+        """
+        return _AFTransparentBlock(obj)
 
     # -----------------------------------------------------------------------
     # VRFs — "vrf context NAME"
