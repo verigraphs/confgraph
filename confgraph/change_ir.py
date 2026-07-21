@@ -2995,3 +2995,170 @@ def encode_legacy(ops: ChangeSet) -> LegacyArtifacts:
         # All remaining deletion verbs — top-level tombstones.
         artifacts.no_commands.append(":".join(op.path))
     return artifacts
+
+
+# ---------------------------------------------------------------------------
+# encode_legacy_shim — Phase-4 OSS deprecation shim (ChangeSet → LegacyArtifacts)
+# ---------------------------------------------------------------------------
+#
+# `no_commands` / `interface_no_commands` / `bgp_no_commands` are PUBLISHED OSS
+# model fields.  CCR-0025 Phase 4 §8.2 keeps them populated-but-deprecated for
+# two minor releases after the `CONFGRAPH_CHANGE_IR` default flips to `ops`.
+# Batch B deletes native parser tombstone emission, so from then on the ONLY way
+# to keep those fields filled is to re-encode the composed ChangeSet back into
+# the legacy vocabulary.  `encode_legacy` is that inverse deriver and is already
+# byte-exact for tombstone-derived ops (the `test_change_ir._roundtrip` pin).
+# This shim wraps it with the two things Phase-3 native emission moved OUT of the
+# encode path, so the shim's output stays identical to what the pre-native parser
+# produced:
+#
+#   1. Whole-object SET reconstitution — the retired families (BGP instance L,
+#      routing processes Q, VRF S, singletons T/U/V/W, policy objects Y) now emit
+#      a whole-object CREATE op (`SET (<container>, <key…>, "instance")`) plus
+#      per-member SETs instead of the derived whole-object SET.  The shim rebuilds
+#      the legacy `set_fields[(<container>, <key…>)] = <object>` shape from the
+#      create op and drops the now-subsumed member SETs (the members already live
+#      inside the create op's object value).  Interface members (family X) keep
+#      their per-member set_fields entries — that family emits no create op and
+#      the legacy interface container was always field-decomposed (CCR Appendix X
+#      shim note), so encode_legacy already reproduces it.
+#   2. `_readded_later` suppression (CCR Appendix F.6) — for the four service
+#      entity families whose native delete op is emitted UNCONDITIONALLY while the
+#      legacy tombstone is gated (ip_sla / track / eem / banner), a delete whose
+#      entity is re-defined later in the same script must produce NO tombstone.
+#      The parser applies this at emission today; the shim reproduces it at encode
+#      time from the ChangeSet's line numbers.
+
+
+# One-entry-per-retired-family registry: the whole-object CREATE-op predicates.
+# Mirrors the create-op set derive_ops uses for its native prefix-claim
+# retirement (see `native_prefix_claims`).  A future retired family adds exactly
+# one predicate here (and its matching claim in derive_ops).  Every predicate's
+# op has the shape `SET (<container>, <key…>, "instance")`, so the legacy
+# whole-object path is uniformly `op.path[:-1]` and its value is the parsed
+# object (identical to the value the derived whole-object SET carried).
+_WHOLE_OBJECT_CREATE_PREDICATES: tuple[Callable[["ChangeOp"], bool], ...] = (
+    is_native_bgp_instance_create_op,
+    is_native_ospf_instance_create_op,
+    is_native_eigrp_instance_create_op,
+    is_native_isis_instance_create_op,
+    is_native_vrf_instance_create_op,
+    is_native_policy_instance_create_op,
+    is_native_singleton_instance_create_op,
+)
+
+
+def is_native_whole_object_create_op(op: "ChangeOp") -> bool:
+    """True iff *op* is a whole-object CREATE op for a natively-retired family.
+
+    The shim collapses each such op back to the legacy whole-object
+    ``set_fields`` entry at ``op.path[:-1]`` (dropping the ``"instance"``
+    sentinel segment).  Registry-driven: see ``_WHOLE_OBJECT_CREATE_PREDICATES``.
+    """
+    return any(pred(op) for pred in _WHOLE_OBJECT_CREATE_PREDICATES)
+
+
+def _shim_reconstitute_whole_objects(ops: "ChangeSet") -> "ChangeSet":
+    """Rebuild legacy whole-object SETs from native create + member ops.
+
+    For every whole-object create op, emit a legacy ``SET (<container>,
+    <key…>) = <object>`` in its place and drop the per-member SET ops it
+    subsumes (any SET whose path strictly extends the reconstituted
+    whole-object path — those members already live inside the object value).
+    Deletion ops and unrelated SETs pass through untouched.  A no-op when the
+    ChangeSet carries no create ops (natives-less producers, baselines).
+    """
+    claimed: set[tuple[str, ...]] = {
+        op.path[:-1] for op in ops if is_native_whole_object_create_op(op)
+    }
+    if not claimed:
+        return ops
+
+    def _subsumed(path: tuple[str, ...]) -> bool:
+        return any(
+            len(path) > len(whole) and path[: len(whole)] == whole
+            for whole in claimed
+        )
+
+    result: ChangeSet = []
+    for op in ops:
+        if is_native_whole_object_create_op(op):
+            result.append(
+                ChangeOp(
+                    verb=Verb.SET,
+                    path=op.path[:-1],
+                    value=op.value,
+                    source_line=op.source_line,
+                    line_no=op.line_no,
+                    origin=op.origin,
+                )
+            )
+            continue
+        if op.verb is Verb.SET and _subsumed(op.path):
+            continue  # member of a reconstituted whole object — subsumed
+        result.append(op)
+    return result
+
+
+def _shim_suppress_readded_service_deletes(ops: "ChangeSet") -> "ChangeSet":
+    """Reproduce the parser's ``_readded_later`` tombstone suppression.
+
+    The four service-entity families (ip_sla / track / eem / banner) emit their
+    native delete op UNCONDITIONALLY but the parser suppresses the LEGACY
+    tombstone when the same entity is re-defined LATER in the script (CCR
+    Appendix F.6).  Once Batch B removes native emission, the shim must apply
+    the same suppression from the ChangeSet: drop a native service-entity delete
+    (so ``encode_legacy`` produces no tombstone for it) iff a native
+    service-entity SET re-defines the same entity at a later line.
+
+    The delete path is ``("field", <collection>, <key>)`` (or
+    ``("field", "banners", <field>)``); the re-defining SET path is that path
+    without the ``"field"`` head — i.e. ``delete.path[1:]``.  "Later" mirrors
+    the parser's ``any(positive_line > negation_line)``: the re-add's definition
+    lines come from the parsed object's ``line_numbers`` (all recorded
+    occurrences), falling back to the op's own ``line_no`` (banner writes carry
+    a scalar value, not an object).
+    """
+    readd_lines: dict[tuple[str, ...], list[int]] = {}
+    for op in ops:
+        if op.verb is Verb.SET and is_native_service_entity_op(op):
+            lines = list(getattr(op.value, "line_numbers", None) or [op.line_no])
+            readd_lines.setdefault(op.path, []).extend(lines)
+    if not readd_lines:
+        return ops
+
+    result: ChangeSet = []
+    for op in ops:
+        if (
+            op.verb in (Verb.OBJECT_DELETE, Verb.UNSET)
+            and is_native_service_entity_op(op)
+        ):
+            later = readd_lines.get(op.path[1:])
+            if later and any(line > op.line_no for line in later):
+                continue  # re-added later — tombstone suppressed (F.6 parity)
+        result.append(op)
+    return result
+
+
+def encode_legacy_shim(ops: "ChangeSet") -> LegacyArtifacts:
+    """Phase-4 OSS deprecation shim: ChangeSet → LegacyArtifacts.
+
+    Public entry point that keeps the deprecated ``no_commands`` /
+    ``interface_no_commands`` / ``bgp_no_commands`` fields populated after Batch B
+    removes native parser tombstone emission.  It is :func:`encode_legacy` (the
+    byte-exact core) wrapped with whole-object SET reconstitution and
+    ``_readded_later`` tombstone suppression so its output is identical, family
+    for family, to what the pre-native parser emitted — including the retired
+    families' whole-object ``set_fields`` shapes and the suppressed
+    delete-then-re-add tombstones.
+
+    Byte-exact and container-exact for the tombstone artifacts; the natively
+    hoisted families' tombstones are an order-inert multiset (the established
+    :func:`encode_legacy` / ``_roundtrip`` contract), every other family
+    order-exact.  A drop-in for ``encode_legacy`` on any ChangeSet: on a
+    natives-less ChangeSet the two wrappers are no-ops and it degrades to
+    ``encode_legacy`` verbatim.
+    """
+    return encode_legacy(
+        _shim_reconstitute_whole_objects(_shim_suppress_readded_service_deletes(ops))
+    )
