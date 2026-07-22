@@ -1112,6 +1112,7 @@ class NXOSParser(IOSParser):
         peer_link = None
         delay_restore = None
         auto_recovery = False
+        peer_gateway = False
 
         for child in vpc_obj.children:
             t = child.text.strip()
@@ -1152,6 +1153,15 @@ class NXOSParser(IOSParser):
                 auto_recovery = True
                 continue
 
+            # peer-gateway is default-off; the device emits the bare line when
+            # enabled and `no peer-gateway` (or absence) when disabled.
+            if re.match(r"peer-gateway\b", t):
+                peer_gateway = True
+                continue
+            if re.match(r"no\s+peer-gateway\b", t):
+                peer_gateway = False
+                continue
+
         # Find peer-link from interfaces (interface port-channel X → vpc peer-link)
         for intf_obj in parse.find_objects(r"^interface\s+"):
             for ch in intf_obj.children:
@@ -1175,6 +1185,7 @@ class NXOSParser(IOSParser):
             peer_link=peer_link,
             delay_restore=delay_restore,
             auto_recovery=auto_recovery,
+            peer_gateway=peer_gateway,
         )
 
     # -----------------------------------------------------------------------

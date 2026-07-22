@@ -45,3 +45,7 @@ class VPCConfig(BaseConfigObject):
         default=False,
         description="Auto-recovery enabled after peer failure",
     )
+    peer_gateway: bool = Field(
+        default=False,
+        description="Peer-gateway enabled (peer routes for partner's router MAC)",
+    )
