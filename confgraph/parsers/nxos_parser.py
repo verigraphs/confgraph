@@ -410,9 +410,18 @@ class NXOSParser(IOSParser):
         """Extract neighbor attributes from a CiscoConfParse node's children.
 
         Pure extractor — takes a CCP node (inline or bare ``neighbor`` line),
-        walks ``.all_children`` (which recurses into ``address-family``
-        grandchildren), and returns a dict of parsed attributes.  Callers
-        merge the dict into their model neighbor.
+        walks its **direct** ``.children`` for session-level attributes, then
+        descends each ``address-family <afi> <safi>`` sub-block into a
+        ``BGPNeighborAF`` (CCR-0077).  NX-OS nests ALL per-neighbor policy
+        (prefix-list / route-map / send-community / next-hop-self /
+        default-originate / maximum-prefix) under the address-family, so a
+        recursive ``.all_children`` walk previously flattened it onto the
+        session scalars and left ``address_families == []`` — and on a
+        dual-stack neighbor the ipv6 values clobbered the ipv4 ones.  Now the
+        per-AF policy lives in ``nd["address_families"]``; the session scalars
+        are kept populated from the ipv4-unicast AF only, for back-compat, so
+        they never carry a colliding value.  Callers merge the dict into their
+        model neighbor.
         """
         from confgraph.models.bgp import BGPTimers
 
@@ -429,9 +438,15 @@ class NXOSParser(IOSParser):
             "disable_connected_check": False, "timers": None,
             "local_as": None, "local_as_no_prepend": False,
             "local_as_replace_as": False,
+            "default_originate": False, "default_originate_route_map": None,
+            "address_families": [],
         }
 
-        for child in ccp_node.all_children:
+        # Direct children only — NOT .all_children.  Address-family policy lines
+        # are grandchildren and are handled by the AF descent below; walking
+        # them here would flatten them (the CCR-0077 bug).  Session-genuine
+        # policy (a flattened form) still parses because these branches remain.
+        for child in ccp_node.children:
             cmd = child.text.strip()
 
             # inherit peer NAME → peer_group
@@ -500,7 +515,115 @@ class NXOSParser(IOSParser):
                 else:
                     nd["send_community"] = True
 
+        # --- Per-neighbor address-family descent (CCR-0077) ---
+        # Each `address-family <afi> <safi>` sub-block becomes one BGPNeighborAF.
+        # Match ANY afi/safi pair — not just ipv4|ipv6 unicast|multicast — so
+        # that `l2vpn evpn`, `vpnv4 unicast`, `ipv4 labeled-unicast`, etc. are
+        # descended into address_families (with their true afi/safi) rather than
+        # dropped: previously the recursive `.all_children` walk flattened them
+        # lossily onto the session, and a regex restricted to the unicast set
+        # would turn that lossy-but-PRESENT policy into an absent one.
+        for child in ccp_node.children:
+            afm = re.match(
+                r"address-family\s+(\S+)\s+(\S+?)\s*$",
+                child.text.strip(),
+            )
+            if not afm:
+                continue
+            nd["address_families"].append(
+                NXOSParser._parse_nxos_neighbor_af_block(
+                    child, afm.group(1), afm.group(2)
+                )
+            )
+
+        # Back-compat: keep the flattened session scalars populated, but from
+        # the ipv4-unicast AF ONLY (falling back to the first AF), and only
+        # where a direct-child line has not already set them.  This is what
+        # stops a dual-stack neighbor's ipv6 policy from clobbering the ipv4
+        # scalar — `address_families` is the source of truth.
+        bc_af = next(
+            (a for a in nd["address_families"]
+             if a.afi == "ipv4" and a.safi == "unicast"),
+            None,
+        )
+        if bc_af is None and nd["address_families"]:
+            bc_af = nd["address_families"][0]
+        if bc_af is not None:
+            for key in (
+                "route_map_in", "route_map_out", "prefix_list_in",
+                "prefix_list_out", "maximum_prefix",
+                "default_originate_route_map",
+            ):
+                if nd[key] is None and getattr(bc_af, key) is not None:
+                    nd[key] = getattr(bc_af, key)
+            if nd["send_community"] is None and bc_af.send_community is not None:
+                nd["send_community"] = bc_af.send_community
+            if not nd["next_hop_self"] and bc_af.next_hop_self:
+                nd["next_hop_self"] = True
+            if not nd["route_reflector_client"] and bc_af.route_reflector_client:
+                nd["route_reflector_client"] = True
+            if not nd["default_originate"] and bc_af.default_originate:
+                nd["default_originate"] = True
+
         return nd
+
+    @staticmethod
+    def _parse_nxos_neighbor_af_block(af_child, afi: str, safi: str):
+        """Build one ``BGPNeighborAF`` from a neighbor ``address-family`` block.
+
+        NX-OS emits all per-neighbor policy nested under
+        ``neighbor <ip> / address-family <afi> <safi>``.  Mirrors the IOS-XR
+        descent (``_parse_iosxr_neighbor_af_block``, CCR-0046) but with NX-OS
+        token syntax (`route-map <RM> in|out`, `prefix-list <PL> in|out`,
+        `next-hop-self`, `send-community`, `maximum-prefix <n> [<thr>]`,
+        `default-originate [route-map <RM>]`).  Reads the AF block's direct
+        ``.children`` only.
+        """
+        from confgraph.models.bgp import BGPNeighborAF
+
+        af: dict = {
+            "route_map_in": None, "route_map_out": None,
+            "prefix_list_in": None, "prefix_list_out": None,
+            "next_hop_self": False, "route_reflector_client": False,
+            "send_community": None, "maximum_prefix": None,
+            "maximum_prefix_threshold": None,
+            "default_originate": False, "default_originate_route_map": None,
+        }
+
+        for pc in af_child.children:
+            cmd = pc.text.strip()
+            if cmd.startswith("route-map ") and cmd.endswith(" in"):
+                af["route_map_in"] = cmd[len("route-map "):-len(" in")].strip()
+            elif cmd.startswith("route-map ") and cmd.endswith(" out"):
+                af["route_map_out"] = cmd[len("route-map "):-len(" out")].strip()
+            elif cmd.startswith("prefix-list ") and cmd.endswith(" in"):
+                af["prefix_list_in"] = cmd[len("prefix-list "):-len(" in")].strip()
+            elif cmd.startswith("prefix-list ") and cmd.endswith(" out"):
+                af["prefix_list_out"] = cmd[len("prefix-list "):-len(" out")].strip()
+            elif cmd == "next-hop-self":
+                af["next_hop_self"] = True
+            elif cmd == "route-reflector-client":
+                af["route_reflector_client"] = True
+            elif cmd.startswith("send-community"):
+                if "both" in cmd:
+                    af["send_community"] = "both"
+                elif "extended" in cmd:
+                    af["send_community"] = "extended"
+                else:
+                    af["send_community"] = True
+            elif cmd.startswith("maximum-prefix "):
+                mp = cmd.split()
+                if len(mp) >= 2 and mp[1].isdigit():
+                    af["maximum_prefix"] = int(mp[1])
+                    if len(mp) >= 3 and mp[2].isdigit():
+                        af["maximum_prefix_threshold"] = int(mp[2])
+            elif cmd.startswith("default-originate route-map "):
+                af["default_originate"] = True
+                af["default_originate_route_map"] = cmd.split(None, 2)[2].strip()
+            elif cmd == "default-originate":
+                af["default_originate"] = True
+
+        return BGPNeighborAF(afi=afi, safi=safi, **af)
 
     def _parse_bgp_neighbors(self, bgp_obj) -> list["BGPNeighbor"]:
         """Parse BGP neighbors, adding NX-OS nested-block / ``inherit peer`` support.
@@ -612,6 +735,9 @@ class NXOSParser(IOSParser):
                 local_as=nd["local_as"],
                 local_as_no_prepend=nd["local_as_no_prepend"],
                 local_as_replace_as=nd["local_as_replace_as"],
+                default_originate=nd["default_originate"],
+                default_originate_route_map=nd["default_originate_route_map"],
+                address_families=nd["address_families"],
             ))
 
         return neighbors

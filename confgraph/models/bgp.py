@@ -229,6 +229,22 @@ class BGPNeighbor(BaseModel):
         default_factory=list,
         description="Address-family specific configurations",
     )
+    default_originate: bool = Field(
+        default=False,
+        description=(
+            "Originate a default route to this neighbor. On NX-OS this is a back-compat "
+            "scalar hoisted from the ipv4-unicast neighbor address-family (where NX-OS "
+            "nests it); address_families[].default_originate is the per-AF source of truth. "
+            "IOS-XR neighbors carry it per-AF only and leave this scalar False."
+        ),
+    )
+    default_originate_route_map: str | None = Field(
+        default=None,
+        description=(
+            "Route-map gating default-originate (references RouteMapConfig). Back-compat "
+            "scalar hoisted from the ipv4-unicast neighbor address-family."
+        ),
+    )
     local_as: int | None = Field(
         default=None, description="Local AS override for this neighbor"
     )
