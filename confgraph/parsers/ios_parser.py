@@ -6030,6 +6030,8 @@ class IOSParser(BaseParser):
                     "next_hop_self": False,
                     "route_reflector_client": False,
                     "send_community": None,
+                    "default_originate": False,
+                    "default_originate_route_map": None,
                     "fall_over_bfd": False,
                     "shutdown": False,
                     "disable_connected_check": False,
@@ -6085,6 +6087,17 @@ class IOSParser(BaseParser):
                 neighbor_dict[peer_ip_str]["next_hop_self"] = True
             elif command == "route-reflector-client":
                 neighbor_dict[peer_ip_str]["route_reflector_client"] = True
+            elif command.startswith("default-originate"):
+                # `neighbor X default-originate` (unconditional) OR
+                # `neighbor X default-originate route-map RM` (conditional). The
+                # boolean is set in BOTH cases; the route-map only for the
+                # conditional form. The classic (non-AF) neighbor walk keeps its
+                # own dispatch, so this mirrors the shared apply_peer_group_command
+                # branch rather than reusing it.
+                neighbor_dict[peer_ip_str]["default_originate"] = True
+                do_m = re.search(r"route-map\s+(\S+)", command)
+                if do_m:
+                    neighbor_dict[peer_ip_str]["default_originate_route_map"] = do_m.group(1)
             elif command == "fall-over bfd":
                 neighbor_dict[peer_ip_str]["fall_over_bfd"] = True
             elif command == "shutdown":
@@ -6169,6 +6182,8 @@ class IOSParser(BaseParser):
                     send_community=neighbor_data["send_community"],
                     fall_over_bfd=neighbor_data.get("fall_over_bfd", False),
                     disable_connected_check=neighbor_data.get("disable_connected_check", False),
+                    default_originate=neighbor_data.get("default_originate", False),
+                    default_originate_route_map=neighbor_data.get("default_originate_route_map"),
                     shutdown=neighbor_data.get("shutdown", False),
                     timers=neighbor_data["timers"],
                     local_as=neighbor_data["local_as"],
@@ -6899,10 +6914,6 @@ class IOSParser(BaseParser):
                 # not part of the shared vocabulary.
                 if cmd == "activate":
                     af_nb_data[peer_str]["activate"] = True
-                elif cmd.startswith("default-originate"):
-                    rm_m = re.search(r"route-map\s+(\S+)", cmd)
-                    if rm_m:
-                        af_nb_data[peer_str]["default_originate_route_map"] = rm_m.group(1)
                 elif cmd.startswith("maximum-prefix ") and "warning-only" in cmd:
                     af_nb_data[peer_str]["maximum_prefix_warning_only"] = True
                 elif cmd.startswith("advertise-map "):

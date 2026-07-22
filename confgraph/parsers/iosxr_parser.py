@@ -600,6 +600,7 @@ class IOSXRParser(IOSParser):
             "next_hop_self": False,
             "send_community": False,
             "route_reflector_client": False,
+            "default_originate": False,
             "default_originate_route_map": None,
             "maximum_prefix": None,
             "maximum_prefix_threshold": None,
@@ -644,8 +645,17 @@ class IOSXRParser(IOSParser):
                     af_data["send_community"] = "extended"
                 else:
                     af_data["send_community"] = True
-            elif cmd.startswith("default-originate route-policy "):
-                af_data["default_originate_route_map"] = cmd.split(None, 2)[2].strip()
+            elif cmd.startswith("default-originate"):
+                # IOS-XR emits `default-originate` (unconditional) or
+                # `default-originate route-policy <name>` (conditional) as a bare
+                # child of the neighbor's address-family sub-block. The boolean is
+                # set in BOTH cases; the route-policy is recorded only for the
+                # conditional form (stored in default_originate_route_map, the
+                # dialect-neutral field the model exposes).
+                af_data["default_originate"] = True
+                rp_m = re.match(r"default-originate\s+route-policy\s+(\S+)", cmd)
+                if rp_m:
+                    af_data["default_originate_route_map"] = rp_m.group(1)
 
         return af_data
 
@@ -1911,7 +1921,18 @@ class IOSXRParser(IOSParser):
                     continue
                 afi, safi = m.group(1), "unicast"
                 af_data = self._parse_iosxr_neighbor_af_block(af_child)
-                if any(v for v in af_data.values() if v and v is not True):
+                # `v is not True` keeps a bare-activate AF block from attaching,
+                # but it also discards blocks whose only modelled content is a
+                # boolean flag. `default-originate` (unconditional) is exactly such
+                # a block — witnessed on-device as a lone child of the neighbor AF
+                # sub-block — so OR it in explicitly rather than letting the
+                # generic filter drop the value we just set. (The same latent drop
+                # affects next-hop-self / route-reflector-client-only AF blocks;
+                # that broader filter fix is out of scope for CCR-0078.)
+                if (
+                    any(v for v in af_data.values() if v and v is not True)
+                    or af_data.get("default_originate")
+                ):
                     nb.address_families.append(BGPNeighborAF(afi=afi, safi=safi, **af_data))
 
     # -----------------------------------------------------------------------
