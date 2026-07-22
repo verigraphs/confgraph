@@ -4277,6 +4277,37 @@ class IOSParser(BaseParser):
                             origin="native",
                         )
                     )
+                # ops-only AF `no network` (no legacy twin) — the NX-OS
+                # address-family-scoped spelling of BGP origination withdrawal
+                # (CCR-0081).  The family-5b instance walk only sees router-bgp-
+                # level `no network`; NX-OS puts network statements under the AF
+                # block, so without this the AF-scoped `no network <cidr>` parsed
+                # as a silent no-op.  Mirror of the AF `no aggregate-address` walk
+                # above (singular `bgp_instance` head, `network` segment).
+                for c in af_children:
+                    if not re.match(r"^\s*no\s+network\s+", c.text):
+                        continue
+                    prefix = self._bgp_network_prefix_from_line(c.text)
+                    if prefix is None:
+                        continue
+                    ops.append(
+                        ChangeOp(
+                            verb=Verb.LIST_REMOVE,
+                            path=(
+                                "bgp_instance",
+                                asn_s,
+                                vrf_s,
+                                "af",
+                                *bgp_af_key(af),
+                                "network",
+                                prefix,
+                            ),
+                            value=None,
+                            source_line=c.text.strip(),
+                            line_no=c.linenum,
+                            origin="native",
+                        )
+                    )
         ops.extend(getattr(self, "_pending_native_bgp_ops", None) or [])
         ops.sort(key=lambda op: op.line_no if op.line_no >= 0 else float("inf"))
         return ops
