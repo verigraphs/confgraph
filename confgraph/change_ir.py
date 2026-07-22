@@ -1977,6 +1977,8 @@ _SINGLETON_MEMBER_KEYS: dict[str, dict[str, Callable[[Any], tuple[str, ...]]]] =
         "pim_rp_addresses": lambda r: (str(r.rp_address), r.acl or ""),
         "msdp_peers": lambda p: (str(p.peer_address),),
         "multicast_routing_vrfs": lambda v: (str(v),),
+        "pim_anycast_rp": lambda a: (str(a.anycast_address), str(a.peer_address)),
+        "pim_spt_threshold": lambda s: (s.threshold, s.group_list or ""),
     },
     "bfd": {
         "templates": lambda t: (t.name,),

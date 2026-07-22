@@ -74,7 +74,13 @@ from confgraph.models.bfd import BFDConfig, BFDTemplate, BFDInterval, BFDMap
 from confgraph.models.ipsla import IPSLAOperation, IPSLASchedule, IPSLAReaction
 from confgraph.models.eem import EEMApplet, EEMEvent, EEMAction
 from confgraph.models.object_tracking import ObjectTrack, TrackListObject
-from confgraph.models.multicast import MulticastConfig, PIMRPAddress, MSDPPeer
+from confgraph.models.multicast import (
+    MulticastConfig,
+    PIMRPAddress,
+    PIMAnycastRP,
+    PIMSPTThreshold,
+    MSDPPeer,
+)
 from confgraph.models.aaa import AAAConfig, AAAAuthList, AAAAuthorList, AAAAcctList, TacacsServer, RadiusServer
 from confgraph.models.dns import DNSConfig
 from confgraph.models.dhcp import DHCPConfig, DHCPExcludedRange, DHCPPool
@@ -11079,12 +11085,20 @@ class IOSParser(BaseParser):
                     rp_addr = IPv4Address(m.group(1))
                     rest = m.group(2)
                     acl = None
-                    acl_m = re.search(r"\b(\S+)$", rest.strip())
-                    if acl_m and not acl_m.group(1).startswith("override") and not acl_m.group(1).startswith("bidir"):
-                        acl = acl_m.group(1)
+                    group_range = None
+                    # `group-list <prefix>` (NX-OS) names groups by PREFIX, not by ACL name.
+                    # A bare trailing token (IOS `ip pim rp-address <rp> <acl>`) is an ACL.
+                    gl_m = re.search(r"\bgroup-list\s+(\S+)", rest)
+                    if gl_m:
+                        group_range = gl_m.group(1)
+                    else:
+                        acl_m = re.search(r"\b(\S+)$", rest.strip())
+                        if acl_m and not acl_m.group(1).startswith("override") and not acl_m.group(1).startswith("bidir"):
+                            acl = acl_m.group(1)
                     pim_rp_addresses.append(PIMRPAddress(
                         rp_address=rp_addr,
                         acl=acl,
+                        group_range=group_range,
                         override="override" in rest,
                         bidir="bidir" in rest,
                     ))
@@ -11095,11 +11109,32 @@ class IOSParser(BaseParser):
         pim_autorp = False
         pim_bsr_candidate = None
         pim_rp_candidate = None
+        pim_anycast_rp = []
+        pim_spt_threshold = []
 
         for obj in pim_misc_objs:
             t = obj.text.strip()
             if "ssm range" in t:
                 pim_ssm_range = self._extract_match(t, r"\bssm\s+range\s+(\S+)")
+            elif re.match(r"^ip\s+pim\s+anycast-rp\s+", t):
+                # NX-OS: `ip pim anycast-rp <anycast-rp-address> <peer-rp-address>`
+                am = re.match(r"^ip\s+pim\s+anycast-rp\s+(\S+)\s+(\S+)", t)
+                if am:
+                    try:
+                        pim_anycast_rp.append(PIMAnycastRP(
+                            anycast_address=IPv4Address(am.group(1)),
+                            peer_address=IPv4Address(am.group(2)),
+                        ))
+                    except Exception:
+                        pass
+            elif re.match(r"^ip\s+pim\s+spt-threshold\s+", t):
+                # NX-OS: `ip pim spt-threshold [infinity|<kbps>] [group-list <name>]`
+                sm = re.match(r"^ip\s+pim\s+spt-threshold\s+(\S+)(.*)", t)
+                if sm:
+                    pim_spt_threshold.append(PIMSPTThreshold(
+                        threshold=sm.group(1),
+                        group_list=self._extract_match(sm.group(2), r"group-list\s+(\S+)"),
+                    ))
             elif "autorp" in t.lower():
                 pim_autorp = True
             elif "bsr-candidate" in t:
@@ -11145,6 +11180,8 @@ class IOSParser(BaseParser):
             multicast_routing_vrfs=multicast_routing_vrfs,
             pim_rp_addresses=pim_rp_addresses,
             pim_ssm_range=pim_ssm_range,
+            pim_anycast_rp=pim_anycast_rp,
+            pim_spt_threshold=pim_spt_threshold,
             pim_autorp=pim_autorp,
             pim_bsr_candidate=pim_bsr_candidate,
             pim_rp_candidate=pim_rp_candidate,
