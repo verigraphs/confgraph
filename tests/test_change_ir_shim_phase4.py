@@ -324,3 +324,59 @@ def test_shim_is_pure_no_input_mutation():
     before = list(ops)
     encode_legacy_shim(ops)
     assert ops == before
+
+
+# ---------------------------------------------------------------------------
+# Metamorphic drift guard — proves the identity sweep actually catches drift
+# ---------------------------------------------------------------------------
+
+# (config, victim tombstone, drifted replacement, expected-hoisted).  One case
+# per arm of ``_assert_tombstones_match_parser``: a NON-hoisted family
+# (order-exact sequence arm) and a natively-hoisted family (order-inert multiset
+# arm).  ``expected_hoisted`` is asserted below so a future tombstone-format
+# rename makes THIS test fail loudly instead of silently degrading into a no-op.
+_DRIFT_CASES = {
+    "sequence_arm_acl": (
+        "no ip access-list extended DEAD\n", "acl:DEAD", "acl:DEAF", False,
+    ),
+    "multiset_arm_ip_sla": (
+        "no ip sla 5\n", "field:ip_sla_operations:5",
+        "field:ip_sla_operations:55", True,
+    ),
+}
+
+
+@pytest.mark.parametrize(
+    "case", _DRIFT_CASES.values(), ids=_DRIFT_CASES.keys()
+)
+def test_identity_sweep_catches_native_emission_drift(case):
+    """If native emission drifts from what the shim reconstructs, the byte-identity
+    assertion MUST fail — otherwise the whole sweep is a rubber stamp.
+
+    Mutates only a locally-parsed model's ``no_commands`` (native emission), which
+    is independent of the shim's ChangeSet source (``native_change_ops``); no
+    global/shared emission state is touched, so nothing needs restoring across
+    cases.  Guarded against silent decay: the victim must actually be present and
+    live in its expected arm before the drift is injected.
+    """
+    text, victim, drifted, expected_hoisted = case
+
+    # Baseline: shim reconstruction is byte-identical to native emission.
+    _assert_tombstones_match_parser(IOSParser(text).parse())
+
+    # Precondition — the victim exists and lives in the arm this case names.
+    pc = IOSParser(text).parse()
+    assert victim in pc.no_commands, (
+        f"drift-guard victim {victim!r} not in native emission {pc.no_commands!r} "
+        "— tombstone format changed; update this case, do not delete it"
+    )
+    assert _is_reordered_native_tombstone(victim) is expected_hoisted, (
+        f"{victim!r} changed arm (hoisted={not expected_hoisted}); "
+        "this case no longer exercises the arm it claims"
+    )
+
+    # Inject a one-token drift into native emission; shim output is unchanged, so
+    # the identity assertion must now fail on the arm this case targets.
+    pc.no_commands = [t.replace(victim, drifted) for t in pc.no_commands]
+    with pytest.raises(AssertionError):
+        _assert_tombstones_match_parser(pc)
