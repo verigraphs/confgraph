@@ -6,6 +6,8 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.6] - 2026-07-27
+
 ### Changed
 
 - **Op-primary parsers (IOS, NX-OS, EOS) no longer emit legacy tombstone
