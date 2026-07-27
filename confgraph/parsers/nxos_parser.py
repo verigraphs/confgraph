@@ -625,6 +625,53 @@ class NXOSParser(IOSParser):
 
         return BGPNeighborAF(afi=afi, safi=safi, **af)
 
+    def _emit_bgp_neighbor_submode_negations(
+        self, bgp_or_af_obj, asn, vrf, pg_names
+    ) -> None:
+        """NX-OS indented neighbor sub-mode ``no <attr>`` negations (CCR-0112).
+
+        NX-OS prints per-neighbor negations INSIDE the ``neighbor <ip>`` block —
+        ``no description`` at session level, ``no next-hop-self`` under
+        ``address-family ipv4 unicast`` (corpus: verified-capture n9kv 10.3.8,
+        next-hop-self is an address-family child). Both spellings are mapped to
+        the SAME session-level ``field:neighbor:<peer>:<attr>`` reset op the flat
+        ``no neighbor X <attr>`` line would emit (parity), through the shared
+        ``_emit_bgp_neighbor_no_op`` path — mirroring how the POSITIVE AF policy
+        is flattened onto the session neighbor (CCR-0077). Direct-child neighbor
+        blocks only (``find_child_objects``), so global-scope neighbors are never
+        swept into a VRF instance and vice-versa.
+        """
+        for nb_obj in bgp_or_af_obj.find_child_objects(r"^\s+neighbor\s+\S+"):
+            m = re.match(r"^\s+neighbor\s+(\S+)", nb_obj.text)
+            if not m:
+                continue
+            peer = m.group(1)
+            # Only real IP neighbors; skip peer-group / template names.
+            try:
+                IPv4Address(peer)
+            except ValueError:
+                from ipaddress import IPv6Address
+                try:
+                    IPv6Address(peer)
+                except ValueError:
+                    continue
+
+            def _walk_no_lines(node):
+                for child in node.children:
+                    nm = re.match(r"^\s+no\s+(\S.*)$", child.text)
+                    if nm:
+                        self._emit_bgp_neighbor_no_op(
+                            peer, nm.group(1).strip(), child, asn, vrf, pg_names
+                        )
+
+            # Session-level negations (direct children of the neighbor block)…
+            _walk_no_lines(nb_obj)
+            # …and address-family sub-block negations (where NX-OS nests
+            # next-hop-self / send-community / route-map / prefix-list).
+            for child in nb_obj.children:
+                if re.match(r"^\s+address-family\s+", child.text):
+                    _walk_no_lines(child)
+
     def _parse_bgp_neighbors(self, bgp_obj) -> list["BGPNeighbor"]:
         """Parse BGP neighbors, adding NX-OS nested-block / ``inherit peer`` support.
 
