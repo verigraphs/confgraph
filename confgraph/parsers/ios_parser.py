@@ -5,6 +5,11 @@ from ipaddress import IPv4Address, IPv4Interface, IPv4Network, IPv6Address, IPv6
 
 from confgraph.parsers.base import BaseParser, PatternSet, apply_peer_group_command, _default_pg_data
 from confgraph.utils.interface import normalize_interface_name
+# CCR-0110 E6: the native deletion-op path builder (colon-valued value tails stay
+# ONE segment — the SET convention).  Module-level: change_ir has no top-level
+# confgraph imports, so this cannot cycle (the other change_ir names in this file
+# stay lazily imported at their call sites, unchanged).
+from confgraph.change_ir import _native_deletion_path
 from confgraph.models.base import OSType
 from confgraph.models.vrf import VRFConfig
 from confgraph.models.interface import (
@@ -2116,7 +2121,7 @@ class IOSParser(BaseParser):
 
         op = ChangeOp(
             verb=Verb.LIST_REMOVE,
-            path=tuple(tombstone.split(":")),
+            path=_native_deletion_path(tombstone),
             value=None,
             source_line=obj.text.strip(),
             line_no=obj.linenum,
@@ -2144,7 +2149,7 @@ class IOSParser(BaseParser):
         """
         from confgraph.change_ir import ChangeOp, Verb
 
-        path = tuple(tombstone.split(":"))
+        path = _native_deletion_path(tombstone)
         verb = Verb.UNSET if path[3:] == ("rd",) else Verb.LIST_REMOVE
         op = ChangeOp(
             verb=verb,
@@ -2168,7 +2173,7 @@ class IOSParser(BaseParser):
 
         op = ChangeOp(
             verb=Verb.OBJECT_DELETE,
-            path=tuple(tombstone.split(":")),
+            path=_native_deletion_path(tombstone),
             value=None,
             source_line=obj.text.strip(),
             line_no=obj.linenum,
@@ -2209,7 +2214,7 @@ class IOSParser(BaseParser):
 
         op = ChangeOp(
             verb=_verb_for_top_tombstone(tombstone),
-            path=tuple(tombstone.split(":")),
+            path=_native_deletion_path(tombstone),
             value=None,
             source_line=obj.text.strip(),
             line_no=obj.linenum,
@@ -2248,7 +2253,7 @@ class IOSParser(BaseParser):
 
         op = ChangeOp(
             verb=_verb_for_top_tombstone(tombstone),
-            path=tuple(tombstone.split(":")),
+            path=_native_deletion_path(tombstone),
             value=None,
             source_line=obj.text.strip(),
             line_no=obj.linenum,
@@ -2288,7 +2293,7 @@ class IOSParser(BaseParser):
 
         op = ChangeOp(
             verb=_verb_for_top_tombstone(tombstone),
-            path=tuple(tombstone.split(":")),
+            path=_native_deletion_path(tombstone),
             value=None,
             source_line=obj.text.strip(),
             line_no=obj.linenum,
@@ -2347,7 +2352,7 @@ class IOSParser(BaseParser):
 
         op = ChangeOp(
             verb=Verb.LIST_REMOVE,
-            path=tuple(tombstone.split(":")),
+            path=_native_deletion_path(tombstone),
             value=None,
             source_line=obj.text.strip(),
             line_no=obj.linenum,
@@ -2374,7 +2379,7 @@ class IOSParser(BaseParser):
 
         op = ChangeOp(
             verb=Verb.OBJECT_DELETE,
-            path=tuple(tombstone.split(":")),
+            path=_native_deletion_path(tombstone),
             value=None,
             source_line=obj.text.strip(),
             line_no=obj.linenum,
@@ -5886,7 +5891,7 @@ class IOSParser(BaseParser):
             op = ChangeOp(
                 verb=verb,
                 path=("bgp_instance", str(asn), vrf or "")
-                + tuple(tombstone.split(":")),
+                + _native_deletion_path(tombstone),
                 value=None,
                 source_line=node.text.strip(),
                 line_no=node.linenum,

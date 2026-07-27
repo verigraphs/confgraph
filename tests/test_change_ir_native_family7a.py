@@ -131,8 +131,10 @@ class TestRemovalEmission:
     def test_rt_removal_native_byte_exact(self):
         pc = _parse(VRF_FULL)
         removal = next(op for op in _f7(pc) if op.verb is Verb.LIST_REMOVE)
+        # CCR-0110 E6: the colon-valued RT tail is ONE path segment (the SET
+        # convention); encode_legacy's ":".join reproduces the byte-exact string.
         assert removal.path == (
-            "field", "vrfs", "GUEST", "route_target_export", "65400", "20",
+            "field", "vrfs", "GUEST", "route_target_export", "65400:20",
         )
         assert removal.origin == "native"
         assert removal.line_no >= 0

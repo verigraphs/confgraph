@@ -358,6 +358,127 @@ def _verb_for_bgp_tombstone(tombstone: str) -> Verb:
 
 
 # ---------------------------------------------------------------------------
+# CCR-0110 Phase E step E6 — the colon-convention flip (NATIVE emission only).
+#
+# The SET half of the IR keeps a colon-containing value as ONE path segment
+# ("SET paths never colon-join", see the convention note further below).  Native
+# deletion emission historically built ``path=tuple(tombstone.split(":"))``,
+# which SPLIT a colon-valued tail — IPv6 hosts, route-targets (``65000:100``),
+# channelized next-hops (``Serial0/0:0``), colon-bearing names — across several
+# segments.  That was the codec's latent non-injectivity: two logically distinct
+# shapes could collide in tuple space.  E6 makes NATIVE deletion paths adopt the
+# SET convention: the tombstone's STRUCTURAL segments split as before, but the
+# VALUE tail collapses back to a single segment.
+#
+# Invisible to consumers by construction: ``encode_legacy`` is ``":".join(path)``
+# so the flip is byte-invariant (a value as one segment joins identically to the
+# same value pre-split — the shim golden suite proves this unchanged), and the
+# engine's tuple dispatch re-canonicalizes (splits every segment on ':') before
+# matching, so application is unchanged.  The flip only makes the op PATH itself
+# injective.
+#
+# DERIVED emission (``derive_ops``' tombstone->path constructors) is NOT flipped:
+# the derived channel (IOS-XR walk + degraded natives-less paths) keeps split
+# form until Phase 5 (CCR-0110 F5) and is colon-free today by measurement.
+#
+# Each row is ``(leading, n_trailing)``: *leading* matches the fixed structural
+# head (``_TS_L`` literal / ``_TS_ANY`` one structural segment such as a VRF
+# name / ASN); the VALUE span is the segments between the head and the last
+# *n_trailing* structural segments (a trailing NUM port / a trailing field name),
+# and collapses to one ``":".join`` segment.  A tombstone matching no row keeps
+# the plain split — correct, because such shapes carry a colon-free value, for
+# which split already equals collapsed.  Every row's value position is
+# cross-pinned against the engine's declarative SPAN/TAIL spec
+# (``confgraph_entrp.simulation.tuple_dispatch._FIELD_TABLE``) by the entrp suite
+# (``tests/deletion_dispatch/test_native_path_convention.py``) so the two
+# sources cannot silently diverge.
+#
+# Deliberately EXCLUDED (colon-free value domain -> split == canonical, no row):
+#   * interface-scoped member removals (helper / nhrp_nhs / secondary_ips /
+#     igmp_* keys are dotted-quads / CIDR / group numbers — colon-free);
+#   * ``aaa`` authentication/authorization/accounting (two adjacent value spans
+#     whose boundary is unrecoverable from the joined string — services and list
+#     names are colon-free, so leaving them split is already canonical);
+#   * ``bgp`` AF redistribute (DERIVED channel; ``<proto>:<pid>`` colon-free).
+# ---------------------------------------------------------------------------
+
+_TS_L = lambda v: ("L", v)   # literal structural segment (must equal v)
+_TS_ANY = ("ANY",)           # exactly one structural segment (name / asn / vrf)
+
+# (leading matchers, n_trailing) — see the block comment above.  Tombstones are
+# matched RELATIVE to their own scope: BGP-channel rows omit the
+# ``("bgp_instance", asn, vrf)`` prefix the emitter prepends afterwards.
+_COLON_VALUE_SHAPES: tuple = (
+    # field channel — single value tail.
+    ((_TS_L("field"), _TS_L("ntp"), _TS_L("server")), 0),
+    ((_TS_L("field"), _TS_L("ntp"), _TS_L("peer")), 0),
+    ((_TS_L("field"), _TS_L("snmp"), _TS_L("community")), 0),
+    ((_TS_L("field"), _TS_L("snmp"), _TS_L("host")), 0),
+    ((_TS_L("field"), _TS_L("snmp"), _TS_L("view")), 0),
+    ((_TS_L("field"), _TS_L("snmp"), _TS_L("group")), 0),
+    ((_TS_L("field"), _TS_L("snmp"), _TS_L("user")), 0),
+    ((_TS_L("field"), _TS_L("syslog"), _TS_L("host")), 0),
+    ((_TS_L("field"), _TS_L("dns"), _TS_L("name_server")), 0),
+    ((_TS_L("field"), _TS_L("dns"), _TS_L("domain")), 0),
+    ((_TS_L("field"), _TS_L("multicast"), _TS_L("rp")), 0),
+    ((_TS_L("field"), _TS_L("multicast"), _TS_L("msdp")), 0),
+    ((_TS_L("field"), _TS_L("dhcp"), _TS_L("pool")), 0),
+    ((_TS_L("field"), _TS_L("dhcp"), _TS_L("excluded")), 0),
+    ((_TS_L("field"), _TS_L("bfd"), _TS_L("template")), 0),
+    ((_TS_L("field"), _TS_L("lldp"), _TS_L("tlv")), 0),
+    ((_TS_L("field"), _TS_L("aaa"), _TS_L("tacacs")), 0),
+    ((_TS_L("field"), _TS_L("aaa"), _TS_L("tacacs_named")), 0),
+    ((_TS_L("field"), _TS_L("aaa"), _TS_L("radius")), 0),
+    ((_TS_L("field"), _TS_L("aaa"), _TS_L("radius_named")), 0),
+    # field channel — value tail after a named VRF.
+    ((_TS_L("field"), _TS_L("vrfs"), _TS_ANY, _TS_L("route_target_import")), 0),
+    ((_TS_L("field"), _TS_L("vrfs"), _TS_ANY, _TS_L("route_target_export")), 0),
+    ((_TS_L("field"), _TS_L("vrfs"), _TS_ANY, _TS_L("route_target_both")), 0),
+    # field channel — value span (IPv6 host) with a trailing NUM port.
+    ((_TS_L("field"), _TS_L("netflow"), _TS_L("destination")), 1),
+    # top-level static channel — nh tail (dest is IPv4-only == colon-free).
+    ((_TS_L("static"), _TS_ANY, _TS_ANY), 0),
+    # BGP channel (before the bgp_instance prefix): full neighbor removal, and
+    # a per-neighbor field reset whose peer is the value and <field> trails.
+    ((_TS_L("neighbor"),), 0),
+    ((_TS_L("field"), _TS_L("neighbor")), 1),
+)
+
+
+def _match_ts_leading(leading: tuple, segs: list) -> bool:
+    for matcher, seg in zip(leading, segs):
+        if matcher[0] == "L" and seg != matcher[1]:
+            return False
+    return True
+
+
+def _native_deletion_path(tombstone: str) -> tuple:
+    """Colon-split a native-emission tombstone into its op path, keeping the
+    VALUE tail as ONE segment (the SET convention — CCR-0110 E6).
+
+    The structural head splits on ``":"`` exactly as before; the value span
+    (recognised via :data:`_COLON_VALUE_SHAPES`) rejoins into a single segment.
+    A tombstone matching no shape keeps the plain split — its value is colon-free
+    so the two are identical.  Byte-invariant under ``encode_legacy``
+    (``":".join`` of the result reproduces *tombstone*).
+    """
+    segs = tombstone.split(":")
+    for leading, n_trailing in _COLON_VALUE_SHAPES:
+        nlead = len(leading)
+        # Need the full head + all trailing structural segments + >=1 value seg.
+        if len(segs) < nlead + n_trailing + 1:
+            continue
+        if not _match_ts_leading(leading, segs):
+            continue
+        head = tuple(segs[:nlead])
+        if n_trailing:
+            value = ":".join(segs[nlead:-n_trailing])
+            return head + (value,) + tuple(segs[-n_trailing:])
+        return head + (":".join(segs[nlead:]),)
+    return tuple(segs)
+
+
+# ---------------------------------------------------------------------------
 # SET derivation registries
 # ---------------------------------------------------------------------------
 
@@ -2845,7 +2966,14 @@ def derive_ops(proposal: "ParsedConfig") -> ChangeSet:
     # whole-object ``SET ("banners",)`` when native per-field banner ops
     # exist; those are emitted structurally for every non-default banner
     # field, so the whole-object op is redundant by construction.
-    native_paths = {op.path for op in natives}
+    # Exact-path dedupe compares JOIN-NORMALIZED paths (CCR-0110 E6): after the
+    # colon-convention flip a NATIVE deletion op collapses its colon-valued tail
+    # to one segment while the DERIVED twin (kept split until Phase 5) does not,
+    # so ``("field","ntp","server","2001:db8::9")`` and its split twin
+    # ``(...,"2001","db8","","9")`` are the SAME intent — comparing on
+    # ``":".join(path)`` dedupes them regardless of convention (byte-exact, since
+    # both encode to the identical legacy string).  Convention-agnostic forever.
+    native_paths = {":".join(map(str, op.path)) for op in natives}
     # Container-claim (prefix) dedupe — family 3.  EXCLUDE BGP native ops
     # (CCR Appendix H codec adjustment) AND IS-IS native ops (CCR Appendix M,
     # same adjustment): a native BGP sub-op path such as
@@ -2927,7 +3055,8 @@ def derive_ops(proposal: "ParsedConfig") -> ChangeSet:
     return natives + [
         op
         for op in ops
-        if op.path not in native_paths and op.path not in native_prefix_claims
+        if ":".join(map(str, op.path)) not in native_paths
+        and op.path not in native_prefix_claims
     ]
 
 
