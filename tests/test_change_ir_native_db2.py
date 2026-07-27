@@ -34,6 +34,7 @@ from confgraph.change_ir import (
 from confgraph.parsers.ios_parser import IOSParser
 from confgraph.parsers.iosxr_parser import IOSXRParser
 from confgraph.parsers.nxos_parser import NXOSParser
+from tests._ccr0110_e_helpers import legacy_artifacts
 
 
 def _parse(text: str, parser_cls=IOSParser):
@@ -93,7 +94,7 @@ class TestEmission:
         # Byte-exact twins in no_commands (drained by parse_deletion_commands),
         # exactly the colon-join of each path.
         for path in ops:
-            assert ":".join(path) in pc.no_commands
+            assert ":".join(path) in legacy_artifacts(pc).no_commands
 
     def test_twin_equals_encode_legacy_roundtrip(self):
         pc = _parse(WITHDRAWALS)
@@ -102,7 +103,7 @@ class TestEmission:
         for op in _neg_ops(pc):
             twin = ":".join(op.path)
             assert art.no_commands.count(twin) == 1  # exactly once — no double-encode
-            assert pc.no_commands.count(twin) == 1
+            assert legacy_artifacts(pc).no_commands.count(twin) == 1
 
     def test_derived_twin_retired_by_exact_path_dedupe(self):
         pc = _parse(WITHDRAWALS)
@@ -129,7 +130,7 @@ class TestEmission:
         )
         (op,) = _neg_ops(pc)
         assert op.path == ("field", "ospf", "1", "CUST", "redistribute", "static", "")
-        assert "field:ospf:1:CUST:redistribute:static:" in pc.no_commands
+        assert "field:ospf:1:CUST:redistribute:static:" in legacy_artifacts(pc).no_commands
 
     def test_virtual_link_rid_canonicalized_like_positive_parse(self):
         # Unparseable router-id → blind on BOTH walks (positive drops it too).
@@ -253,7 +254,7 @@ class TestPerOS:
         assert ("field", "ospf", "1", "", "default_information_originate") in paths
         assert ("field", "eigrp", "100", "", "redistribute", "static", "") in paths
         for op in _neg_ops(pc):
-            assert ":".join(op.path) in pc.no_commands
+            assert ":".join(op.path) in legacy_artifacts(pc).no_commands
 
     def test_iosxr_ospf_absent_eigrp_ops_only(self):
         # IOS-XR has its OWN parse_ospf (no walks) and its OWN
@@ -283,8 +284,11 @@ class TestRegressionPins:
             " no area 1 stub\n"
             " no redistribute static\n"
         )
+        # stub_reset is a DERIVED-only tombstone (parser still emits it, the
+        # process:bgp survivor class) — read direct; the redistribute twin is
+        # native-backed, so its string is reconstructed by the shim codec.
         assert "field:ospf:1:area:1:stub_reset" in pc.no_commands
-        assert "field:ospf:1::redistribute:static:" in pc.no_commands
+        assert "field:ospf:1::redistribute:static:" in legacy_artifacts(pc).no_commands
         composed = derive_ops(pc)
         stub = [op for op in composed if op.path == ("field", "ospf", "1", "area", "1", "stub_reset")]
         assert len(stub) == 1 and stub[0].origin == "derived"

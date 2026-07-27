@@ -20,16 +20,21 @@ engine classifier routes the tombstones to the VRF coverage area.
 
 from __future__ import annotations
 
+from confgraph.change_ir import derive_ops, encode_legacy_shim
 from confgraph.parsers.ios_parser import IOSParser
 from confgraph.parsers.nxos_parser import NXOSParser
 
 
+# CCR-0110 Phase E: op-primary parsers no longer emit tombstone strings — the
+# removals are carried by native ChangeOps.  The legacy string vocabulary these
+# tests pin is reconstructed from the composed ChangeSet by the shim codec
+# (byte-exact, verified against frozen goldens by test_change_ir_shim_phase4).
 def _ios_tombstones(config: str) -> list[str]:
-    return IOSParser(config).parse_deletion_commands()
+    return encode_legacy_shim(derive_ops(IOSParser(config).parse())).no_commands
 
 
 def _nxos_tombstones(config: str) -> list[str]:
-    return NXOSParser(config).parse_deletion_commands()
+    return encode_legacy_shim(derive_ops(NXOSParser(config).parse())).no_commands
 
 
 # ---------------------------------------------------------------------------

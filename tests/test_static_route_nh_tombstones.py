@@ -18,11 +18,17 @@ Run:
 
 from __future__ import annotations
 
+from confgraph.change_ir import derive_ops, encode_legacy_shim
 from confgraph.parsers.ios_parser import IOSParser
 
 
 def _tombstones(cfg: str) -> list[str]:
-    return IOSParser(cfg).parse_deletion_commands()
+    # CCR-0110 Phase E: op-primary parsers no longer emit tombstone strings —
+    # the deletion is carried by native ChangeOps.  The legacy string
+    # vocabulary these tests pin is now reconstructed from the composed
+    # ChangeSet by the shim codec (byte-exact, verified against frozen goldens
+    # by test_change_ir_shim_phase4).
+    return encode_legacy_shim(derive_ops(IOSParser(cfg).parse())).no_commands
 
 
 class TestNHCarryingTombstones:

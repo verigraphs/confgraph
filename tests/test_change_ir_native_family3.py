@@ -27,6 +27,7 @@ from confgraph.change_ir import (
     banner_scalar_fields,
     derive_ops,
     encode_legacy,
+    encode_legacy_shim,
     interface_list_replace_fields,
     interface_scalar_fields,
     is_native_service_entity_op,
@@ -41,6 +42,27 @@ from confgraph.parsers.nxos_parser import NXOSParser
 
 def _parse(text: str, parser_cls=IOSParser):
     return parser_cls(text).parse()
+
+
+def _legacy(pc):
+    """CCR-0110 Phase E: op-primary parsers no longer populate no_commands —
+    reconstruct the legacy tombstone vocabulary from the composed ChangeSet via
+    the golden-pinned shim codec (byte-exact vs ``test_change_ir_shim_phase4``,
+    including the ``_readded_later`` service-entity suppression)."""
+    return encode_legacy_shim(derive_ops(pc))
+
+
+def _reconstruct_tombstones(pc):
+    """CCR-0110 Phase E: repopulate the deprecated string containers from the
+    composed ChangeSet so the natives-less derive-fallback path can be exercised
+    as a JunOS/pre-Phase-3 parse would.  Call BEFORE nulling ``native_change_ops``."""
+    art = _legacy(pc)
+    pc.no_commands = list(art.no_commands)
+    for iface in pc.interfaces:
+        iface.no_commands = art.interface_no_commands.get(iface.name, [])
+    for bgp in pc.bgp_instances:
+        bgp.no_commands = art.bgp_no_commands.get((str(bgp.asn), bgp.vrf or ""), [])
+    return pc
 
 
 def _f3_ops(pc):
@@ -160,11 +182,11 @@ class TestNativeDeleteEmission:
         assert deletes[0].source_line == "no ip sla 10"
         assert deletes[0].origin == "native"
         # …while the LEGACY encoding stays suppressed (byte-identity with WI-8)
-        assert "field:ip_sla_operations:10" not in pc.no_commands
+        assert "field:ip_sla_operations:10" not in _legacy(pc).no_commands
 
     def test_tombstone_still_emitted_without_readd(self):
         pc = _parse("no ip sla 10\n")
-        assert pc.no_commands == ["field:ip_sla_operations:10"]
+        assert _legacy(pc).no_commands == ["field:ip_sla_operations:10"]
         deletes = [op for op in _f3_ops(pc) if op.verb is Verb.OBJECT_DELETE]
         assert len(deletes) == 1
         # single source: the tombstone is the op's legacy encoding
@@ -181,7 +203,7 @@ class TestNativeDeleteEmission:
             (Verb.OBJECT_DELETE, ("field", "eem_applets", "FOO")),
             (Verb.UNSET, ("field", "banners", "exec_banner")),
         }
-        assert pc.no_commands == [
+        assert _legacy(pc).no_commands == [
             "field:ip_sla_operations:10",
             "field:object_tracks:9",
             "field:eem_applets:FOO",
@@ -223,7 +245,7 @@ class TestNativeCreateEmissionAndOrder:
         ops = _f3_ops(pc)
         assert [op.verb for op in ops] == [Verb.SET, Verb.OBJECT_DELETE]
         # legacy: the guard does NOT suppress (positive precedes negation)
-        assert pc.no_commands == ["field:ip_sla_operations:10"]
+        assert _legacy(pc).no_commands == ["field:ip_sla_operations:10"]
 
     def test_entity_set_carries_final_state_and_block_provenance(self):
         pc = _parse("ip sla 10\n icmp-echo 1.2.3.4\n frequency 30\n")
@@ -251,7 +273,7 @@ class TestNativeCreateEmissionAndOrder:
             (Verb.UNSET, ("field", "banners", "motd")),
             (Verb.SET, ("banners", "motd")),
         ]
-        assert "field:banners:motd" not in pc.no_commands  # suppressed encoding
+        assert "field:banners:motd" not in _legacy(pc).no_commands  # suppressed encoding
 
     def test_banner_add_then_delete_sequence(self):
         pc = _parse("banner motd #new#\nno banner motd\n")
@@ -260,7 +282,7 @@ class TestNativeCreateEmissionAndOrder:
             (Verb.SET, ("banners", "motd")),
             (Verb.UNSET, ("field", "banners", "motd")),
         ]
-        assert pc.no_commands == ["field:banners:motd"]
+        assert _legacy(pc).no_commands == ["field:banners:motd"]
 
     def test_banner_types_order_independently(self):
         """Different banner fields interleave each with their OWN negation —
@@ -351,6 +373,7 @@ class TestHybridComposition:
         """Natives-less configs (JunOS/PAN-OS parses, hand-built models)
         keep full derived translation — graceful degradation."""
         pc = _parse(KITCHEN_SINK)
+        _reconstruct_tombstones(pc)
         pc.native_change_ops = None
         ops = derive_ops(pc)
         assert all(op.origin == "derived" for op in ops)
@@ -364,9 +387,11 @@ class TestHybridComposition:
         the PARSER artifact remains suppressed — the Phase-4 shim must
         apply the suppression at encode time (recorded follow-up)."""
         pc = _parse(DEL_THEN_READD)
-        assert "field:ip_sla_operations:10" not in pc.no_commands
+        # encode_legacy (raw codec) keeps the unsuppressed intent…
         art = encode_legacy(derive_ops(pc))
         assert "field:ip_sla_operations:10" in art.no_commands
+        # …the shim applies the _readded_later suppression at encode time.
+        assert "field:ip_sla_operations:10" not in _legacy(pc).no_commands
 
 
 # ---------------------------------------------------------------------------
@@ -382,7 +407,7 @@ class TestInheritance:
         )
         ops = _f3_ops(pc)
         assert [op.verb for op in ops] == [Verb.OBJECT_DELETE, Verb.SET]
-        assert "field:ip_sla_operations:10" not in pc.no_commands
+        assert "field:ip_sla_operations:10" not in _legacy(pc).no_commands
 
     def test_nxos_track_and_eem(self):
         pc = _parse(
@@ -392,7 +417,7 @@ class TestInheritance:
             ("field", "object_tracks", "9"),
             ("field", "eem_applets", "FOO"),
         }
-        assert pc.no_commands == [
+        assert _legacy(pc).no_commands == [
             "field:object_tracks:9",
             "field:eem_applets:FOO",
         ]

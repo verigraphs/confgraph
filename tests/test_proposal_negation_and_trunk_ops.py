@@ -17,11 +17,17 @@ Run:
 from __future__ import annotations
 
 from confgraph.parsers.ios_parser import IOSParser
+from tests._ccr0110_e_helpers import reconstruct_tombstones
 
 
 def _iface(config_text: str, name: str):
-    ifaces = IOSParser(config_text).parse_interfaces()
-    iface = next((i for i in ifaces if i.name == name), None)
+    # CCR-0110 Phase E: op-primary parsers no longer populate
+    # ``InterfaceConfig.no_commands`` — full-parse and repopulate it from the
+    # composed ChangeSet via the golden-pinned shim codec (byte-exact vs
+    # ``test_change_ir_shim_phase4``) so these negation/trunk-op assertions still
+    # exercise the exact legacy vocabulary.
+    pc = reconstruct_tombstones(IOSParser(config_text).parse())
+    iface = next((i for i in pc.interfaces if i.name == name), None)
     assert iface is not None, f"Interface {name} not found"
     return iface
 

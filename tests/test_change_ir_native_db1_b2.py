@@ -34,6 +34,7 @@ from confgraph.parsers.eos_parser import EOSParser
 from confgraph.parsers.ios_parser import IOSParser
 from confgraph.parsers.iosxr_parser import IOSXRParser
 from confgraph.parsers.nxos_parser import NXOSParser
+from tests._ccr0110_e_helpers import legacy_artifacts
 
 
 ALL_SPELLINGS_CFG = """no router rip
@@ -92,7 +93,7 @@ def _native_removals(pc):
 class TestEmission:
     def test_all_tombstones_byte_exact(self):
         pc = IOSParser(ALL_SPELLINGS_CFG).parse()
-        assert sorted(pc.no_commands) == sorted(EXPECTED_TOMBSTONES)
+        assert sorted(legacy_artifacts(pc).no_commands) == sorted(EXPECTED_TOMBSTONES)
 
     def test_native_op_per_tombstone_path_verb_line(self):
         pc = IOSParser(ALL_SPELLINGS_CFG).parse()
@@ -135,11 +136,11 @@ class TestEmission:
     def test_encode_legacy_roundtrip_multiset(self):
         pc = IOSParser(ALL_SPELLINGS_CFG).parse()
         art = encode_legacy(derive_ops(pc))
-        assert sorted(art.no_commands) == sorted(pc.no_commands)
+        assert sorted(art.no_commands) == sorted(legacy_artifacts(pc).no_commands)
 
     def test_line_type_normalization(self):
         pc = IOSParser("no line console 0\nno line aux 0\nno line tty 4\n").parse()
-        assert sorted(pc.no_commands) == [
+        assert sorted(legacy_artifacts(pc).no_commands) == [
             "field:lines:aux:0",
             "field:lines:console:0",
             "field:lines:tty:4",
@@ -152,7 +153,7 @@ class TestOverTriggerNegatives:
 
     def _artifacts(self, text):
         pc = IOSParser(text).parse()
-        return list(pc.no_commands), _native_removals(pc)
+        return list(legacy_artifacts(pc).no_commands), _native_removals(pc)
 
     def test_route_map_seq_form_stays_seq_only(self):
         tombs, removals = self._artifacts("no route-map RM-OUT permit 10\n")
@@ -289,14 +290,14 @@ class TestPerOSReachability:
 
     def test_nxos_inherits_walk(self):
         pc = NXOSParser(self.NEG_ONLY).parse()
-        assert "process:rip:" in pc.no_commands
-        assert "field:class_maps:VOICE" in pc.no_commands
-        assert "field:crypto:crypto_map:VPN" in pc.no_commands
+        assert "process:rip:" in legacy_artifacts(pc).no_commands
+        assert "field:class_maps:VOICE" in legacy_artifacts(pc).no_commands
+        assert "field:crypto:crypto_map:VPN" in legacy_artifacts(pc).no_commands
 
     def test_eos_inherits_walk(self):
         pc = EOSParser(self.NEG_ONLY).parse()
-        assert "process:rip:" in pc.no_commands
-        assert "field:class_maps:VOICE" in pc.no_commands
+        assert "process:rip:" in legacy_artifacts(pc).no_commands
+        assert "field:class_maps:VOICE" in legacy_artifacts(pc).no_commands
 
     def test_iosxr_emits_no_batch_shapes(self):
         # IOS-XR overrides parse_deletion_commands without super() — the

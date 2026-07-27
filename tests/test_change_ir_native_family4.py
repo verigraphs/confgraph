@@ -31,6 +31,7 @@ from confgraph.change_ir import (
 from confgraph.parsers.eos_parser import EOSParser
 from confgraph.parsers.ios_parser import IOSParser
 from confgraph.parsers.nxos_parser import NXOSParser
+from tests._ccr0110_e_helpers import legacy_artifacts
 
 
 def _parse(text: str, parser_cls=IOSParser):
@@ -197,7 +198,7 @@ class TestTombstoneSingleSource:
         pc = _parse(KITCHEN_SINK)
         # Every static tombstone in no_commands is reproduced by encoding its
         # native op — the codec IS ":".join(path).
-        static_tombs = [t for t in pc.no_commands if t.startswith("static:")]
+        static_tombs = [t for t in legacy_artifacts(pc).no_commands if t.startswith("static:")]
         encoded = {
             ":".join(op.path) for op in _removes(_f4_ops(pc))
         }
@@ -207,11 +208,11 @@ class TestTombstoneSingleSource:
         # Statics have NO _readded_later suppression: delete-then-readd still
         # emits the tombstone (byte-identity), the ordered apply fixes the net.
         pc = _parse(DEL_THEN_READD)
-        assert any(t.startswith("static:") for t in pc.no_commands)
+        assert any(t.startswith("static:") for t in legacy_artifacts(pc).no_commands)
 
     def test_channelized_nh_colon_survives_roundtrip(self):
         pc = _parse("no ip route 10.0.0.0 255.0.0.0 Serial0/0/0:0\n")
-        tomb = next(t for t in pc.no_commands if t.startswith("static:"))
+        tomb = next(t for t in legacy_artifacts(pc).no_commands if t.startswith("static:"))
         op = _removes(_f4_ops(pc))[0]
         assert ":".join(op.path) == tomb  # colon in NH spec survives join
 
@@ -316,7 +317,7 @@ class TestMultiOS:
         assert removes[0].path == ("static", "TENANT", "10.5.0.0/24", "10.9.9.9")
         assert removes[0].origin == "native"
         # tombstone byte-identity preserved
-        assert "static:TENANT:10.5.0.0/24:10.9.9.9" in pc.no_commands
+        assert "static:TENANT:10.5.0.0/24:10.9.9.9" in legacy_artifacts(pc).no_commands
 
     def test_eos_global_static(self):
         pc = _parse(

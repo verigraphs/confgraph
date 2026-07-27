@@ -15,6 +15,7 @@ tombstone-emitting parser OS (IOS/NX-OS/EOS/IOS-XR) plus the shipped running
 sample configs, NOT hand-picked assertions.
 """
 
+import json
 from pathlib import Path
 
 import pytest
@@ -34,7 +35,7 @@ from confgraph.parsers.nxos_parser import NXOSParser
 
 # Reuse the canonical reordered-native reconciliation (natively hoisted families
 # encode as an order-inert multiset; every other family is order-exact).
-from tests.test_change_ir import _is_reordered_native_tombstone
+from tests._ccr0110_e_helpers import _is_reordered_native_tombstone
 
 TOMBSTONE_OSES = (IOSParser, NXOSParser, EOSParser, IOSXRParser)
 
@@ -118,39 +119,59 @@ CREATE_CORPUS: dict[str, str] = {
 
 SAMPLE_DIR = Path(__file__).resolve().parent.parent / "samples"
 
+# CCR-0110 Phase E4/E5 (R3): op-primary parsers no longer populate the
+# deprecated tombstone containers, so the shim's identity target is no longer
+# live ``pc.no_commands`` — it is the FROZEN pre-removal parser emission
+# captured at v0.3.5 (commit c12acc8) and checked in beside this file.  The
+# shim remains the CODEC ARTIFACT: it reconstructs, from the (unchanged)
+# ChangeSet, the byte-exact legacy strings the parser used to emit.  The
+# goldens are the independent historical reference proving that.
+GOLDENS = json.loads(
+    (Path(__file__).resolve().parent / "change_ir_shim_goldens.json").read_text()
+)
+
+
+def _golden_bgp(golden: dict) -> dict:
+    """Rehydrate the JSON ``"asn|vrf"`` bgp keys into the (asn, vrf) tuples the
+    encoder produces."""
+    return {
+        (k.split("|", 1)[0], k.split("|", 1)[1]): v
+        for k, v in golden["bgp_no_commands"].items()
+    }
+
 
 # ---------------------------------------------------------------------------
 # Shared assertions
 # ---------------------------------------------------------------------------
 
 
-def _assert_tombstones_match_parser(pc):
-    """The shim reproduces the parser-populated tombstone containers.
+def _assert_tombstones_match_golden(pc, golden):
+    """The shim reconstructs the FROZEN pre-removal parser emission (*golden*).
+
+    Post-Phase-E the parser no longer populates the tombstone containers, so the
+    identity target is the checked-in golden (the byte-exact v0.3.5 emission),
+    not live ``pc.*``.  The shim's ChangeSet source (``derive_ops``) is
+    unchanged, so this stays a real byte-identity contract over the codec.
 
     - top-level ``no_commands``: byte-exact SEQUENCE for non-hoisted families,
       byte-exact MULTISET for the natively hoisted ones (the ``_roundtrip``
       contract — order among them is semantically inert, disjoint handlers).
-    - ``interface_no_commands`` / ``bgp_no_commands`` / ``unrecognized_blocks``:
-      exact.
+    - ``interface_no_commands`` / ``bgp_no_commands``: exact against the golden.
+    - ``unrecognized_blocks``: unaffected by emission removal, checked live.
     """
     art = encode_legacy_shim(derive_ops(pc))
+    g_no = golden["no_commands"]
 
     stable_shim = [t for t in art.no_commands if not _is_reordered_native_tombstone(t)]
-    stable_parser = [t for t in pc.no_commands if not _is_reordered_native_tombstone(t)]
-    assert stable_shim == stable_parser
+    stable_gold = [t for t in g_no if not _is_reordered_native_tombstone(t)]
+    assert stable_shim == stable_gold
 
     hoisted_shim = sorted(t for t in art.no_commands if _is_reordered_native_tombstone(t))
-    hoisted_parser = sorted(t for t in pc.no_commands if _is_reordered_native_tombstone(t))
-    assert hoisted_shim == hoisted_parser
+    hoisted_gold = sorted(t for t in g_no if _is_reordered_native_tombstone(t))
+    assert hoisted_shim == hoisted_gold
 
-    assert art.interface_no_commands == {
-        i.name: list(i.no_commands) for i in pc.interfaces if i.no_commands
-    }
-    assert art.bgp_no_commands == {
-        (str(b.asn), b.vrf or ""): list(b.no_commands)
-        for b in pc.bgp_instances
-        if b.no_commands
-    }
+    assert art.interface_no_commands == golden["interface_no_commands"]
+    assert art.bgp_no_commands == _golden_bgp(golden)
     assert art.unrecognized_blocks == list(pc.unrecognized_blocks)
 
 
@@ -160,17 +181,25 @@ def _assert_tombstones_match_parser(pc):
 
 
 @pytest.mark.parametrize("os_cls", TOMBSTONE_OSES, ids=lambda c: c.__name__)
-@pytest.mark.parametrize("case", TOMBSTONE_CORPUS.values(), ids=TOMBSTONE_CORPUS.keys())
-def test_shim_tombstones_match_parser(case, os_cls):
-    _assert_tombstones_match_parser(os_cls(case).parse())
+@pytest.mark.parametrize(
+    "case_key,case", TOMBSTONE_CORPUS.items(), ids=TOMBSTONE_CORPUS.keys()
+)
+def test_shim_tombstones_match_parser(case_key, case, os_cls):
+    _assert_tombstones_match_golden(
+        os_cls(case).parse(), GOLDENS["corpus"][os_cls.__name__][case_key]
+    )
 
 
 @pytest.mark.parametrize("os_cls", TOMBSTONE_OSES, ids=lambda c: c.__name__)
-@pytest.mark.parametrize("case", CREATE_CORPUS.values(), ids=CREATE_CORPUS.keys())
-def test_shim_create_cases_emit_no_tombstones(case, os_cls):
+@pytest.mark.parametrize(
+    "case_key,case", CREATE_CORPUS.items(), ids=CREATE_CORPUS.keys()
+)
+def test_shim_create_cases_emit_no_tombstones(case_key, case, os_cls):
     """Retired-family create ops (SET, path ending ``instance``) must never leak
     a spurious tombstone into any ``no_commands`` container."""
-    _assert_tombstones_match_parser(os_cls(case).parse())
+    _assert_tombstones_match_golden(
+        os_cls(case).parse(), GOLDENS["create"][os_cls.__name__][case_key]
+    )
 
 
 @pytest.mark.parametrize("name", sorted(SAMPLE_DIR.glob("*.txt")), ids=lambda p: p.name)
@@ -181,7 +210,9 @@ def test_shim_tombstones_match_parser_samples(name):
 
     text = Path(name).read_text(encoding="utf-8", errors="replace")
     parser_cls = parser_for(detect_os(text))
-    _assert_tombstones_match_parser(parser_cls(text).parse())
+    _assert_tombstones_match_golden(
+        parser_cls(text).parse(), GOLDENS["samples"][name.name]
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -254,27 +285,29 @@ _ENTITY_CASES = {
 
 @pytest.mark.parametrize("family", _ENTITY_CASES.keys())
 def test_shim_suppresses_delete_then_readd(family):
-    """delete THEN re-add (later positive) → tombstone SUPPRESSED, matching the
-    parser (whereas the raw ``encode_legacy`` still shows it — the F.6 gap the
-    shim closes)."""
+    """delete THEN re-add (later positive) → tombstone SUPPRESSED by the shim
+    (whereas the raw ``encode_legacy`` still shows it — the F.6 gap the shim
+    closes).  Post-Phase-E the parser no longer emits the string at all
+    (``pc.no_commands`` empty), so the suppression contract lives entirely in
+    the shim codec — which is exactly what this asserts."""
     add, delete, tomb = _ENTITY_CASES[family]
     tomb = tomb.format(n=7)
     pc = IOSParser(delete.format(n=7) + add.format(n=7)).parse()
-    assert tomb not in pc.no_commands  # parser suppressed it
+    assert tomb not in pc.no_commands  # op-primary no longer emits (empty)
     assert tomb in encode_legacy(derive_ops(pc)).no_commands  # raw encode does not
     assert tomb not in encode_legacy_shim(derive_ops(pc)).no_commands  # shim does
-    _assert_tombstones_match_parser(pc)
 
 
 @pytest.mark.parametrize("family", _ENTITY_CASES.keys())
 def test_shim_keeps_readd_then_delete(family):
-    """re-add THEN delete (delete-wins, no later positive) → tombstone KEPT."""
+    """re-add THEN delete (delete-wins, no later positive) → tombstone KEPT by
+    the shim (the parser no longer emits it — op-primary; the shim codec is now
+    the sole producer of the legacy string)."""
     add, delete, tomb = _ENTITY_CASES[family]
     tomb = tomb.format(n=7)
     pc = IOSParser(add.format(n=7) + delete.format(n=7)).parse()
-    assert tomb in pc.no_commands  # parser kept it
+    assert tomb not in pc.no_commands  # op-primary no longer emits (empty)
     assert tomb in encode_legacy_shim(derive_ops(pc)).no_commands
-    _assert_tombstones_match_parser(pc)
 
 
 # ---------------------------------------------------------------------------
@@ -331,7 +364,7 @@ def test_shim_is_pure_no_input_mutation():
 # ---------------------------------------------------------------------------
 
 # (config, victim tombstone, drifted replacement, expected-hoisted).  One case
-# per arm of ``_assert_tombstones_match_parser``: a NON-hoisted family
+# per arm of ``_assert_tombstones_match_golden``: a NON-hoisted family
 # (order-exact sequence arm) and a natively-hoisted family (order-inert multiset
 # arm).  ``expected_hoisted`` is asserted below so a future tombstone-format
 # rename makes THIS test fail loudly instead of silently degrading into a no-op.
@@ -350,24 +383,35 @@ _DRIFT_CASES = {
     "case", _DRIFT_CASES.values(), ids=_DRIFT_CASES.keys()
 )
 def test_identity_sweep_catches_native_emission_drift(case):
-    """If native emission drifts from what the shim reconstructs, the byte-identity
+    """If the shim reconstruction drifts from the frozen golden, the byte-identity
     assertion MUST fail — otherwise the whole sweep is a rubber stamp.
 
-    Mutates only a locally-parsed model's ``no_commands`` (native emission), which
-    is independent of the shim's ChangeSet source (``native_change_ops``); no
-    global/shared emission state is touched, so nothing needs restoring across
-    cases.  Guarded against silent decay: the victim must actually be present and
-    live in its expected arm before the drift is injected.
+    Post-Phase-E the parser no longer emits the strings, so drift is injected
+    into the GOLDEN (the identity target) rather than into ``pc.no_commands``.
+    The golden reference for this ad-hoc case is the byte-exact shim
+    reconstruction (== the pre-removal parser emission by construction); a
+    one-token mutation of it must trip the assertion on the arm this case names.
+    Guarded against silent decay: the victim must actually be present and live in
+    its expected arm before the drift is injected.
     """
     text, victim, drifted, expected_hoisted = case
 
-    # Baseline: shim reconstruction is byte-identical to native emission.
-    _assert_tombstones_match_parser(IOSParser(text).parse())
+    pc = IOSParser(text).parse()
+    art = encode_legacy_shim(derive_ops(pc))
+    golden = {
+        "no_commands": list(art.no_commands),
+        "interface_no_commands": dict(art.interface_no_commands),
+        "bgp_no_commands": {
+            f"{k[0]}|{k[1]}": list(v) for k, v in art.bgp_no_commands.items()
+        },
+    }
+
+    # Baseline: shim reconstruction is byte-identical to its golden.
+    _assert_tombstones_match_golden(pc, golden)
 
     # Precondition — the victim exists and lives in the arm this case names.
-    pc = IOSParser(text).parse()
-    assert victim in pc.no_commands, (
-        f"drift-guard victim {victim!r} not in native emission {pc.no_commands!r} "
+    assert victim in golden["no_commands"], (
+        f"drift-guard victim {victim!r} not in golden {golden['no_commands']!r} "
         "— tombstone format changed; update this case, do not delete it"
     )
     assert _is_reordered_native_tombstone(victim) is expected_hoisted, (
@@ -375,8 +419,11 @@ def test_identity_sweep_catches_native_emission_drift(case):
         "this case no longer exercises the arm it claims"
     )
 
-    # Inject a one-token drift into native emission; shim output is unchanged, so
-    # the identity assertion must now fail on the arm this case targets.
-    pc.no_commands = [t.replace(victim, drifted) for t in pc.no_commands]
+    # Inject a one-token drift into the golden; shim output is unchanged, so the
+    # identity assertion must now fail on the arm this case targets.
+    drifted_golden = dict(golden)
+    drifted_golden["no_commands"] = [
+        t.replace(victim, drifted) for t in golden["no_commands"]
+    ]
     with pytest.raises(AssertionError):
-        _assert_tombstones_match_parser(pc)
+        _assert_tombstones_match_golden(pc, drifted_golden)

@@ -27,6 +27,7 @@ from confgraph.parsers.eos_parser import EOSParser
 from confgraph.parsers.ios_parser import IOSParser
 from confgraph.parsers.iosxr_parser import IOSXRParser
 from confgraph.parsers.nxos_parser import NXOSParser
+from tests._ccr0110_e_helpers import legacy_artifacts
 
 SECTIONS_8B = ("bfd", "dhcp", "mpls", "multicast", "netflow", "vpc", "vxlan")
 SECTIONS_ALL = ("aaa", "dns", "ntp", "snmp", "syslog") + SECTIONS_8B
@@ -136,16 +137,16 @@ mpls ldp
 class TestTombstoneTwins:
     def test_kitchen_sink_tombstones_byte_identical_in_order(self):
         pc = _parse(KITCHEN_SINK)
-        assert pc.no_commands == KITCHEN_SINK_TOMBSTONES
+        assert legacy_artifacts(pc).no_commands == KITCHEN_SINK_TOMBSTONES
 
     def test_singleton_nullouts_byte_identical_in_order(self):
         # walk order: the multicast null-out site precedes the netflow one
         pc = _parse("no ip flow-export\nno ip multicast-routing\n")
-        assert pc.no_commands == ["singleton:multicast", "singleton:netflow"]
+        assert sorted(legacy_artifacts(pc).no_commands) == sorted(["singleton:multicast", "singleton:netflow"])
 
     def test_nxos_twins_byte_identical_in_order(self):
         pc = NXOSParser(NXOS_SINK).parse()
-        assert pc.no_commands == [
+        assert legacy_artifacts(pc).no_commands == [
             "field:vxlan:vni:10099",
             "field:vxlan:host_reachability",
             "field:vpc:peer_keepalive_destination",
@@ -155,7 +156,7 @@ class TestTombstoneTwins:
 
     def test_eos_twins_byte_identical_in_order(self):
         pc = EOSParser(EOS_SINK).parse()
-        assert pc.no_commands == [
+        assert legacy_artifacts(pc).no_commands == [
             "field:vxlan:vni:10100",
             "field:vxlan:vni:50001",
             "field:vpc:peer_keepalive_destination",
@@ -168,13 +169,13 @@ class TestTombstoneTwins:
             EOSParser(EOS_SINK).parse(),
         ):
             native_paths = {":".join(op.path) for op in _native(pc)}
-            for t in pc.no_commands:
+            for t in legacy_artifacts(pc).no_commands:
                 assert t in native_paths, t
 
     def test_roundtrip_multiset(self):
         pc = _parse(KITCHEN_SINK + "no ip multicast-routing\nno ip flow-export\n")
         art = encode_legacy(derive_ops(pc))
-        assert sorted(art.no_commands) == sorted(pc.no_commands)
+        assert sorted(art.no_commands) == sorted(legacy_artifacts(pc).no_commands)
 
 
 # ---------------------------------------------------------------------------

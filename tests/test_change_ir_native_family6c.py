@@ -42,6 +42,7 @@ from confgraph.change_ir import (
 )
 from confgraph.parsers.ios_parser import IOSParser
 from confgraph.parsers.nxos_parser import NXOSParser
+from tests._ccr0110_e_helpers import legacy_artifacts
 
 
 def _parse(text: str, parser_cls=IOSParser):
@@ -307,7 +308,7 @@ def test_process_delete_native_byte_exact():
     op = dels[0]
     assert op.path == ("process", "ospf", "1")
     assert op.origin == "native" and op.line_no >= 0
-    assert pc.no_commands == ["process:ospf:1"]
+    assert legacy_artifacts(pc).no_commands == ["process:ospf:1"]
     assert encode_legacy([op]).no_commands == ["process:ospf:1"]
 
 
@@ -405,4 +406,4 @@ def test_nxos_inherits_process_ospf_delete():
     pc = _parse("no router ospf 1\n", parser_cls=NXOSParser)
     dels = [op for op in _f6c(pc) if op.verb is Verb.OBJECT_DELETE]
     assert dels and dels[0].path == ("process", "ospf", "1")
-    assert pc.no_commands == ["process:ospf:1"]
+    assert legacy_artifacts(pc).no_commands == ["process:ospf:1"]

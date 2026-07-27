@@ -31,6 +31,7 @@ from confgraph.parsers.eos_parser import EOSParser
 from confgraph.parsers.ios_parser import IOSParser
 from confgraph.parsers.iosxr_parser import IOSXRParser
 from confgraph.parsers.nxos_parser import NXOSParser
+from tests._ccr0110_e_helpers import iface_nc, legacy_artifacts
 
 
 def _unsets(ops, iface=None, field=None):
@@ -101,15 +102,16 @@ class TestSubclassAEmission:
     def test_tombstones_land_in_interface_no_commands_byte_exact(self):
         pc = IOSParser(SUBCLASS_A_CFG).parse()
         gi1 = next(i for i in pc.interfaces if i.name == "GigabitEthernet0/1")
-        assert gi1.no_commands == [
+        expected = [
             "field:interface:GigabitEthernet0/1:stp_root_guard",
             "field:interface:GigabitEthernet0/1:port_security_sticky",
             "field:interface:GigabitEthernet0/1:dot1x_mab",
             "field:interface:GigabitEthernet0/1:pim_bfd",
         ]
+        assert iface_nc(pc, "GigabitEthernet0/1") == expected
         # Single-source: encode_legacy over the ops reproduces the container.
         art = encode_legacy(_unsets(derive_ops(pc), "GigabitEthernet0/1"))
-        assert art.interface_no_commands["GigabitEthernet0/1"] == gi1.no_commands
+        assert art.interface_no_commands["GigabitEthernet0/1"] == expected
 
     def test_fields_parse_to_default_false(self):
         # The negation lines themselves must not leak into the positive parse.
@@ -198,7 +200,7 @@ class TestSubclassBEmission:
 
     def test_tombstones_byte_exact(self):
         pc = IOSParser(SUBCLASS_B_CFG).parse()
-        assert sorted(pc.no_commands) == sorted(EXPECTED_B_TOMBSTONES)
+        assert sorted(legacy_artifacts(pc).no_commands) == sorted(EXPECTED_B_TOMBSTONES)
 
     def test_native_ops_line_numbered_with_provenance(self):
         pc = IOSParser(SUBCLASS_B_CFG).parse()
@@ -277,7 +279,7 @@ class TestFhrpGrammarBoundary:
         pc = IOSParser(
             "interface Vlan100\n no standby 1\n no standby 2 ip\n"
         ).parse()
-        assert sorted(pc.no_commands) == [
+        assert sorted(legacy_artifacts(pc).no_commands) == [
             "field:interface:Vlan100:hsrp_groups:1",
             "field:interface:Vlan100:hsrp_vip:2",
         ]
@@ -293,7 +295,7 @@ class TestRefreshEmission:
             " standby 1 ip 10.0.0.254\n"
         )
         pc = IOSParser(cfg).parse()
-        assert "field:interface:Vlan100:hsrp_groups:1" in pc.no_commands
+        assert "field:interface:Vlan100:hsrp_groups:1" in legacy_artifacts(pc).no_commands
         ops = derive_ops(pc)
         (removal,) = _removals(ops, "hsrp_groups")
         positive = next(
@@ -316,7 +318,7 @@ class TestPerOS:
             " no ip address 10.1.1.2/24 secondary\n"
         )
         pc = NXOSParser(cfg).parse()
-        assert sorted(pc.no_commands) == [
+        assert sorted(legacy_artifacts(pc).no_commands) == [
             "field:interface:Vlan100:hsrp_groups:5",
             "field:interface:Vlan100:secondary_ips:10.1.1.2/24",
             "field:interface:Vlan100:vrrp_groups:7",
@@ -331,7 +333,7 @@ class TestPerOS:
             " no ip address 10.2.2.2/24 secondary\n"
         )
         pc = EOSParser(cfg).parse()
-        assert sorted(pc.no_commands) == [
+        assert sorted(legacy_artifacts(pc).no_commands) == [
             "field:interface:Vlan100:secondary_ips:10.2.2.2/24",
             "field:interface:Vlan100:vrrp_groups:9",
         ]
@@ -363,6 +365,6 @@ class TestDemoCorpusShape:
             " standby 2 ip 10.40.1.254\n"
         )
         pc = IOSParser(cfg).parse()
-        assert pc.no_commands == ["field:interface:Vlan100:hsrp_vip:1"]
+        assert legacy_artifacts(pc).no_commands == ["field:interface:Vlan100:hsrp_vip:1"]
         gi = pc.interfaces[0]
         assert [g.group_number for g in gi.hsrp_groups] == [2]

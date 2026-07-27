@@ -1429,31 +1429,25 @@ class EOSParser(IOSParser):
                 # "no vxlan vlan <vlan_id> vni <vni_id>"
                 m = re.match(r"no\s+vxlan\s+vlan\s+\d+\s+vni\s+(\d+)", t)
                 if m:
-                    tombstones.extend(
-                        self._queue_native_singleton_removal(
+                    self._queue_native_singleton_removal(
                             f"field:vxlan:vni:{m.group(1)}", child
-                        ).no_commands
-                    )
+                        )
                     continue
                 # "no vxlan vrf <name> vni <vni_id>"
                 m = re.match(r"no\s+vxlan\s+vrf\s+\S+\s+vni\s+(\d+)", t)
                 if m:
-                    tombstones.extend(
-                        self._queue_native_singleton_removal(
+                    self._queue_native_singleton_removal(
                             f"field:vxlan:vni:{m.group(1)}", child
-                        ).no_commands
-                    )
+                        )
 
         # --- MLAG peer-address removal (nested under mlag configuration) ---
         for mlag_obj in parse.find_objects(r"^mlag\s+configuration"):
             for child in mlag_obj.children:
                 t = child.text.strip()
                 if re.match(r"no\s+peer-address\b", t):
-                    tombstones.extend(
-                        self._queue_native_singleton_removal(
+                    self._queue_native_singleton_removal(
                             "field:vpc:peer_keepalive_destination", child
-                        ).no_commands
-                    )
+                        )
 
         return tombstones
 

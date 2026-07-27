@@ -24,18 +24,24 @@ from __future__ import annotations
 from confgraph.parsers.eos_parser import EOSParser
 from confgraph.parsers.ios_parser import IOSParser
 from confgraph.parsers.nxos_parser import NXOSParser
+from tests._ccr0110_e_helpers import legacy_artifacts
 
 
+# CCR-0110 Phase E: op-primary parsers no longer emit tombstone strings from
+# ``parse_deletion_commands()`` — every service-entity deletion is carried by a
+# native ChangeOp and the legacy string vocabulary (including the
+# ``_readded_later`` suppression) is reconstructed from the composed ChangeSet by
+# the golden-pinned shim codec (byte-exact vs ``test_change_ir_shim_phase4``).
 def _ios_tombstones(config: str) -> list[str]:
-    return IOSParser(config).parse_deletion_commands()
+    return legacy_artifacts(IOSParser(config).parse()).no_commands
 
 
 def _nxos_tombstones(config: str) -> list[str]:
-    return NXOSParser(config).parse_deletion_commands()
+    return legacy_artifacts(NXOSParser(config).parse()).no_commands
 
 
 def _eos_tombstones(config: str) -> list[str]:
-    return EOSParser(config).parse_deletion_commands()
+    return legacy_artifacts(EOSParser(config).parse()).no_commands
 
 
 # ---------------------------------------------------------------------------

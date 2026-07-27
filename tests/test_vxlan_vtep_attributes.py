@@ -5,6 +5,7 @@ CCR: confgraph_entrp_vxlan_vtep_attributes_not_evaluated.md (parser side)
 """
 
 from confgraph.parsers.nxos_parser import NXOSParser
+from tests._ccr0110_e_helpers import legacy_artifacts
 
 
 NXOS_VXLAN_CONFIG = """
@@ -102,11 +103,12 @@ interface nve1
   no host-reachability protocol bgp
   member vni 10010
 """
-        parser = NXOSParser(config)
-        tombstones = parser.parse_deletion_commands()
+        # CCR-0110 Phase E: op-primary parsers no longer emit tombstone strings —
+        # the deletion is native; the legacy vocabulary is reconstructed from the
+        # composed ChangeSet by the golden-pinned shim codec.
+        tombstones = legacy_artifacts(NXOSParser(config).parse()).no_commands
         assert "field:vxlan:host_reachability" in tombstones
 
     def test_no_tombstone_when_present(self):
-        parser = NXOSParser(NXOS_VXLAN_CONFIG)
-        tombstones = parser.parse_deletion_commands()
+        tombstones = legacy_artifacts(NXOSParser(NXOS_VXLAN_CONFIG).parse()).no_commands
         assert "field:vxlan:host_reachability" not in tombstones

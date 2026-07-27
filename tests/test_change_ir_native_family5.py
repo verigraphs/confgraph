@@ -32,6 +32,7 @@ from confgraph.change_ir import (
 )
 from confgraph.parsers.ios_parser import IOSParser
 from confgraph.parsers.nxos_parser import NXOSParser
+from tests._ccr0110_e_helpers import bgp_nc, reconstruct_tombstones
 
 
 def _parse(text: str, parser_cls=IOSParser):
@@ -128,20 +129,19 @@ class TestEmission:
 class TestByteIdentityAndComposition:
     def test_legacy_no_commands_byte_exact(self):
         pc = _parse(DELETE_READD)
-        bgp = pc.bgp_instances[0]
-        assert bgp.no_commands == [
+        expected = [
             "neighbor:10.0.0.2",
             "field:neighbor:10.0.0.3:route_map_in",
             "field:neighbor:10.0.0.3:shutdown",
         ]
+        assert bgp_nc(pc, 65000) == expected
         # encode_legacy reproduces the scoped container byte-exactly.
         art = encode_legacy(derive_ops(pc))
-        assert art.bgp_no_commands[("65000", "")] == bgp.no_commands
+        assert art.bgp_no_commands[("65000", "")] == expected
 
     def test_ipv6_peer_byte_exact(self):
         pc = _parse("router bgp 65000\n no neighbor 2001:db8::1\n")
-        bgp = pc.bgp_instances[0]
-        assert bgp.no_commands == ["neighbor:2001:db8::1"]
+        assert bgp_nc(pc, 65000) == ["neighbor:2001:db8::1"]
         art = encode_legacy(derive_ops(pc))
         assert art.bgp_no_commands[("65000", "")] == ["neighbor:2001:db8::1"]
 
@@ -217,6 +217,7 @@ class TestByteIdentityAndComposition:
 
     def test_derived_fallback_without_natives(self):
         pc = _parse(DELETE_READD)
+        reconstruct_tombstones(pc)
         pc.native_change_ops = None
         ops = derive_ops(pc)
         # Natives-less: the deriver translates the bgp tombstones itself.
@@ -233,8 +234,7 @@ class TestMultiOS:
             "  no neighbor 10.0.0.3\n",
             NXOSParser,
         )
-        bgp = pc.bgp_instances[0]
-        assert "neighbor:10.0.0.3" in bgp.no_commands
+        assert "neighbor:10.0.0.3" in bgp_nc(pc, 65000)
         ops = _f5(pc)
         assert any(o.verb is Verb.OBJECT_DELETE and o.path[-1] == "10.0.0.3"
                    for o in ops)

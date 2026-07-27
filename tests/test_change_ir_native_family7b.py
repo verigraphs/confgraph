@@ -31,6 +31,7 @@ from confgraph.parsers.eos_parser import EOSParser
 from confgraph.parsers.ios_parser import IOSParser
 from confgraph.parsers.iosxr_parser import IOSXRParser
 from confgraph.parsers.nxos_parser import NXOSParser
+from tests._ccr0110_e_helpers import legacy_artifacts
 
 
 def _parse(text: str, parser_cls=IOSParser):
@@ -184,7 +185,7 @@ class TestCrossKindRegression:
             and op.path == ("vrfs", "GUEST", "route_target_import", "65400:77")
         )
         assert positive.line_no > removal.line_no >= 0
-        assert "field:vrfs:GUEST:route_target_both:65400:77" in pc.no_commands
+        assert "field:vrfs:GUEST:route_target_both:65400:77" in legacy_artifacts(pc).no_commands
 
 
 class TestAntiRot:

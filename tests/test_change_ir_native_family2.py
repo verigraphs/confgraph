@@ -23,6 +23,7 @@ from confgraph.change_ir import (
     Verb,
     derive_ops,
     encode_legacy,
+    encode_legacy_shim,
     interface_list_replace_fields,
     interface_scalar_fields,
 )
@@ -33,6 +34,28 @@ from confgraph.parsers.nxos_parser import NXOSParser
 
 def _parse(text: str, parser_cls=IOSParser):
     return parser_cls(text).parse()
+
+
+def _iface_nc(pc, name):
+    """CCR-0110 Phase E: op-primary parsers no longer populate
+    ``interface_no_commands`` — the legacy tombstone vocabulary is reconstructed
+    from the composed ChangeSet by the golden-pinned shim codec (byte-exact vs
+    ``test_change_ir_shim_phase4``)."""
+    return encode_legacy_shim(derive_ops(pc)).interface_no_commands.get(name, [])
+
+
+def _reconstruct_tombstones(pc):
+    """CCR-0110 Phase E: repopulate the deprecated string containers from the
+    composed ChangeSet so the natives-less derive-fallback path — which
+    op-primary parsers no longer feed, but a JunOS/pre-Phase-3 parse would — can
+    be exercised.  Call BEFORE nulling ``native_change_ops``."""
+    art = encode_legacy_shim(derive_ops(pc))
+    pc.no_commands = list(art.no_commands)
+    for iface in pc.interfaces:
+        iface.no_commands = art.interface_no_commands.get(iface.name, [])
+    for bgp in pc.bgp_instances:
+        bgp.no_commands = art.bgp_no_commands.get((str(bgp.asn), bgp.vrf or ""), [])
+    return pc
 
 
 def _trunk_ops(pc):
@@ -98,7 +121,7 @@ class TestNativeDeltaEmission:
             " switchport trunk allowed vlan remove 20\n"
             " switchport trunk allowed vlan add 30,40-42\n"
         )
-        assert pc.interfaces[0].no_commands == [
+        assert _iface_nc(pc, "GigabitEthernet0/1") == [
             f"{_PFX}:remove:20",
             f"{_PFX}:add:30,40-42",
         ]
@@ -115,7 +138,8 @@ class TestNativeDeltaEmission:
             " no shutdown\n"
         )
         p = "field:interface:GigabitEthernet0/1"
-        assert pc.interfaces[0].no_commands == [
+        recon = _iface_nc(pc, "GigabitEthernet0/1")
+        assert recon == [
             f"{p}:description",
             f"{p}:trunk_allowed_vlans:add:30",
             f"{p}:ospf_cost",
@@ -127,9 +151,7 @@ class TestNativeDeltaEmission:
             op for op in pc.native_change_ops
             if op.path[:2] == ("field", "interface")
         ]
-        assert [":".join(op.path) for op in codec_ops] == list(
-            pc.interfaces[0].no_commands
-        )
+        assert [":".join(op.path) for op in codec_ops] == recon
 
     def test_anchor_discards_pending_delta_ops(self):
         """An absolute form replaces device state — earlier deltas emit
@@ -307,6 +329,7 @@ class TestHybridComposition:
         derives the trunk delta ops from the tombstones — capability
         degrades to legacy parity, intent is never dropped."""
         pc = _parse(_KITCHEN_SINK)
+        _reconstruct_tombstones(pc)
         pc.native_change_ops = None
         ops = derive_ops(pc)
         deltas = [
@@ -337,7 +360,7 @@ class TestInheritance:
         rem = by_iface["Ethernet1/1"]
         assert rem.verb is Verb.LIST_REMOVE
         assert rem.origin == "native"
-        assert pc.interfaces[0].no_commands == [
+        assert _iface_nc(pc, "Ethernet1/1") == [
             "field:interface:Ethernet1/1:trunk_allowed_vlans:remove:20"
         ]
         none_op = by_iface["Ethernet1/2"]

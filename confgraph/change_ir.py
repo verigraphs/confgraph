@@ -3045,11 +3045,19 @@ def encode_legacy(ops: ChangeSet) -> LegacyArtifacts:
 # ---------------------------------------------------------------------------
 #
 # `no_commands` / `interface_no_commands` / `bgp_no_commands` are PUBLISHED OSS
-# model fields.  CCR-0025 Phase 4 §8.2 keeps them populated-but-deprecated for
-# two minor releases after the `CONFGRAPH_CHANGE_IR` default flips to `ops`.
-# Batch B deletes native parser tombstone emission, so from then on the ONLY way
-# to keep those fields filled is to re-encode the composed ChangeSet back into
-# the legacy vocabulary.  `encode_legacy` is that inverse deriver and is already
+# model fields.  CCR-0025 Phase 4 §8.2 (revised) kept them populated-but-
+# deprecated for ONE release cycle (v0.3.5) after the `CONFGRAPH_CHANGE_IR`
+# default flipped to `ops`; CCR-0110 Phase E4/E5 then removed op-primary
+# (IOS/NX-OS/EOS) parser tombstone emission and left the fields EMPTY in v0.3.6
+# except the derived-only survivors whose string CARRIES the deletion (no
+# native op behind them): IOS-XR's whole deletion walk (excepted pending
+# Phase 5) plus, on all OSes, process:bgp:<asn> and the OSPF area
+# stub_reset/nssa_reset shapes.  The
+# shim is NOT product-wired to refill them (owner-confirmed zero external
+# consumers, zero remaining entrp readers); it survives as a CODEC ARTIFACT —
+# the inverse deriver that re-encodes the composed ChangeSet back into the
+# legacy vocabulary, pinned byte-exact against frozen goldens by
+# `test_change_ir_shim_phase4`.  `encode_legacy` is that inverse and is already
 # byte-exact for tombstone-derived ops (the `test_change_ir._roundtrip` pin).
 # This shim wraps it with the two things Phase-3 native emission moved OUT of the
 # encode path, so the shim's output stays identical to what the pre-native parser

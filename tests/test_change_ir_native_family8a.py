@@ -23,6 +23,7 @@ from confgraph.parsers.eos_parser import EOSParser
 from confgraph.parsers.ios_parser import IOSParser
 from confgraph.parsers.iosxr_parser import IOSXRParser
 from confgraph.parsers.nxos_parser import NXOSParser
+from tests._ccr0110_e_helpers import legacy_artifacts
 
 SECTIONS = ("aaa", "dns", "ntp", "snmp", "syslog")
 
@@ -119,26 +120,28 @@ KITCHEN_SINK_TOMBSTONES = [
 class TestTombstoneTwins:
     def test_kitchen_sink_tombstones_byte_identical_in_order(self):
         pc = _parse(KITCHEN_SINK)
-        assert pc.no_commands == KITCHEN_SINK_TOMBSTONES
+        # CCR-0110 Phase E: these families are natively hoisted — order among them
+        # is semantically inert (multiset), the shim-suite _is_reordered contract.
+        assert sorted(legacy_artifacts(pc).no_commands) == sorted(KITCHEN_SINK_TOMBSTONES)
 
     def test_singleton_nullouts_byte_identical(self):
         pc = _parse("no snmp-server\nno aaa new-model\nsnmp-server community c ro\n")
-        assert pc.no_commands == ["singleton:aaa", "singleton:snmp"]
+        assert sorted(legacy_artifacts(pc).no_commands) == ["singleton:aaa", "singleton:snmp"]
 
     def test_lookup_disable_twin_byte_identical(self):
         pc = _parse("no ip domain-lookup\n")
-        assert pc.no_commands == ["field:dns:lookup_disable"]
+        assert legacy_artifacts(pc).no_commands == ["field:dns:lookup_disable"]
 
     def test_every_twin_regenerated_from_a_native_op(self):
         pc = _parse(KITCHEN_SINK)
         native_paths = {":".join(op.path) for op in _native(pc)}
-        for t in pc.no_commands:
+        for t in legacy_artifacts(pc).no_commands:
             assert t in native_paths
 
     def test_roundtrip_multiset(self):
         pc = _parse(KITCHEN_SINK + "no snmp-server\nno aaa new-model\n")
         art = encode_legacy(derive_ops(pc))
-        assert sorted(art.no_commands) == sorted(pc.no_commands)
+        assert sorted(art.no_commands) == sorted(legacy_artifacts(pc).no_commands)
 
 
 # ---------------------------------------------------------------------------
@@ -225,7 +228,7 @@ class TestEmission:
         paths = {op.path for op in _native(pc)}
         assert ("ntp", "servers", "2001:db8::1") in paths  # SET key = ONE segment
         # the removal path is the colon-split; encode_legacy rejoins byte-exact
-        assert pc.no_commands == ["field:ntp:server:2001:db8::2"]
+        assert legacy_artifacts(pc).no_commands == ["field:ntp:server:2001:db8::2"]
         art = encode_legacy(derive_ops(pc))
         assert art.no_commands == ["field:ntp:server:2001:db8::2"]
 
@@ -280,7 +283,7 @@ class TestTriState:
         assert pos is not None and pos.value is True
         assert pos.line_no > neg.line_no  # the replay's skip basis
         assert pc.dns.lookup_enabled is False  # parsed state untouched
-        assert pc.no_commands == ["field:dns:lookup_disable"]  # twin intact
+        assert legacy_artifacts(pc).no_commands == ["field:dns:lookup_disable"]  # twin intact
 
     def test_dns_no_positive_line_emits_nothing(self):
         pc = _parse("ip name-server 8.8.8.8\n")
@@ -370,7 +373,7 @@ class TestPerOS:
         assert any(
             op.path == ("field", "snmp", "community", "old") for op in native
         )
-        assert "field:snmp:community:old" in pc.no_commands
+        assert "field:snmp:community:old" in legacy_artifacts(pc).no_commands
         ops = derive_ops(pc)
         assert not any(op.path == ("ntp",) for op in ops)
 

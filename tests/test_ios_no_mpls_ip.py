@@ -4,10 +4,14 @@ CCR: confgraph_ios_interface_no_mpls_ip_deletion.md
 """
 
 from confgraph.parsers.ios_parser import IOSParser
+from tests._ccr0110_e_helpers import reconstruct_tombstones
 
 
 def _parse(config: str):
-    return IOSParser(config).parse()
+    # CCR-0110 Phase E: op-primary parsers no longer populate
+    # ``InterfaceConfig.no_commands`` — repopulate from the composed ChangeSet via
+    # the golden-pinned shim codec (byte-exact vs ``test_change_ir_shim_phase4``).
+    return reconstruct_tombstones(IOSParser(config).parse())
 
 
 def _get_interface(pc, name: str):

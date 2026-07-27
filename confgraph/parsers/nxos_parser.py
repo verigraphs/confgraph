@@ -1371,11 +1371,9 @@ class NXOSParser(IOSParser):
                 # regenerate the tombstone FROM it (single source, byte-exact).
                 # super().parse_deletion_commands() already initialised
                 # _pending_native_vrf_ops.
-                tombstones.extend(
-                    self._queue_native_vrf_delete(
+                self._queue_native_vrf_delete(
                         f"field:vrfs:{m.group(1)}", obj
-                    ).no_commands
-                )
+                    )
 
         # --- VRF static route deletions (nested under vrf context NAME) ---
         for vrf_obj in parse.find_objects(r"^vrf\s+context\s+(\S+)"):
@@ -1394,9 +1392,7 @@ class NXOSParser(IOSParser):
                     # LIST_REMOVE op and regenerate the tombstone from it
                     # (single source).  super().parse_deletion_commands()
                     # already initialised _pending_native_static_ops.
-                    tombstones.extend(
-                        self._queue_native_static_delete(tombstone, child).no_commands
-                    )
+                    self._queue_native_static_delete(tombstone, child)
 
         # --- VXLAN nested deletions (under interface nve) ---
         # Change-IR family 8b (CCR Appendix U): tombstones regenerated FROM the
@@ -1408,17 +1404,13 @@ class NXOSParser(IOSParser):
                 t = child.text.strip()
                 m = re.match(r"no\s+member\s+vni\s+(\d+)", t)
                 if m:
-                    tombstones.extend(
-                        self._queue_native_singleton_removal(
+                    self._queue_native_singleton_removal(
                             f"field:vxlan:vni:{m.group(1)}", child
-                        ).no_commands
-                    )
+                        )
                 if re.match(r"no\s+host-reachability\s+protocol\b", t):
-                    tombstones.extend(
-                        self._queue_native_singleton_removal(
+                    self._queue_native_singleton_removal(
                             "field:vxlan:host_reachability", child
-                        ).no_commands
-                    )
+                        )
 
         # --- vPC peer-keepalive removal (nested under vpc domain) ---
         # ONE ``no peer-keepalive`` line fans out to THREE scalar-reset
@@ -1433,11 +1425,9 @@ class NXOSParser(IOSParser):
                         "field:vpc:peer_keepalive_source",
                         "field:vpc:peer_keepalive_vrf",
                     ):
-                        tombstones.extend(
-                            self._queue_native_singleton_removal(
+                        self._queue_native_singleton_removal(
                                 _vpc_ts, child
-                            ).no_commands
-                        )
+                            )
 
         return tombstones
 

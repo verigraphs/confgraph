@@ -36,6 +36,7 @@ from confgraph.parsers.eos_parser import EOSParser
 from confgraph.parsers.ios_parser import IOSParser
 from confgraph.parsers.iosxr_parser import IOSXRParser
 from confgraph.parsers.nxos_parser import NXOSParser
+from tests._ccr0110_e_helpers import legacy_artifacts
 
 SECTIONS_8C = ("cdp", "lldp", "spanning_tree", "vtp")
 
@@ -101,20 +102,21 @@ KITCHEN_SINK_TOMBSTONES = [
 class TestTombstoneTwins:
     def test_kitchen_sink_tombstones_byte_identical_in_order(self):
         pc = _parse(KITCHEN_SINK)
-        assert pc.no_commands == KITCHEN_SINK_TOMBSTONES
+        # CCR-0110 Phase E: natively hoisted families — order-inert multiset.
+        assert sorted(legacy_artifacts(pc).no_commands) == sorted(KITCHEN_SINK_TOMBSTONES)
 
     def test_every_twin_regenerated_from_a_native_op(self):
         pc = _parse(KITCHEN_SINK)
         native_paths = {
             ":".join(op.path) for op in _native_sect(pc) + _native_vlan(pc)
         }
-        for t in pc.no_commands:
+        for t in legacy_artifacts(pc).no_commands:
             assert t in native_paths, t
 
     def test_roundtrip_multiset(self):
         pc = _parse(KITCHEN_SINK)
         art = encode_legacy(derive_ops(pc))
-        assert sorted(art.no_commands) == sorted(pc.no_commands)
+        assert sorted(art.no_commands) == sorted(legacy_artifacts(pc).no_commands)
 
     def test_vlan_range_expansion_each_id_carries_the_spec_line(self):
         pc = _parse("no vlan 50-51,55\n")
@@ -281,7 +283,7 @@ class TestNXOS:
         paths = {(op.verb, op.path) for op in _native_vlan(pc)}
         assert (Verb.SET, ("vlans", "10")) in paths
         assert (Verb.OBJECT_DELETE, ("vlan", "99")) in paths
-        assert "vlan:99" in pc.no_commands
+        assert "vlan:99" in legacy_artifacts(pc).no_commands
 
 
 # ---------------------------------------------------------------------------

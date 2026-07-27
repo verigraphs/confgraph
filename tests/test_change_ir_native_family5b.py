@@ -32,6 +32,7 @@ from confgraph.change_ir import (
 )
 from confgraph.parsers.ios_parser import IOSParser
 from confgraph.parsers.nxos_parser import NXOSParser
+from tests._ccr0110_e_helpers import bgp_nc
 
 
 def _parse(text: str, parser_cls=IOSParser):
@@ -131,7 +132,7 @@ class TestLegacyByteIdentity:
         # Candidate-B keeps the exact legacy tombstone string; no network adds
         # NOTHING to no_commands (silently dropped, as today).
         pc = _parse(PG_AND_NETWORK)
-        assert pc.bgp_instances[0].no_commands == [
+        assert bgp_nc(pc, 65000) == [
             "field:neighbor:UPSTREAM:peer_group",
             "field:neighbor:10.0.0.2:route_map_in",
         ]
@@ -139,7 +140,10 @@ class TestLegacyByteIdentity:
     def test_encode_legacy_roundtrip_byte_identical(self):
         pc = _parse(PG_AND_NETWORK)
         arts = encode_legacy(derive_ops(pc))
-        assert arts.bgp_no_commands[("65000", "")] == pc.bgp_instances[0].no_commands
+        assert arts.bgp_no_commands[("65000", "")] == [
+            "field:neighbor:UPSTREAM:peer_group",
+            "field:neighbor:10.0.0.2:route_map_in",
+        ]
 
     def test_no_network_encodes_to_nothing(self):
         pc = _parse("router bgp 65000\n no network 172.16.0.0 mask 255.255.0.0\n")

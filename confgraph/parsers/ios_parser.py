@@ -784,7 +784,6 @@ class IOSParser(BaseParser):
             intf_type = self._determine_interface_type(intf_name)
 
             # Basic attributes
-            iface_no_commands: list[str] = []
             iface_unset_ops: list = []
             description = None
             desc_children = intf_obj.find_child_objects(r"^\s+description\s+(.+)")
@@ -796,7 +795,7 @@ class IOSParser(BaseParser):
                 no_desc = intf_obj.find_child_objects(r"^\s+no\s+description")
                 if no_desc:
                     self._native_iface_unset(
-                        iface_unset_ops, iface_no_commands,
+                        iface_unset_ops,
                         intf_name, "description", no_desc[-1],
                     )
 
@@ -989,38 +988,29 @@ class IOSParser(BaseParser):
                         # shape legacy artifacts are structurally blind to).
                         self._pending_native_trunk_none.add(intf_name)
                 # Change-IR Phase 3 family 2: un-anchored delta lines emit
-                # native LIST_ADD/LIST_REMOVE ops with verbatim provenance;
-                # the legacy tombstone string is generated FROM the op via
-                # encode_legacy (single source — byte-identical to the
-                # pre-family-2 bespoke f-string, same position/order).
+                # native LIST_ADD/LIST_REMOVE ops with verbatim provenance.
+                # CCR-0110 Phase E4/E5: the op is the single source; the
+                # deprecated interface_no_commands string channel is retired.
                 if trunk_vlan_ops:
-                    from confgraph.change_ir import (
-                        ChangeOp,
-                        Verb,
-                        encode_legacy,
-                    )
+                    from confgraph.change_ir import ChangeOp, Verb
 
                     for op, spec, child in trunk_vlan_ops:
-                        change_op = ChangeOp(
-                            verb=Verb.LIST_ADD if op == "add" else Verb.LIST_REMOVE,
-                            path=(
-                                "field",
-                                "interface",
-                                intf_name,
-                                "trunk_allowed_vlans",
-                                op,
-                                spec,
-                            ),
-                            value=spec,
-                            source_line=child.text.strip(),
-                            line_no=child.linenum,
-                            origin="native",
-                        )
-                        iface_unset_ops.append(change_op)
-                        iface_no_commands.extend(
-                            encode_legacy([change_op]).interface_no_commands[
-                                intf_name
-                            ]
+                        iface_unset_ops.append(
+                            ChangeOp(
+                                verb=Verb.LIST_ADD if op == "add" else Verb.LIST_REMOVE,
+                                path=(
+                                    "field",
+                                    "interface",
+                                    intf_name,
+                                    "trunk_allowed_vlans",
+                                    op,
+                                    spec,
+                                ),
+                                value=spec,
+                                source_line=child.text.strip(),
+                                line_no=child.linenum,
+                                origin="native",
+                            )
                         )
 
             trunk_native_children = intf_obj.find_child_objects(
@@ -1241,7 +1231,7 @@ class IOSParser(BaseParser):
                 no_cost = intf_obj.find_child_objects(r"^\s+no\s+ip\s+ospf\s+cost")
                 if no_cost:
                     self._native_iface_unset(
-                        iface_unset_ops, iface_no_commands,
+                        iface_unset_ops,
                         intf_name, "ospf_cost", no_cost[-1],
                     )
 
@@ -1458,7 +1448,7 @@ class IOSParser(BaseParser):
             no_mpls = intf_obj.find_child_objects(r"^\s+no\s+mpls\s+ip\b")
             if no_mpls:
                 self._native_iface_unset(
-                    iface_unset_ops, iface_no_commands,
+                    iface_unset_ops,
                     intf_name, "mpls_ip", no_mpls[-1],
                 )
 
@@ -1532,7 +1522,7 @@ class IOSParser(BaseParser):
             if no_bfd:
                 for bfd_field in ("bfd_interval", "bfd_min_rx", "bfd_multiplier"):
                     self._native_iface_unset(
-                        iface_unset_ops, iface_no_commands,
+                        iface_unset_ops,
                         intf_name, bfd_field, no_bfd[-1],
                     )
 
@@ -1649,19 +1639,12 @@ class IOSParser(BaseParser):
             if intf_obj.find_child_objects(r"^\s+no\s+lldp\s+receive"):
                 lldp_receive = False
 
-            # Field-negation UNSET ops (F1/WI-1 families) — their legacy
-            # tombstones are generated from the ops via encode_legacy
-            # (byte-identical to the pre-Phase-3 bespoke strings).
+            # Field-negation UNSET ops (F1/WI-1 families).  CCR-0110 Phase
+            # E4/E5: the ops are the single source; the deprecated
+            # interface_no_commands string channel is retired (op-primary).
             negation_ops = self._detect_interface_field_negation_ops(
                 intf_obj, intf_name
             )
-            negation_tombstones: list[str] = []
-            if negation_ops:
-                from confgraph.change_ir import encode_legacy
-
-                negation_tombstones = encode_legacy(
-                    negation_ops
-                ).interface_no_commands.get(intf_name, [])
             self._pending_native_unset_ops.extend(iface_unset_ops + negation_ops)
 
             interfaces.append(
@@ -1764,7 +1747,7 @@ class IOSParser(BaseParser):
                     cdp_enabled=cdp_enabled,
                     lldp_transmit=lldp_transmit,
                     lldp_receive=lldp_receive,
-                    no_commands=iface_no_commands + negation_tombstones,
+                    no_commands=[],
                 )
             )
 
@@ -1916,29 +1899,28 @@ class IOSParser(BaseParser):
     def _native_iface_unset(
         self,
         ops: list,
-        no_commands: list[str],
         intf_name: str,
         field: str,
         child=None,
     ) -> None:
-        """Emit one native UNSET op + its codec-generated legacy tombstone.
+        """Queue one native interface-field UNSET op.
 
-        The tombstone string appended to *no_commands* is produced from the
-        op via ``encode_legacy`` (byte-exact ``":".join(path)``) — the op is
-        the single source; parse artifacts are an encoding of it.
+        CCR-0110 Phase E4/E5: op-primary parsers no longer persist the
+        deprecated ``interface_no_commands`` string channel — the op is the
+        single source of the field reset.
         """
-        from confgraph.change_ir import ChangeOp, Verb, encode_legacy
+        from confgraph.change_ir import ChangeOp, Verb
 
-        op = ChangeOp(
-            verb=Verb.UNSET,
-            path=("field", "interface", intf_name, field),
-            value=None,
-            source_line=(child.text.strip() if child is not None else ""),
-            line_no=(child.linenum if child is not None else -1),
-            origin="native",
+        ops.append(
+            ChangeOp(
+                verb=Verb.UNSET,
+                path=("field", "interface", intf_name, field),
+                value=None,
+                source_line=(child.text.strip() if child is not None else ""),
+                line_no=(child.linenum if child is not None else -1),
+                origin="native",
+            )
         )
-        ops.append(op)
-        no_commands.extend(encode_legacy([op]).interface_no_commands[intf_name])
 
     def _native_iface_set_ops(self, iface) -> list:
         """Native SET ops for one FINAL InterfaceConfig (families 1 + 2).
@@ -2130,7 +2112,7 @@ class IOSParser(BaseParser):
         NH specs that themselves contain a colon (channelized interfaces).
         Reused by the NX-OS ``vrf context`` deletion override.
         """
-        from confgraph.change_ir import ChangeOp, Verb, encode_legacy
+        from confgraph.change_ir import ChangeOp, Verb
 
         op = ChangeOp(
             verb=Verb.LIST_REMOVE,
@@ -2141,7 +2123,6 @@ class IOSParser(BaseParser):
             origin="native",
         )
         self._pending_native_static_ops.append(op)
-        return encode_legacy([op])
 
     def _queue_native_vrf_removal(self, tombstone: str, obj):
         """Build + queue a native family-7a VRF member-removal op from a
@@ -2161,7 +2142,7 @@ class IOSParser(BaseParser):
         (R.0 design item 1 — NOT emission suppression, so the legacy twin
         keeps flowing and the round-trip pin holds).
         """
-        from confgraph.change_ir import ChangeOp, Verb, encode_legacy
+        from confgraph.change_ir import ChangeOp, Verb
 
         path = tuple(tombstone.split(":"))
         verb = Verb.UNSET if path[3:] == ("rd",) else Verb.LIST_REMOVE
@@ -2174,7 +2155,6 @@ class IOSParser(BaseParser):
             origin="native",
         )
         self._pending_native_vrf_ops.append(op)
-        return encode_legacy([op])
 
     def _queue_native_vrf_delete(self, tombstone: str, obj):
         """Build + queue the native family-7a whole-VRF OBJECT_DELETE from a
@@ -2184,7 +2164,7 @@ class IOSParser(BaseParser):
         op — single source).  Line-numbered for 7b; applied DELETE-WINS-last
         in 7a (CCR Appendix R.1).
         """
-        from confgraph.change_ir import ChangeOp, Verb, encode_legacy
+        from confgraph.change_ir import ChangeOp, Verb
 
         op = ChangeOp(
             verb=Verb.OBJECT_DELETE,
@@ -2195,7 +2175,6 @@ class IOSParser(BaseParser):
             origin="native",
         )
         self._pending_native_vrf_ops.append(op)
-        return encode_legacy([op])
 
     def _queue_native_singleton_removal(self, tombstone: str, obj):
         """Build + queue a native family-8a/8b singleton-section removal op
@@ -2226,7 +2205,6 @@ class IOSParser(BaseParser):
         from confgraph.change_ir import (
             ChangeOp,
             _verb_for_top_tombstone,
-            encode_legacy,
         )
 
         op = ChangeOp(
@@ -2238,7 +2216,6 @@ class IOSParser(BaseParser):
             origin="native",
         )
         self._pending_native_singleton_ops.append(op)
-        return encode_legacy([op])
 
     def _queue_native_policy_removal(self, tombstone: str, obj):
         """Build + queue a native family-8f policy-object removal op from
@@ -2267,7 +2244,6 @@ class IOSParser(BaseParser):
         from confgraph.change_ir import (
             ChangeOp,
             _verb_for_top_tombstone,
-            encode_legacy,
         )
 
         op = ChangeOp(
@@ -2279,7 +2255,6 @@ class IOSParser(BaseParser):
             origin="native",
         )
         self._pending_native_policy_ops.append(op)
-        return encode_legacy([op])
 
     def _queue_native_keyed_removal(self, tombstone: str, obj):
         """Build + queue a native WI-DB1-B2 keyed-removal op from its legacy
@@ -2309,7 +2284,6 @@ class IOSParser(BaseParser):
         from confgraph.change_ir import (
             ChangeOp,
             _verb_for_top_tombstone,
-            encode_legacy,
         )
 
         op = ChangeOp(
@@ -2321,7 +2295,6 @@ class IOSParser(BaseParser):
             origin="native",
         )
         self._pending_native_keyed_removal_ops.append(op)
-        return encode_legacy([op])
 
     def _queue_native_vlan_delete(self, vid: str, obj) -> list:
         """Build + queue a native family-8c VLAN OBJECT_DELETE for one
@@ -2337,7 +2310,7 @@ class IOSParser(BaseParser):
         ``super().parse_deletion_commands()``; IOS-XR overrides without
         ``super()`` and never emits these shapes.
         """
-        from confgraph.change_ir import ChangeOp, Verb, encode_legacy
+        from confgraph.change_ir import ChangeOp, Verb
 
         op = ChangeOp(
             verb=Verb.OBJECT_DELETE,
@@ -2348,7 +2321,6 @@ class IOSParser(BaseParser):
             origin="native",
         )
         self._pending_native_vlan_ops.append(op)
-        return encode_legacy([op]).no_commands
 
     def _queue_native_iface_member_removal(self, tombstone: str, obj):
         """Build + queue a native family-8e interface member-removal op from
@@ -2371,7 +2343,7 @@ class IOSParser(BaseParser):
         last-occurrence lines (R.0 — NOT emission suppression, so the
         legacy twin keeps flowing and byte-identity holds).
         """
-        from confgraph.change_ir import ChangeOp, Verb, encode_legacy
+        from confgraph.change_ir import ChangeOp, Verb
 
         op = ChangeOp(
             verb=Verb.LIST_REMOVE,
@@ -2382,7 +2354,6 @@ class IOSParser(BaseParser):
             origin="native",
         )
         self._pending_native_interface_ops.append(op)
-        return encode_legacy([op])
 
     def _queue_native_interface_delete(self, tombstone: str, obj):
         """Build + queue the native family-8e whole-interface OBJECT_DELETE
@@ -2399,7 +2370,7 @@ class IOSParser(BaseParser):
         walk via ``super().parse_deletion_commands()``; IOS-XR overrides
         without ``super()`` and never emits the shape.
         """
-        from confgraph.change_ir import ChangeOp, Verb, encode_legacy
+        from confgraph.change_ir import ChangeOp, Verb
 
         op = ChangeOp(
             verb=Verb.OBJECT_DELETE,
@@ -2410,7 +2381,6 @@ class IOSParser(BaseParser):
             origin="native",
         )
         self._pending_native_interface_ops.append(op)
-        return encode_legacy([op])
 
     def _native_vlan_ops(self, pc) -> list:
         """Native family-8c VLAN-database ops (CCR Appendix V).
@@ -4712,12 +4682,6 @@ class IOSParser(BaseParser):
         # getattr-safe), so the reset here owns the per-parse lifecycle.  NX-OS
         # inherits this walk (nxos_parser.parse_ospf wraps super().parse_ospf()).
         self._pending_native_ospf_ops = []
-        # WI-DB2 (CCR Appendix AD): byte-exact legacy twins for the four
-        # withdrawal ops emitted below (redistribute / default-information
-        # originate / area virtual-link / area filter-list) — regenerated
-        # FROM the ops via encode_legacy (single source) and drained into
-        # ``no_commands`` by parse_deletion_commands.
-        self._pending_ospf_negation_tombstones = []
 
         # Find all OSPF router configs. The process header pattern set accepts
         # a numeric process id and a string process tag (NX-OS / IOS-XR);
@@ -5121,18 +5085,17 @@ class IOSParser(BaseParser):
             _neg_prefix = ("field", "ospf", str(process_id), ospf_vrf or "")
 
             def _queue_ospf_negation(verb, path_tail, child):
-                from confgraph.change_ir import encode_legacy
-                op = ChangeOp(
-                    verb=verb,
-                    path=_neg_prefix + path_tail,
-                    value=None,
-                    source_line=child.text.strip(),
-                    line_no=child.linenum,
-                    origin="native",
-                )
-                self._pending_native_ospf_ops.append(op)
-                self._pending_ospf_negation_tombstones.extend(
-                    encode_legacy([op]).no_commands
+                # CCR-0110 Phase E4/E5: queue the native op only; op-primary
+                # parsers no longer persist the deprecated no_commands string.
+                self._pending_native_ospf_ops.append(
+                    ChangeOp(
+                        verb=verb,
+                        path=_neg_prefix + path_tail,
+                        value=None,
+                        source_line=child.text.strip(),
+                        line_no=child.linenum,
+                        origin="native",
+                    )
                 )
 
             # (1) ``no redistribute <proto> [<pid>]`` — keyed removal; the
@@ -5900,7 +5863,7 @@ class IOSParser(BaseParser):
         colons).  Legacy mode still consumes ``BGPConfig.no_commands`` exactly
         as today; ops mode replays the native ops in order.
         """
-        from confgraph.change_ir import ChangeOp, Verb, encode_legacy
+        from confgraph.change_ir import ChangeOp, Verb
 
         tombstones: list[str] = []
         pg_names = peer_group_names or set()
@@ -5914,9 +5877,6 @@ class IOSParser(BaseParser):
             today — byte-identical — but a native ``OBJECT_DELETE`` op so ops
             mode removes the group AND its members).
             """
-            if asn is None:
-                tombstones.append(tombstone)
-                return
             if verb is None:
                 verb = (
                     Verb.OBJECT_DELETE
@@ -5933,9 +5893,6 @@ class IOSParser(BaseParser):
                 origin="native",
             )
             self._pending_native_bgp_ops.append(op)
-            tombstones.extend(
-                encode_legacy([op]).bgp_no_commands[(str(asn), vrf or "")]
-            )
 
         for nc in bgp_or_af_obj.find_child_objects(r"^\s+no\s+neighbor\s+\S+"):
             m = re.search(r"^\s+no\s+neighbor\s+(\S+)(?:\s+(.+))?$", nc.text)
@@ -7473,7 +7430,7 @@ class IOSParser(BaseParser):
           - ``no ip prefix-list <name> seq <num>``        → ``prefix-list:<name>:seq:<num>``
           - ``no <seq>`` inside ip access-list blocks    → ``acl-seq:<name>:<seq>``
         """
-        from confgraph.change_ir import ChangeOp, Verb, encode_legacy
+        from confgraph.change_ir import ChangeOp, Verb
 
         tombstones: list[str] = []
         parse = self._get_parse_obj()
@@ -7565,9 +7522,7 @@ class IOSParser(BaseParser):
                 # regenerate the tombstone FROM it (single source, byte-exact).
                 # Unconditional — statics have no _readded_later guard; the
                 # ops-mode ordered apply fixes delete-then-readd instead.
-                tombstones.extend(
-                    self._queue_native_static_delete(tombstone, obj).no_commands
-                )
+                self._queue_native_static_delete(tombstone, obj)
         # --- vlan database deletions ---
         # Change-IR Phase 3 family 8c (CCR Appendix V): each expanded id
         # becomes a NATIVE, line-numbered OBJECT_DELETE ``("vlan", <id>)``
@@ -7587,15 +7542,11 @@ class IOSParser(BaseParser):
                         try:
                             start, end = part.split("-", 1)
                             for vid in range(int(start), int(end) + 1):
-                                tombstones.extend(
-                                    self._queue_native_vlan_delete(str(vid), obj)
-                                )
+                                self._queue_native_vlan_delete(str(vid), obj)
                         except ValueError:
                             pass
                     else:
-                        tombstones.extend(
-                            self._queue_native_vlan_delete(part, obj)
-                        )
+                        self._queue_native_vlan_delete(part, obj)
 
 
         # --- process-level deletions ---
@@ -7625,8 +7576,15 @@ class IOSParser(BaseParser):
                 if not hasattr(self, "_pending_native_ospf_ops"):
                     self._pending_native_ospf_ops = []
                 self._pending_native_ospf_ops.append(op)
-                tombstones.extend(encode_legacy([op]).no_commands)
 
+        # CCR-0110 Phase E4 op-primary-residual (Finding-1): ``no router bgp <asn>``
+        # is the ONE op-primary deletion with NO native op behind it — its
+        # ChangeOp is DERIVED from this raw tombstone string (empty-and-diff
+        # confirmed IOS/NX-OS/EOS lose only OBJECT_DELETE(process,bgp,<asn>) if the
+        # string is dropped).  It is therefore KEPT as a derived-only survivor,
+        # IOS-XR-style — NOT emission that Phase E removes.  Retiring it (routing
+        # the whole-instance delete through a native line-numbered op) is Phase-5
+        # work; dropping the string now would silently drop the deletion.
         for obj in parse.find_objects(r"^no\s+router\s+bgp\s+"):
             m = re.search(r"^no\s+router\s+bgp\s+(\S+)", obj.text)
             if m:
@@ -7656,7 +7614,6 @@ class IOSParser(BaseParser):
             if not hasattr(self, "_pending_native_isis_ops"):
                 self._pending_native_isis_ops = []
             self._pending_native_isis_ops.append(op)
-            tombstones.extend(encode_legacy([op]).no_commands)
 
         for obj in parse.find_objects(r"^no\s+router\s+eigrp\s+"):
             m = re.search(r"^no\s+router\s+eigrp\s+(\S+)", obj.text)
@@ -7682,7 +7639,6 @@ class IOSParser(BaseParser):
                 if not hasattr(self, "_pending_native_eigrp_ops"):
                     self._pending_native_eigrp_ops = []
                 self._pending_native_eigrp_ops.append(op)
-                tombstones.extend(encode_legacy([op]).no_commands)
 
         # Change-IR WI-DB1-B2 (CCR Appendix AB): the whole-process
         # ``no router rip`` delete — a NATIVE, line-numbered OBJECT_DELETE
@@ -7696,9 +7652,7 @@ class IOSParser(BaseParser):
         # ``_DELETION_RULES["process:rip:"]`` handler in BOTH modes
         # (delete-wins, both textual orders — the 6a-6c posture).
         for obj in parse.find_objects(r"^no\s+router\s+rip\s*$"):
-            tombstones.extend(
-                self._queue_native_keyed_removal("process:rip:", obj).no_commands
-            )
+            self._queue_native_keyed_removal("process:rip:", obj)
 
         # Change-IR family 8f (CCR Appendix Y): the whole-ACL delete is a
         # NATIVE line-numbered OBJECT_DELETE; the byte-exact ``acl:<name>``
@@ -7710,11 +7664,9 @@ class IOSParser(BaseParser):
                 r"^no\s+ip\s+access-list\s+(?:standard|extended)\s+(\S+)", obj.text
             )
             if m:
-                tombstones.extend(
-                    self._queue_native_policy_removal(
+                self._queue_native_policy_removal(
                         f"acl:{m.group(1)}", obj
-                    ).no_commands
-                )
+                    )
 
         # --- route-map sequence deletion ---
         # Family 8f: native LIST_REMOVE at the true line; the engine replay
@@ -7725,11 +7677,9 @@ class IOSParser(BaseParser):
                 r"^no\s+route-map\s+(\S+)\s+(?:permit|deny)\s+(\d+)", obj.text
             )
             if m:
-                tombstones.extend(
-                    self._queue_native_policy_removal(
+                self._queue_native_policy_removal(
                         f"route-map:{m.group(1)}:seq:{m.group(2)}", obj
-                    ).no_commands
-                )
+                    )
                 continue
             # WI-DB1-B2 (CCR Appendix AB): seq-less whole-object
             # ``no route-map <name>`` — a NATIVE, line-numbered
@@ -7743,11 +7693,9 @@ class IOSParser(BaseParser):
             # ``no route-map RM permit`` (action-scoped) stays blind.
             m = re.search(r"^no\s+route-map\s+(\S+)\s*$", obj.text)
             if m:
-                tombstones.extend(
-                    self._queue_native_policy_removal(
+                self._queue_native_policy_removal(
                         f"route-map:{m.group(1)}", obj
-                    ).no_commands
-                )
+                    )
 
         # --- prefix-list sequence deletion ---
         # Family 8f: native LIST_REMOVE (same posture as route-map seqs).
@@ -7756,11 +7704,9 @@ class IOSParser(BaseParser):
                 r"^no\s+ip\s+prefix-list\s+(\S+)\s+seq\s+(\d+)", obj.text
             )
             if m:
-                tombstones.extend(
-                    self._queue_native_policy_removal(
+                self._queue_native_policy_removal(
                         f"prefix-list:{m.group(1)}:seq:{m.group(2)}", obj
-                    ).no_commands
-                )
+                    )
                 continue
             # WI-DB1-B2 (CCR Appendix AB): seq-less whole-object
             # ``no ip prefix-list <name>`` — same D1-class mechanism as the
@@ -7769,11 +7715,9 @@ class IOSParser(BaseParser):
             # ``no ip prefix-list <n> description|permit …`` stay blind.
             m = re.search(r"^no\s+ip\s+prefix-list\s+(\S+)\s*$", obj.text)
             if m:
-                tombstones.extend(
-                    self._queue_native_policy_removal(
+                self._queue_native_policy_removal(
                         f"prefix-list:{m.group(1)}", obj
-                    ).no_commands
-                )
+                    )
 
         # --- WI-DB1-B2 (CCR Appendix AB): policy-list whole-object deletes ---
         # Owner decision: WHOLE-OBJECT only (entry-level ``… permit <val>``
@@ -7796,11 +7740,9 @@ class IOSParser(BaseParser):
             # ``standard|expanded|permit|deny`` becomes undeletable by
             # negation — left blind, never wrongly deleted.
             if m and m.group(1) not in ("standard", "expanded", "permit", "deny"):
-                tombstones.extend(
-                    self._queue_native_keyed_removal(
+                self._queue_native_keyed_removal(
                         f"field:community_lists:{m.group(1)}", obj
-                    ).no_commands
-                )
+                    )
         for obj in parse.find_objects(r"^no\s+ip\s+as-path\s+access-list\s+"):
             m = re.search(
                 r"^no\s+ip\s+as-path\s+access-list\s+(\S+)\s*$", obj.text
@@ -7812,11 +7754,9 @@ class IOSParser(BaseParser):
             # list names are numeric (1–500), so only the action words can
             # arrive here via incomplete CLI — reject them.
             if m and m.group(1) not in ("permit", "deny"):
-                tombstones.extend(
-                    self._queue_native_keyed_removal(
+                self._queue_native_keyed_removal(
                         f"field:as_path_lists:{m.group(1)}", obj
-                    ).no_commands
-                )
+                    )
 
         # --- WI-DB1-B2 (CCR Appendix AB): NAT keyed-entry removals ---
         # The 8b ``field:dhcp:pool:`` shape — native LIST_REMOVE +
@@ -7831,11 +7771,9 @@ class IOSParser(BaseParser):
             t = obj.text.strip()
             m = re.match(r"^no\s+ip\s+nat\s+pool\s+(\S+)", t)
             if m:
-                tombstones.extend(
-                    self._queue_native_singleton_removal(
+                self._queue_native_singleton_removal(
                         f"field:nat:pool:{m.group(1)}", obj
-                    ).no_commands
-                )
+                    )
                 continue
             m = re.match(
                 r"^no\s+ip\s+nat\s+(?:inside|outside)\s+source\s+list\s+(\S+)\s+"
@@ -7843,11 +7781,9 @@ class IOSParser(BaseParser):
                 t,
             )
             if m:
-                tombstones.extend(
-                    self._queue_native_singleton_removal(
+                self._queue_native_singleton_removal(
                         f"field:nat:dynamic:{m.group(1)}", obj
-                    ).no_commands
-                )
+                    )
                 continue
             m = re.match(
                 r"^no\s+ip\s+nat\s+inside\s+source\s+static\s+"
@@ -7863,11 +7799,9 @@ class IOSParser(BaseParser):
                 except ValueError:
                     continue
                 key = f"{m.group(1)}:{m.group(2)}" if m.group(2) else m.group(1)
-                tombstones.extend(
-                    self._queue_native_singleton_removal(
+                self._queue_native_singleton_removal(
                         f"field:nat:static:{key}", obj
-                    ).no_commands
-                )
+                    )
             # Bare/incomplete forms (``no ip nat inside``, list form without
             # pool|interface) and scalar resets (``no ip nat translation …``)
             # stay blind — enumerated in Appendix AB.3.
@@ -7886,29 +7820,23 @@ class IOSParser(BaseParser):
                 obj.text.strip(),
             )
             if m:
-                tombstones.extend(
-                    self._queue_native_singleton_removal(
+                self._queue_native_singleton_removal(
                         f"field:crypto:crypto_map:{m.group(1)}:{m.group(2)}", obj
-                    ).no_commands
-                )
+                    )
                 continue
             m = re.match(r"^no\s+crypto\s+map\s+(\S+)\s*$", obj.text.strip())
             if m:
-                tombstones.extend(
-                    self._queue_native_singleton_removal(
+                self._queue_native_singleton_removal(
                         f"field:crypto:crypto_map:{m.group(1)}", obj
-                    ).no_commands
-                )
+                    )
         for obj in parse.find_objects(r"^no\s+crypto\s+isakmp\s+policy\s+"):
             m = re.match(
                 r"^no\s+crypto\s+isakmp\s+policy\s+(\d+)\s*$", obj.text.strip()
             )
             if m:
-                tombstones.extend(
-                    self._queue_native_singleton_removal(
+                self._queue_native_singleton_removal(
                         f"field:crypto:isakmp_policy:{m.group(1)}", obj
-                    ).no_commands
-                )
+                    )
         for obj in parse.find_objects(r"^no\s+crypto\s+ipsec\s+transform-set\s+"):
             m = re.match(
                 r"^no\s+crypto\s+ipsec\s+transform-set\s+(\S+)", obj.text.strip()
@@ -7916,11 +7844,9 @@ class IOSParser(BaseParser):
             if m:
                 # Trailing transform tokens are allowed — the device accepts
                 # the full-line form and removal is whole-object either way.
-                tombstones.extend(
-                    self._queue_native_singleton_removal(
+                self._queue_native_singleton_removal(
                         f"field:crypto:transform_set:{m.group(1)}", obj
-                    ).no_commands
-                )
+                    )
 
         # --- WI-DB1-B2 (CCR Appendix AB): lines / class-map / policy-map ---
         # Keyed whole-object deletes on _SIMPLE_LIST_FIELDS collections
@@ -7943,11 +7869,9 @@ class IOSParser(BaseParser):
                 key = f"{line_type}:{m.group(2)}"
                 if m.group(3):
                     key = f"{key}:{m.group(3)}"
-                tombstones.extend(
-                    self._queue_native_keyed_removal(
+                self._queue_native_keyed_removal(
                         f"field:lines:{key}", obj
-                    ).no_commands
-                )
+                    )
         for obj in parse.find_objects(r"^no\s+class-map\s+"):
             # Name extraction mirrors parse_class_maps exactly; the bare
             # ``no class-map match-any|match-all`` (no name — incomplete
@@ -7958,19 +7882,15 @@ class IOSParser(BaseParser):
                 obj.text.strip(),
             )
             if m and m.group(1) not in ("match-any", "match-all"):
-                tombstones.extend(
-                    self._queue_native_keyed_removal(
+                self._queue_native_keyed_removal(
                         f"field:class_maps:{m.group(1)}", obj
-                    ).no_commands
-                )
+                    )
         for obj in parse.find_objects(r"^no\s+policy-map\s+"):
             m = re.match(r"^no\s+policy-map\s+(\S+)\s*$", obj.text.strip())
             if m:
-                tombstones.extend(
-                    self._queue_native_keyed_removal(
+                self._queue_native_keyed_removal(
                         f"field:policy_maps:{m.group(1)}", obj
-                    ).no_commands
-                )
+                    )
 
         # --- singleton protocol removals (whole-section) ---
         # Change-IR family 8b (CCR Appendix U): the whole-section multicast
@@ -7981,11 +7901,9 @@ class IOSParser(BaseParser):
         # (no super(); XR is gated) — untouched.
         _mcast_null_objs = parse.find_objects(r"^no\s+ip\s+multicast-routing")
         if _mcast_null_objs:
-            tombstones.extend(
-                self._queue_native_singleton_removal(
+            self._queue_native_singleton_removal(
                     "singleton:multicast", _mcast_null_objs[0]
-                ).no_commands
-            )
+                )
         # Change-IR family 8a (CCR Appendix T): the whole-section AAA null-out
         # is a NATIVE UNSET; the byte-exact ``singleton:aaa`` tombstone is
         # regenerated FROM it (single source).  The engine replay applies it
@@ -7993,11 +7911,9 @@ class IOSParser(BaseParser):
         # additive-then-deletion order for delete+recreate scripts).
         _aaa_null_objs = parse.find_objects(r"^no\s+aaa\s+new-model")
         if _aaa_null_objs:
-            tombstones.extend(
-                self._queue_native_singleton_removal(
+            self._queue_native_singleton_removal(
                     "singleton:aaa", _aaa_null_objs[0]
-                ).no_commands
-            )
+                )
 
         # --- Multicast entry-level tombstones ---
         # Change-IR family 8b (CCR Appendix U): every entry-level tombstone in
@@ -8008,29 +7924,23 @@ class IOSParser(BaseParser):
         for obj in parse.find_objects(r"^no\s+ip\s+pim\s+rp-address\s+"):
             m = re.match(r"^no\s+ip\s+pim\s+rp-address\s+(\S+)", obj.text.strip())
             if m:
-                tombstones.extend(
-                    self._queue_native_singleton_removal(
+                self._queue_native_singleton_removal(
                         f"field:multicast:rp:{m.group(1)}", obj
-                    ).no_commands
-                )
+                    )
         for obj in parse.find_objects(r"^no\s+ip\s+msdp\s+peer\s+"):
             m = re.match(r"^no\s+ip\s+msdp\s+peer\s+(\S+)", obj.text.strip())
             if m:
-                tombstones.extend(
-                    self._queue_native_singleton_removal(
+                self._queue_native_singleton_removal(
                         f"field:multicast:msdp:{m.group(1)}", obj
-                    ).no_commands
-                )
+                    )
 
         # --- BFD entry-level tombstones ---
         for obj in parse.find_objects(r"^no\s+bfd-template\s+"):
             m = re.match(r"^no\s+bfd-template\s+(?:single-hop|multi-hop)\s+(\S+)", obj.text.strip())
             if m:
-                tombstones.extend(
-                    self._queue_native_singleton_removal(
+                self._queue_native_singleton_removal(
                         f"field:bfd:template:{m.group(1)}", obj
-                    ).no_commands
-                )
+                    )
             # Untyped "no bfd-template <name>" or bare "no bfd ..." (slow-timers
             # etc.) are attribute removals, not service removal — no tombstone.
         # --- Syslog entry-level tombstones ---
@@ -8044,29 +7954,23 @@ class IOSParser(BaseParser):
             t = obj.text.strip()
             m = re.match(r"^no\s+logging\s+host\s+(\S+)", t)
             if m:
-                tombstones.extend(
-                    self._queue_native_singleton_removal(
+                self._queue_native_singleton_removal(
                         f"field:syslog:host:{m.group(1)}", obj
-                    ).no_commands
-                )
+                    )
 
         # --- DNS entry-level tombstones ---
         for obj in parse.find_objects(r"^no\s+ip\s+name-server\s+"):
             m = re.match(r"^no\s+ip\s+name-server\s+(\S+)", obj.text.strip())
             if m:
-                tombstones.extend(
-                    self._queue_native_singleton_removal(
+                self._queue_native_singleton_removal(
                         f"field:dns:name_server:{m.group(1)}", obj
-                    ).no_commands
-                )
+                    )
         for obj in parse.find_objects(r"^no\s+ip\s+domain.list\s+"):
             m = re.match(r"^no\s+ip\s+domain.list\s+(\S+)", obj.text.strip())
             if m:
-                tombstones.extend(
-                    self._queue_native_singleton_removal(
+                self._queue_native_singleton_removal(
                         f"field:dns:domain:{m.group(1)}", obj
-                    ).no_commands
-                )
+                    )
         _lookup_null_objs = parse.find_objects(r"^no\s+ip\s+domain.lookup\s*$")
         if _lookup_null_objs:
             # Targeted action tombstone — disables lookups ONLY.  The former
@@ -8079,48 +7983,38 @@ class IOSParser(BaseParser):
             # engine replay skips it iff the line-detected positive
             # ``ip domain lookup`` op carries a later line); tombstone
             # regenerated byte-exact from the op.
-            tombstones.extend(
-                self._queue_native_singleton_removal(
+            self._queue_native_singleton_removal(
                     "field:dns:lookup_disable", _lookup_null_objs[-1]
-                ).no_commands
-            )
+                )
 
         # --- NetFlow entry-level tombstones ---
         for obj in parse.find_objects(r"^no\s+ip\s+flow-export\s+destination\s+"):
             m = re.match(r"^no\s+ip\s+flow-export\s+destination\s+(\S+)\s+(\d+)", obj.text.strip())
             if m:
-                tombstones.extend(
-                    self._queue_native_singleton_removal(
+                self._queue_native_singleton_removal(
                         f"field:netflow:destination:{m.group(1)}:{m.group(2)}", obj
-                    ).no_commands
-                )
+                    )
         # Bare "no ip flow-export" → whole-section removal.  Family 8b: NATIVE
         # UNSET (pass C, origin-blind — delete-wins, both textual orders).
         _netflow_null_objs = parse.find_objects(r"^no\s+ip\s+flow-export\s*$")
         if _netflow_null_objs:
-            tombstones.extend(
-                self._queue_native_singleton_removal(
+            self._queue_native_singleton_removal(
                     "singleton:netflow", _netflow_null_objs[0]
-                ).no_commands
-            )
+                )
 
         # --- DHCP entry-level tombstones ---
         for obj in parse.find_objects(r"^no\s+ip\s+dhcp\s+pool\s+"):
             m = re.match(r"^no\s+ip\s+dhcp\s+pool\s+(\S+)", obj.text.strip())
             if m:
-                tombstones.extend(
-                    self._queue_native_singleton_removal(
+                self._queue_native_singleton_removal(
                         f"field:dhcp:pool:{m.group(1)}", obj
-                    ).no_commands
-                )
+                    )
         for obj in parse.find_objects(r"^no\s+ip\s+dhcp\s+excluded-address\s+"):
             m = re.match(r"^no\s+ip\s+dhcp\s+excluded-address\s+(\S+)", obj.text.strip())
             if m:
-                tombstones.extend(
-                    self._queue_native_singleton_removal(
+                self._queue_native_singleton_removal(
                         f"field:dhcp:excluded:{m.group(1)}", obj
-                    ).no_commands
-                )
+                    )
         # WI-DB1-B3 (CCR Appendix AC.1): ``no ip dhcp snooping vlan <spec>``
         # removes the EXACT spec-string member (specs are opaque strings on
         # this model surface — partial-range forms stay blind, AC.3).  The
@@ -8134,11 +8028,9 @@ class IOSParser(BaseParser):
                 obj.text.strip(),
             )
             if m:
-                tombstones.extend(
-                    self._queue_native_singleton_removal(
+                self._queue_native_singleton_removal(
                         f"field:dhcp:snooping_vlan:{m.group(1)}", obj
-                    ).no_commands
-                )
+                    )
 
         # --- Spanning-tree vlan_configs tombstones (WI-DB1-B3, Appendix AC.1) ---
         # Whole-entry removal (``no spanning-tree vlan <spec>``) and the
@@ -8163,48 +8055,38 @@ class IOSParser(BaseParser):
                 t,
             )
             if m:
-                tombstones.extend(
-                    self._queue_native_singleton_removal(
+                self._queue_native_singleton_removal(
                         "field:spanning_tree:vlan_reset:"
                         f"{m.group(1)}:{_stp_attr_field[m.group(2)]}",
                         obj,
-                    ).no_commands
-                )
+                    )
                 continue
             m = re.match(r"^no\s+spanning-tree\s+vlan\s+([\d,\-]+)\s*$", t)
             if m:
-                tombstones.extend(
-                    self._queue_native_singleton_removal(
+                self._queue_native_singleton_removal(
                         f"field:spanning_tree:vlan:{m.group(1)}", obj
-                    ).no_commands
-                )
+                    )
 
         # --- NTP entry-level tombstones ---
         for obj in parse.find_objects(r"^no\s+ntp\s+"):
             t = obj.text.strip()
             m = re.match(r"^no\s+ntp\s+server\s+(\S+)", t)
             if m:
-                tombstones.extend(
-                    self._queue_native_singleton_removal(
+                self._queue_native_singleton_removal(
                         f"field:ntp:server:{m.group(1)}", obj
-                    ).no_commands
-                )
+                    )
                 continue
             m = re.match(r"^no\s+ntp\s+peer\s+(\S+)", t)
             if m:
-                tombstones.extend(
-                    self._queue_native_singleton_removal(
+                self._queue_native_singleton_removal(
                         f"field:ntp:peer:{m.group(1)}", obj
-                    ).no_commands
-                )
+                    )
                 continue
             m = re.match(r"^no\s+ntp\s+authentication-key\s+(\d+)", t)
             if m:
-                tombstones.extend(
-                    self._queue_native_singleton_removal(
+                self._queue_native_singleton_removal(
                         f"field:ntp:auth_key:{m.group(1)}", obj
-                    ).no_commands
-                )
+                    )
 
         # --- SNMP entry-level tombstones ---
         # Bare "no snmp-server" (no sub-command) → whole-section removal.
@@ -8214,110 +8096,84 @@ class IOSParser(BaseParser):
         # regenerated byte-exact from the op.
         _snmp_null_objs = parse.find_objects(r"^no\s+snmp-server\s*$")
         if _snmp_null_objs:
-            tombstones.extend(
-                self._queue_native_singleton_removal(
+            self._queue_native_singleton_removal(
                     "singleton:snmp", _snmp_null_objs[0]
-                ).no_commands
-            )
+                )
         for obj in parse.find_objects(r"^no\s+snmp-server\s+"):
             t = obj.text.strip()
             m = re.match(r"^no\s+snmp-server\s+community\s+(\S+)", t)
             if m:
-                tombstones.extend(
-                    self._queue_native_singleton_removal(
+                self._queue_native_singleton_removal(
                         f"field:snmp:community:{m.group(1)}", obj
-                    ).no_commands
-                )
+                    )
                 continue
             m = re.match(r"^no\s+snmp-server\s+host\s+(\S+)", t)
             if m:
-                tombstones.extend(
-                    self._queue_native_singleton_removal(
+                self._queue_native_singleton_removal(
                         f"field:snmp:host:{m.group(1)}", obj
-                    ).no_commands
-                )
+                    )
                 continue
             m = re.match(r"^no\s+snmp-server\s+view\s+(\S+)", t)
             if m:
-                tombstones.extend(
-                    self._queue_native_singleton_removal(
+                self._queue_native_singleton_removal(
                         f"field:snmp:view:{m.group(1)}", obj
-                    ).no_commands
-                )
+                    )
                 continue
             m = re.match(r"^no\s+snmp-server\s+group\s+(\S+)", t)
             if m:
-                tombstones.extend(
-                    self._queue_native_singleton_removal(
+                self._queue_native_singleton_removal(
                         f"field:snmp:group:{m.group(1)}", obj
-                    ).no_commands
-                )
+                    )
                 continue
             m = re.match(r"^no\s+snmp-server\s+user\s+(\S+)", t)
             if m:
-                tombstones.extend(
-                    self._queue_native_singleton_removal(
+                self._queue_native_singleton_removal(
                         f"field:snmp:user:{m.group(1)}", obj
-                    ).no_commands
-                )
+                    )
 
         # --- AAA entry-level tombstones ---
         for obj in parse.find_objects(r"^no\s+aaa\s+authentication\s+"):
             m = re.match(r"^no\s+aaa\s+authentication\s+(\S+)\s+(\S+)", obj.text.strip())
             if m:
-                tombstones.extend(
-                    self._queue_native_singleton_removal(
+                self._queue_native_singleton_removal(
                         f"field:aaa:authentication:{m.group(1)}:{m.group(2)}", obj
-                    ).no_commands
-                )
+                    )
         for obj in parse.find_objects(r"^no\s+aaa\s+authorization\s+"):
             m = re.match(r"^no\s+aaa\s+authorization\s+(\S+)\s+(\S+)", obj.text.strip())
             if m:
-                tombstones.extend(
-                    self._queue_native_singleton_removal(
+                self._queue_native_singleton_removal(
                         f"field:aaa:authorization:{m.group(1)}:{m.group(2)}", obj
-                    ).no_commands
-                )
+                    )
         for obj in parse.find_objects(r"^no\s+aaa\s+accounting\s+"):
             m = re.match(r"^no\s+aaa\s+accounting\s+(\S+)\s+(\S+)", obj.text.strip())
             if m:
-                tombstones.extend(
-                    self._queue_native_singleton_removal(
+                self._queue_native_singleton_removal(
                         f"field:aaa:accounting:{m.group(1)}:{m.group(2)}", obj
-                    ).no_commands
-                )
+                    )
         for obj in parse.find_objects(r"^no\s+tacacs\s+server\s+"):
             m = re.match(r"^no\s+tacacs\s+server\s+(\S+)", obj.text.strip())
             if m:
-                tombstones.extend(
-                    self._queue_native_singleton_removal(
+                self._queue_native_singleton_removal(
                         f"field:aaa:tacacs_named:{m.group(1)}", obj
-                    ).no_commands
-                )
+                    )
         for obj in parse.find_objects(r"^no\s+tacacs-server\s+host\s+"):
             m = re.match(r"^no\s+tacacs-server\s+host\s+(\S+)", obj.text.strip())
             if m:
-                tombstones.extend(
-                    self._queue_native_singleton_removal(
+                self._queue_native_singleton_removal(
                         f"field:aaa:tacacs:{m.group(1)}", obj
-                    ).no_commands
-                )
+                    )
         for obj in parse.find_objects(r"^no\s+radius\s+server\s+"):
             m = re.match(r"^no\s+radius\s+server\s+(\S+)", obj.text.strip())
             if m:
-                tombstones.extend(
-                    self._queue_native_singleton_removal(
+                self._queue_native_singleton_removal(
                         f"field:aaa:radius_named:{m.group(1)}", obj
-                    ).no_commands
-                )
+                    )
         for obj in parse.find_objects(r"^no\s+radius-server\s+host\s+"):
             m = re.match(r"^no\s+radius-server\s+host\s+(\S+)", obj.text.strip())
             if m:
-                tombstones.extend(
-                    self._queue_native_singleton_removal(
+                self._queue_native_singleton_removal(
                         f"field:aaa:radius:{m.group(1)}", obj
-                    ).no_commands
-                )
+                    )
 
         # --- LLDP entry-level tombstones ---
         # Change-IR family 8c (CCR Appendix V): native LIST_REMOVE queued at
@@ -8326,11 +8182,9 @@ class IOSParser(BaseParser):
         for obj in parse.find_objects(r"^no\s+lldp\s+tlv-select\s+"):
             m = re.match(r"^no\s+lldp\s+tlv-select\s+(\S+)", obj.text.strip())
             if m:
-                tombstones.extend(
-                    self._queue_native_singleton_removal(
+                self._queue_native_singleton_removal(
                         f"field:lldp:tlv:{m.group(1)}", obj
-                    ).no_commands
-                )
+                    )
 
         # --- Service entity removals: IP SLA / object track / EEM / banner ---
         # (CCR confgraph_service_entity_removal_tombstones.md.)  Path segments
@@ -8339,41 +8193,28 @@ class IOSParser(BaseParser):
         # (IPSLA / OBJECT_TRACKING / EEM / BANNER) via _TOP_FIELD_AREA.
         # NX-OS/EOS inherit these walks — the syntax is identical there.
         #
-        # Device-true "delete + re-add" = replace: when the SAME entity is
-        # positively re-asserted later in the script (``no ip sla 1`` followed
-        # by ``ip sla 1 …`` — the canonical retarget shape), the keyed replace
-        # merge already models the replacement, and a tombstone would clobber
-        # the re-added entity (deletions apply after the additive pass).  Each
-        # walk therefore suppresses the TOMBSTONE if a positive definition of
-        # the same entity appears after the negation line.
-        #
         # Change-IR Phase 3 family 3 (CCR change_ir_proposal_operations.md,
         # Appendix F): the native ChangeOp is emitted UNCONDITIONALLY at the
         # negation's true script position — ops mode orders delete vs
-        # (re)create structurally, so it needs no suppression.  The guard now
-        # gates only the LEGACY ENCODING: the tombstone string is generated
-        # from the just-emitted op via encode_legacy at the same append site
-        # (byte-identical content and order; single source).  Full guard
-        # retirement is Phase 4.
-        from confgraph.change_ir import ChangeOp, Verb, encode_legacy
+        # (re)create structurally, so it needs no suppression.  CCR-0110
+        # Phase E4/E5 retired the legacy-encoding guard (``_readded_later``)
+        # that used to gate string emission for the delete-then-readd shape:
+        # op-primary parsers no longer persist the deprecated no_commands
+        # string channel, so there is nothing left to suppress — the op is
+        # the single source and the engine resolves ordering structurally.
+        from confgraph.change_ir import ChangeOp, Verb
 
-        def _readded_later(neg_linenum: int, positive_pattern: str) -> bool:
-            return any(
-                o.linenum > neg_linenum
-                for o in parse.find_objects(positive_pattern)
+        def _native_entity_delete(obj, verb, path: tuple) -> None:
+            self._pending_native_entity_ops.append(
+                ChangeOp(
+                    verb=verb,
+                    path=path,
+                    value=None,
+                    source_line=obj.text.strip(),
+                    line_no=obj.linenum,
+                    origin="native",
+                )
             )
-
-        def _native_entity_delete(obj, verb, path: tuple) -> "ChangeOp":
-            op = ChangeOp(
-                verb=verb,
-                path=path,
-                value=None,
-                source_line=obj.text.strip(),
-                line_no=obj.linenum,
-                origin="native",
-            )
-            self._pending_native_entity_ops.append(op)
-            return op
 
         # ``no ip sla <id>`` only — sub-forms (``no ip sla schedule 10``,
         # ``no ip sla responder``) are attribute removals, not entity removal.
@@ -8381,11 +8222,9 @@ class IOSParser(BaseParser):
             m = re.match(r"^no\s+ip\s+sla\s+(\d+)\s*$", obj.text.strip())
             if not m:
                 continue
-            op = _native_entity_delete(
+            _native_entity_delete(
                 obj, Verb.OBJECT_DELETE, ("field", "ip_sla_operations", m.group(1))
             )
-            if not _readded_later(obj.linenum, rf"^ip\s+sla\s+{m.group(1)}\s*$"):
-                tombstones.extend(encode_legacy([op]).no_commands)
 
         # ``no track <id>`` only — ``no track 1 ip sla …`` (attribute negation
         # inside a re-assert) is not a whole-entity removal.
@@ -8393,24 +8232,17 @@ class IOSParser(BaseParser):
             m = re.match(r"^no\s+track\s+(\d+)\s*$", obj.text.strip())
             if not m:
                 continue
-            op = _native_entity_delete(
+            _native_entity_delete(
                 obj, Verb.OBJECT_DELETE, ("field", "object_tracks", m.group(1))
             )
-            if not _readded_later(obj.linenum, rf"^track\s+{m.group(1)}\b"):
-                tombstones.extend(encode_legacy([op]).no_commands)
 
         for obj in parse.find_objects(r"^no\s+event\s+manager\s+applet\s+"):
             m = re.match(r"^no\s+event\s+manager\s+applet\s+(\S+)", obj.text.strip())
             if not m:
                 continue
-            op = _native_entity_delete(
+            _native_entity_delete(
                 obj, Verb.OBJECT_DELETE, ("field", "eem_applets", m.group(1))
             )
-            if not _readded_later(
-                obj.linenum,
-                rf"^event\s+manager\s+applet\s+{re.escape(m.group(1))}\s*$",
-            ):
-                tombstones.extend(encode_legacy([op]).no_commands)
 
         # ``no banner <type>`` → scalar reset of the BannerConfig field.  The
         # tombstone carries the model FIELD name (exec → exec_banner) so the
@@ -8421,13 +8253,11 @@ class IOSParser(BaseParser):
             )
             if not m:
                 continue
-            op = _native_entity_delete(
+            _native_entity_delete(
                 obj,
                 Verb.UNSET,
                 ("field", "banners", self._BANNER_FIELD_BY_CLI[m.group(1)]),
             )
-            if not _readded_later(obj.linenum, rf"^banner\s+{m.group(1)}\b"):
-                tombstones.extend(encode_legacy([op]).no_commands)
 
         # --- whole-VRF deletions ---
         # ``no vrf definition GUEST`` → ``field:vrfs:GUEST``
@@ -8441,11 +8271,9 @@ class IOSParser(BaseParser):
                 # Change-IR family 7a (CCR Appendix R): queue the native
                 # line-numbered OBJECT_DELETE and regenerate the tombstone
                 # FROM it (single source, byte-exact).
-                tombstones.extend(
-                    self._queue_native_vrf_delete(
+                self._queue_native_vrf_delete(
                         f"field:vrfs:{m.group(1)}", obj
-                    ).no_commands
-                )
+                    )
 
         # --- interface deletions ---
         # ``no interface Loopback0`` → ``interface:Loopback0``
@@ -8455,12 +8283,10 @@ class IOSParser(BaseParser):
             m = re.search(r"^no\s+interface\s+(\S+)", obj.text)
             if m:
                 # Change-IR family 8e (CCR Appendix X): queue the native
-                # line-numbered OBJECT_DELETE and regenerate the tombstone
-                # FROM it (single source, byte-exact).
-                tombstones.extend(
-                    self._queue_native_interface_delete(
-                        f"interface:{normalize_interface_name(m.group(1))}", obj
-                    ).no_commands
+                # line-numbered OBJECT_DELETE (op is the single source; the
+                # deprecated no_commands string is retired, CCR-0110 Phase E).
+                self._queue_native_interface_delete(
+                    f"interface:{normalize_interface_name(m.group(1))}", obj
                 )
 
         # --- ACE-level deletions: "no <seq>" inside ip access-list blocks ---
@@ -8480,11 +8306,9 @@ class IOSParser(BaseParser):
                     # Family 8f (CCR Appendix Y): native ACE removal at the
                     # true child line; the ``acl-seq:<name>:<seq>``
                     # tombstone is regenerated FROM it (single source).
-                    tombstones.extend(
-                        self._queue_native_policy_removal(
+                    self._queue_native_policy_removal(
                             f"acl-seq:{acl_name}:{m2.group(1)}", child
-                        ).no_commands
-                    )
+                        )
 
         # --- Registry-driven nested block deletions ---
         # Each NestedDeletionRule maps a (parent_block, nested_no_command) pair
@@ -8530,11 +8354,9 @@ class IOSParser(BaseParser):
                     # same position (single source, the family-4 pattern).
                     # Non-VRF templates are unchanged.
                     if rule.template.startswith("vrfs:"):
-                        tombstones.extend(
-                            self._queue_native_vrf_removal(
+                        self._queue_native_vrf_removal(
                                 nested_tombstone, child
-                            ).no_commands
-                        )
+                            )
                     # Change-IR family 8e (CCR Appendix X): the two
                     # interface member-removal templates (helper /
                     # nhrp_nhs) are queued as NATIVE line-numbered
@@ -8543,30 +8365,19 @@ class IOSParser(BaseParser):
                     # (single source, the 7a pattern).  Other templates
                     # are unchanged.
                     elif rule.template.startswith("interface:"):
-                        tombstones.extend(
-                            self._queue_native_iface_member_removal(
+                        self._queue_native_iface_member_removal(
                                 nested_tombstone, child
-                            ).no_commands
-                        )
+                            )
                     else:
                         tombstones.append(nested_tombstone)
 
-        # WI-DB2 (CCR Appendix AD): drain the byte-exact legacy twins of the
-        # family-6 IGP withdrawal ops queued by parse_ospf / parse_eigrp
-        # (both run BEFORE this step in the base parse loop).  The strings
-        # were regenerated FROM the ops via encode_legacy at emission time
-        # (single source); suppression (WI-8 re-added-later) already applied
-        # there, so a suppressed refresh emits NEITHER the op NOR the twin.
-        # IOS-XR overrides parse_deletion_commands without super() — its own
-        # parse_ospf never emits these; the inherited parse_eigrp op stays
-        # ops-only on XR (disclosed, the `no network` posture).
-        tombstones.extend(
-            getattr(self, "_pending_ospf_negation_tombstones", None) or []
-        )
-        tombstones.extend(
-            getattr(self, "_pending_eigrp_negation_tombstones", None) or []
-        )
-
+        # CCR-0110 Phase E4/E5: the family-6 IGP withdrawal ops queued by
+        # parse_ospf / parse_eigrp used to drain their byte-exact legacy twins
+        # into ``tombstones`` here; op-primary parsers no longer persist the
+        # deprecated no_commands string channel, so only the native ops remain
+        # (queued in place; the drain and its two pending-tombstone lists are
+        # retired).  ``tombstones`` now carries only the derived-only
+        # ``process:bgp:`` entries (no native op behind them, IOS-XR-style).
         return tombstones
 
     def parse_acls(self) -> list[ACLConfig]:
@@ -9268,11 +9079,6 @@ class IOSParser(BaseParser):
         # (the ``process:eigrp`` whole-process delete emitter, which APPENDS
         # getattr-safe), so the reset here owns the per-parse lifecycle.
         self._pending_native_eigrp_ops = []
-        # WI-DB2 (CCR Appendix AD): byte-exact legacy twins for the
-        # ``no redistribute`` withdrawal ops emitted below — regenerated FROM
-        # the ops via encode_legacy (single source) and drained into
-        # ``no_commands`` by parse_deletion_commands.
-        self._pending_eigrp_negation_tombstones = []
 
         for eigrp_obj in parse.find_objects(r"^router\s+eigrp\s+"):
             # CCR-0067: NX-OS nests a named EIGRP instance's attributes
@@ -9515,10 +9321,6 @@ class IOSParser(BaseParser):
                     origin="native",
                 )
                 self._pending_native_eigrp_ops.append(op)
-                from confgraph.change_ir import encode_legacy
-                self._pending_eigrp_negation_tombstones.extend(
-                    encode_legacy([op]).no_commands
-                )
 
             # misc
             auto_summary = bool(eigrp_obj.find_child_objects(r"^\s+auto-summary"))

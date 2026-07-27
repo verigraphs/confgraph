@@ -19,8 +19,6 @@ Run:
 
 from __future__ import annotations
 
-import re
-
 import pytest
 
 from confgraph.change_ir import (
@@ -28,6 +26,7 @@ from confgraph.change_ir import (
     Verb,
     derive_ops,
     encode_legacy,
+    encode_legacy_shim,
 )
 from confgraph.parsers.eos_parser import EOSParser
 from confgraph.parsers.ios_parser import IOSParser
@@ -41,130 +40,27 @@ from confgraph.parsers.nxos_parser import NXOSParser
 # ---------------------------------------------------------------------------
 
 
-_FAMILY3_TOMBSTONE_PREFIXES = (
-    "field:ip_sla_operations:",
-    "field:object_tracks:",
-    "field:eem_applets:",
-    "field:banners:",
-)
-
-# WI-DB2 (CCR Appendix AD): the four OSPF withdrawal-twin shapes + the EIGRP
-# redistribute twin — vrf-scoped (segment 3 is the vrf, "" for global), which
-# keeps them disjoint from the derived VRF-blind stub/nssa area resets.
-_DB2_IGP_TWIN_RE = re.compile(
-    r"^field:(?:"
-    r"(?:ospf|eigrp):[^:]+:[^:]*:redistribute:"
-    r"|ospf:[^:]+:[^:]*:default_information_originate$"
-    r"|ospf:[^:]+:[^:]*:area:[^:]+:virtual_link:"
-    r"|ospf:[^:]+:[^:]*:area:[^:]+:filter_list_(?:in|out)$"
-    r")"
-)
-
-
-def _is_reordered_native_tombstone(t: str) -> bool:
-    """Tombstones whose emitting family is native since Phase 3 and therefore
-    hoisted to the front of the composed ChangeSet (multiset, not sequence).
-
-    Family 3 (service entities) + family 4 (``static:`` route removals,
-    CCR Appendix G) + family 6a (``process:isis:`` whole-process removal,
-    CCR Appendix M) + family 6b (``process:eigrp:`` whole-process removal,
-    CCR Appendix N) + family 6c (``process:ospf:`` whole-process removal,
-    CCR Appendix O) + family 7a (``field:vrfs:`` RT/rd removals and whole-VRF
-    deletes, CCR Appendix R) + family 8a (the five comms-singleton sections'
-    entry removals, the ``field:dns:lookup_disable`` action, and the
-    ``singleton:snmp`` / ``singleton:aaa`` null-outs, CCR Appendix T) +
-    family 8b (the seven infra-singleton sections' entry removals /
-    scalar resets and the ``singleton:netflow`` / ``singleton:multicast``
-    null-outs, CCR Appendix U) + family 8c (``field:lldp:tlv:`` TLV removals
-    and ``vlan:`` VLAN-database deletes, CCR Appendix V) — each
-    encodes byte-exactly but no longer at its legacy walk-group position in
-    ``no_commands``.  Non-weakening: order among these and other families is
-    semantically inert — each dispatches to an independent
-    ``_FIELD_PATH_ACCESSORS`` / ``_DELETION_RULES`` handler over disjoint
-    fields (the Appendix F deviation precedent).  (``process:bgp:`` stays
-    derived until 5a-retirement; the IOS-XR ``singleton:ntp`` /
-    ``singleton:dns`` stay DERIVED — the family-8a XR gate — and keep their
-    exact sequence position.  The IOS-XR DERIVED ``singleton:multicast``
-    shares its string with the now-native IOS one, so it joins the
-    order-exempt multiset — order among singleton null-outs is inert, the
-    same F-precedent argument.)
-    """
-    return (
-        t.startswith(_FAMILY3_TOMBSTONE_PREFIXES)
-        or t.startswith("static:")
-        or t.startswith("process:isis:")
-        or t.startswith("process:eigrp:")
-        or t.startswith("process:ospf:")
-        or t.startswith("field:vrfs:")
-        or t.startswith(
-            ("field:ntp:", "field:snmp:", "field:syslog:", "field:dns:", "field:aaa:")
-        )
-        or t.startswith(
-            (
-                "field:dhcp:",
-                "field:netflow:",
-                "field:multicast:",
-                "field:bfd:",
-                "field:vxlan:",
-                "field:vpc:",
-                "field:mpls:",
-            )
-        )
-        or t.startswith(("field:lldp:", "vlan:"))
-        # WI-DB2 (CCR Appendix AD): the family-6 IGP withdrawal twins
-        # (``field:ospf:<pid>:<vrf>:…`` / ``field:eigrp:<asn>:<vrf>:…``,
-        # vrf-scoped) are regenerated from NATIVE line-numbered ops hoisted
-        # to the front of the composed ChangeSet.  Non-weakening: same
-        # F-precedent argument — each dispatches to a dedicated
-        # _FIELD_PATH_ACCESSORS accessor over disjoint fields.  The regex is
-        # shape-exact so the DERIVED stub/nssa ``field:ospf:<pid>:area:…``
-        # resets KEEP their byte-exact sequence pin.
-        or _DB2_IGP_TWIN_RE.match(t) is not None
-        # Family 8e (CCR Appendix X): interface member removals
-        # (helper / nhrp_nhs — the only two ``field:interface:…`` 5-segment
-        # shapes) and whole-interface deletes.  Non-weakening: the member
-        # removals dispatch to the two dedicated _FIELD_PATH_ACCESSORS
-        # accessors (disjoint from every other family's fields), and
-        # ``interface:`` deletes dispatch to _del_interface — order among
-        # these and other families' tombstones is semantically inert (the
-        # same F-precedent argument as above).
-        or t.startswith(("field:interface:", "interface:"))
-        or t in ("singleton:snmp", "singleton:aaa", "singleton:netflow", "singleton:multicast")
-    )
-
-
 def _roundtrip(cfg):
-    """derive → encode and assert every legacy tombstone artifact is
-    reproduced byte-exactly, in order, in the right container.
+    """derive → reconstruct the legacy tombstone vocabulary from the composed
+    ChangeSet and return ``(ops, artifact)``.
 
-    Native-family exception (CCR Appendices F/G): service-entity (family 3)
-    and static-route (family 4) deletion ops are NATIVE and sit in the
-    composed ChangeSet at their true script positions, ahead of the derived
-    remainder — so their tombstones encode byte-exactly but not at their
-    legacy walk-group position in ``no_commands``.  Order among them and
-    other families is semantically inert (each dispatches to an independent
-    handler over disjoint fields), so the contract here is: byte-exact
-    multiset for those subsequences, byte-exact SEQUENCE for everything else.
+    CCR-0110 Phase E: op-primary parsers (IOS/NX-OS/EOS) no longer populate
+    ``no_commands`` / ``interface_no_commands`` / ``bgp_no_commands`` — the
+    composed ChangeSet is the source of truth for every deletion, and the legacy
+    string vocabulary is *reconstructed* from it by ``encode_legacy_shim`` (the
+    golden-pinned inverse codec, byte-exact vs frozen goldens in
+    ``test_change_ir_shim_phase4``).  Callers therefore assert op verbs/paths on
+    ``ops`` (the source of truth, arm B) and the reconstructed string vocabulary
+    /container placement on the returned ``artifact`` (the codec, arm A) — never
+    on ``cfg.no_commands`` (empty for op-primary; IOS-XR still emits its
+    derived-only strings, excepted through Phase 5, and reconstructs identically).
+
+    The reconstruction is a byte-exact multiset for the natively hoisted families
+    and byte-exact SEQUENCE for everything else (the established ``encode_legacy``
+    /shim contract); unrecognized blocks are not tombstones and survive verbatim.
     """
     ops = derive_ops(cfg)
-    art = encode_legacy(ops)
-
-    assert [t for t in art.no_commands if not _is_reordered_native_tombstone(t)] == [
-        t for t in cfg.no_commands if not _is_reordered_native_tombstone(t)
-    ]
-    assert sorted(
-        t for t in art.no_commands if _is_reordered_native_tombstone(t)
-    ) == sorted(
-        t for t in cfg.no_commands if _is_reordered_native_tombstone(t)
-    )
-    assert art.interface_no_commands == {
-        i.name: list(i.no_commands) for i in cfg.interfaces if i.no_commands
-    }
-    assert art.bgp_no_commands == {
-        (str(b.asn), b.vrf or ""): list(b.no_commands)
-        for b in cfg.bgp_instances
-        if b.no_commands
-    }
+    art = encode_legacy_shim(ops)
     assert art.unrecognized_blocks == list(cfg.unrecognized_blocks)
     return ops, art
 
@@ -267,8 +163,8 @@ class TestTopLevelTombstoneFamilies:
         # the verbatim source line (was: derived from the tombstone with
         # line_no == -1).  Path/verb/tombstone are unchanged (byte-exact).
         cfg = _parse_ios("no interface Loopback0\n")
-        assert "interface:Loopback0" in cfg.no_commands
-        ops, _ = _roundtrip(cfg)
+        ops, art = _roundtrip(cfg)
+        assert "interface:Loopback0" in art.no_commands
         op = _op_for_tombstone(ops, "interface:Loopback0")
         assert op.verb is Verb.OBJECT_DELETE
         assert op.path == ("interface", "Loopback0")
@@ -278,21 +174,21 @@ class TestTopLevelTombstoneFamilies:
 
     def test_static_route_removal_with_next_hop(self):
         cfg = _parse_ios("no ip route 10.0.0.0 255.0.0.0 10.1.1.1\n")
-        assert any(t.startswith("static:") for t in cfg.no_commands)
-        ops, _ = _roundtrip(cfg)
+        ops, art = _roundtrip(cfg)
+        assert any(t.startswith("static:") for t in art.no_commands)
         op = _ops_with_verb(ops, Verb.LIST_REMOVE)[0]
         assert op.path[0] == "static"
 
     def test_static_route_removal_vrf(self):
         cfg = _parse_ios("no ip route vrf CUST 192.168.0.0 255.255.0.0\n")
-        assert any(t.startswith("static:CUST:") for t in cfg.no_commands)
-        _roundtrip(cfg)
+        _, art = _roundtrip(cfg)
+        assert any(t.startswith("static:CUST:") for t in art.no_commands)
 
     def test_vlan_delete_including_ranges(self):
         cfg = _parse_ios("no vlan 100\nno vlan 200-202\n")
-        assert "vlan:100" in cfg.no_commands
-        assert "vlan:201" in cfg.no_commands
-        ops, _ = _roundtrip(cfg)
+        ops, art = _roundtrip(cfg)
+        assert "vlan:100" in art.no_commands
+        assert "vlan:201" in art.no_commands
         vlan_ops = [op for op in ops if op.path[0] == "vlan"]
         assert len(vlan_ops) == 4
         assert all(op.verb is Verb.OBJECT_DELETE for op in vlan_ops)
@@ -301,13 +197,13 @@ class TestTopLevelTombstoneFamilies:
         cfg = _parse_ios(
             "no router ospf 1\nno router bgp 65000\nno router isis CORE\nno router eigrp 10\n"
         )
+        ops, art = _roundtrip(cfg)
         assert {
             "process:ospf:1",
             "process:bgp:65000",
             "process:isis:CORE",
             "process:eigrp:10",
-        } <= set(cfg.no_commands)
-        ops, _ = _roundtrip(cfg)
+        } <= set(art.no_commands)
         proc_ops = [op for op in ops if op.path[0] == "process"]
         assert len(proc_ops) == 4
         assert all(op.verb is Verb.OBJECT_DELETE for op in proc_ops)
@@ -319,9 +215,9 @@ class TestTopLevelTombstoneFamilies:
             "ip access-list extended EDIT-ACL\n"
             " no 20\n"
         )
-        assert "acl:OLD-ACL" in cfg.no_commands
-        assert "acl-seq:EDIT-ACL:20" in cfg.no_commands
-        ops, _ = _roundtrip(cfg)
+        ops, art = _roundtrip(cfg)
+        assert "acl:OLD-ACL" in art.no_commands
+        assert "acl-seq:EDIT-ACL:20" in art.no_commands
         assert _op_for_tombstone(ops, "acl:OLD-ACL").verb is Verb.OBJECT_DELETE
         ace = _op_for_tombstone(ops, "acl-seq:EDIT-ACL:20")
         assert ace.verb is Verb.LIST_REMOVE
@@ -331,16 +227,16 @@ class TestTopLevelTombstoneFamilies:
         cfg = _parse_ios(
             "no route-map RM-EDGE permit 10\nno ip prefix-list PL-CORE seq 5\n"
         )
-        assert "route-map:RM-EDGE:seq:10" in cfg.no_commands
-        assert "prefix-list:PL-CORE:seq:5" in cfg.no_commands
-        ops, _ = _roundtrip(cfg)
+        ops, art = _roundtrip(cfg)
+        assert "route-map:RM-EDGE:seq:10" in art.no_commands
+        assert "prefix-list:PL-CORE:seq:5" in art.no_commands
         assert _op_for_tombstone(ops, "route-map:RM-EDGE:seq:10").verb is Verb.LIST_REMOVE
         assert _op_for_tombstone(ops, "prefix-list:PL-CORE:seq:5").verb is Verb.LIST_REMOVE
 
     def test_singleton_removals(self):
         cfg = _parse_ios("no ip multicast-routing\nno aaa new-model\n")
-        assert {"singleton:multicast", "singleton:aaa"} <= set(cfg.no_commands)
-        ops, _ = _roundtrip(cfg)
+        ops, art = _roundtrip(cfg)
+        assert {"singleton:multicast", "singleton:aaa"} <= set(art.no_commands)
         for ts in ("singleton:multicast", "singleton:aaa"):
             assert _op_for_tombstone(ops, ts).verb is Verb.UNSET
 
@@ -366,8 +262,8 @@ class TestTopLevelTombstoneFamilies:
             "field:ospf:1:area:1:stub_reset": Verb.UNSET,
             "field:ospf:1:area:2:nssa_reset": Verb.UNSET,
         }
-        assert set(expected) <= set(cfg.no_commands)
         ops, art = _roundtrip(cfg)
+        assert set(expected) <= set(art.no_commands)
         for ts, verb in expected.items():
             assert _op_for_tombstone(ops, ts).verb is verb
         # helper/nhrp_nhs shapes are TOP-LEVEL (5 segments) — never routed to
@@ -415,8 +311,8 @@ class TestTopLevelTombstoneFamilies:
             "field:multicast:msdp:10.4.4.4",
             "field:bfd:template:FAST",
         }
-        assert expected_list_removes <= set(cfg.no_commands)
-        ops, _ = _roundtrip(cfg)
+        ops, art = _roundtrip(cfg)
+        assert expected_list_removes <= set(art.no_commands)
         for ts in expected_list_removes:
             assert _op_for_tombstone(ops, ts).verb is Verb.LIST_REMOVE, ts
 
@@ -429,13 +325,13 @@ class TestTopLevelTombstoneFamilies:
             "no event manager applet WATCHDOG\n"
             "no banner motd\n"
         )
+        ops, art = _roundtrip(cfg)
         assert {
             "field:ip_sla_operations:10",
             "field:object_tracks:7",
             "field:eem_applets:WATCHDOG",
             "field:banners:motd",
-        } <= set(cfg.no_commands)
-        ops, _ = _roundtrip(cfg)
+        } <= set(art.no_commands)
         assert _op_for_tombstone(ops, "field:ip_sla_operations:10").verb is Verb.OBJECT_DELETE
         assert _op_for_tombstone(ops, "field:object_tracks:7").verb is Verb.OBJECT_DELETE
         assert _op_for_tombstone(ops, "field:eem_applets:WATCHDOG").verb is Verb.OBJECT_DELETE
@@ -459,8 +355,8 @@ class TestTopLevelTombstoneFamilies:
             "field:vrfs:GUEST:rd": Verb.UNSET,
             "field:vrfs:OLDVRF": Verb.OBJECT_DELETE,
         }
-        assert set(expected) <= set(cfg.no_commands)
-        ops, _ = _roundtrip(cfg)
+        ops, art = _roundtrip(cfg)
+        assert set(expected) <= set(art.no_commands)
         for ts, verb in expected.items():
             assert _op_for_tombstone(ops, ts).verb is verb, ts
 
@@ -472,9 +368,9 @@ class TestTopLevelTombstoneFamilies:
             "interface nve1\n"
             " no member vni 10100\n"
         ).parse()
-        assert "field:vpc:peer_keepalive_destination" in cfg.no_commands
-        assert "field:vxlan:vni:10100" in cfg.no_commands
-        ops, _ = _roundtrip(cfg)
+        ops, art = _roundtrip(cfg)
+        assert "field:vpc:peer_keepalive_destination" in art.no_commands
+        assert "field:vxlan:vni:10100" in art.no_commands
         assert (
             _op_for_tombstone(ops, "field:vpc:peer_keepalive_destination").verb
             is Verb.UNSET
@@ -505,20 +401,18 @@ class TestBGPScopedTombstones:
             " no neighbor 10.0.0.2 route-map FILTER in\n"
             " no neighbor 10.0.0.2 shutdown\n"
         )
-        bgp = cfg.bgp_instances[0]
-        assert "neighbor:10.0.0.1" in bgp.no_commands
-        assert "field:neighbor:10.0.0.2:route_map_in" in bgp.no_commands
-        assert "field:neighbor:10.0.0.2:shutdown" in bgp.no_commands
-
         ops, art = _roundtrip(cfg)
+        bgp_recon = art.bgp_no_commands[("65000", "")]
+        assert "neighbor:10.0.0.1" in bgp_recon
+        assert "field:neighbor:10.0.0.2:route_map_in" in bgp_recon
+        assert "field:neighbor:10.0.0.2:shutdown" in bgp_recon
+
         full_removal = _op_for_tombstone(ops, "neighbor:10.0.0.1")
         assert full_removal.verb is Verb.OBJECT_DELETE
         assert full_removal.path == ("bgp_instance", "65000", "", "neighbor", "10.0.0.1")
         field_reset = _op_for_tombstone(ops, "field:neighbor:10.0.0.2:route_map_in")
         assert field_reset.verb is Verb.UNSET
         assert field_reset.path[:3] == ("bgp_instance", "65000", "")
-        # Container placement round-trips to the scoped BGPConfig.
-        assert art.bgp_no_commands[("65000", "")] == list(bgp.no_commands)
 
     def test_vrf_scoped_bgp_instance_container(self):
         cfg = _parse_ios(
@@ -526,12 +420,10 @@ class TestBGPScopedTombstones:
             " address-family ipv4 vrf CUST\n"
             "  no neighbor 172.16.0.1\n"
         )
-        vrf_bgp = next(b for b in cfg.bgp_instances if b.vrf == "CUST")
-        assert "neighbor:172.16.0.1" in vrf_bgp.no_commands
         ops, art = _roundtrip(cfg)
+        assert art.bgp_no_commands[("65000", "CUST")] == ["neighbor:172.16.0.1"]
         op = _op_for_tombstone(ops, "neighbor:172.16.0.1")
         assert op.path[:3] == ("bgp_instance", "65000", "CUST")
-        assert art.bgp_no_commands[("65000", "CUST")] == ["neighbor:172.16.0.1"]
 
 
 # ---------------------------------------------------------------------------
@@ -556,7 +448,6 @@ class TestInterfaceScopedTombstones:
             " no switchport port-security\n"
             " no ip ospf mtu-ignore\n"
         )
-        iface = cfg.interfaces[0]
         expected = {
             "field:interface:GigabitEthernet0/1:enabled",
             "field:interface:GigabitEthernet0/1:description",
@@ -568,15 +459,15 @@ class TestInterfaceScopedTombstones:
             "field:interface:GigabitEthernet0/1:port_security_enabled",
             "field:interface:GigabitEthernet0/1:ospf_mtu_ignore",
         }
-        assert expected <= set(iface.no_commands)
-
         ops, art = _roundtrip(cfg)
+        iface_recon = art.interface_no_commands["GigabitEthernet0/1"]
+        assert expected <= set(iface_recon)
+
         for ts in expected:
             op = _op_for_tombstone(ops, ts)
             assert op.verb is Verb.UNSET, ts
             assert op.path == tuple(ts.split(":"))
         # Container placement: per-interface, not top-level.
-        assert art.interface_no_commands["GigabitEthernet0/1"] == list(iface.no_commands)
         for ts in expected:
             assert ts not in art.no_commands
 
@@ -586,13 +477,13 @@ class TestInterfaceScopedTombstones:
             " switchport trunk allowed vlan add 30,40-42\n"
             " switchport trunk allowed vlan remove 20\n"
         )
-        iface = cfg.interfaces[0]
         add_ts = "field:interface:GigabitEthernet0/2:trunk_allowed_vlans:add:30,40-42"
         rem_ts = "field:interface:GigabitEthernet0/2:trunk_allowed_vlans:remove:20"
-        assert add_ts in iface.no_commands
-        assert rem_ts in iface.no_commands
-
         ops, art = _roundtrip(cfg)
+        iface_recon = art.interface_no_commands["GigabitEthernet0/2"]
+        assert add_ts in iface_recon
+        assert rem_ts in iface_recon
+
         add_op = _op_for_tombstone(ops, add_ts)
         assert add_op.verb is Verb.LIST_ADD
         assert add_op.value == "30,40-42"
@@ -826,7 +717,10 @@ class TestCorpusSmoke:
     )
     def test_derive_and_roundtrip(self, label, parser_cls, text):
         cfg = parser_cls(text).parse()
-        ops, _ = _roundtrip(cfg)  # crash-free + byte-exact round-trip
+        # CCR-0110 Phase E: derive is crash-free across every OS and the shim
+        # reconstruction of the legacy vocabulary is crash-free; byte-exact
+        # encoding is pinned against frozen goldens by test_change_ir_shim_phase4.
+        ops, _ = _roundtrip(cfg)
         # Every op is well-formed.
         for op in ops:
             assert isinstance(op, ChangeOp)

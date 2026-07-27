@@ -24,6 +24,7 @@ from confgraph.change_ir import (
     Verb,
     derive_ops,
     encode_legacy,
+    encode_legacy_shim,
     interface_scalar_fields,
     _derive_interface_set_ops,
 )
@@ -35,6 +36,15 @@ from confgraph.parsers.nxos_parser import NXOSParser
 
 def _parse(text: str, parser_cls=IOSParser):
     return parser_cls(text).parse()
+
+
+def _iface_nc(pc, name):
+    """CCR-0110 Phase E: op-primary parsers no longer populate
+    ``interface_no_commands`` — the deletion is carried by native ChangeOps and
+    the legacy tombstone vocabulary is reconstructed from the composed ChangeSet
+    by the golden-pinned shim codec (byte-exact vs ``test_change_ir_shim_phase4``).
+    """
+    return encode_legacy_shim(derive_ops(pc)).interface_no_commands.get(name, [])
 
 
 KITCHEN_SINK = (
@@ -207,7 +217,7 @@ class TestNativeUnsetEmission:
         assert op.line_no > 0
         assert op.origin == "native"
         # tombstone regenerated from the op — byte-identical to pre-Phase-3
-        assert pc.interfaces[0].no_commands == [
+        assert _iface_nc(pc, "GigabitEthernet0/0") == [
             "field:interface:GigabitEthernet0/0:enabled"
         ]
 
@@ -230,7 +240,7 @@ class TestNativeUnsetEmission:
             " no ip ospf mtu-ignore\n"
         )
         p = "field:interface:GigabitEthernet0/1"
-        assert pc.interfaces[0].no_commands == [
+        assert _iface_nc(pc, "GigabitEthernet0/1") == [
             f"{p}:description",
             f"{p}:trunk_allowed_vlans:add:30",
             f"{p}:ospf_cost",
@@ -362,7 +372,7 @@ class TestInheritance:
         assert str(ip_op.value) == "10.0.0.1/30"
         assert by_path[("interface", "Ethernet1/1", "lldp_transmit")].value is True
         assert ("field", "interface", "Ethernet1/1", "enabled") in by_path
-        assert pc.interfaces[0].no_commands == [
+        assert _iface_nc(pc, "Ethernet1/1") == [
             "field:interface:Ethernet1/1:enabled"
         ]
 
@@ -388,6 +398,6 @@ class TestInheritance:
         assert op.path == ("field", "interface", "GigabitEthernet0/0/0/0", "acl_in")
         assert op.source_line == "no ipv4 access-group EDGE-IN ingress"
         assert op.origin == "native"
-        assert pc.interfaces[0].no_commands == [
+        assert _iface_nc(pc, "GigabitEthernet0/0/0/0") == [
             "field:interface:GigabitEthernet0/0/0/0:acl_in"
         ]

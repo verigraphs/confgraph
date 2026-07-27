@@ -46,6 +46,7 @@ from confgraph.parsers.eos_parser import EOSParser
 from confgraph.parsers.ios_parser import IOSParser
 from confgraph.parsers.iosxr_parser import IOSXRParser
 from confgraph.parsers.nxos_parser import NXOSParser
+from tests._ccr0110_e_helpers import legacy_artifacts
 
 KITCHEN_SINK = """hostname r1
 ip access-list extended ACL-IN
@@ -272,7 +273,7 @@ class TestRetirement:
 class TestRemovalTwins:
     def test_byte_exact_twins_and_walk_positions(self):
         pc = IOSParser(REMOVALS).parse()
-        assert pc.no_commands == [
+        assert legacy_artifacts(pc).no_commands == [
             "acl:ACL-OLD",
             "route-map:RM-OUT:seq:20",
             "prefix-list:PL-A:seq:10",
@@ -285,7 +286,7 @@ class TestRemovalTwins:
             t
             for t in art.no_commands
             if t.split(":")[0] in ("acl", "acl-seq", "route-map", "prefix-list")
-        ) == sorted(pc.no_commands)
+        ) == sorted(legacy_artifacts(pc).no_commands)
 
     def test_verbs_from_codec_registry(self):
         pc = IOSParser(REMOVALS).parse()
@@ -314,7 +315,7 @@ no route-map RM-NX permit 20
             ("acls", "ACL-NX"),
             ("route_maps", "RM-NX"),
         }
-        assert "route-map:RM-NX:seq:20" in pc.no_commands
+        assert "route-map:RM-NX:seq:20" in legacy_artifacts(pc).no_commands
         assert any(is_native_policy_removal_op(op) for op in ops)
 
     def test_eos_shares_the_walks(self):

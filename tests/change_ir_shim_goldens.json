@@ -1,0 +1,847 @@
+{
+ "corpus": {
+  "EOSParser": {
+   "acl_and_ace": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {},
+    "no_commands": [
+     "acl:DEAD"
+    ]
+   },
+   "bgp_scoped": {
+    "bgp_no_commands": {
+     "65000|": [
+      "neighbor:10.0.0.9"
+     ]
+    },
+    "interface_no_commands": {},
+    "no_commands": []
+   },
+   "interface_delete": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {},
+    "no_commands": [
+     "interface:Loopback9"
+    ]
+   },
+   "interface_scoped": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {
+     "GigabitEthernet0/1": [
+      "field:interface:GigabitEthernet0/1:enabled"
+     ]
+    },
+    "no_commands": [
+     "field:interface:GigabitEthernet0/1:helper:10.9.9.9"
+    ]
+   },
+   "mixed_kitchen_sink": {
+    "bgp_no_commands": {
+     "65000|": [
+      "neighbor:10.0.0.9"
+     ]
+    },
+    "interface_no_commands": {
+     "Gi0/2": [
+      "field:interface:Gi0/2:enabled"
+     ]
+    },
+    "no_commands": [
+     "process:ospf:3",
+     "acl:DEAD",
+     "route-map:RM-OLD:seq:10",
+     "field:ntp:server:9.9.9.9",
+     "field:ip_sla_operations:5",
+     "field:vrfs:OLD",
+     "interface:Loopback9"
+    ]
+   },
+   "nested_field_deletes": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {},
+    "no_commands": [
+     "field:ntp:server:9.9.9.9",
+     "field:snmp:community:PUBLIC",
+     "field:interface:Vlan10:helper:10.0.0.100"
+    ]
+   },
+   "policy_seq_deletes": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {},
+    "no_commands": [
+     "route-map:RM-EDGE:seq:20"
+    ]
+   },
+   "process_deletes": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {},
+    "no_commands": [
+     "process:ospf:3",
+     "process:bgp:65010",
+     "process:isis:DEADTAG",
+     "process:eigrp:44"
+    ]
+   },
+   "service_entities": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {},
+    "no_commands": [
+     "field:ip_sla_operations:5",
+     "field:object_tracks:9",
+     "field:eem_applets:OLD",
+     "field:banners:motd"
+    ]
+   },
+   "singleton_nullouts": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {},
+    "no_commands": [
+     "singleton:snmp"
+    ]
+   },
+   "static_routes": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {},
+    "no_commands": [
+     "static::10.0.0.0/24:192.0.2.1",
+     "static:CUST:10.1.0.0/16"
+    ]
+   },
+   "vlan_delete": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {},
+    "no_commands": [
+     "vlan:100",
+     "vlan:200"
+    ]
+   },
+   "vrf_delete": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {},
+    "no_commands": [
+     "field:vrfs:GUEST"
+    ]
+   }
+  },
+  "IOSParser": {
+   "acl_and_ace": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {},
+    "no_commands": [
+     "acl:DEAD"
+    ]
+   },
+   "bgp_scoped": {
+    "bgp_no_commands": {
+     "65000|": [
+      "neighbor:10.0.0.9"
+     ]
+    },
+    "interface_no_commands": {},
+    "no_commands": []
+   },
+   "interface_delete": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {},
+    "no_commands": [
+     "interface:Loopback9"
+    ]
+   },
+   "interface_scoped": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {
+     "GigabitEthernet0/1": [
+      "field:interface:GigabitEthernet0/1:enabled"
+     ]
+    },
+    "no_commands": [
+     "field:interface:GigabitEthernet0/1:helper:10.9.9.9"
+    ]
+   },
+   "mixed_kitchen_sink": {
+    "bgp_no_commands": {
+     "65000|": [
+      "neighbor:10.0.0.9"
+     ]
+    },
+    "interface_no_commands": {
+     "Gi0/2": [
+      "field:interface:Gi0/2:enabled"
+     ]
+    },
+    "no_commands": [
+     "process:ospf:3",
+     "acl:DEAD",
+     "route-map:RM-OLD:seq:10",
+     "field:ntp:server:9.9.9.9",
+     "field:ip_sla_operations:5",
+     "field:vrfs:OLD",
+     "interface:Loopback9"
+    ]
+   },
+   "nested_field_deletes": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {},
+    "no_commands": [
+     "field:ntp:server:9.9.9.9",
+     "field:snmp:community:PUBLIC",
+     "field:interface:Vlan10:helper:10.0.0.100"
+    ]
+   },
+   "policy_seq_deletes": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {},
+    "no_commands": [
+     "route-map:RM-EDGE:seq:20"
+    ]
+   },
+   "process_deletes": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {},
+    "no_commands": [
+     "process:ospf:3",
+     "process:bgp:65010",
+     "process:isis:DEADTAG",
+     "process:eigrp:44"
+    ]
+   },
+   "service_entities": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {},
+    "no_commands": [
+     "field:ip_sla_operations:5",
+     "field:object_tracks:9",
+     "field:eem_applets:OLD",
+     "field:banners:motd"
+    ]
+   },
+   "singleton_nullouts": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {},
+    "no_commands": [
+     "singleton:snmp"
+    ]
+   },
+   "static_routes": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {},
+    "no_commands": [
+     "static::10.0.0.0/24:192.0.2.1",
+     "static:CUST:10.1.0.0/16"
+    ]
+   },
+   "vlan_delete": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {},
+    "no_commands": [
+     "vlan:100",
+     "vlan:200"
+    ]
+   },
+   "vrf_delete": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {},
+    "no_commands": [
+     "field:vrfs:GUEST"
+    ]
+   }
+  },
+  "IOSXRParser": {
+   "acl_and_ace": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {},
+    "no_commands": []
+   },
+   "bgp_scoped": {
+    "bgp_no_commands": {
+     "65000|": [
+      "neighbor:10.0.0.9"
+     ]
+    },
+    "interface_no_commands": {},
+    "no_commands": []
+   },
+   "interface_delete": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {},
+    "no_commands": []
+   },
+   "interface_scoped": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {},
+    "no_commands": []
+   },
+   "mixed_kitchen_sink": {
+    "bgp_no_commands": {
+     "65000|": [
+      "neighbor:10.0.0.9"
+     ]
+    },
+    "interface_no_commands": {},
+    "no_commands": [
+     "process:ospf:3",
+     "singleton:ntp"
+    ]
+   },
+   "nested_field_deletes": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {},
+    "no_commands": [
+     "singleton:ntp"
+    ]
+   },
+   "policy_seq_deletes": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {},
+    "no_commands": []
+   },
+   "process_deletes": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {},
+    "no_commands": [
+     "process:ospf:3",
+     "process:bgp:65010",
+     "process:isis:DEADTAG"
+    ]
+   },
+   "service_entities": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {},
+    "no_commands": []
+   },
+   "singleton_nullouts": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {},
+    "no_commands": [
+     "singleton:ntp"
+    ]
+   },
+   "static_routes": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {},
+    "no_commands": []
+   },
+   "vlan_delete": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {},
+    "no_commands": []
+   },
+   "vrf_delete": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {},
+    "no_commands": []
+   }
+  },
+  "NXOSParser": {
+   "acl_and_ace": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {},
+    "no_commands": [
+     "acl:DEAD"
+    ]
+   },
+   "bgp_scoped": {
+    "bgp_no_commands": {
+     "65000|": [
+      "neighbor:10.0.0.9"
+     ]
+    },
+    "interface_no_commands": {},
+    "no_commands": []
+   },
+   "interface_delete": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {},
+    "no_commands": [
+     "interface:Loopback9"
+    ]
+   },
+   "interface_scoped": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {
+     "GigabitEthernet0/1": [
+      "field:interface:GigabitEthernet0/1:enabled"
+     ]
+    },
+    "no_commands": [
+     "field:interface:GigabitEthernet0/1:helper:10.9.9.9"
+    ]
+   },
+   "mixed_kitchen_sink": {
+    "bgp_no_commands": {
+     "65000|": [
+      "neighbor:10.0.0.9"
+     ]
+    },
+    "interface_no_commands": {
+     "Gi0/2": [
+      "field:interface:Gi0/2:enabled"
+     ]
+    },
+    "no_commands": [
+     "process:ospf:3",
+     "acl:DEAD",
+     "route-map:RM-OLD:seq:10",
+     "field:ntp:server:9.9.9.9",
+     "field:ip_sla_operations:5",
+     "field:vrfs:OLD",
+     "interface:Loopback9"
+    ]
+   },
+   "nested_field_deletes": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {},
+    "no_commands": [
+     "field:ntp:server:9.9.9.9",
+     "field:snmp:community:PUBLIC",
+     "field:interface:Vlan10:helper:10.0.0.100"
+    ]
+   },
+   "policy_seq_deletes": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {},
+    "no_commands": [
+     "route-map:RM-EDGE:seq:20"
+    ]
+   },
+   "process_deletes": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {},
+    "no_commands": [
+     "process:ospf:3",
+     "process:bgp:65010",
+     "process:isis:DEADTAG",
+     "process:eigrp:44"
+    ]
+   },
+   "service_entities": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {},
+    "no_commands": [
+     "field:ip_sla_operations:5",
+     "field:object_tracks:9",
+     "field:eem_applets:OLD",
+     "field:banners:motd"
+    ]
+   },
+   "singleton_nullouts": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {},
+    "no_commands": [
+     "singleton:snmp"
+    ]
+   },
+   "static_routes": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {},
+    "no_commands": [
+     "static::10.0.0.0/24:192.0.2.1",
+     "static:CUST:10.1.0.0/16"
+    ]
+   },
+   "vlan_delete": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {},
+    "no_commands": [
+     "vlan:100",
+     "vlan:200"
+    ]
+   },
+   "vrf_delete": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {},
+    "no_commands": [
+     "field:vrfs:GUEST"
+    ]
+   }
+  }
+ },
+ "create": {
+  "EOSParser": {
+   "L_bgp_instance": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {},
+    "no_commands": []
+   },
+   "Q_eigrp_process": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {},
+    "no_commands": []
+   },
+   "Q_isis_process": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {},
+    "no_commands": []
+   },
+   "Q_ospf_process": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {},
+    "no_commands": []
+   },
+   "S_vrf": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {},
+    "no_commands": []
+   },
+   "T_singleton_ntp": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {},
+    "no_commands": []
+   },
+   "U_singleton_dhcp": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {},
+    "no_commands": []
+   },
+   "V_singleton_lldp": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {},
+    "no_commands": []
+   },
+   "W_nat": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {},
+    "no_commands": []
+   },
+   "Y_acl": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {},
+    "no_commands": []
+   },
+   "Y_prefix_list": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {},
+    "no_commands": []
+   },
+   "Y_route_map": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {},
+    "no_commands": []
+   }
+  },
+  "IOSParser": {
+   "L_bgp_instance": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {},
+    "no_commands": []
+   },
+   "Q_eigrp_process": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {},
+    "no_commands": []
+   },
+   "Q_isis_process": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {},
+    "no_commands": []
+   },
+   "Q_ospf_process": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {},
+    "no_commands": []
+   },
+   "S_vrf": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {},
+    "no_commands": []
+   },
+   "T_singleton_ntp": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {},
+    "no_commands": []
+   },
+   "U_singleton_dhcp": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {},
+    "no_commands": []
+   },
+   "V_singleton_lldp": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {},
+    "no_commands": []
+   },
+   "W_nat": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {},
+    "no_commands": []
+   },
+   "Y_acl": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {},
+    "no_commands": []
+   },
+   "Y_prefix_list": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {},
+    "no_commands": []
+   },
+   "Y_route_map": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {},
+    "no_commands": []
+   }
+  },
+  "IOSXRParser": {
+   "L_bgp_instance": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {},
+    "no_commands": []
+   },
+   "Q_eigrp_process": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {},
+    "no_commands": []
+   },
+   "Q_isis_process": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {},
+    "no_commands": []
+   },
+   "Q_ospf_process": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {},
+    "no_commands": []
+   },
+   "S_vrf": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {},
+    "no_commands": []
+   },
+   "T_singleton_ntp": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {},
+    "no_commands": []
+   },
+   "U_singleton_dhcp": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {},
+    "no_commands": []
+   },
+   "V_singleton_lldp": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {},
+    "no_commands": []
+   },
+   "W_nat": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {},
+    "no_commands": []
+   },
+   "Y_acl": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {},
+    "no_commands": []
+   },
+   "Y_prefix_list": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {},
+    "no_commands": []
+   },
+   "Y_route_map": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {},
+    "no_commands": []
+   }
+  },
+  "NXOSParser": {
+   "L_bgp_instance": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {},
+    "no_commands": []
+   },
+   "Q_eigrp_process": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {},
+    "no_commands": []
+   },
+   "Q_isis_process": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {},
+    "no_commands": []
+   },
+   "Q_ospf_process": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {},
+    "no_commands": []
+   },
+   "S_vrf": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {},
+    "no_commands": []
+   },
+   "T_singleton_ntp": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {},
+    "no_commands": []
+   },
+   "U_singleton_dhcp": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {},
+    "no_commands": []
+   },
+   "V_singleton_lldp": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {},
+    "no_commands": []
+   },
+   "W_nat": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {},
+    "no_commands": []
+   },
+   "Y_acl": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {},
+    "no_commands": []
+   },
+   "Y_prefix_list": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {},
+    "no_commands": []
+   },
+   "Y_route_map": {
+    "bgp_no_commands": {},
+    "interface_no_commands": {},
+    "no_commands": []
+   }
+  }
+ },
+ "samples": {
+  "eos.txt": {
+   "bgp_no_commands": {},
+   "interface_no_commands": {},
+   "no_commands": []
+  },
+  "ios.txt": {
+   "bgp_no_commands": {},
+   "interface_no_commands": {
+    "GigabitEthernet0/0": [
+     "field:interface:GigabitEthernet0/0:enabled"
+    ],
+    "GigabitEthernet0/1": [
+     "field:interface:GigabitEthernet0/1:enabled"
+    ],
+    "GigabitEthernet0/3": [
+     "field:interface:GigabitEthernet0/3:enabled"
+    ],
+    "GigabitEthernet0/4": [
+     "field:interface:GigabitEthernet0/4:enabled"
+    ],
+    "GigabitEthernet0/5": [
+     "field:interface:GigabitEthernet0/5:enabled"
+    ],
+    "Port-channel1": [
+     "field:interface:Port-channel1:enabled"
+    ],
+    "Vlan10": [
+     "field:interface:Vlan10:enabled"
+    ]
+   },
+   "no_commands": []
+  },
+  "ios01.txt": {
+   "bgp_no_commands": {},
+   "interface_no_commands": {
+    "GigabitEthernet0/0": [
+     "field:interface:GigabitEthernet0/0:enabled"
+    ],
+    "GigabitEthernet0/1": [
+     "field:interface:GigabitEthernet0/1:enabled"
+    ],
+    "GigabitEthernet0/3": [
+     "field:interface:GigabitEthernet0/3:enabled"
+    ],
+    "GigabitEthernet0/4": [
+     "field:interface:GigabitEthernet0/4:enabled"
+    ],
+    "GigabitEthernet0/5": [
+     "field:interface:GigabitEthernet0/5:enabled"
+    ],
+    "GigabitEthernet0/6": [
+     "field:interface:GigabitEthernet0/6:enabled"
+    ],
+    "Port-channel1": [
+     "field:interface:Port-channel1:enabled"
+    ],
+    "Vlan10": [
+     "field:interface:Vlan10:enabled"
+    ]
+   },
+   "no_commands": []
+  },
+  "ios_xe.txt": {
+   "bgp_no_commands": {},
+   "interface_no_commands": {
+    "GigabitEthernet1": [
+     "field:interface:GigabitEthernet1:enabled"
+    ],
+    "GigabitEthernet2": [
+     "field:interface:GigabitEthernet2:enabled"
+    ],
+    "GigabitEthernet3": [
+     "field:interface:GigabitEthernet3:enabled"
+    ],
+    "GigabitEthernet4": [
+     "field:interface:GigabitEthernet4:enabled"
+    ],
+    "Port-channel10": [
+     "field:interface:Port-channel10:enabled"
+    ],
+    "TenGigabitEthernet1/0/1": [
+     "field:interface:TenGigabitEthernet1/0/1:enabled"
+    ],
+    "TenGigabitEthernet1/0/2": [
+     "field:interface:TenGigabitEthernet1/0/2:enabled"
+    ],
+    "TenGigabitEthernet1/0/3": [
+     "field:interface:TenGigabitEthernet1/0/3:enabled"
+    ],
+    "Vlan10": [
+     "field:interface:Vlan10:enabled"
+    ],
+    "Vlan20": [
+     "field:interface:Vlan20:enabled"
+    ]
+   },
+   "no_commands": []
+  },
+  "ios_xr.txt": {
+   "bgp_no_commands": {},
+   "interface_no_commands": {},
+   "no_commands": []
+  },
+  "nxos.txt": {
+   "bgp_no_commands": {},
+   "interface_no_commands": {
+    "Ethernet1/1": [
+     "field:interface:Ethernet1/1:enabled"
+    ],
+    "Ethernet1/10": [
+     "field:interface:Ethernet1/10:enabled"
+    ],
+    "Ethernet1/11": [
+     "field:interface:Ethernet1/11:enabled"
+    ],
+    "Ethernet1/2": [
+     "field:interface:Ethernet1/2:enabled"
+    ],
+    "Ethernet1/20": [
+     "field:interface:Ethernet1/20:enabled"
+    ],
+    "Ethernet1/3": [
+     "field:interface:Ethernet1/3:enabled"
+    ],
+    "Ethernet1/4": [
+     "field:interface:Ethernet1/4:enabled"
+    ],
+    "Vlan10": [
+     "field:interface:Vlan10:enabled"
+    ],
+    "Vlan20": [
+     "field:interface:Vlan20:enabled"
+    ]
+   },
+   "no_commands": []
+  }
+ }
+}

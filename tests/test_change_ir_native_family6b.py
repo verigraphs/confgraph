@@ -36,6 +36,7 @@ from confgraph.change_ir import (
 )
 from confgraph.parsers.ios_parser import IOSParser
 from confgraph.parsers.nxos_parser import NXOSParser
+from tests._ccr0110_e_helpers import legacy_artifacts
 
 
 def _parse(text: str, parser_cls=IOSParser):
@@ -185,7 +186,7 @@ def test_process_delete_native_byte_exact():
     op = dels[0]
     assert op.path == ("process", "eigrp", "100")
     assert op.origin == "native" and op.line_no >= 0
-    assert pc.no_commands == ["process:eigrp:100"]
+    assert legacy_artifacts(pc).no_commands == ["process:eigrp:100"]
     assert encode_legacy([op]).no_commands == ["process:eigrp:100"]
 
 
@@ -265,7 +266,7 @@ def test_nxos_inherits_process_eigrp_delete():
     pc = _parse("no router eigrp 100\n", parser_cls=NXOSParser)
     dels = [op for op in _f6b(pc) if op.verb is Verb.OBJECT_DELETE]
     assert dels and dels[0].path == ("process", "eigrp", "100")
-    assert pc.no_commands == ["process:eigrp:100"]
+    assert legacy_artifacts(pc).no_commands == ["process:eigrp:100"]
 
 
 def test_vrf_instance_keys_carry_vrf():

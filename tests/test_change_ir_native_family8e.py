@@ -37,6 +37,7 @@ from confgraph.parsers.eos_parser import EOSParser
 from confgraph.parsers.ios_parser import IOSParser
 from confgraph.parsers.iosxr_parser import IOSXRParser
 from confgraph.parsers.nxos_parser import NXOSParser
+from tests._ccr0110_e_helpers import legacy_artifacts
 
 KITCHEN_SINK = """hostname r1
 interface GigabitEthernet0/0
@@ -251,8 +252,8 @@ class TestRemovalTwins:
             " no ip nhrp nhs 203.0.113.1\n"
         )
         pc = IOSParser(cfg).parse()
-        assert "field:interface:Vlan10:helper:10.0.0.100" in pc.no_commands
-        assert "field:interface:Tunnel0:nhrp_nhs:203.0.113.1" in pc.no_commands
+        assert "field:interface:Vlan10:helper:10.0.0.100" in legacy_artifacts(pc).no_commands
+        assert "field:interface:Tunnel0:nhrp_nhs:203.0.113.1" in legacy_artifacts(pc).no_commands
         removals = [
             op
             for op in derive_ops(pc)
@@ -268,7 +269,7 @@ class TestRemovalTwins:
         # Byte-exact regeneration through the codec.
         art = encode_legacy(removals)
         assert sorted(art.no_commands) == sorted(
-            t for t in pc.no_commands if t.startswith("field:interface:")
+            t for t in legacy_artifacts(pc).no_commands if t.startswith("field:interface:")
         )
 
     def test_refresh_idiom_still_emits_both_sides(self):
@@ -280,7 +281,7 @@ class TestRemovalTwins:
             " ip helper-address 10.0.0.100\n"
         )
         pc = IOSParser(cfg).parse()
-        assert "field:interface:Vlan10:helper:10.0.0.100" in pc.no_commands
+        assert "field:interface:Vlan10:helper:10.0.0.100" in legacy_artifacts(pc).no_commands
         ops = derive_ops(pc)
         removal = next(
             op
@@ -294,7 +295,7 @@ class TestRemovalTwins:
 class TestInterfaceDelete:
     def test_native_delete_op_and_twin(self):
         pc = IOSParser("no interface Loopback5\n").parse()
-        assert pc.no_commands == ["interface:Loopback5"]
+        assert legacy_artifacts(pc).no_commands == ["interface:Loopback5"]
         ops = derive_ops(pc)
         deletes = [op for op in ops if is_native_interface_delete_op(op)]
         assert len(deletes) == 1
@@ -310,7 +311,7 @@ class TestInterfaceDelete:
 
     def test_abbreviated_spelling_normalizes(self):
         pc = IOSParser("no interface Gi0/1\n").parse()
-        assert pc.no_commands == ["interface:GigabitEthernet0/1"]
+        assert legacy_artifacts(pc).no_commands == ["interface:GigabitEthernet0/1"]
         (d,) = [op for op in derive_ops(pc) if is_native_interface_delete_op(op)]
         assert d.path == ("interface", "GigabitEthernet0/1")
 
@@ -337,8 +338,8 @@ class TestPerOS:
             "no interface Vlan20\n"
         )
         pc = NXOSParser(cfg).parse()
-        assert "field:interface:Vlan10:helper:10.0.0.100" in pc.no_commands
-        assert "interface:Vlan20" in pc.no_commands
+        assert "field:interface:Vlan10:helper:10.0.0.100" in legacy_artifacts(pc).no_commands
+        assert "interface:Vlan20" in legacy_artifacts(pc).no_commands
         ops = derive_ops(pc)
         assert any(is_native_interface_delete_op(op) for op in ops)
         assert any(
@@ -348,7 +349,7 @@ class TestPerOS:
 
     def test_eos_shares_the_walks(self):
         pc = EOSParser("hostname sw1\nno interface Loopback3\n").parse()
-        assert "interface:Loopback3" in pc.no_commands
+        assert "interface:Loopback3" in legacy_artifacts(pc).no_commands
         assert any(is_native_interface_delete_op(op) for op in derive_ops(pc))
 
     def test_iosxr_member_sets_but_no_deletion_ops(self):

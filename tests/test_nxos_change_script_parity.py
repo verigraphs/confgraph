@@ -22,14 +22,34 @@ from __future__ import annotations
 
 from confgraph.parsers.eos_parser import EOSParser
 from confgraph.parsers.nxos_parser import NXOSParser
+from tests._ccr0110_e_helpers import legacy_artifacts, reconstruct_tombstones
+
+
+# CCR-0110 Phase E: op-primary parsers (NX-OS/EOS) no longer populate
+# ``InterfaceConfig.no_commands`` / ``parse_deletion_commands()`` output — every
+# deletion is carried by a native ChangeOp and the legacy string vocabulary is
+# reconstructed from the composed ChangeSet by the golden-pinned shim codec
+# (byte-exact vs ``test_change_ir_shim_phase4``).  These helpers full-parse and
+# repopulate the deprecated containers from that reconstruction so this file's
+# change-script-parity assertions still exercise the exact legacy vocabulary.
+
+
+def _ifaces(cfg: str, parser_cls):
+    pc = parser_cls(cfg).parse()
+    reconstruct_tombstones(pc)
+    return {i.name: i for i in pc.interfaces}
+
+
+def _tombstones(cfg: str, parser_cls) -> list[str]:
+    return legacy_artifacts(parser_cls(cfg).parse()).no_commands
 
 
 def _nxos_ifaces(cfg: str):
-    return {i.name: i for i in NXOSParser(cfg).parse_interfaces()}
+    return _ifaces(cfg, NXOSParser)
 
 
 def _nxos_tombstones(cfg: str) -> list[str]:
-    return NXOSParser(cfg).parse_deletion_commands()
+    return _tombstones(cfg, NXOSParser)
 
 
 # ---------------------------------------------------------------------------
@@ -203,33 +223,26 @@ class TestNXOSCIDRStaticDeletionTombstones:
 
 class TestEOSParity:
     def test_eos_no_shutdown_tombstone(self):
-        ifaces = {
-            i.name: i
-            for i in EOSParser(
-                "interface Ethernet1\n   no shutdown\n"
-            ).parse_interfaces()
-        }
+        ifaces = _ifaces("interface Ethernet1\n   no shutdown\n", EOSParser)
         assert (
             "field:interface:Ethernet1:enabled" in ifaces["Ethernet1"].no_commands
         )
 
     def test_eos_unanchored_trunk_remove_delta_op(self):
-        ifaces = {
-            i.name: i
-            for i in EOSParser(
-                "interface Ethernet1\n"
-                "   switchport trunk allowed vlan remove 20\n"
-            ).parse_interfaces()
-        }
+        ifaces = _ifaces(
+            "interface Ethernet1\n"
+            "   switchport trunk allowed vlan remove 20\n",
+            EOSParser,
+        )
         assert (
             "field:interface:Ethernet1:trunk_allowed_vlans:remove:20"
             in ifaces["Ethernet1"].no_commands
         )
 
     def test_eos_cidr_deletion_with_nh(self):
-        ts = EOSParser("no ip route 1.1.1.0/24 10.0.0.1\n").parse_deletion_commands()
+        ts = _tombstones("no ip route 1.1.1.0/24 10.0.0.1\n", EOSParser)
         assert "static::1.1.1.0/24:10.0.0.1" in ts
 
     def test_eos_cidr_deletion_without_nh(self):
-        ts = EOSParser("no ip route 2.2.2.0/24\n").parse_deletion_commands()
+        ts = _tombstones("no ip route 2.2.2.0/24\n", EOSParser)
         assert "static::2.2.2.0/24" in ts

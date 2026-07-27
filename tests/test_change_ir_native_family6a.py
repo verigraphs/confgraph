@@ -33,6 +33,7 @@ from confgraph.change_ir import (
 )
 from confgraph.parsers.ios_parser import IOSParser
 from confgraph.parsers.nxos_parser import NXOSParser
+from tests._ccr0110_e_helpers import legacy_artifacts
 
 
 def _parse(text: str, parser_cls=IOSParser):
@@ -178,7 +179,7 @@ def test_process_delete_native_byte_exact_tagged():
     assert op.path == ("process", "isis", "CORE")
     assert op.origin == "native" and op.line_no >= 0
     # Byte-exact legacy tombstone, unchanged from today.
-    assert pc.no_commands == ["process:isis:CORE"]
+    assert legacy_artifacts(pc).no_commands == ["process:isis:CORE"]
     assert encode_legacy([op]).no_commands == ["process:isis:CORE"]
 
 
@@ -186,7 +187,7 @@ def test_process_delete_native_byte_exact_bare_tag():
     pc = _parse("no router isis\n")
     op = next(op for op in _f6(pc) if op.verb is Verb.OBJECT_DELETE)
     assert op.path == ("process", "isis", "")
-    assert pc.no_commands == ["process:isis:"]
+    assert legacy_artifacts(pc).no_commands == ["process:isis:"]
     assert encode_legacy([op]).no_commands == ["process:isis:"]
 
 
@@ -265,4 +266,4 @@ def test_nxos_inherits_process_isis_delete():
     pc = _parse("no router isis CORE\n", parser_cls=NXOSParser)
     dels = [op for op in _f6(pc) if op.verb is Verb.OBJECT_DELETE]
     assert dels and dels[0].path == ("process", "isis", "CORE")
-    assert pc.no_commands == ["process:isis:CORE"]
+    assert legacy_artifacts(pc).no_commands == ["process:isis:CORE"]

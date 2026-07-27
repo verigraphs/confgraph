@@ -36,6 +36,7 @@ from confgraph.parsers.eos_parser import EOSParser
 from confgraph.parsers.ios_parser import IOSParser
 from confgraph.parsers.iosxr_parser import IOSXRParser
 from confgraph.parsers.nxos_parser import NXOSParser
+from tests._ccr0110_e_helpers import legacy_artifacts
 
 
 def _native(pc):
@@ -132,7 +133,7 @@ class TestDHCPRelayOption:
 class TestDHCPSnoopingVlanRemoval:
     def test_tombstone_twin_and_native_op(self):
         pc = IOSParser("no ip dhcp snooping vlan 10,20\n").parse()
-        assert pc.no_commands == ["field:dhcp:snooping_vlan:10,20"]
+        assert legacy_artifacts(pc).no_commands == ["field:dhcp:snooping_vlan:10,20"]
         (op,) = _removals(pc)
         assert op.path == ("field", "dhcp", "snooping_vlan", "10,20")
         assert op.verb is Verb.LIST_REMOVE
@@ -317,7 +318,7 @@ class TestSTPBooleanResets:
 class TestSTPVlanRemovals:
     def test_whole_entry_tombstone_twin(self):
         pc = IOSParser("no spanning-tree vlan 200\n").parse()
-        assert pc.no_commands == ["field:spanning_tree:vlan:200"]
+        assert legacy_artifacts(pc).no_commands == ["field:spanning_tree:vlan:200"]
         (op,) = _removals(pc)
         assert op.path == ("field", "spanning_tree", "vlan", "200")
         assert op.verb is Verb.LIST_REMOVE
@@ -330,7 +331,7 @@ class TestSTPVlanRemovals:
             "no spanning-tree vlan 10-20 forward-time 9\n"
             "no spanning-tree vlan 1,5 max-age\n"
         ).parse()
-        assert pc.no_commands == [
+        assert legacy_artifacts(pc).no_commands == [
             "field:spanning_tree:vlan_reset:100:priority",
             "field:spanning_tree:vlan_reset:100:hello_time",
             "field:spanning_tree:vlan_reset:10-20:forward_time",
@@ -393,11 +394,11 @@ class TestComposition:
     def test_encode_legacy_roundtrip_multiset(self):
         pc = IOSParser(BATCH_CFG).parse()
         art = encode_legacy(derive_ops(pc))
-        assert sorted(art.no_commands) == sorted(pc.no_commands)
+        assert sorted(art.no_commands) == sorted(legacy_artifacts(pc).no_commands)
 
     def test_scalar_resets_never_pollute_no_commands(self):
         pc = IOSParser(BATCH_CFG).parse()
-        assert sorted(pc.no_commands) == sorted(BATCH_TOMBSTONES)
+        assert sorted(legacy_artifacts(pc).no_commands) == sorted(BATCH_TOMBSTONES)
 
     def test_unrecognized_disclosure_preserved(self):
         # The V.6/AB.2 posture: top-level no-lines stay unrecognized-flagged
@@ -417,13 +418,13 @@ class TestPerOSReachability:
         ).parse()
         assert pc.dhcp.snooping_enabled is False
         assert pc.vtp.mode == "server"
-        assert "field:spanning_tree:vlan_reset:100:priority" in pc.no_commands
+        assert "field:spanning_tree:vlan_reset:100:priority" in legacy_artifacts(pc).no_commands
 
     def test_eos_inherits_the_batch(self):
         pc = EOSParser(
             "no ip dhcp snooping vlan 30\nno spanning-tree vlan 200\n"
         ).parse()
-        assert sorted(pc.no_commands) == [
+        assert sorted(legacy_artifacts(pc).no_commands) == [
             "field:dhcp:snooping_vlan:30",
             "field:spanning_tree:vlan:200",
         ]

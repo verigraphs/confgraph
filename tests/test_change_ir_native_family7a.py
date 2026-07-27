@@ -36,6 +36,7 @@ from confgraph.parsers.eos_parser import EOSParser
 from confgraph.parsers.ios_parser import IOSParser
 from confgraph.parsers.iosxr_parser import IOSXRParser
 from confgraph.parsers.junos_parser import JunOSParser
+from tests._ccr0110_e_helpers import legacy_artifacts
 from confgraph.parsers.nxos_parser import NXOSParser
 
 
@@ -139,14 +140,14 @@ class TestRemovalEmission:
         assert encode_legacy([removal]).no_commands == [
             "field:vrfs:GUEST:route_target_export:65400:20"
         ]
-        assert "field:vrfs:GUEST:route_target_export:65400:20" in pc.no_commands
+        assert "field:vrfs:GUEST:route_target_export:65400:20" in legacy_artifacts(pc).no_commands
 
     def test_rd_reset_native_byte_exact(self):
         pc = _parse(VRF_FULL)
         rd_unset = next(op for op in _f7(pc) if op.verb is Verb.UNSET)
         assert rd_unset.path == ("field", "vrfs", "GUEST", "rd")
         assert encode_legacy([rd_unset]).no_commands == ["field:vrfs:GUEST:rd"]
-        assert "field:vrfs:GUEST:rd" in pc.no_commands
+        assert "field:vrfs:GUEST:rd" in legacy_artifacts(pc).no_commands
 
     def test_whole_vrf_delete_native_line_numbered(self):
         pc = _parse(VRF_FULL)
@@ -155,7 +156,7 @@ class TestRemovalEmission:
         assert delete.path == ("field", "vrfs", "OLD")
         assert delete.line_no >= 0
         assert encode_legacy([delete]).no_commands == ["field:vrfs:OLD"]
-        assert "field:vrfs:OLD" in pc.no_commands
+        assert "field:vrfs:OLD" in legacy_artifacts(pc).no_commands
 
     def test_refresh_removal_emitted_unconditionally(self):
         # R.0 design item 1: NO emission suppression — the op is always
@@ -169,7 +170,7 @@ class TestRemovalEmission:
         )
         removals = [op for op in _f7(pc) if op.verb is Verb.LIST_REMOVE]
         assert len(removals) == 1
-        assert "field:vrfs:GUEST:route_target_export:65400:10" in pc.no_commands
+        assert "field:vrfs:GUEST:route_target_export:65400:10" in legacy_artifacts(pc).no_commands
 
 
 class TestColonRoundTrip:
@@ -182,7 +183,7 @@ class TestColonRoundTrip:
                 f"  no route-target import {rt}\n"
             )
             expected = f"field:vrfs:T:route_target_import:{rt}"
-            assert pc.no_commands == [expected]
+            assert legacy_artifacts(pc).no_commands == [expected]
             removal = next(op for op in _f7(pc) if op.verb is Verb.LIST_REMOVE)
             assert encode_legacy([removal]).no_commands == [expected]
 
@@ -276,7 +277,7 @@ class TestPerOS:
         assert positive.line_no > removal.line_no >= 0
         delete = next(op for op in _f7(pc) if op.verb is Verb.OBJECT_DELETE)
         assert delete.path == ("field", "vrfs", "DEAD")
-        assert "field:vrfs:DEAD" in pc.no_commands
+        assert "field:vrfs:DEAD" in legacy_artifacts(pc).no_commands
 
     def test_eos_instance_state_walk_positives_no_removals(self):
         pc = _parse(
