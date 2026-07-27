@@ -7239,9 +7239,17 @@ class IOSParser(BaseParser):
 
             neighbors = self._parse_bgp_neighbors(vrf_obj)
 
+            # Instance-level redistribute — DIRECT children of the ``vrf NAME``
+            # block only (``find_child_objects``), mirroring the global
+            # instance-level walk (``_parse_bgp_redistribute`` reads
+            # ``bgp_obj.children``). ``all_children`` (recursive) also swept in
+            # ``redistribute`` lines nested inside the VRF's ``address-family``
+            # sub-blocks, which item-3 parity now parses at the AF level, so an
+            # AF-nested VRF redistribute double-counted: one AF-scoped op plus a
+            # spurious instance-level op. Direct-children-only closes that
+            # (CCR-0112 parity extension; cross-OS CCR-0114).
             redistribute = self._parse_bgp_redistribute_stmts(
-                [c for c in vrf_obj.all_children
-                 if re.match(r"^\s+redistribute\s+\S+", c.text)]
+                vrf_obj.find_child_objects(r"^\s+redistribute\s+(\S+)")
             )
 
             # VRF-scoped ``no neighbor X [attr]`` tombstones (full removals +

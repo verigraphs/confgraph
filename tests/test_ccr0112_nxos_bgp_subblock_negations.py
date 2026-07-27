@@ -28,6 +28,7 @@ negations here sit at those same, device-verified locations.
 from __future__ import annotations
 
 from confgraph.change_ir import Verb
+from confgraph.parsers.eos_parser import EOSParser
 from confgraph.parsers.nxos_parser import NXOSParser
 
 
@@ -285,6 +286,93 @@ class TestVrfAfFullParity:
             return out
 
         assert norm_af_ops(self.VRF) == norm_af_ops(self.GLOBAL)
+
+
+# ---------------------------------------------------------------------------
+# Item 3 (parity extension, instance-level redistribute double-count) — a VRF
+# ``redistribute`` nested inside an ``address-family`` sub-block must emit ONLY
+# the AF-level op (parity with global). The instance-level VRF redistribute walk
+# now reads DIRECT children of the ``vrf NAME`` block, mirroring the global
+# instance-level walk (``_parse_bgp_redistribute`` over ``bgp_obj.children``),
+# so an AF-nested line no longer also emits a spurious instance-level op.
+# ---------------------------------------------------------------------------
+
+class TestVrfRedistributeInstanceVsAf:
+    # ---- AF-nested (NX-OS) ----------------------------------------------
+    # `redistribute direct route-map RM` inside a VRF's `address-family ipv4
+    # unicast` is a verified-capture NX-OS form (syntax-corpus/nxos/bgp.yaml,
+    # global-af-network-redistribute) — the same line the item-3 parity fixture
+    # (TestVrfAfFullParity) already exercises. NX-OS emits `redistribute` ONLY
+    # inside an address-family, never at the vrf instance level.
+    VRF_AF_NESTED = (
+        "feature bgp\n"
+        "router bgp 65001\n"
+        "  vrf CUST\n"
+        "    address-family ipv4 unicast\n"
+        "      redistribute direct route-map RM\n"
+    )
+    # ---- instance-level (EOS) -------------------------------------------
+    # EOS is the OS in the shared `_parse_bgp_vrf_blocks` path that emits
+    # `redistribute` DIRECTLY under `router bgp <asn>` / `vrf NAME` (not in an
+    # address-family). `redistribute connected` is verified-capture from cEOS
+    # 4.36.1F (syntax-corpus/eos/bgp.yaml, the `vrf <vrf-name>` block entry).
+    EOS_VRF_INSTANCE_LEVEL = (
+        "router bgp 65000\n"
+        "   vrf CUSTOMER_A\n"
+        "      rd 65000:100\n"
+        "      neighbor 192.168.10.2 remote-as 65100\n"
+        "      redistribute connected\n"
+    )
+
+    def _redist_ops(self, pc):
+        return [o for o in _bgp_ops(pc) if "redistribute" in o.path]
+
+    def _instance_level_redist_ops(self, pc, vrf):
+        # instance-level VRF redistribute op has NO `af` segment; shape is
+        # (bgp_instances, <asn>, <vrf>, redistribute, <proto>, <pid>)
+        return [
+            o for o in self._redist_ops(pc)
+            if o.path[2] == vrf and "af" not in o.path
+        ]
+
+    def _af_level_redist_ops(self, pc, vrf):
+        return [
+            o for o in self._redist_ops(pc)
+            if o.path[2] == vrf and "af" in o.path
+        ]
+
+    def test_af_nested_redistribute_emits_only_af_op(self):
+        # The whole point of the fix: exactly ONE redistribute op for CUST, and
+        # it is AF-scoped. No spurious instance-level duplicate.
+        pc = _parse(self.VRF_AF_NESTED)
+        assert len(self._redist_ops(pc)) == 1
+        assert self._instance_level_redist_ops(pc, "CUST") == []
+        assert [o.path for o in self._af_level_redist_ops(pc, "CUST")] == [
+            ("bgp_instances", "65001", "CUST", "af", "ipv4", "unicast", "CUST",
+             "redistribute", "direct", "")
+        ]
+
+    def test_af_nested_redistribute_absent_from_bgpconfig(self):
+        # The VRF BGPConfig.redistribute field must NOT carry AF-nested entries —
+        # matching the global instance, whose .redistribute also excludes them.
+        pc = _parse(self.VRF_AF_NESTED)
+        bvrf = next(b for b in pc.bgp_instances if b.vrf == "CUST")
+        assert bvrf.redistribute == []
+
+    def test_instance_level_redistribute_still_emits_instance_op(self):
+        # A redistribute directly under `vrf NAME` (not in an AF) is unchanged by
+        # the fix: it is a DIRECT child of the vrf block, so it still emits its
+        # instance-level op and still populates BGPConfig.redistribute. Uses the
+        # EOS device-emitted `redistribute connected` shape through the shared
+        # `_parse_bgp_vrf_blocks` path.
+        pc = EOSParser(self.EOS_VRF_INSTANCE_LEVEL).parse()
+        inst_ops = self._instance_level_redist_ops(pc, "CUSTOMER_A")
+        assert [o.path for o in inst_ops] == [
+            ("bgp_instances", "65000", "CUSTOMER_A", "redistribute", "connected", "")
+        ]
+        assert self._af_level_redist_ops(pc, "CUSTOMER_A") == []
+        bvrf = next(b for b in pc.bgp_instances if b.vrf == "CUSTOMER_A")
+        assert [r.protocol for r in bvrf.redistribute] == ["connected"]
 
 
 # ---------------------------------------------------------------------------
