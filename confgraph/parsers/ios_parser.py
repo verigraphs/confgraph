@@ -4070,7 +4070,12 @@ class IOSParser(BaseParser):
             # (default_information_originate/auto_summary/synchronization) are
             # never set by the AF parser (always model default) → nothing to
             # emit; they ride the surviving derived SET untouched (task #22).
-            # NX-OS VRF instances carry no AFs (address_families=[]) → no-op.
+            # Since CCR-0112 item 3 (parity extension) block-form VRF instances
+            # DO carry parsed AFs — _parse_bgp_vrf_af_blocks builds each VRF AF
+            # through the SAME _build_bgp_af helper the global path uses — so
+            # this loop now emits VRF-scoped (vrf_s=<name>) AF ops for networks,
+            # redistribute, aggregates and the maximum_paths scalars for those
+            # instances too, with no per-scope branching here.
             for af in bgp.address_families:
                 af_node = None
                 for c in candidates:
@@ -6763,6 +6768,93 @@ class IOSParser(BaseParser):
 
         return address_families
 
+    def _build_bgp_af(
+        self, af_child, afi: str, safi: str, vrf: str | None
+    ) -> "BGPAddressFamily":
+        """Extract EVERY field of ONE ``address-family`` sub-block into a
+        ``BGPAddressFamily``.
+
+        The single per-AF extractor shared by the global AF walker
+        (``_parse_bgp_address_families``, ``vrf=None``) and the block-form
+        VRF-instance AF walker (``_parse_bgp_vrf_af_blocks``, ``vrf=<name>``).
+        The two loops were byte-identical except for this ``vrf`` value and the
+        container walked; factoring the body here is the structural fix — adding
+        the next AF field is one edit, not two (global + VRF).
+
+        Extracts: ``networks``, ``redistribute``, ``aggregate_addresses``,
+        ``maximum_paths``, ``maximum_paths_ibgp``, ``prefix_validate_allow_invalid``,
+        and the three line-detected False-default flags
+        (``default_information_originate`` / ``auto_summary`` / ``synchronization``)
+        via the SHARED ``_bgp_af_flag22_updates`` classifier.
+        """
+        networks = self._parse_bgp_network_stmts(
+            af_child.find_child_objects(r"^\s+network\s+")
+        )
+        redistribute = self._parse_bgp_redistribute_stmts(
+            af_child.find_child_objects(r"^\s+redistribute\s+(\S+)")
+        )
+
+        # Aggregates — through the ONE shared aggregate-address line parser
+        # (_parse_bgp_aggregate_stmts). The copy that used to sit here read
+        # `as-set summary-only` as as_set=False.
+        aggregates = self._parse_bgp_aggregate_stmts(
+            af_child.find_child_objects(r"^\s+aggregate-address\s+(\S+)")
+        )
+
+        # Parse maximum-paths (eBGP) and maximum-paths ibgp
+        maximum_paths = None
+        mp_children = af_child.find_child_objects(r"^\s+maximum-paths\s+(?!ibgp)(\d+)")
+        if mp_children:
+            v = self._extract_match(mp_children[0].text, r"^\s+maximum-paths\s+(\d+)")
+            if v:
+                maximum_paths = int(v)
+
+        maximum_paths_ibgp = None
+        mp_ibgp_children = af_child.find_child_objects(r"^\s+maximum-paths\s+ibgp\s+(\d+)")
+        if mp_ibgp_children:
+            v = self._extract_match(mp_ibgp_children[0].text, r"^\s+maximum-paths\s+ibgp\s+(\d+)")
+            if v:
+                maximum_paths_ibgp = int(v)
+
+        # RPKI prefix validation mode.
+        # 'bgp bestpath prefix-validate allow-invalid' → permissive (True).
+        # 'no bgp bestpath prefix-validate allow-invalid' → strict (False).
+        # Absent from this AF block → None (merger: do not override baseline).
+        prefix_validate_allow_invalid: bool | None = None
+        if af_child.find_child_objects(
+            r"^\s+no\s+bgp\s+bestpath\s+prefix-validate\s+allow-invalid"
+        ):
+            prefix_validate_allow_invalid = False
+        elif af_child.find_child_objects(
+            r"^\s+bgp\s+bestpath\s+prefix-validate\s+allow-invalid"
+        ):
+            prefix_validate_allow_invalid = True
+
+        # Task #22 (CCR Appendix Z): AF-level flags — fold the SHARED
+        # line classifier in line order (last-line-wins); absence == the
+        # model default False for all three.
+        af_flags: dict[str, object] = {
+            "default_information_originate": False,
+            "auto_summary": False,
+            "synchronization": False,
+        }
+        for c in af_child.children:
+            for fld, val in self._bgp_af_flag22_updates(c.text):
+                af_flags[fld] = val
+
+        return BGPAddressFamily(
+            afi=afi,
+            safi=safi,
+            vrf=vrf,
+            networks=networks,
+            redistribute=redistribute,
+            aggregate_addresses=aggregates,
+            maximum_paths=maximum_paths,
+            maximum_paths_ibgp=maximum_paths_ibgp,
+            prefix_validate_allow_invalid=prefix_validate_allow_invalid,
+            **af_flags,
+        )
+
     def _parse_bgp_address_families(self, bgp_obj) -> list[BGPAddressFamily]:
         """Parse BGP address-families (global, non-VRF)."""
         address_families = []
@@ -6783,75 +6875,9 @@ class IOSParser(BaseParser):
             afi = match.group(1)
             safi = match.group(2) or "unicast"
 
-            networks = self._parse_bgp_network_stmts(
-                af_child.find_child_objects(r"^\s+network\s+")
-            )
-            redistribute = self._parse_bgp_redistribute_stmts(
-                af_child.find_child_objects(r"^\s+redistribute\s+(\S+)")
-            )
-
-            # Aggregates — through the ONE shared aggregate-address line parser
-            # (_parse_bgp_aggregate_stmts). The copy that used to sit here read
-            # `as-set summary-only` as as_set=False.
-            aggregates = self._parse_bgp_aggregate_stmts(
-                af_child.find_child_objects(r"^\s+aggregate-address\s+(\S+)")
-            )
-
-            # Parse maximum-paths (eBGP) and maximum-paths ibgp
-            maximum_paths = None
-            mp_children = af_child.find_child_objects(r"^\s+maximum-paths\s+(?!ibgp)(\d+)")
-            if mp_children:
-                v = self._extract_match(mp_children[0].text, r"^\s+maximum-paths\s+(\d+)")
-                if v:
-                    maximum_paths = int(v)
-
-            maximum_paths_ibgp = None
-            mp_ibgp_children = af_child.find_child_objects(r"^\s+maximum-paths\s+ibgp\s+(\d+)")
-            if mp_ibgp_children:
-                v = self._extract_match(mp_ibgp_children[0].text, r"^\s+maximum-paths\s+ibgp\s+(\d+)")
-                if v:
-                    maximum_paths_ibgp = int(v)
-
-            # RPKI prefix validation mode.
-            # 'bgp bestpath prefix-validate allow-invalid' → permissive (True).
-            # 'no bgp bestpath prefix-validate allow-invalid' → strict (False).
-            # Absent from this AF block → None (merger: do not override baseline).
-            prefix_validate_allow_invalid: bool | None = None
-            if af_child.find_child_objects(
-                r"^\s+no\s+bgp\s+bestpath\s+prefix-validate\s+allow-invalid"
-            ):
-                prefix_validate_allow_invalid = False
-            elif af_child.find_child_objects(
-                r"^\s+bgp\s+bestpath\s+prefix-validate\s+allow-invalid"
-            ):
-                prefix_validate_allow_invalid = True
-
-            # Task #22 (CCR Appendix Z): AF-level flags — fold the SHARED
-            # line classifier in line order (last-line-wins); absence == the
-            # model default False for all three.
-            af_flags: dict[str, object] = {
-                "default_information_originate": False,
-                "auto_summary": False,
-                "synchronization": False,
-            }
-            for c in af_child.children:
-                for fld, val in self._bgp_af_flag22_updates(c.text):
-                    af_flags[fld] = val
-
-            address_families.append(
-                BGPAddressFamily(
-                    afi=afi,
-                    safi=safi,
-                    vrf=None,
-                    networks=networks,
-                    redistribute=redistribute,
-                    aggregate_addresses=aggregates,
-                    maximum_paths=maximum_paths,
-                    maximum_paths_ibgp=maximum_paths_ibgp,
-                    prefix_validate_allow_invalid=prefix_validate_allow_invalid,
-                    **af_flags,
-                )
-            )
+            # Full per-AF extraction (all fields) via the shared builder;
+            # global scope ⇒ vrf=None.
+            address_families.append(self._build_bgp_af(af_child, afi, safi, None))
 
         # AF-scoped settings the device printed at the PROCESS level (see
         # _parse_bgp_process_level_af_settings) belong to the implicit ipv4-unicast
@@ -7260,11 +7286,14 @@ class IOSParser(BaseParser):
         """Address-family sub-blocks of a block-form ``vrf NAME`` BGP instance.
 
         Parses each ``address-family <afi> [<safi>]`` under the VRF block into a
-        ``BGPAddressFamily`` carrying at minimum its ``network`` statements
-        (CCR-0112 item 3 — ``at minimum network``). Reuses the shared
-        ``_parse_bgp_network_stmts`` line parser rather than re-deriving the
-        network grammar. ``find_child_objects`` is direct-children-only, so a
-        global-scope AF is never swept into a VRF instance.
+        ``BGPAddressFamily`` at FULL PARITY with the global AF path (CCR-0112
+        item 3, parity extension): every field the global walker extracts —
+        ``networks``, ``redistribute``, ``aggregate_addresses``,
+        ``maximum_paths[_ibgp]``, ``prefix_validate_allow_invalid``, and the
+        three AF flags — via the SAME ``_build_bgp_af`` helper the global walker
+        uses, differing only in ``vrf=vrf_name``. ``find_child_objects`` is
+        direct-children-only, so a global-scope AF is never swept into a VRF
+        instance.
         """
         address_families: list[BGPAddressFamily] = []
         _AF_RE = r"^\s+address-family\s+(ipv4|ipv6)(?:\s+(unicast|multicast))?\s*$"
@@ -7274,16 +7303,8 @@ class IOSParser(BaseParser):
                 continue
             afi = m.group(1)
             safi = m.group(2) or "unicast"
-            networks = self._parse_bgp_network_stmts(
-                af_child.find_child_objects(r"^\s+network\s+")
-            )
             address_families.append(
-                BGPAddressFamily(
-                    afi=afi,
-                    safi=safi,
-                    vrf=vrf_name,
-                    networks=networks,
-                )
+                self._build_bgp_af(af_child, afi, safi, vrf_name)
             )
         return address_families
 

@@ -189,6 +189,105 @@ class TestVrfAfNetwork:
 
 
 # ---------------------------------------------------------------------------
+# Item 3 (parity extension) — a VRF-instance address-family parses the FULL
+# global-path AF content (not just `network`) and emits the same VRF-scoped ops.
+# ---------------------------------------------------------------------------
+
+class TestVrfAfFullParity:
+    # Device-EMITTED NX-OS forms (syntax-corpus/nxos/bgp.yaml):
+    #   redistribute direct route-map <RM>       — verified-capture
+    #     (global-af-network-redistribute, ctx "router bgp / address-family
+    #      ipv4 unicast"; emitted verbatim)
+    #   aggregate-address <cidr> summary-only     — verified-capture
+    #     (af-network-aggregate-withdrawal, n9kv 10.5(5); classless CIDR)
+    #   maximum-paths <n> / maximum-paths ibgp <n> — emitted verbatim inside the
+    #     AF sub-mode (doc-only, slug af-maximum-paths-multipath: Nexus 9000
+    #     10.3(x) cmd-ref `maximum-paths [ibgp] <n>`). The default is 1 for BOTH
+    #     eBGP and iBGP, and NX-OS suppresses a value == default (same nvgen
+    #     behaviour the corpus captured for IS-IS); 4 and 2 are non-default, so
+    #     the device DOES echo them. Same token in a VRF, one nesting level deeper.
+    # Same content is placed once at the GLOBAL scope and once inside `vrf CUST`;
+    # the two parse + emit identically except for the vrf segments.
+    AF_BODY = (
+        "    network 10.1.0.0/16\n"
+        "    redistribute direct route-map RM\n"
+        "    aggregate-address 10.2.0.0/16 summary-only\n"
+        "    maximum-paths 4\n"
+        "    maximum-paths ibgp 2\n"
+    )
+    GLOBAL = (
+        "feature bgp\n"
+        "router bgp 65001\n"
+        "  address-family ipv4 unicast\n"
+        + AF_BODY
+    )
+    VRF = (
+        "feature bgp\n"
+        "router bgp 65001\n"
+        "  vrf CUST\n"
+        "    address-family ipv4 unicast\n"
+        + "".join("  " + line for line in AF_BODY.splitlines(keepends=True))
+    )
+
+    def _vrf_af(self, pc):
+        bvrf = next(b for b in pc.bgp_instances if b.vrf == "CUST")
+        assert len(bvrf.address_families) == 1
+        return bvrf.address_families[0]
+
+    def test_model_carries_every_field(self):
+        af = self._vrf_af(_parse(self.VRF))
+        assert (af.afi, af.safi, af.vrf) == ("ipv4", "unicast", "CUST")
+        assert [str(n.prefix) for n in af.networks] == ["10.1.0.0/16"]
+        assert [r.protocol for r in af.redistribute] == ["direct"]
+        assert [str(a.prefix) for a in af.aggregate_addresses] == ["10.2.0.0/16"]
+        assert af.maximum_paths == 4
+        assert af.maximum_paths_ibgp == 2
+
+    def test_vrf_scoped_redistribute_op_emitted(self):
+        pc = _parse(self.VRF)
+        assert [
+            o.path for o in _bgp_ops(pc)
+            if o.path[2] == "CUST" and "af" in o.path and "redistribute" in o.path
+        ] == [("bgp_instances", "65001", "CUST", "af", "ipv4", "unicast", "CUST",
+               "redistribute", "direct", "")]
+
+    def test_vrf_scoped_aggregate_op_emitted(self):
+        pc = _parse(self.VRF)
+        assert [
+            o.path for o in _bgp_ops(pc)
+            if o.path[2] == "CUST" and "af" in o.path and "aggregate" in o.path
+        ] == [("bgp_instances", "65001", "CUST", "af", "ipv4", "unicast", "CUST",
+               "aggregate", "10.2.0.0/16")]
+
+    def test_vrf_scoped_scalar_ops_emitted(self):
+        pc = _parse(self.VRF)
+        scalars = {
+            o.path[-1]: o.value for o in _bgp_ops(pc)
+            if o.path[2] == "CUST" and "af" in o.path and "scalar" in o.path
+        }
+        assert scalars.get("maximum_paths") == 4
+        assert scalars.get("maximum_paths_ibgp") == 2
+
+    def test_parity_ops_identical_except_vrf_segments(self):
+        # Normalize away the two vrf-bearing path segments (the instance vrf at
+        # index 2 and the af-key vrf at index 6); the VRF AF's op stream must
+        # then be byte-identical to the GLOBAL AF's — proving parity, not a
+        # divergent VRF-only spelling.
+        def norm_af_ops(cfg):
+            pc = _parse(cfg)
+            out = set()
+            for o in _bgp_ops(pc):
+                if len(o.path) >= 7 and o.path[3] == "af":
+                    p = list(o.path)
+                    p[2] = ""   # instance vrf scope
+                    p[6] = ""   # af-key vrf
+                    out.add((o.verb, tuple(p)))
+            return out
+
+        assert norm_af_ops(self.VRF) == norm_af_ops(self.GLOBAL)
+
+
+# ---------------------------------------------------------------------------
 # Sibling guard — the sub-mode walk is NX-OS-scoped (IOSParser hook is a no-op)
 # ---------------------------------------------------------------------------
 
