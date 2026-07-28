@@ -1903,15 +1903,20 @@ class IOSParser(BaseParser):
     #       form as the empty-list state; the cisco-ios ``no`` form requires an
     #       address, so on IOS this pattern never matches a real line and the
     #       member rule handles the operand-bearing form).
+    #   * ``varp_addresses`` — ``no ip virtual-router address`` (EOS: a
+    #       candidate-config reset that wipes ALL VARP addresses on the
+    #       interface, device-confirmed on cEOS 4.36.1F; EOS-only, so the
+    #       pattern never matches on other OSes).
     # The remaining ``default_factory`` fields (secondary_ips, hsrp/vrrp/glbp
-    # groups, ospf_message_digest_keys, nhrp_nhs, nhrp_map, varp_addresses,
-    # igmp_join_groups, igmp_static_groups) have NO vendor-established bare
-    # whole-list negation — their ``no`` form requires the member key and is
-    # handled member-level; no entry is invented for them.
+    # groups, ospf_message_digest_keys, nhrp_nhs, nhrp_map, igmp_join_groups,
+    # igmp_static_groups) have NO vendor-established bare whole-list negation —
+    # their ``no`` form requires the member key and is handled member-level; no
+    # entry is invented for them.
     _IFACE_WHOLE_LIST_RESET_PATTERNS: dict[str, str] = {
         "trunk_allowed_vlans": r"^\s+no\s+switchport\s+trunk\s+allowed\s+vlan\s*$",
         "ipv6_addresses": r"^\s+no\s+ipv6\s+address\s*$",
         "helper_addresses": r"^\s+no\s+ip\s+helper-address\s*$",
+        "varp_addresses": r"^\s+no\s+ip\s+virtual-router\s+address\s*$",
     }
 
     # Family 8e (CCR Appendix X): per-MEMBER command-line locators for the
@@ -2119,6 +2124,48 @@ class IOSParser(BaseParser):
                     break
         return ops
 
+    def _apply_whole_list_reset_to_model(self, iface) -> None:
+        """CCR-0113: reconcile the PARSED member-list model with a bare
+        whole-list negation, in document order.
+
+        A bare (operand-LESS) whole-list negation resets the field, so the
+        interface's final positive state keeps only members whose LAST positive
+        line comes AFTER the LAST reset line (a reset-then-readd repopulates;
+        a positive-then-reset clears).  Applied to the plain member-list reset
+        fields (ipv6_addresses / helper_addresses / varp_addresses); the delta
+        field ``trunk_allowed_vlans`` is already reconciled in-loop by its
+        stateful parse (the un-anchoring reset boundary), so the four reset
+        fields end uniform.  Runs at finalization — AFTER every subclass
+        interface post-patch (EOS VARP) — so the derived per-member SET ops in
+        ``_native_iface_set_ops`` see the same post-reset state as the model
+        (no SET/UNSET contradiction on the same field).
+        """
+        raw_lines = iface.raw_lines or []
+        line_numbers = iface.line_numbers or []
+
+        def _last_line(pattern: str) -> int:
+            hit = -1
+            for i, line in enumerate(raw_lines):
+                if re.match(pattern, line):
+                    hit = line_numbers[i] if i < len(line_numbers) else i
+            return hit
+
+        for field_name, neg_pattern in self._IFACE_WHOLE_LIST_RESET_PATTERNS.items():
+            builder = self._IFACE_MEMBER_LINE_BUILDERS.get(field_name)
+            if builder is None:
+                continue  # trunk_allowed_vlans (delta field) — handled in-loop
+            value = getattr(iface, field_name, None)
+            if not value:
+                continue
+            reset_line = _last_line(neg_pattern)
+            if reset_line < 0:
+                continue  # no bare negation present — leave the list untouched
+            kept = [
+                item for item in value if _last_line(builder(item)) > reset_line
+            ]
+            if len(kept) != len(value):
+                value[:] = kept
+
     def _attach_native_change_ops(self, pc) -> None:
         """Populate ``ParsedConfig.native_change_ops`` (families 1 + 2 + 3).
 
@@ -2141,6 +2188,11 @@ class IOSParser(BaseParser):
 
         ops: list = []
         for iface in pc.interfaces:
+            # CCR-0113: clear members reset away by a bare whole-list negation
+            # BEFORE deriving per-member SET ops, so the model and the derived
+            # SETs agree (no member SET on a field the UNSET op simultaneously
+            # resets).
+            self._apply_whole_list_reset_to_model(iface)
             ops.extend(self._native_iface_set_ops(iface))
             ops.extend(unsets_by_iface.pop(iface.name, []))
         for leftover in unsets_by_iface.values():  # defensive — should be empty

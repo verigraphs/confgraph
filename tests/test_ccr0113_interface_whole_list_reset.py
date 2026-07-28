@@ -18,10 +18,16 @@ This pins the emission fix:
     route through the member-removal handler — the reset is disjoint.
 
 Only fields with a vendor-established bare whole-list-reset spelling are
-covered (syntax-corpus / consultant grounded, CCR-0113):
+covered (syntax-corpus / consultant grounded + device-confirmed, CCR-0113):
   * ``trunk_allowed_vlans`` — ``no switchport trunk allowed vlan`` (cisco-ios)
   * ``ipv6_addresses``      — ``no ipv6 address`` (cisco-ios + EOS)
   * ``helper_addresses``    — ``no ip helper-address`` (EOS)
+  * ``varp_addresses``      — ``no ip virtual-router address`` (EOS, device-
+                              confirmed cEOS 4.36.1F)
+
+All four are uniform on the PARSED model: a bare whole-list negation clears the
+field's list (a later positive re-add repopulates it), in addition to emitting
+the UNSET op / reset tombstone.
 
 Run:
     uv run pytest tests/test_ccr0113_interface_whole_list_reset.py -v
@@ -168,17 +174,33 @@ class TestIpv6WholeListReset:
         assert self._PFX in iface_nc(pc, _GI)
         op = _reset_op(pc, _GI, "ipv6_addresses")
         assert op is not None and op.verb is Verb.UNSET
+        # Parsed model cleared (final positive state is empty).
+        iface = next(i for i in pc.interfaces if i.name == _GI)
+        assert iface.ipv6_addresses == []
 
-    def test_add_then_reset_ordered(self):
+    def test_add_then_reset_drops_member_set(self):
+        # The member reset away by the later bare `no` is NOT emitted as a SET
+        # (model and derived ops agree): only the whole-list UNSET remains.
         pc = _parse(
             f"interface {_GI}\n"
-            " ipv6 address 2001:DB8::1/64\n"   # L2 member SET
+            " ipv6 address 2001:DB8::1/64\n"   # L2 member (reset away)
             " no ipv6 address\n"               # L3 reset
         )
         ops = _iface_ops(pc, _GI, "ipv6_addresses")
-        member_set = next(o for o in ops if o.verb is Verb.SET)
+        assert [o.verb for o in ops] == [Verb.UNSET]
+
+    def test_reset_then_readd_emits_member_set_after_reset(self):
+        pc = _parse(
+            f"interface {_GI}\n"
+            " no ipv6 address\n"               # L2 reset
+            " ipv6 address 2001:DB8::9/64\n"   # L3 re-add (survives)
+        )
+        iface = next(i for i in pc.interfaces if i.name == _GI)
+        assert [str(a) for a in iface.ipv6_addresses] == ["2001:db8::9/64"]
+        ops = _iface_ops(pc, _GI, "ipv6_addresses")
         reset = next(o for o in ops if o.verb is Verb.UNSET)
-        assert member_set.line_no < reset.line_no   # reset wins (later line)
+        member_set = next(o for o in ops if o.verb is Verb.SET)
+        assert reset.line_no < member_set.line_no   # add wins (later line)
 
     def test_no_negation_no_reset(self):
         pc = _parse(f"interface {_GI}\n ipv6 address 2001:DB8::1/64\n")
@@ -249,3 +271,126 @@ def test_ipv6_reset_inherited_by_eos():
         cls=EOSParser,
     )
     assert f"field:interface:{_GI}:ipv6_addresses" in iface_nc(pc, _GI)
+
+
+# ---------------------------------------------------------------------------
+# varp_addresses — EOS `no ip virtual-router address` (device-confirmed reset)
+# ---------------------------------------------------------------------------
+
+
+class TestVarpWholeListResetEOS:
+    _ETH = "Ethernet1"
+    _PFX = "field:interface:Ethernet1:varp_addresses"
+
+    def test_bare_negation_emits_reset_and_clears_model(self):
+        pc = _parse(
+            f"interface {self._ETH}\n"
+            " ip virtual-router address 10.0.0.1\n"
+            " ip virtual-router address 10.0.0.2\n"
+            " no ip virtual-router address\n",
+            cls=EOSParser,
+        )
+        iface = next(i for i in pc.interfaces if i.name == self._ETH)
+        assert iface.varp_addresses == []            # model cleared
+        assert self._PFX in iface_nc(pc, self._ETH)  # reset tombstone
+        op = _reset_op(pc, self._ETH, "varp_addresses")
+        assert op is not None and op.verb is Verb.UNSET
+
+    def test_reset_then_readd_repopulates(self):
+        pc = _parse(
+            f"interface {self._ETH}\n"
+            " ip virtual-router address 10.0.0.1\n"
+            " no ip virtual-router address\n"
+            " ip virtual-router address 10.0.0.9\n",
+            cls=EOSParser,
+        )
+        iface = next(i for i in pc.interfaces if i.name == self._ETH)
+        assert [str(a) for a in iface.varp_addresses] == ["10.0.0.9"]
+        assert self._PFX in iface_nc(pc, self._ETH)  # reset still emitted
+
+    def test_positive_only_no_reset(self):
+        pc = _parse(
+            f"interface {self._ETH}\n ip virtual-router address 10.0.0.1\n",
+            cls=EOSParser,
+        )
+        iface = next(i for i in pc.interfaces if i.name == self._ETH)
+        assert [str(a) for a in iface.varp_addresses] == ["10.0.0.1"]
+        assert self._PFX not in iface_nc(pc, self._ETH)
+        assert _reset_op(pc, self._ETH, "varp_addresses") is None
+
+
+# ---------------------------------------------------------------------------
+# Parsed-model consistency — uniform across all four reset fields.
+# (field, positive_line, member_a, member_b, member_c, parser)
+# ---------------------------------------------------------------------------
+
+import pytest  # noqa: E402
+
+
+_FOUR_FIELDS = [
+    (
+        "trunk_allowed_vlans",
+        "switchport trunk allowed vlan {}",
+        "10", "20", "30",
+        "no switchport trunk allowed vlan",
+        IOSParser,
+        _GI,
+        lambda v: v,  # ints for trunk
+    ),
+    (
+        "ipv6_addresses",
+        "ipv6 address {}",
+        "2001:db8::1/64", "2001:db8::2/64", "2001:db8::3/64",
+        "no ipv6 address",
+        IOSParser,
+        _GI,
+        str,
+    ),
+    (
+        "helper_addresses",
+        "ip helper-address {}",
+        "10.0.0.1", "10.0.0.2", "10.0.0.3",
+        "no ip helper-address",
+        EOSParser,
+        "Ethernet1",
+        str,
+    ),
+    (
+        "varp_addresses",
+        "ip virtual-router address {}",
+        "10.0.0.1", "10.0.0.2", "10.0.0.3",
+        "no ip virtual-router address",
+        EOSParser,
+        "Ethernet1",
+        str,
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "field,pos,a,b,c,neg,cls,name,norm",
+    _FOUR_FIELDS,
+    ids=[f[0] for f in _FOUR_FIELDS],
+)
+def test_parsed_model_consistency_across_reset_fields(
+    field, pos, a, b, c, neg, cls, name, norm
+):
+    def parsed(cfg):
+        pc = cls(cfg).parse()
+        iface = next(i for i in pc.interfaces if i.name == name)
+        return [norm(x) for x in getattr(iface, field)]
+
+    # bare no  ->  []
+    assert parsed(f"interface {name}\n {neg}\n") == []
+    # positive-then-bare-no  ->  []
+    assert (
+        parsed(f"interface {name}\n {pos.format(a)}\n {pos.format(b)}\n {neg}\n")
+        == []
+    )
+    # bare-no-then-readd  ->  the re-added members only
+    # (trunk's absolute re-add re-anchors; the address fields re-collect)
+    readd = parsed(f"interface {name}\n {pos.format(a)}\n {neg}\n {pos.format(c)}\n")
+    if field == "trunk_allowed_vlans":
+        assert readd == [30]                 # absolute re-anchor
+    else:
+        assert readd == [c]
