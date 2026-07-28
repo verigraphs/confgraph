@@ -6728,7 +6728,10 @@ class IOSParser(BaseParser):
     _BGP_PROCESS_LEVEL_AF_FANOUT: tuple[str, ...] = ()
 
     def _merge_bgp_process_level_af_settings(
-        self, bgp_obj, address_families: list["BGPAddressFamily"]
+        self,
+        bgp_obj,
+        address_families: list["BGPAddressFamily"],
+        vrf: str | None = None,
     ) -> list["BGPAddressFamily"]:
         """Fold ``_parse_bgp_process_level_af_settings`` into the address-families.
 
@@ -6739,6 +6742,14 @@ class IOSParser(BaseParser):
         ``address-family`` block at all (classic IOS), the implicit IPv4-unicast
         family is synthesized to carry them — otherwise the settings would have
         nowhere in the model to live.
+
+        ``vrf`` scopes the fold: for a GLOBAL instance it is ``None`` (the default,
+        byte-identical to the historical behavior); for a block-form ``vrf NAME``
+        BGP instance it is the VRF name, so a synthesized target family and the
+        target-match are scoped to that VRF — the exact parity the shared VRF
+        walker needs so a flat ``aggregate-address`` under ``vrf NAME`` lands where
+        the global instance puts its flat aggregate (CCR-0114, EOS device-verified
+        cEOS 4.36.1F).
         """
         settings = {
             field: value
@@ -6749,11 +6760,12 @@ class IOSParser(BaseParser):
             return address_families
 
         target = next(
-            (af for af in address_families if af.afi == "ipv4" and af.safi == "unicast"),
+            (af for af in address_families
+             if af.afi == "ipv4" and af.safi == "unicast" and af.vrf == vrf),
             None,
         )
         if target is None:
-            target = BGPAddressFamily(afi="ipv4", safi="unicast", vrf=None)
+            target = BGPAddressFamily(afi="ipv4", safi="unicast", vrf=vrf)
             address_families.append(target)
 
         for field, value in settings.items():
@@ -7252,6 +7264,18 @@ class IOSParser(BaseParser):
                 vrf_obj.find_child_objects(r"^\s+redistribute\s+(\S+)")
             )
 
+            # Instance-level (flat, direct-child) ``network`` statements under the
+            # ``vrf NAME`` block — the SAME shape the global instance reads via
+            # ``_parse_bgp_networks(bgp_obj)``, mirrored here so a VRF instance
+            # reaches parity with the global instance for the flat form. EOS emits
+            # VRF ``network`` FLAT as a direct child of ``vrf NAME`` (device-verified
+            # cEOS 4.36.1F) — it stays flat even when configured under
+            # ``address-family ipv4``. ``_parse_bgp_networks`` reads DIRECT children
+            # only, so an AF-nested VRF network (NX-OS / IOS-XR) is read by
+            # ``_parse_bgp_vrf_af_blocks`` and never also swept here — no
+            # double-count (CCR-0114).
+            networks = self._parse_bgp_networks(vrf_obj, vrf=vrf_name)
+
             # VRF-scoped ``no neighbor X [attr]`` tombstones (full removals +
             # field resets) — the SAME shared walk the IOS-XE ``address-family
             # ipv4 vrf`` path uses (_parse_bgp_vrf_instances). It also fires the
@@ -7266,6 +7290,20 @@ class IOSParser(BaseParser):
             # shared ``_parse_bgp_network_stmts`` line parser (no divergent
             # grammar); each AF is scoped to this VRF.
             vrf_address_families = self._parse_bgp_vrf_af_blocks(vrf_obj, vrf_name)
+
+            # Flat (direct-child) ``aggregate-address`` under ``vrf NAME`` — the
+            # instance-level BGPConfig has no ``aggregate_addresses`` field
+            # (aggregates live on BGPAddressFamily), so the global instance folds
+            # its flat aggregate into the implicit IPv4-unicast AF via
+            # ``_merge_bgp_process_level_af_settings``. Mirror that here, scoped to
+            # this VRF (``vrf=vrf_name``): the flat aggregate lands on the VRF's
+            # ipv4/unicast family (reusing an existing one, else synthesizing it),
+            # so it is not lost. Direct-children-only inside the merge means an
+            # AF-nested aggregate (NX-OS / IOS-XR) is never also swept — no
+            # double-count (CCR-0114, EOS device-verified cEOS 4.36.1F).
+            vrf_address_families = self._merge_bgp_process_level_af_settings(
+                vrf_obj, vrf_address_families, vrf=vrf_name
+            )
 
             vrf_instances.append(
                 BGPConfig(
@@ -7282,6 +7320,7 @@ class IOSParser(BaseParser):
                     neighbors=neighbors,
                     peer_groups=[],
                     address_families=vrf_address_families,
+                    networks=networks,
                     redistribute=redistribute,
                     no_commands=vrf_no_commands,
                     **rts,
