@@ -916,7 +916,24 @@ class IOSParser(BaseParser):
             trunk_allowed_children = intf_obj.find_child_objects(
                 r"^\s+switchport\s+trunk\s+allowed\s+vlan\s+(.+)"
             )
-            if trunk_allowed_children:
+            # CCR-0113: interleave the bare (operand-LESS) whole-list negation
+            # ``no switchport trunk allowed vlan`` with the positive
+            # absolute/delta lines, in document order.  On the device the bare
+            # negation restores the default allowed list, so it must UN-ANCHOR
+            # the running set here: a following ``add``/``remove`` then becomes
+            # an un-anchored delta (emitted as a LIST_ADD/LIST_REMOVE op the
+            # merger applies against the baseline) instead of folding into the
+            # pre-reset absolute set (the [1,2,3] + reset + add 10 → [1,2,3,10]
+            # fold this CCR removes).  The reset OP itself is emitted uniformly
+            # by ``_detect_interface_field_negation_ops`` via the whole-list
+            # reset registry — here we only prevent the fold and re-order.
+            _TRUNK_RESET_RE = r"^\s+no\s+switchport\s+trunk\s+allowed\s+vlan\s*$"
+            trunk_reset_children = intf_obj.find_child_objects(_TRUNK_RESET_RE)
+            trunk_seq = sorted(
+                list(trunk_allowed_children) + list(trunk_reset_children),
+                key=lambda c: c.linenum,
+            )
+            if trunk_seq:
                 # Process all lines as ordered set operations:
                 #   'vlan <list>'     → set/replace (anchors the set)
                 #   'add <list>'      → union
@@ -925,6 +942,7 @@ class IOSParser(BaseParser):
                 #                       so it anchors the set too)
                 #   'none'            → empty set (anchors the set)
                 #   'all'             → all (1-4094) (anchors the set)
+                #   bare 'no …'       → reset (un-anchors; clears running set)
                 #
                 # add/remove are *stateful* — they operate on the device's
                 # current allowed list.  In a full running config that state is
@@ -941,7 +959,17 @@ class IOSParser(BaseParser):
                 vlan_set: set[int] = set()
                 anchored = False  # True once an absolute form fixes the base state
                 trunk_vlan_ops: list[tuple] = []  # (op, spec, source child)
-                for child in trunk_allowed_children:
+                for child in trunk_seq:
+                    if re.match(_TRUNK_RESET_RE, child.text):
+                        # Bare whole-list reset: the device restores the default
+                        # allowed list.  Discard any pre-reset absolute anchor and
+                        # accumulated deltas, and un-anchor so a following delta is
+                        # emitted as an op (reset-then-add → reset + add, not a
+                        # folded absolute).
+                        anchored = False
+                        vlan_set = set()
+                        trunk_vlan_ops.clear()
+                        continue
                     vlan_str = self._extract_match(
                         child.text,
                         r"^\s+switchport\s+trunk\s+allowed\s+vlan\s+(.+)",
@@ -1848,6 +1876,42 @@ class IOSParser(BaseParser):
         "lldp_transmit": r"^\s+lldp\s+transmit\s*$",
         "lldp_receive": r"^\s+lldp\s+receive\s*$",
         "cdp_enabled": r"^\s+cdp\s+enable\s*$",
+    }
+
+    # CCR-0113: per-field BARE (operand-LESS) whole-list negation spellings for
+    # the ``default_factory`` InterfaceConfig list fields.  A bare negation
+    # resets the ENTIRE list to its factory default (unlike the operand-bearing
+    # member removals in ``NESTED_DELETION_RULES``, which drop one member).  It
+    # emits a native UNSET op at ``("field","interface",<name>,<field>)`` whose
+    # ``encode_legacy`` twin is the 4-segment ``field:interface:<name>:<field>``
+    # whole-list reset tombstone (distinct from the 5-segment member form); the
+    # merger's ``_reset_field`` honors that shape (default_factory-aware after
+    # CCR-0111).  Every pattern is ``$``-anchored so the whole-list reset is
+    # DISJOINT from the member removals (``no ip helper-address`` vs
+    # ``no ip helper-address 10.0.0.1``).
+    #
+    # ONE entry per field, added only when a vendor establishes a bare
+    # whole-list-reset semantics (never invented from the positive grammar):
+    #   * ``trunk_allowed_vlans`` — ``no switchport trunk allowed vlan``
+    #       (cisco-ios: resets the allowed list to default).  NX-OS/EOS restore
+    #       the default with ``… all`` / an explicit full range and never emit a
+    #       bare ``no``, so this spelling is cisco-ios-only.
+    #   * ``ipv6_addresses`` — ``no ipv6 address`` (cisco-ios command ref:
+    #       "removes all manually configured IPv6 addresses from an interface";
+    #       EOS emits the bare form as the empty-list state).
+    #   * ``helper_addresses`` — ``no ip helper-address`` (EOS emits the bare
+    #       form as the empty-list state; the cisco-ios ``no`` form requires an
+    #       address, so on IOS this pattern never matches a real line and the
+    #       member rule handles the operand-bearing form).
+    # The remaining ``default_factory`` fields (secondary_ips, hsrp/vrrp/glbp
+    # groups, ospf_message_digest_keys, nhrp_nhs, nhrp_map, varp_addresses,
+    # igmp_join_groups, igmp_static_groups) have NO vendor-established bare
+    # whole-list negation — their ``no`` form requires the member key and is
+    # handled member-level; no entry is invented for them.
+    _IFACE_WHOLE_LIST_RESET_PATTERNS: dict[str, str] = {
+        "trunk_allowed_vlans": r"^\s+no\s+switchport\s+trunk\s+allowed\s+vlan\s*$",
+        "ipv6_addresses": r"^\s+no\s+ipv6\s+address\s*$",
+        "helper_addresses": r"^\s+no\s+ip\s+helper-address\s*$",
     }
 
     # Family 8e (CCR Appendix X): per-MEMBER command-line locators for the
@@ -4481,6 +4545,21 @@ class IOSParser(BaseParser):
         pb_ch = intf_obj.find_child_objects(r"^\s+no\s+ip\s+pim\s+bfd\s*$")
         if pb_ch:
             ops.append(_unset("pim_bfd", pb_ch[-1]))
+
+        # CCR-0113: bare (operand-LESS) whole-list negations reset a
+        # default_factory list field to its factory default.  Registry-driven
+        # (``_IFACE_WHOLE_LIST_RESET_PATTERNS`` — one entry per grounded field):
+        # each present bare-negation line emits the whole-list UNSET op at
+        # ``("field","interface",<name>,<field>)``, whose ``encode_legacy`` twin
+        # is the 4-segment ``field:interface:<name>:<field>`` reset tombstone
+        # (disjoint from the 5-segment member-removal tombstones, which the
+        # $-anchored patterns cannot match).  Last matching line wins, mirroring
+        # the scalar-reset ``[-1]`` last-occurrence posture above.  NX-OS/EOS
+        # inherit this method (and its registry) via ``super()``.
+        for field_name, pattern in self._IFACE_WHOLE_LIST_RESET_PATTERNS.items():
+            reset_ch = intf_obj.find_child_objects(pattern)
+            if reset_ch:
+                ops.append(_unset(field_name, reset_ch[-1]))
 
         return ops
 
