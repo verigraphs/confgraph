@@ -777,6 +777,15 @@ class IOSParser(BaseParser):
         # was written; a native SET [] op is emitted at finalization.
         self._pending_native_unset_ops = []
         self._pending_native_trunk_none: set[str] = set()
+        # CCR-0113: the (interface, field) pairs for which a whole-list reset
+        # OP was actually emitted (by _detect_interface_field_negation_ops via
+        # _IFACE_WHOLE_LIST_RESET_PATTERNS).  This is the SINGLE SOURCE OF TRUTH
+        # the finalization model-clear (_apply_whole_list_reset_to_model)
+        # reconciles against, so the parsed-model clear and the op stream always
+        # agree.  IOS-XR OVERRIDES _detect_interface_field_negation_ops and
+        # emits no whole-list reset op, so it never populates this set → no
+        # model-clear on IOS-XR (both the op and the clear are absent, in step).
+        self._pending_whole_list_resets: set[tuple[str, str]] = set()
 
         for intf_obj in intf_objs:
             intf_name = self._extract_match(intf_obj.text, r"^interface\s+(\S+)")
@@ -2139,7 +2148,17 @@ class IOSParser(BaseParser):
         interface post-patch (EOS VARP) — so the derived per-member SET ops in
         ``_native_iface_set_ops`` see the same post-reset state as the model
         (no SET/UNSET contradiction on the same field).
+
+        GATED on the reset OP having actually been emitted for this
+        (interface, field) pair (``_pending_whole_list_resets``, populated on
+        the op-emission path in ``_detect_interface_field_negation_ops``): the
+        model-clear and the op stream are coupled — both fire or neither.  A
+        subclass that overrides the negation walk and emits no whole-list reset
+        op (IOS-XR) therefore gets no model-clear either.
         """
+        emitted = getattr(self, "_pending_whole_list_resets", None) or set()
+        if not emitted:
+            return
         raw_lines = iface.raw_lines or []
         line_numbers = iface.line_numbers or []
 
@@ -2151,6 +2170,8 @@ class IOSParser(BaseParser):
             return hit
 
         for field_name, neg_pattern in self._IFACE_WHOLE_LIST_RESET_PATTERNS.items():
+            if (iface.name, field_name) not in emitted:
+                continue  # no reset op emitted for this pair — leave model as-is
             builder = self._IFACE_MEMBER_LINE_BUILDERS.get(field_name)
             if builder is None:
                 continue  # trunk_allowed_vlans (delta field) — handled in-loop
@@ -4612,6 +4633,11 @@ class IOSParser(BaseParser):
             reset_ch = intf_obj.find_child_objects(pattern)
             if reset_ch:
                 ops.append(_unset(field_name, reset_ch[-1]))
+                # Record the (interface, field) pair so the finalization
+                # model-clear reconciles ONLY fields that actually emitted the
+                # op (kept in lockstep on this same emission path).
+                if hasattr(self, "_pending_whole_list_resets"):
+                    self._pending_whole_list_resets.add((intf_name, field_name))
 
         return ops
 

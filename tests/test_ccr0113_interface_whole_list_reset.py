@@ -38,6 +38,7 @@ from __future__ import annotations
 from confgraph.change_ir import Verb
 from confgraph.parsers.eos_parser import EOSParser
 from confgraph.parsers.ios_parser import IOSParser
+from confgraph.parsers.iosxr_parser import IOSXRParser
 from tests._ccr0110_e_helpers import iface_nc
 
 
@@ -271,6 +272,21 @@ def test_ipv6_reset_inherited_by_eos():
         cls=EOSParser,
     )
     assert f"field:interface:{_GI}:ipv6_addresses" in iface_nc(pc, _GI)
+
+
+def test_iosxr_bare_negation_neither_op_nor_model_clear():
+    # IOS-XR OVERRIDES the negation walk and emits NO whole-list reset op.
+    # The model-clear is gated on the op having been emitted, so the parsed
+    # list must stay intact — model and op stream agree (neither fires).
+    name = "GigabitEthernet0/0/0/1"
+    pc = _parse(
+        f"interface {name}\n ipv6 address 2001:DB8::1/64\n no ipv6 address\n",
+        cls=IOSXRParser,
+    )
+    iface = next(i for i in pc.interfaces if i.name == name)
+    assert [str(a) for a in iface.ipv6_addresses] == ["2001:db8::1/64"]  # NOT cleared
+    assert f"field:interface:{name}:ipv6_addresses" not in iface_nc(pc, name)
+    assert _reset_op(pc, name, "ipv6_addresses") is None
 
 
 # ---------------------------------------------------------------------------
