@@ -18,7 +18,8 @@ the derived whole-instance ``SET ("bgp_instances", asn, vrf)`` STILL SURVIVES
   ``prefix_validate_allow_invalid``,
 - byte-identity: AF SETs encode to ``set_fields`` only, the ops-only aggregate
   removal encodes to NOTHING; the derived whole-instance SET survives; anti-rot
-  (no 5c-B.1 AF form derived); NX-OS VRF instances carry no AFs (no-op).
+  (no 5c-B.1 AF form derived).  (NX-OS VRF-instance AF content — once dropped —
+  now decomposes too: CCR-0112 item 3.)
 
 The three AF scalars (default_information_originate / auto_summary /
 synchronization) were unparsed at 5c-B.1 time; task #22 (WI-DB3, Appendix Z)
@@ -240,19 +241,32 @@ def test_anti_rot_every_af_form_native():
     assert all(o.origin == "native" for o in af_forms)
 
 
-def test_nxos_vrf_instance_emits_no_af_ops():
-    # NX-OS VRF instances carry no AFs (address_families=[]) — Finding 3; the AF
-    # loop is a no-op there.  (Global NX-OS AF blocks DO decompose.)
+def test_nxos_vrf_instance_af_now_decomposes():
+    # CCR-0112 item 3: NX-OS VRF-instance address-family content is no longer
+    # dropped.  The VRF's ``address-family ipv4 unicast`` decomposes into a keyed
+    # AF SET scoped to the VRF, carrying its ``network`` statement — parity with
+    # the global AF decomposition.  (Was: address_families=[] hardcoded, Finding 3.)
     pc = _parse(
         "feature bgp\nrouter bgp 65000\n router-id 1.1.1.1\n"
         " address-family ipv4 unicast\n  network 10.1.0.0/16\n"
         " vrf CUST\n  address-family ipv4 unicast\n   network 10.9.0.0/16\n",
         NXOSParser,
     )
-    vrf_af = [
-        o for o in _af_ops(pc) if o.path[2] == "CUST"
+    # VRF-scoped AF shell SET (len-7 path, afvrf == CUST).
+    vrf_af_shell = [
+        o for o in _af_ops(pc)
+        if o.path[2] == "CUST" and o.verb is Verb.SET and len(o.path) == 7
     ]
-    assert vrf_af == []
+    assert len(vrf_af_shell) == 1
+    assert vrf_af_shell[0].path == (
+        "bgp_instances", "65000", "CUST", "af", "ipv4", "unicast", "CUST",
+    )
+    # VRF-scoped AF network op carrying 10.9.0.0/16.
+    vrf_af_net = [
+        o for o in _af_ops(pc)
+        if o.path[2] == "CUST" and "network" in o.path
+    ]
+    assert any("10.9.0.0/16" in o.path for o in vrf_af_net)
     glob_af = [o for o in _af_ops(pc) if o.path[2] == "" and o.verb is Verb.SET and len(o.path) == 7]
     assert len(glob_af) == 1  # global AF still decomposes
 

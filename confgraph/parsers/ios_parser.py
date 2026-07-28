@@ -3640,15 +3640,16 @@ class IOSParser(BaseParser):
 
         A gated instance is one whose content native emission cannot fully
         reconstruct, so the whole-instance SET stays authoritative (today's
-        5a/5b/5c coexistence).  Today exactly **NX-OS VRF instances**:
-        ``nxos_parser._parse_bgp_vrf_instances`` drops block-form ``vrf`` neighbors
-        (the inline-only ``neighbor X <cmd>`` regex never matches a bare block
-        header) and never parses VRF address-families (``address_families=[]``),
-        so those instances can carry content invisible to native ops — keeping the
-        derived SET is the rot-safe posture.  Every other IOS/NX-OS instance
-        (global ``router bgp`` + IOS ``address-family ipv4 vrf N``, whose neighbors
-        ARE parsed inline) is fully native → retired.  Verified empirically across
-        the corpus (Appendix L gated-exception enumeration).
+        5a/5b/5c coexistence).  Today exactly **NX-OS VRF instances**.  Block-form
+        ``vrf`` neighbors ARE parsed now — ``nxos_parser._parse_bgp_vrf_instances``
+        delegates to the shared ``_parse_bgp_vrf_blocks`` (CCR-0032), which reuses
+        the polymorphic ``_parse_bgp_neighbors``; and VRF-instance address-family
+        ``network`` content plus VRF-scoped neighbor negations are parsed too
+        (CCR-0112).  The gate is retained conservatively pending an audited
+        native-op parity check for the whole VRF instance; every other IOS/NX-OS
+        instance (global ``router bgp`` + IOS ``address-family ipv4 vrf N``) is
+        fully native → retired.  Verified empirically across the corpus
+        (Appendix L gated-exception enumeration).
         """
         os_val = getattr(self.os_type, "value", self.os_type)
         return os_val == "nxos" and bgp.vrf is not None
@@ -4069,7 +4070,12 @@ class IOSParser(BaseParser):
             # (default_information_originate/auto_summary/synchronization) are
             # never set by the AF parser (always model default) → nothing to
             # emit; they ride the surviving derived SET untouched (task #22).
-            # NX-OS VRF instances carry no AFs (address_families=[]) → no-op.
+            # Since CCR-0112 item 3 (parity extension) block-form VRF instances
+            # DO carry parsed AFs — _parse_bgp_vrf_af_blocks builds each VRF AF
+            # through the SAME _build_bgp_af helper the global path uses — so
+            # this loop now emits VRF-scoped (vrf_s=<name>) AF ops for networks,
+            # redistribute, aggregates and the maximum_paths scalars for those
+            # instances too, with no per-scope branching here.
             for af in bgp.address_families:
                 af_node = None
                 for c in candidates:
@@ -5836,6 +5842,101 @@ class IOSParser(BaseParser):
         ("peer-group",              "peer_group"),
     ]
 
+    def _emit_bgp_neighbor_no_op(
+        self,
+        peer: str,
+        attr: str,
+        node,
+        asn: int,
+        vrf: str | None,
+        pg_names: set[str],
+    ) -> None:
+        """Queue the native ChangeOp for one neighbor negation targeting *peer*.
+
+        *attr* is the command text AFTER the neighbor spec: ``""`` means full
+        neighbor removal (``no neighbor X``); otherwise it is the negated
+        attribute (``next-hop-self`` / ``description ...`` / ``route-map RM in``
+        …). SINGLE emission path + SINGLE ``_BGP_NEIGHBOR_NO_FIELD_MAP`` registry
+        shared by the flat ``no neighbor X <attr>`` walk
+        (``_parse_bgp_neighbor_tombstones``) and the NX-OS indented neighbor
+        sub-mode ``no <attr>`` walk (``_emit_bgp_neighbor_submode_negations``),
+        so both spellings emit byte-identical ops.
+        """
+        from confgraph.change_ir import ChangeOp, Verb
+
+        def _emit(tombstone: str, verb: "Verb | None" = None) -> None:
+            if verb is None:
+                verb = (
+                    Verb.OBJECT_DELETE
+                    if tombstone.startswith("neighbor:")
+                    else Verb.UNSET
+                )
+            self._pending_native_bgp_ops.append(
+                ChangeOp(
+                    verb=verb,
+                    path=("bgp_instance", str(asn), vrf or "")
+                    + _native_deletion_path(tombstone),
+                    value=None,
+                    source_line=node.text.strip(),
+                    line_no=node.linenum,
+                    origin="native",
+                )
+            )
+
+        if not attr:
+            # "no neighbor X" — full neighbor removal
+            _emit(f"neighbor:{peer}")
+            return
+
+        # Directional policy objects: attribute is keyword + name + direction
+        if attr.startswith("route-map "):
+            field = "route_map_in" if attr.endswith(" in") else "route_map_out" if attr.endswith(" out") else None
+            if field:
+                _emit(f"field:neighbor:{peer}:{field}")
+            return
+        if attr.startswith("prefix-list "):
+            field = "prefix_list_in" if attr.endswith(" in") else "prefix_list_out" if attr.endswith(" out") else None
+            if field:
+                _emit(f"field:neighbor:{peer}:{field}")
+            return
+        if attr.startswith("filter-list "):
+            field = "filter_list_in" if attr.endswith(" in") else "filter_list_out" if attr.endswith(" out") else None
+            if field:
+                _emit(f"field:neighbor:{peer}:{field}")
+            return
+
+        # Family 5b Candidate-B (CCR Appendix I): ``no neighbor GROUP peer-group``
+        # where GROUP names a peer-group deletes the GROUP AND all its member
+        # neighbors — an OBJECT_DELETE native op.
+        if attr == "peer-group" and self._is_bgp_peer_group_ref(peer, pg_names):
+            _emit(f"field:neighbor:{peer}:peer_group", verb=Verb.OBJECT_DELETE)
+            return
+
+        # Simple prefix-match table
+        for prefix, field_name in self._BGP_NEIGHBOR_NO_FIELD_MAP:
+            if prefix in ("route-map", "prefix-list", "filter-list"):
+                continue  # already handled above
+            if attr == prefix or attr.startswith(prefix + " "):
+                _emit(f"field:neighbor:{peer}:{field_name}")
+                break
+        # Unrecognised attribute — skip silently (never a full-removal tombstone)
+
+    def _emit_bgp_neighbor_submode_negations(
+        self,
+        bgp_or_af_obj,
+        asn: int,
+        vrf: str | None,
+        pg_names: set[str],
+    ) -> None:
+        """Hook for indented neighbor sub-mode ``no <attr>`` negations.
+
+        No-op on IOS / IOS-XR / EOS — those dialects express neighbor negations
+        as flat ``no neighbor X <attr>`` lines, already handled by
+        ``_parse_bgp_neighbor_tombstones``. Overridden on NX-OS, which prints the
+        negation INSIDE the ``neighbor <ip>`` block (CCR-0112).
+        """
+        return None
+
     def _parse_bgp_neighbor_tombstones(
         self,
         bgp_or_af_obj,
@@ -5873,32 +5974,6 @@ class IOSParser(BaseParser):
         tombstones: list[str] = []
         pg_names = peer_group_names or set()
 
-        def _emit(tombstone: str, node, verb: "Verb | None" = None) -> None:
-            """Queue the native op and append its byte-exact legacy string.
-
-            *verb* overrides the default verb selection (used by the family-5b
-            Candidate-B peer-group deletion: ``no neighbor GROUP peer-group``
-            emits the SAME ``field:neighbor:GROUP:peer_group`` legacy string as
-            today — byte-identical — but a native ``OBJECT_DELETE`` op so ops
-            mode removes the group AND its members).
-            """
-            if verb is None:
-                verb = (
-                    Verb.OBJECT_DELETE
-                    if tombstone.startswith("neighbor:")
-                    else Verb.UNSET
-                )
-            op = ChangeOp(
-                verb=verb,
-                path=("bgp_instance", str(asn), vrf or "")
-                + _native_deletion_path(tombstone),
-                value=None,
-                source_line=node.text.strip(),
-                line_no=node.linenum,
-                origin="native",
-            )
-            self._pending_native_bgp_ops.append(op)
-
         for nc in bgp_or_af_obj.find_child_objects(r"^\s+no\s+neighbor\s+\S+"):
             m = re.search(r"^\s+no\s+neighbor\s+(\S+)(?:\s+(.+))?$", nc.text)
             if not m:
@@ -5906,52 +5981,18 @@ class IOSParser(BaseParser):
 
             peer = m.group(1)
             attr = (m.group(2) or "").strip()
+            self._emit_bgp_neighbor_no_op(peer, attr, nc, asn, vrf, pg_names)
 
-            if not attr:
-                # "no neighbor X" — full neighbor removal
-                _emit(f"neighbor:{peer}", nc)
-                continue
-
-            # Directional policy objects: attribute starts with keyword + name + direction
-            if attr.startswith("route-map "):
-                field = "route_map_in" if attr.endswith(" in") else "route_map_out" if attr.endswith(" out") else None
-                if field:
-                    _emit(f"field:neighbor:{peer}:{field}", nc)
-                continue
-            if attr.startswith("prefix-list "):
-                field = "prefix_list_in" if attr.endswith(" in") else "prefix_list_out" if attr.endswith(" out") else None
-                if field:
-                    _emit(f"field:neighbor:{peer}:{field}", nc)
-                continue
-            if attr.startswith("filter-list "):
-                field = "filter_list_in" if attr.endswith(" in") else "filter_list_out" if attr.endswith(" out") else None
-                if field:
-                    _emit(f"field:neighbor:{peer}:{field}", nc)
-                continue
-
-            # Family 5b Candidate-B (CCR Appendix I): ``no neighbor GROUP
-            # peer-group`` where GROUP names a peer-group deletes the GROUP AND
-            # all its member neighbors (Cisco documented behavior).  Legacy
-            # emits the SAME ``field:neighbor:GROUP:peer_group`` string
-            # (byte-identical — the group survives, the documented modeling
-            # gap); ops mode gets an OBJECT_DELETE native op that removes the
-            # group and its members in ChangeSet order.
-            if attr == "peer-group" and self._is_bgp_peer_group_ref(peer, pg_names):
-                _emit(
-                    f"field:neighbor:{peer}:peer_group",
-                    nc,
-                    verb=Verb.OBJECT_DELETE,
-                )
-                continue
-
-            # Simple prefix-match table
-            for prefix, field_name in self._BGP_NEIGHBOR_NO_FIELD_MAP:
-                if prefix in ("route-map", "prefix-list", "filter-list"):
-                    continue  # already handled above
-                if attr == prefix or attr.startswith(prefix + " "):
-                    _emit(f"field:neighbor:{peer}:{field_name}", nc)
-                    break
-            # Unrecognised attribute — skip silently (do not emit a full-removal tombstone)
+        # NX-OS prints per-neighbor negations INSIDE the ``neighbor <ip>`` block
+        # (``no next-hop-self`` under the address-family, ``no description`` at
+        # session level) rather than as flat ``no neighbor X <attr>`` lines. The
+        # hook is a no-op on IOS / IOS-XR / EOS (byte-unchanged) and overridden on
+        # NX-OS to emit — via the SAME _emit_bgp_neighbor_no_op path — the
+        # field-reset op the equivalent flat spelling would emit (parity).
+        if asn is not None:
+            self._emit_bgp_neighbor_submode_negations(
+                bgp_or_af_obj, asn, vrf, pg_names
+            )
 
         # Family 5b (CCR Appendix I): instance-level ``no network <prefix>`` —
         # an OPS-ONLY native LIST_REMOVE with NO legacy twin (the line is
@@ -6727,6 +6768,93 @@ class IOSParser(BaseParser):
 
         return address_families
 
+    def _build_bgp_af(
+        self, af_child, afi: str, safi: str, vrf: str | None
+    ) -> "BGPAddressFamily":
+        """Extract EVERY field of ONE ``address-family`` sub-block into a
+        ``BGPAddressFamily``.
+
+        The single per-AF extractor shared by the global AF walker
+        (``_parse_bgp_address_families``, ``vrf=None``) and the block-form
+        VRF-instance AF walker (``_parse_bgp_vrf_af_blocks``, ``vrf=<name>``).
+        The two loops were byte-identical except for this ``vrf`` value and the
+        container walked; factoring the body here is the structural fix — adding
+        the next AF field is one edit, not two (global + VRF).
+
+        Extracts: ``networks``, ``redistribute``, ``aggregate_addresses``,
+        ``maximum_paths``, ``maximum_paths_ibgp``, ``prefix_validate_allow_invalid``,
+        and the three line-detected False-default flags
+        (``default_information_originate`` / ``auto_summary`` / ``synchronization``)
+        via the SHARED ``_bgp_af_flag22_updates`` classifier.
+        """
+        networks = self._parse_bgp_network_stmts(
+            af_child.find_child_objects(r"^\s+network\s+")
+        )
+        redistribute = self._parse_bgp_redistribute_stmts(
+            af_child.find_child_objects(r"^\s+redistribute\s+(\S+)")
+        )
+
+        # Aggregates — through the ONE shared aggregate-address line parser
+        # (_parse_bgp_aggregate_stmts). The copy that used to sit here read
+        # `as-set summary-only` as as_set=False.
+        aggregates = self._parse_bgp_aggregate_stmts(
+            af_child.find_child_objects(r"^\s+aggregate-address\s+(\S+)")
+        )
+
+        # Parse maximum-paths (eBGP) and maximum-paths ibgp
+        maximum_paths = None
+        mp_children = af_child.find_child_objects(r"^\s+maximum-paths\s+(?!ibgp)(\d+)")
+        if mp_children:
+            v = self._extract_match(mp_children[0].text, r"^\s+maximum-paths\s+(\d+)")
+            if v:
+                maximum_paths = int(v)
+
+        maximum_paths_ibgp = None
+        mp_ibgp_children = af_child.find_child_objects(r"^\s+maximum-paths\s+ibgp\s+(\d+)")
+        if mp_ibgp_children:
+            v = self._extract_match(mp_ibgp_children[0].text, r"^\s+maximum-paths\s+ibgp\s+(\d+)")
+            if v:
+                maximum_paths_ibgp = int(v)
+
+        # RPKI prefix validation mode.
+        # 'bgp bestpath prefix-validate allow-invalid' → permissive (True).
+        # 'no bgp bestpath prefix-validate allow-invalid' → strict (False).
+        # Absent from this AF block → None (merger: do not override baseline).
+        prefix_validate_allow_invalid: bool | None = None
+        if af_child.find_child_objects(
+            r"^\s+no\s+bgp\s+bestpath\s+prefix-validate\s+allow-invalid"
+        ):
+            prefix_validate_allow_invalid = False
+        elif af_child.find_child_objects(
+            r"^\s+bgp\s+bestpath\s+prefix-validate\s+allow-invalid"
+        ):
+            prefix_validate_allow_invalid = True
+
+        # Task #22 (CCR Appendix Z): AF-level flags — fold the SHARED
+        # line classifier in line order (last-line-wins); absence == the
+        # model default False for all three.
+        af_flags: dict[str, object] = {
+            "default_information_originate": False,
+            "auto_summary": False,
+            "synchronization": False,
+        }
+        for c in af_child.children:
+            for fld, val in self._bgp_af_flag22_updates(c.text):
+                af_flags[fld] = val
+
+        return BGPAddressFamily(
+            afi=afi,
+            safi=safi,
+            vrf=vrf,
+            networks=networks,
+            redistribute=redistribute,
+            aggregate_addresses=aggregates,
+            maximum_paths=maximum_paths,
+            maximum_paths_ibgp=maximum_paths_ibgp,
+            prefix_validate_allow_invalid=prefix_validate_allow_invalid,
+            **af_flags,
+        )
+
     def _parse_bgp_address_families(self, bgp_obj) -> list[BGPAddressFamily]:
         """Parse BGP address-families (global, non-VRF)."""
         address_families = []
@@ -6747,75 +6875,9 @@ class IOSParser(BaseParser):
             afi = match.group(1)
             safi = match.group(2) or "unicast"
 
-            networks = self._parse_bgp_network_stmts(
-                af_child.find_child_objects(r"^\s+network\s+")
-            )
-            redistribute = self._parse_bgp_redistribute_stmts(
-                af_child.find_child_objects(r"^\s+redistribute\s+(\S+)")
-            )
-
-            # Aggregates — through the ONE shared aggregate-address line parser
-            # (_parse_bgp_aggregate_stmts). The copy that used to sit here read
-            # `as-set summary-only` as as_set=False.
-            aggregates = self._parse_bgp_aggregate_stmts(
-                af_child.find_child_objects(r"^\s+aggregate-address\s+(\S+)")
-            )
-
-            # Parse maximum-paths (eBGP) and maximum-paths ibgp
-            maximum_paths = None
-            mp_children = af_child.find_child_objects(r"^\s+maximum-paths\s+(?!ibgp)(\d+)")
-            if mp_children:
-                v = self._extract_match(mp_children[0].text, r"^\s+maximum-paths\s+(\d+)")
-                if v:
-                    maximum_paths = int(v)
-
-            maximum_paths_ibgp = None
-            mp_ibgp_children = af_child.find_child_objects(r"^\s+maximum-paths\s+ibgp\s+(\d+)")
-            if mp_ibgp_children:
-                v = self._extract_match(mp_ibgp_children[0].text, r"^\s+maximum-paths\s+ibgp\s+(\d+)")
-                if v:
-                    maximum_paths_ibgp = int(v)
-
-            # RPKI prefix validation mode.
-            # 'bgp bestpath prefix-validate allow-invalid' → permissive (True).
-            # 'no bgp bestpath prefix-validate allow-invalid' → strict (False).
-            # Absent from this AF block → None (merger: do not override baseline).
-            prefix_validate_allow_invalid: bool | None = None
-            if af_child.find_child_objects(
-                r"^\s+no\s+bgp\s+bestpath\s+prefix-validate\s+allow-invalid"
-            ):
-                prefix_validate_allow_invalid = False
-            elif af_child.find_child_objects(
-                r"^\s+bgp\s+bestpath\s+prefix-validate\s+allow-invalid"
-            ):
-                prefix_validate_allow_invalid = True
-
-            # Task #22 (CCR Appendix Z): AF-level flags — fold the SHARED
-            # line classifier in line order (last-line-wins); absence == the
-            # model default False for all three.
-            af_flags: dict[str, object] = {
-                "default_information_originate": False,
-                "auto_summary": False,
-                "synchronization": False,
-            }
-            for c in af_child.children:
-                for fld, val in self._bgp_af_flag22_updates(c.text):
-                    af_flags[fld] = val
-
-            address_families.append(
-                BGPAddressFamily(
-                    afi=afi,
-                    safi=safi,
-                    vrf=None,
-                    networks=networks,
-                    redistribute=redistribute,
-                    aggregate_addresses=aggregates,
-                    maximum_paths=maximum_paths,
-                    maximum_paths_ibgp=maximum_paths_ibgp,
-                    prefix_validate_allow_invalid=prefix_validate_allow_invalid,
-                    **af_flags,
-                )
-            )
+            # Full per-AF extraction (all fields) via the shared builder;
+            # global scope ⇒ vrf=None.
+            address_families.append(self._build_bgp_af(af_child, afi, safi, None))
 
         # AF-scoped settings the device printed at the PROCESS level (see
         # _parse_bgp_process_level_af_settings) belong to the implicit ipv4-unicast
@@ -7177,10 +7239,33 @@ class IOSParser(BaseParser):
 
             neighbors = self._parse_bgp_neighbors(vrf_obj)
 
+            # Instance-level redistribute — DIRECT children of the ``vrf NAME``
+            # block only (``find_child_objects``), mirroring the global
+            # instance-level walk (``_parse_bgp_redistribute`` reads
+            # ``bgp_obj.children``). ``all_children`` (recursive) also swept in
+            # ``redistribute`` lines nested inside the VRF's ``address-family``
+            # sub-blocks, which item-3 parity now parses at the AF level, so an
+            # AF-nested VRF redistribute double-counted: one AF-scoped op plus a
+            # spurious instance-level op. Direct-children-only closes that
+            # (CCR-0112 parity extension; cross-OS CCR-0114).
             redistribute = self._parse_bgp_redistribute_stmts(
-                [c for c in vrf_obj.all_children
-                 if re.match(r"^\s+redistribute\s+\S+", c.text)]
+                vrf_obj.find_child_objects(r"^\s+redistribute\s+(\S+)")
             )
+
+            # VRF-scoped ``no neighbor X [attr]`` tombstones (full removals +
+            # field resets) — the SAME shared walk the IOS-XE ``address-family
+            # ipv4 vrf`` path uses (_parse_bgp_vrf_instances). It also fires the
+            # neighbor sub-mode negation hook, so VRF-scoped ``neighbor <ip>``
+            # blocks with indented ``no <attr>`` lines emit too (CCR-0112).
+            vrf_no_commands = self._parse_bgp_neighbor_tombstones(
+                vrf_obj, asn=asn, vrf=vrf_name, peer_group_names=set()
+            )
+
+            # VRF-instance address-family sub-blocks — at minimum ``network``
+            # statements (CCR-0112 item 3). Previously hardcoded to []. Uses the
+            # shared ``_parse_bgp_network_stmts`` line parser (no divergent
+            # grammar); each AF is scoped to this VRF.
+            vrf_address_families = self._parse_bgp_vrf_af_blocks(vrf_obj, vrf_name)
 
             vrf_instances.append(
                 BGPConfig(
@@ -7196,13 +7281,40 @@ class IOSParser(BaseParser):
                     bestpath_options=BGPBestpathOptions(),
                     neighbors=neighbors,
                     peer_groups=[],
-                    address_families=[],
+                    address_families=vrf_address_families,
                     redistribute=redistribute,
+                    no_commands=vrf_no_commands,
                     **rts,
                 )
             )
 
         return vrf_instances
+
+    def _parse_bgp_vrf_af_blocks(self, vrf_obj, vrf_name: str) -> list["BGPAddressFamily"]:
+        """Address-family sub-blocks of a block-form ``vrf NAME`` BGP instance.
+
+        Parses each ``address-family <afi> [<safi>]`` under the VRF block into a
+        ``BGPAddressFamily`` at FULL PARITY with the global AF path (CCR-0112
+        item 3, parity extension): every field the global walker extracts —
+        ``networks``, ``redistribute``, ``aggregate_addresses``,
+        ``maximum_paths[_ibgp]``, ``prefix_validate_allow_invalid``, and the
+        three AF flags — via the SAME ``_build_bgp_af`` helper the global walker
+        uses, differing only in ``vrf=vrf_name``. ``find_child_objects`` is
+        direct-children-only, so a global-scope AF is never swept into a VRF
+        instance.
+        """
+        address_families: list[BGPAddressFamily] = []
+        _AF_RE = r"^\s+address-family\s+(ipv4|ipv6)(?:\s+(unicast|multicast))?\s*$"
+        for af_child in vrf_obj.find_child_objects(_AF_RE):
+            m = re.search(_AF_RE, af_child.text)
+            if not m:
+                continue
+            afi = m.group(1)
+            safi = m.group(2) or "unicast"
+            address_families.append(
+                self._build_bgp_af(af_child, afi, safi, vrf_name)
+            )
+        return address_families
 
     def _parse_ospf_vrf_instances(self, parse) -> list["OSPFConfig"]:
         """OSPF-VRF instances from ``router ospf N`` → ``vrf NAME`` nested blocks.
