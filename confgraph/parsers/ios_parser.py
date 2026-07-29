@@ -10926,7 +10926,13 @@ class IOSParser(BaseParser):
             port = frequency = threshold_val = timeout = None
             vrf = tag = None
 
-            for c in obj.children:
+            # Walk ALL descendants, not just direct children: IOS emits the
+            # timing sub-parameters flat under `ip sla N` (siblings of the
+            # operation line), but NX-OS emits the operation as a config
+            # submode and nests `frequency`/`timeout`/`tag` one level deeper
+            # beneath it. `all_children` flattens both shapes so a single
+            # classification handles them (CCR-0091).
+            for c in obj.all_children:
                 ct = c.text.strip()
                 # Legacy "ip sla monitor" body: "type echo protocol ipIcmpEcho ADDR"
                 # normalizes to the modern icmp-echo operation.
@@ -10942,6 +10948,14 @@ class IOSParser(BaseParser):
                         op_type = op
                         parts = ct.split()
                         destination = parts[1] if len(parts) > 1 else None
+                        # UDP/TCP operations carry the destination port as the
+                        # numeric token immediately after the destination
+                        # (`udp-jitter <dst> <port>` / `udp-echo <dst> <port>` /
+                        # `tcp-connect <dst> <port>`). ICMP/DNS operations put a
+                        # keyword there instead, so guard on a bare digit token
+                        # and leave `port` None otherwise (CCR-0091).
+                        if len(parts) > 2 and parts[2].isdigit():
+                            port = int(parts[2])
                         # The operation line carries the source, and it names it
                         # EITHER by interface OR by address — the two are
                         # alternatives in one optional bracket group
