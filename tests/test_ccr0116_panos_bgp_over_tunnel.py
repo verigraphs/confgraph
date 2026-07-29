@@ -304,6 +304,101 @@ def test_gateway_without_egress_degrades():
 # Non-PAN-OS regression: field-driven, so other OSes are untouched
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# parse_crypto reads the IKE crypto profile from the NESTED emitted path
+# (protocol/ikev{1,2}/ike-crypto-profile), not the flat child (CCR-0116).
+# ---------------------------------------------------------------------------
+
+def _crypto_map_transform_sets(parsed):
+    """All transform_sets across every crypto-map entry (the IKE profile names)."""
+    out = []
+    assert parsed.crypto is not None
+    for cmap in parsed.crypto.crypto_maps:
+        for entry in cmap.entries:
+            out.extend(entry.transform_sets)
+    return out
+
+
+def test_parse_crypto_reads_nested_ikev2_profile():
+    # FULL_CHAIN's gw-branch carries protocol/ikev2/ike-crypto-profile = default.
+    parsed = PANOSParser(FULL_CHAIN).parse()
+    assert "default" in _crypto_map_transform_sets(parsed), (
+        "IKE crypto profile from protocol/ikev2 not carried onto the crypto map"
+    )
+
+
+IKEV1_GATEWAY = """\
+<config version="10.1.0">
+  <devices>
+    <entry name="localhost.localdomain">
+      <network>
+        <interface>
+          <ethernet>
+            <entry name="ethernet1/1">
+              <layer3><ip><entry name="203.0.113.1/30"/></ip></layer3>
+            </entry>
+          </ethernet>
+        </interface>
+        <ike>
+          <gateway>
+            <entry name="gw-legacy">
+              <local-address><interface>ethernet1/1</interface></local-address>
+              <peer-address><ip>203.0.113.9</ip></peer-address>
+              <protocol>
+                <version>ikev1</version>
+                <ikev1><ike-crypto-profile>legacy-ike</ike-crypto-profile></ikev1>
+              </protocol>
+            </entry>
+          </gateway>
+        </ike>
+      </network>
+    </entry>
+  </devices>
+</config>
+"""
+
+
+def test_parse_crypto_reads_nested_ikev1_profile():
+    parsed = PANOSParser(IKEV1_GATEWAY).parse()
+    assert "legacy-ike" in _crypto_map_transform_sets(parsed)
+
+
+GATEWAY_NO_PROTOCOL = """\
+<config version="10.1.0">
+  <devices>
+    <entry name="localhost.localdomain">
+      <network>
+        <interface>
+          <ethernet>
+            <entry name="ethernet1/1">
+              <layer3><ip><entry name="203.0.113.1/30"/></ip></layer3>
+            </entry>
+          </ethernet>
+        </interface>
+        <ike>
+          <gateway>
+            <entry name="gw-bare">
+              <local-address><interface>ethernet1/1</interface></local-address>
+              <peer-address><ip>203.0.113.9</ip></peer-address>
+            </entry>
+          </gateway>
+        </ike>
+      </network>
+    </entry>
+  </devices>
+</config>
+"""
+
+
+def test_parse_crypto_gateway_without_protocol_block_graceful():
+    # No protocol block -> no IKE crypto profile, but the gateway still yields a
+    # crypto-map entry (with its peer) and nothing crashes.
+    parsed = PANOSParser(GATEWAY_NO_PROTOCOL).parse()
+    assert parsed.crypto is not None
+    assert len(parsed.crypto.crypto_maps) == 1
+    assert parsed.crypto.crypto_maps[0].entries[0].transform_sets == []
+
+
 def test_non_panos_tunnel_unaffected():
     # An IOS-style tunnel using the pre-existing tunnel_source field must NOT
     # gain any underlay/crypto edge — the new fields default None.

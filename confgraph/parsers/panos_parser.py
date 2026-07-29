@@ -283,13 +283,31 @@ class PANOSParser(BaseParser):
                 }
         return bindings
 
+    @staticmethod
+    def _ike_crypto_profile(gw: Element) -> str | None:
+        """The Phase-1 IKE crypto profile named on an ``ike/gateway`` entry.
+
+        A device EMITS it nested under the negotiated IKE version —
+        ``protocol/ikev2/ike-crypto-profile`` or ``protocol/ikev1/…`` (pan-os-python
+        ``path="protocol/ikev{1,2}/ike-crypto-profile"``; ``protocol/version``
+        selects which, ikev2 since PAN-OS 7.0).  A FLAT ``ike-crypto-profile`` child
+        of the gateway is not the emitted shape; it is read last, only as lenient
+        back-compat, so a hand-written config still resolves.  One reader for both
+        ``_ike_gateways`` (the tunnel underlay chain) and ``parse_crypto`` (the
+        crypto map) — they must not diverge (CCR-0116).
+        """
+        return (
+            text_val(gw, "protocol/ikev2/ike-crypto-profile")
+            or text_val(gw, "protocol/ikev1/ike-crypto-profile")
+            or text_val(gw, "ike-crypto-profile")
+        )
+
     def _ike_gateways(self) -> dict[str, dict[str, str | None]]:
         """IKE gateway name → {egress, peer_ip, version, ike_crypto_profile}.
 
         ``local-address/interface`` is the PHYSICAL egress the gateway (and every
-        tunnel riding it) depends on.  The IKE crypto profile is nested under the
-        negotiated protocol version (``protocol/ikev2/ike-crypto-profile`` or
-        ``protocol/ikev1/ike-crypto-profile``) (CCR-0116).
+        tunnel riding it) depends on.  The IKE crypto profile read is shared with
+        ``parse_crypto`` via ``_ike_crypto_profile`` (CCR-0116).
         """
         gateways: dict[str, dict[str, str | None]] = {}
         for scope in self._device_scopes():
@@ -304,10 +322,7 @@ class PANOSParser(BaseParser):
                     "egress": text_val(gw, "local-address/interface"),
                     "peer_ip": text_val(gw, "peer-address/ip"),
                     "version": text_val(gw, "protocol/version"),
-                    "ike_crypto_profile": (
-                        text_val(gw, "protocol/ikev2/ike-crypto-profile")
-                        or text_val(gw, "protocol/ikev1/ike-crypto-profile")
-                    ),
+                    "ike_crypto_profile": self._ike_crypto_profile(gw),
                 }
         return gateways
 
@@ -1185,10 +1200,13 @@ class PANOSParser(BaseParser):
                     mode="tunnel",
                 ))
 
-            # IKE gateways → crypto map entries
+            # IKE gateways → crypto map entries.  The IKE crypto profile is
+            # emitted NESTED under protocol/ikev{1,2}; the old flat read returned
+            # nothing on a real export (empty transform_sets).  Shared reader with
+            # _ike_gateways so the crypto map and the tunnel underlay agree.
             for gw in entries(net, "ike/gateway"):
                 peer_ip = _safe_addr(text_val(gw, "peer-address/ip"))
-                crypto_profile = text_val(gw, "ike-crypto-profile")
+                crypto_profile = self._ike_crypto_profile(gw)
                 crypto_map_entries.append(CryptoMapEntry(
                     sequence=seq,
                     peer=peer_ip,
