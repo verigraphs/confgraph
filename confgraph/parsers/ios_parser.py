@@ -7408,6 +7408,17 @@ class IOSParser(BaseParser):
 
             neighbors = self._parse_bgp_neighbors(vrf_obj)
 
+            # Per-neighbor AF policy — the SAME polymorphic hook the global
+            # instance fires (parse_bgp → _apply_bgp_af_neighbor_policies).
+            # IOS-XR's override descends each neighbor's ``address-family``
+            # sub-block into BGPNeighborAF entries; the base walk reads
+            # EOS/IOS-style ``neighbor X <policy>`` lines inside the VRF's AF
+            # blocks; NX-OS AF blocks carry no neighbor lines, so it is a
+            # no-op there. Without this call a VRF neighbor lost its entire
+            # per-AF policy while the identical global block parsed correctly
+            # (CCR-0115).
+            self._apply_bgp_af_neighbor_policies(vrf_obj, neighbors)
+
             # Instance-level redistribute — DIRECT children of the ``vrf NAME``
             # block only (``find_child_objects``), mirroring the global
             # instance-level walk (``_parse_bgp_redistribute`` reads
