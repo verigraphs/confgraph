@@ -36,10 +36,11 @@ class PoliceAction(BaseModel):
 class PolicyMapPolice(BaseModel):
     """Police statement within a policy-map class."""
 
-    rate: int | None = Field(default=None, description="Rate in bps")
-    burst: int | None = Field(default=None, description="Normal burst (bytes)")
+    rate: int | None = Field(default=None, description="Rate value; interpreted per rate_unit (bps when rate_unit is None — the legacy IOS bare form)")
+    burst: int | None = Field(default=None, description="Normal burst value; interpreted per burst_unit (bytes when burst_unit is None)")
     excess_burst: int | None = Field(default=None, description="Excess burst (bytes)")
-    rate_unit: str | None = Field(default=None, description="Rate unit (bps, kbps, mbps, gbps, percent)")
+    rate_unit: str | None = Field(default=None, description="Rate unit (pps, bps, kbps, mbps, gbps, percent); None = legacy IOS bps default")
+    burst_unit: str | None = Field(default=None, description="Burst unit (packets, bytes, ms); None = legacy IOS bytes default")
     conform_actions: list[PoliceAction] = Field(default_factory=list)
     exceed_actions: list[PoliceAction] = Field(default_factory=list)
     violate_actions: list[PoliceAction] = Field(default_factory=list)

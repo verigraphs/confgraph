@@ -10700,12 +10700,31 @@ class IOSParser(BaseParser):
                                 priority = int(mm2.group(1))
                         elif re.match(r"police\s+", ct):
                             rate = burst = excess_burst = None
-                            rate_unit = None
-                            pm2 = re.match(r"police\s+(\d+)(?:\s+(\d+))?(?:\s+(\d+))?", ct)
-                            if pm2:
-                                rate = int(pm2.group(1))
-                                burst = int(pm2.group(2)) if pm2.group(2) else None
-                                excess_burst = int(pm2.group(3)) if pm2.group(3) else None
+                            rate_unit = burst_unit = None
+                            # NX-OS / two-rate 'cir' form with explicit units:
+                            #   police cir <n> {pps|kbps|mbps|gbps|bps} [bc <n> [{packets|bytes|ms}]]
+                            # Device-emitted CoPP form (n9kv 10.5(5)):
+                            #   'police cir 50 pps bc 16 packets ...'. The unit token is REQUIRED
+                            # here so the legacy IOS 'police cir <bps>' (no unit) form is left to
+                            # the bare-form fallback below and parses byte-identically to before.
+                            cir_m = re.match(
+                                r"police\s+cir\s+(\d+)\s+(pps|kbps|mbps|gbps|bps)"
+                                r"(?:\s+bc\s+(\d+)(?:\s+(packets|bytes|kbytes|mbytes|ms))?)?",
+                                ct,
+                            )
+                            if cir_m:
+                                rate = int(cir_m.group(1))
+                                rate_unit = cir_m.group(2)
+                                if cir_m.group(3):
+                                    burst = int(cir_m.group(3))
+                                    burst_unit = cir_m.group(4)
+                            else:
+                                # Legacy IOS bare form: police <bps> [<burst> [<excess_burst>]].
+                                pm2 = re.match(r"police\s+(\d+)(?:\s+(\d+))?(?:\s+(\d+))?", ct)
+                                if pm2:
+                                    rate = int(pm2.group(1))
+                                    burst = int(pm2.group(2)) if pm2.group(2) else None
+                                    excess_burst = int(pm2.group(3)) if pm2.group(3) else None
                             conform_actions = exceed_actions = violate_actions = []
                             for pcc in cc.children:
                                 pct = pcc.text.strip()
@@ -10720,7 +10739,7 @@ class IOSParser(BaseParser):
                                         violate_actions = actions_list
                             police = PolicyMapPolice(
                                 rate=rate, burst=burst, excess_burst=excess_burst,
-                                rate_unit=rate_unit,
+                                rate_unit=rate_unit, burst_unit=burst_unit,
                                 conform_actions=conform_actions,
                                 exceed_actions=exceed_actions,
                                 violate_actions=violate_actions,
