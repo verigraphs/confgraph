@@ -143,6 +143,9 @@ class NXOSParser(IOSParser):
                     "rt_import": [],
                     "rt_export": [],
                     "rt_both": [],
+                    "name_servers": [],
+                    "domain_name": None,
+                    "domain_list": [],
                     "scalars": {},
                 }
             else:
@@ -170,6 +173,27 @@ class NXOSParser(IOSParser):
                     val = self._extract_match(text, r"route-target\s+both\s+(\S+)")
                     if val and val not in entry["rt_both"]:
                         entry["rt_both"].append(val)
+                elif text.startswith("ip name-server "):
+                    # VRF-scoped resolver(s) — attribute to THIS VRF, not global
+                    # DNS (CCR-0093). Multiple IPs may share one line; an optional
+                    # "vrf <name>" prefix is stripped as in the global scan.
+                    parts = text.split()[2:]
+                    if len(parts) >= 2 and parts[0].lower() == "vrf":
+                        parts = parts[2:]
+                    for server in parts:
+                        if server not in entry["name_servers"]:
+                            entry["name_servers"].append(server)
+                elif re.match(r"ip\s+domain(?:-|\s+)name\s+\S+", text):
+                    # VRF-scoped domain name (CCR-0093). First occurrence wins,
+                    # mirroring the global DNSConfig.domain_name semantics.
+                    dm = re.match(r"ip\s+domain(?:-|\s+)name\s+(\S+)", text)
+                    if dm and entry["domain_name"] is None:
+                        entry["domain_name"] = dm.group(1)
+                elif re.match(r"ip\s+domain(?:-|\s+)list\s+\S+", text):
+                    # VRF-scoped search domain(s) (CCR-0093).
+                    lm = re.match(r"ip\s+domain(?:-|\s+)list\s+(\S+)", text)
+                    if lm and lm.group(1) not in entry["domain_list"]:
+                        entry["domain_list"].append(lm.group(1))
                 else:
                     # description (direct child of `vrf context`) and
                     # import/export map (under address-family) — the shared VRF
@@ -188,6 +212,9 @@ class NXOSParser(IOSParser):
                     route_target_import=entry["rt_import"],
                     route_target_export=entry["rt_export"],
                     route_target_both=entry["rt_both"],
+                    name_servers=entry["name_servers"],
+                    domain_name=entry["domain_name"],
+                    domain_list=entry["domain_list"],
                     **entry["scalars"],
                 )
             )
@@ -1900,90 +1927,12 @@ class NXOSParser(IOSParser):
             advertise_v2=advertise_v2,
         )
 
-    # -------------------------------------------------------------------
-    # DNS — scan vrf context blocks (N6)
-    # -------------------------------------------------------------------
-
-    def parse_dns(self):
-        """Parse DNS config, including entries inside ``vrf context`` blocks.
-
-        NX-OS places per-VRF DNS entries as children of ``vrf context NAME``
-        stanzas.  The inherited IOS ``parse_dns`` only scans global lines.
-        """
-        from confgraph.models.dns import DNSConfig
-
-        dns = super().parse_dns()
-
-        parse = self._get_parse_obj()
-        vrf_objs = parse.find_objects(r"^vrf\s+context\s+(\S+)")
-
-        extra_servers: list[str] = []
-        extra_domain_name: str | None = None
-        extra_domain_list: list[str] = []
-        extra_lookup_disabled = False
-        extra_raw: list[str] = []
-        extra_line_numbers: list[int] = []
-
-        for vrf_obj in vrf_objs:
-            for child in vrf_obj.children:
-                t = child.text.strip()
-
-                m = re.match(r"ip\s+name-server\s+(.*)", t)
-                if m:
-                    extra_raw.append(child.text)
-                    extra_line_numbers.append(child.linenum)
-                    parts = m.group(1).split()
-                    # Strip optional "vrf <name>" prefix
-                    if len(parts) >= 2 and parts[0].lower() == "vrf":
-                        parts = parts[2:]
-                    extra_servers.extend(parts)
-                    continue
-
-                m = re.match(r"ip\s+domain(?:-|\s+)name\s+(\S+)", t)
-                if m:
-                    extra_raw.append(child.text)
-                    extra_line_numbers.append(child.linenum)
-                    if extra_domain_name is None:
-                        extra_domain_name = m.group(1)
-                    continue
-
-                m = re.match(r"ip\s+domain(?:-|\s+)list\s+(\S+)", t)
-                if m:
-                    extra_raw.append(child.text)
-                    extra_line_numbers.append(child.linenum)
-                    extra_domain_list.append(m.group(1))
-                    continue
-
-                if re.match(r"no\s+ip\s+domain.lookup", t):
-                    extra_raw.append(child.text)
-                    extra_line_numbers.append(child.linenum)
-                    extra_lookup_disabled = True
-
-        if not extra_raw:
-            return dns
-
-        if dns is None:
-            dns = DNSConfig(
-                object_id="dns",
-                raw_lines=extra_raw,
-                source_os=self.os_type,
-                line_numbers=extra_line_numbers,
-                lookup_enabled=not extra_lookup_disabled,
-                domain_name=extra_domain_name,
-                domain_list=extra_domain_list,
-                name_servers=extra_servers,
-            )
-        else:
-            dns.raw_lines.extend(extra_raw)
-            dns.line_numbers.extend(extra_line_numbers)
-            dns.name_servers.extend(extra_servers)
-            if extra_domain_name and dns.domain_name is None:
-                dns.domain_name = extra_domain_name
-            dns.domain_list.extend(extra_domain_list)
-            if extra_lookup_disabled:
-                dns.lookup_enabled = False
-
-        return dns
+    # DNS — VRF-scoped DNS (`ip name-server` / `ip domain-name` /
+    # `ip domain-list` under `vrf context NAME`) is attributed to the VRF in
+    # ``parse_vrfs`` (VRFConfig.name_servers / domain_name / domain_list),
+    # NOT flattened into the global DNSConfig (CCR-0093). The inherited IOS
+    # ``parse_dns`` reads only top-level lines, which is exactly the global
+    # resolver set — so no NX-OS override is needed here.
 
     # -------------------------------------------------------------------
     # AAA — parse group server members (N2)

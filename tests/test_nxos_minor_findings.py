@@ -184,24 +184,33 @@ class TestN4VPCGuardedIPv4:
 
 
 class TestN6VRFContextDNS:
-    """DNS entries inside vrf context blocks are captured."""
+    """DNS entries inside ``vrf context`` blocks attribute to the VRF, not the
+    global resolver set (CCR-0093)."""
+
+    def _vrf(self, pc, name):
+        return next((v for v in pc.vrfs if v.name == name), None)
 
     def test_vrf_context_name_server(self):
         pc = _parse(
             "vrf context management\n"
             "  ip name-server 8.8.8.8 8.8.4.4\n"
         )
-        assert pc.dns is not None
-        assert "8.8.8.8" in pc.dns.name_servers
-        assert "8.8.4.4" in pc.dns.name_servers
+        vrf = self._vrf(pc, "management")
+        assert vrf is not None
+        assert vrf.name_servers == ["8.8.8.8", "8.8.4.4"]
+        # NOT flattened into global DNS.
+        assert pc.dns is None or "8.8.8.8" not in (pc.dns.name_servers or [])
 
     def test_vrf_context_domain_name(self):
         pc = _parse(
             "vrf context management\n"
             "  ip domain-name example.com\n"
         )
-        assert pc.dns is not None
-        assert pc.dns.domain_name == "example.com"
+        vrf = self._vrf(pc, "management")
+        assert vrf is not None
+        assert vrf.domain_name == "example.com"
+        # NOT stolen by the global domain-name.
+        assert pc.dns is None or pc.dns.domain_name != "example.com"
 
     def test_vrf_context_domain_list(self):
         pc = _parse(
@@ -209,19 +218,24 @@ class TestN6VRFContextDNS:
             "  ip domain-list corp.local\n"
             "  ip domain-list lab.local\n"
         )
-        assert pc.dns is not None
-        assert "corp.local" in pc.dns.domain_list
-        assert "lab.local" in pc.dns.domain_list
+        vrf = self._vrf(pc, "management")
+        assert vrf is not None
+        assert "corp.local" in vrf.domain_list
+        assert "lab.local" in vrf.domain_list
 
-    def test_global_and_vrf_merged(self):
+    def test_global_and_vrf_isolated(self):
         pc = _parse(
             "ip name-server 1.1.1.1\n"
             "vrf context management\n"
             "  ip name-server 8.8.8.8\n"
         )
+        # Global DNS carries only the global resolver.
         assert pc.dns is not None
-        assert "1.1.1.1" in pc.dns.name_servers
-        assert "8.8.8.8" in pc.dns.name_servers
+        assert pc.dns.name_servers == ["1.1.1.1"]
+        # The VRF carries only its own resolver.
+        vrf = self._vrf(pc, "management")
+        assert vrf is not None
+        assert vrf.name_servers == ["8.8.8.8"]
 
     def test_no_dns_returns_none(self):
         pc = _parse("hostname SWITCH1\n")
