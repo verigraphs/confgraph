@@ -385,6 +385,14 @@ class BaseParser(ABC):
         """
         return []
 
+    def parse_object_groups(self) -> list["ObjectGroup"]:
+        """Parse named object-groups (address/port sets referenced by ACEs).
+
+        Optional — empty by default. The IOS-family parser overrides it; only
+        NX-OS-style ``object-group ip|ipv6 address|port`` blocks are matched.
+        """
+        return []
+
     def parse_community_lists(self) -> list[CommunityListConfig]:
         """Parse BGP community-list configurations.
 
@@ -630,6 +638,7 @@ class BaseParser(ABC):
         ("prefix_lists",       "parse_prefix_lists"),
         ("static_routes",      "parse_static_routes"),
         ("acls",               "parse_acls"),
+        ("object_groups",      "parse_object_groups"),
         ("community_lists",    "parse_community_lists"),
         ("as_path_lists",      "parse_as_path_lists"),
         ("ntp",                "parse_ntp"),

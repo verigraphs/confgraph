@@ -77,6 +77,13 @@ class ACLEntry(BaseModel):
         default=None,
         description="Source wildcard mask",
     )
+    source_group: str | None = Field(
+        default=None,
+        description=(
+            "Object-group name referenced as the source "
+            "(NX-OS 'addrgroup <NAME>') instead of a literal address"
+        ),
+    )
     destination: str | None = Field(
         default=None,
         description="Destination address or 'any' or 'host X.X.X.X'",
@@ -84,6 +91,13 @@ class ACLEntry(BaseModel):
     destination_wildcard: str | None = Field(
         default=None,
         description="Destination wildcard mask",
+    )
+    destination_group: str | None = Field(
+        default=None,
+        description=(
+            "Object-group name referenced as the destination "
+            "(NX-OS 'addrgroup <NAME>') instead of a literal address"
+        ),
     )
     source_port: str | None = Field(
         default=None,
@@ -133,7 +147,15 @@ class ACLConfig(BaseConfigObject):
     )
     acl_type: str = Field(
         ...,
-        description="ACL type ('standard', 'extended', 'ipv6')",
+        description="ACL grammar type ('standard', 'extended', 'ipv6')",
+    )
+    family: str = Field(
+        default="ipv4",
+        description=(
+            "Address family / list kind: 'ipv4' (ip access-list), "
+            "'ipv6' (ipv6 access-list), or 'mac' (mac access-list). "
+            "Distinguishes v4/v6/mac lists that otherwise share this model."
+        ),
     )
     entries: list[ACLEntry] = Field(
         default_factory=list,

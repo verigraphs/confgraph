@@ -12,6 +12,7 @@ from confgraph.models.route_map import RouteMapConfig
 from confgraph.models.prefix_list import PrefixListConfig
 from confgraph.models.static_route import StaticRoute
 from confgraph.models.acl import ACLConfig
+from confgraph.models.object_group import ObjectGroup
 from confgraph.models.community_list import CommunityListConfig, ASPathListConfig
 from confgraph.models.base import OSType, UnrecognizedBlock
 from confgraph.models.eigrp import EIGRPConfig
@@ -95,6 +96,10 @@ class ParsedConfig(BaseModel):
     acls: list[ACLConfig] = Field(
         default_factory=list,
         description="Access control lists",
+    )
+    object_groups: list[ObjectGroup] = Field(
+        default_factory=list,
+        description="Named object-groups (address/port sets referenced by ACEs)",
     )
     community_lists: list[CommunityListConfig] = Field(
         default_factory=list,
