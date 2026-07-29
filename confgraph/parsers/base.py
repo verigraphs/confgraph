@@ -385,6 +385,14 @@ class BaseParser(ABC):
         """
         return []
 
+    def parse_object_groups(self) -> list["ObjectGroup"]:
+        """Parse named object-groups (address/port sets referenced by ACEs).
+
+        Optional — empty by default. The IOS-family parser overrides it; only
+        NX-OS-style ``object-group ip|ipv6 address|port`` blocks are matched.
+        """
+        return []
+
     def parse_community_lists(self) -> list[CommunityListConfig]:
         """Parse BGP community-list configurations.
 
@@ -479,6 +487,10 @@ class BaseParser(ABC):
 
     def parse_vxlan(self) -> "VXLANConfig | None":
         """Parse VXLAN/VTEP configuration."""
+        return None
+
+    def parse_evpn(self) -> "EVPNConfig | None":
+        """Parse the MP-BGP EVPN control-plane ('evpn' block)."""
         return None
 
     def parse_vpc(self) -> "VPCConfig | None":
@@ -626,6 +638,7 @@ class BaseParser(ABC):
         ("prefix_lists",       "parse_prefix_lists"),
         ("static_routes",      "parse_static_routes"),
         ("acls",               "parse_acls"),
+        ("object_groups",      "parse_object_groups"),
         ("community_lists",    "parse_community_lists"),
         ("as_path_lists",      "parse_as_path_lists"),
         ("ntp",                "parse_ntp"),
@@ -635,6 +648,7 @@ class BaseParser(ABC):
         ("lines",              "parse_lines"),
         ("class_maps",         "parse_class_maps"),
         ("policy_maps",        "parse_policy_maps"),
+        ("control_plane",      "parse_control_plane"),
         ("nat",                "parse_nat"),
         ("crypto",             "parse_crypto"),
         ("bfd",                "parse_bfd"),
@@ -644,6 +658,7 @@ class BaseParser(ABC):
         ("multicast",          "parse_multicast"),
         ("mpls",               "parse_mpls"),
         ("vxlan",              "parse_vxlan"),
+        ("evpn",               "parse_evpn"),
         ("vpc",                "parse_vpc"),
         ("zones",              "parse_zones"),
         ("aaa",                "parse_aaa"),
@@ -658,6 +673,15 @@ class BaseParser(ABC):
         ("netflow",            "parse_netflow"),
         ("no_commands",        "parse_deletion_commands"),
     ]
+
+    def parse_control_plane(self):
+        """Parse the 'control-plane' (CoPP) service-policy binding.
+
+        Default no-op — only platforms that model control-plane policing
+        (NX-OS) override this. Returns None so the field stays absent
+        everywhere else.
+        """
+        return None
 
     def parse_deletion_commands(self) -> list[str]:
         """Parse top-level 'no' deletion commands into tombstone strings.

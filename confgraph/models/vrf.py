@@ -53,3 +53,21 @@ class VRFConfig(BaseConfigObject):
         default=None,
         description="VPN ID (NX-OS specific)",
     )
+    domain_name: str | None = Field(
+        default=None,
+        description=(
+            "VRF-scoped DNS domain name ('ip domain-name' under 'vrf context "
+            "NAME'); distinct from the global DNSConfig.domain_name (NX-OS)"
+        ),
+    )
+    domain_list: list[str] = Field(
+        default_factory=list,
+        description="VRF-scoped DNS search domains ('ip domain-list' under 'vrf context NAME')",
+    )
+    name_servers: list[str] = Field(
+        default_factory=list,
+        description=(
+            "VRF-scoped DNS resolvers ('ip name-server' under 'vrf context NAME'); "
+            "the management VRF's resolver set, kept separate from global DNS (NX-OS)"
+        ),
+    )

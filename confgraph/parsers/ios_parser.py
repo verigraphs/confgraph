@@ -52,6 +52,7 @@ from confgraph.models.prefix_list import (
 )
 from confgraph.models.static_route import StaticRoute
 from confgraph.models.acl import ACLConfig, ACLEntry
+from confgraph.models.object_group import ObjectGroup, ObjectGroupMember
 from confgraph.models.community_list import (
     CommunityListConfig,
     CommunityListEntry,
@@ -1964,6 +1965,15 @@ class IOSParser(BaseParser):
         "glbp_groups": lambda g: rf"^\s+glbp\s+{g.group_number}\b",
         "ospf_message_digest_keys": lambda key_id: (
             rf"^\s+ip\s+ospf\s+message-digest-key\s+{key_id}\s"
+        ),
+        # CCR-0092: NX-OS storm-control — one line per traffic type.
+        "storm_control": lambda sc: (
+            rf"^\s+storm-control\s+{re.escape(sc.traffic_type)}\s+level\b"
+        ),
+        # CCR-0094: NX-OS NetFlow application — one line per direction.
+        "flow_monitors": lambda fm: (
+            rf"^\s+ip\s+flow\s+monitor\s+{re.escape(fm.monitor)}\s+"
+            rf"{re.escape(fm.direction)}\b"
         ),
     }
 
@@ -8704,33 +8714,45 @@ class IOSParser(BaseParser):
         # ``process:bgp:`` entries (no native op behind them, IOS-XR-style).
         return tombstones
 
+    # One header grammar for every named-ACL family. group 1 = family keyword
+    # (ip / ipv6 / mac), group 2 = optional IPv4 standard|extended qualifier
+    # (only IPv4 spells it), group 3 = name. Broadening the match to ipv6/mac
+    # here — rather than adding a second find_objects branch — is what keeps
+    # the walk a single pass. ``ip access-list`` lines match byte-identically
+    # to the previous ``^ip\s+access-list`` form.
+    _ACL_HEADER = re.compile(
+        r"^(ip|ipv6|mac)\s+access-list\s+(?:(standard|extended)\s+)?(\S+)"
+    )
+    # Header keyword -> address family. IPv6/MAC have no standard/extended
+    # split, so their ACEs use the extended grammar (MAC gets its own body
+    # parser, keyed off family, not acl_type).
+    _ACL_FAMILY = {"ip": "ipv4", "ipv6": "ipv6", "mac": "mac"}
+
     def parse_acls(self) -> list[ACLConfig]:
-        """Parse ACL configurations."""
+        """Parse ACL configurations (IPv4 ``ip``, IPv6 ``ipv6``, MAC ``mac``)."""
         acls = []
         parse = self._get_parse_obj()
 
-        # Find all ACL definitions (named ACLs)
-        # IOS: "ip access-list standard|extended NAME"
-        # NX-OS: "ip access-list NAME" (no keyword — treated as extended)
-        acl_objs = parse.find_objects(r"^ip\s+access-list\s+\S+")
+        # Find all named ACL definitions across the three families in one pass.
+        acl_objs = parse.find_objects(r"^(?:ip|ipv6|mac)\s+access-list\s+\S+")
 
         for acl_obj in acl_objs:
-            match = re.search(
-                r"^ip\s+access-list\s+(?:(standard|extended)\s+)?(\S+)",
-                acl_obj.text,
-            )
+            match = self._ACL_HEADER.match(acl_obj.text)
             if not match:
                 continue
 
-            acl_type = match.group(1) or "extended"
-            acl_name = match.group(2)
+            family = self._ACL_FAMILY[match.group(1)]
+            acl_type = match.group(2) or "extended"
+            acl_name = match.group(3)
 
             raw_lines, line_numbers = self._get_raw_lines_and_line_numbers(acl_obj)
 
             # Parse entries
             entries = []
             for entry_child in acl_obj.children:
-                entry = self._parse_acl_entry(entry_child.text.strip(), acl_type)
+                entry = self._parse_acl_entry(
+                    entry_child.text.strip(), acl_type, family=family
+                )
                 if entry is not None:
                     entries.append(entry)
 
@@ -8742,6 +8764,7 @@ class IOSParser(BaseParser):
                     line_numbers=line_numbers,
                     name=acl_name,
                     acl_type=acl_type,
+                    family=family,
                     entries=entries,
                 )
             )
@@ -8752,6 +8775,58 @@ class IOSParser(BaseParser):
         self._parse_numbered_acls(parse, acls)
 
         return acls
+
+    # object-group <ip|ipv6> <address|port> <NAME>. Deliberately narrow: the
+    # ASA/IOS ``object-group network|service`` forms have a different member
+    # grammar and are NOT matched here (they stay unmodeled rather than
+    # mis-modeled), so this shared walk is a no-op on non-NX-OS configs.
+    _OBJECT_GROUP_HEADER = re.compile(
+        r"^object-group\s+(ip|ipv6)\s+(address|port)\s+(\S+)\s*$"
+    )
+
+    def parse_object_groups(self) -> list[ObjectGroup]:
+        """Parse ``object-group ip|ipv6 address|port`` blocks and their members."""
+        groups: list[ObjectGroup] = []
+        parse = self._get_parse_obj()
+
+        for obj in parse.find_objects(
+            r"^object-group\s+(?:ip|ipv6)\s+(?:address|port)\s+\S+"
+        ):
+            m = self._OBJECT_GROUP_HEADER.match(obj.text.strip())
+            if not m:
+                continue
+
+            group_type = f"{m.group(1)} {m.group(2)}"
+            name = m.group(3)
+            raw_lines, line_numbers = self._get_raw_lines_and_line_numbers(obj)
+
+            members: list[ObjectGroupMember] = []
+            for child in obj.children:
+                text = child.text.strip()
+                if not text:
+                    continue
+                sequence = None
+                parts = text.split(None, 1)
+                if parts and parts[0].isdigit():
+                    sequence = int(parts[0])
+                    text = parts[1].strip() if len(parts) > 1 else ""
+                if not text:
+                    continue
+                members.append(ObjectGroupMember(sequence=sequence, value=text))
+
+            groups.append(
+                ObjectGroup(
+                    object_id=f"object_group_{name}",
+                    raw_lines=raw_lines,
+                    source_os=self.os_type,
+                    line_numbers=line_numbers,
+                    name=name,
+                    group_type=group_type,
+                    members=members,
+                )
+            )
+
+        return groups
 
     @staticmethod
     def _numbered_acl_type(number: int) -> str | None:
@@ -8798,23 +8873,36 @@ class IOSParser(BaseParser):
                 )
             )
 
-    def _parse_acl_entry(self, entry_text: str, acl_type: str) -> "ACLEntry | None":
+    def _parse_acl_entry(
+        self, entry_text: str, acl_type: str, family: str = "ipv4"
+    ) -> "ACLEntry | None":
         """Parse one ACL entry line (named child or numbered body) into an
-        ``ACLEntry``. ``acl_type`` selects the standard vs extended grammar;
-        both the named and numbered spellings share this one parser."""
-        # Handle remark
-        if entry_text.startswith("remark "):
-            return ACLEntry(action="remark", remark=entry_text.replace("remark ", "").strip())
-
+        ``ACLEntry``. ``acl_type`` selects the standard vs extended grammar
+        (IPv4/IPv6); ``family`` routes MAC ACEs to their own body grammar.
+        Both the named and numbered spellings share this one parser."""
         parts = entry_text.split()
-        if len(parts) < 2:
+        if not parts:
             return None
 
-        # Check if first part is sequence number
+        # Strip a leading sequence number FIRST. A standalone, sequenced
+        # ``<seq> remark <text>`` line was previously dropped because the
+        # remark check ran against the raw text (which starts with the digit),
+        # never matched, and then failed the permit/deny action check.
         sequence = None
         if parts[0].isdigit():
             sequence = int(parts[0])
             parts = parts[1:]
+
+        if not parts:
+            return None
+
+        # Standalone remark ACE (sequenced or not) — its own entry.
+        if parts[0] == "remark":
+            return ACLEntry(
+                sequence=sequence,
+                action="remark",
+                remark=" ".join(parts[1:]).strip(),
+            )
 
         if len(parts) < 2:
             return None
@@ -8822,6 +8910,11 @@ class IOSParser(BaseParser):
         action = parts[0]  # permit or deny
         if action not in ["permit", "deny"]:
             return None
+
+        # MAC ACLs use a different body grammar (L2 addresses/masks, no IP
+        # protocol or L4 ports) — dispatch on family, not acl_type.
+        if family == "mac":
+            return self._parse_mac_acl_entry(sequence, action, parts[1:])
 
         if acl_type == "standard":
             # Standard ACL: permit/deny source [wildcard]
@@ -8855,6 +8948,7 @@ class IOSParser(BaseParser):
         # Parse source
         source = None
         source_wildcard = None
+        source_group = None
         source_port = None
         idx = 0
 
@@ -8866,27 +8960,27 @@ class IOSParser(BaseParser):
             elif remaining_parts[idx] == "any":
                 source = "any"
                 idx += 1
+            elif remaining_parts[idx] == "addrgroup":
+                # NX-OS object-group reference: the source is the named group,
+                # not a literal address. Previously mis-parsed as
+                # source='addrgroup', source_wildcard='<NAME>'.
+                idx += 1
+                source_group = remaining_parts[idx] if idx < len(remaining_parts) else None
+                idx += 1
             else:
                 source = remaining_parts[idx]
                 idx += 1
-                if idx < len(remaining_parts) and not remaining_parts[idx] in ["eq", "range", "gt", "lt", "host", "any"]:
+                if idx < len(remaining_parts) and not remaining_parts[idx] in ["eq", "range", "gt", "lt", "host", "any", "portgroup"]:
                     source_wildcard = remaining_parts[idx]
                     idx += 1
 
         # Parse source port
-        if idx < len(remaining_parts) and remaining_parts[idx] in ["eq", "range", "gt", "lt"]:
-            port_op = remaining_parts[idx]
-            idx += 1
-            if port_op == "range" and idx + 1 < len(remaining_parts):
-                source_port = f"{port_op} {remaining_parts[idx]} {remaining_parts[idx + 1]}"
-                idx += 2
-            elif idx < len(remaining_parts):
-                source_port = f"{port_op} {remaining_parts[idx]}"
-                idx += 1
+        idx, source_port = self._parse_acl_port(remaining_parts, idx)
 
         # Parse destination
         destination = None
         destination_wildcard = None
+        destination_group = None
         destination_port = None
 
         if idx < len(remaining_parts):
@@ -8897,23 +8991,19 @@ class IOSParser(BaseParser):
             elif remaining_parts[idx] == "any":
                 destination = "any"
                 idx += 1
+            elif remaining_parts[idx] == "addrgroup":
+                idx += 1
+                destination_group = remaining_parts[idx] if idx < len(remaining_parts) else None
+                idx += 1
             else:
                 destination = remaining_parts[idx]
                 idx += 1
-                if idx < len(remaining_parts) and not remaining_parts[idx] in ["eq", "range", "gt", "lt"]:
+                if idx < len(remaining_parts) and not remaining_parts[idx] in ["eq", "range", "gt", "lt", "portgroup"]:
                     destination_wildcard = remaining_parts[idx]
                     idx += 1
 
         # Parse destination port
-        if idx < len(remaining_parts) and remaining_parts[idx] in ["eq", "range", "gt", "lt"]:
-            port_op = remaining_parts[idx]
-            idx += 1
-            if port_op == "range" and idx + 1 < len(remaining_parts):
-                destination_port = f"{port_op} {remaining_parts[idx]} {remaining_parts[idx + 1]}"
-                idx += 2
-            elif idx < len(remaining_parts):
-                destination_port = f"{port_op} {remaining_parts[idx]}"
-                idx += 1
+        idx, destination_port = self._parse_acl_port(remaining_parts, idx)
 
         # Parse flags
         flags = []
@@ -8927,11 +9017,83 @@ class IOSParser(BaseParser):
             protocol=protocol,
             source=source,
             source_wildcard=source_wildcard,
+            source_group=source_group,
             source_port=source_port,
             destination=destination,
             destination_wildcard=destination_wildcard,
+            destination_group=destination_group,
             destination_port=destination_port,
             flags=flags,
+        )
+
+    @staticmethod
+    def _parse_acl_port(tokens: list[str], idx: int) -> tuple[int, str | None]:
+        """Consume a port operand at ``idx``. Returns (new_idx, port_or_None).
+
+        Handles the L4 operators (``eq``/``range``/``gt``/``lt``) exactly as
+        before, plus the NX-OS ``portgroup <NAME>`` object-group reference,
+        recorded as ``"portgroup <NAME>"`` so the group name is preserved
+        instead of falling into ``flags``."""
+        if idx >= len(tokens):
+            return idx, None
+        tok = tokens[idx]
+        if tok == "portgroup":
+            idx += 1
+            name = tokens[idx] if idx < len(tokens) else None
+            return idx + 1, f"portgroup {name}" if name else "portgroup"
+        if tok in ("eq", "range", "gt", "lt"):
+            port_op = tok
+            idx += 1
+            if port_op == "range" and idx + 1 < len(tokens):
+                return idx + 2, f"{port_op} {tokens[idx]} {tokens[idx + 1]}"
+            if idx < len(tokens):
+                return idx + 1, f"{port_op} {tokens[idx]}"
+            # Dangling operator with no operand: consume it, no port recorded
+            # (matches the pre-refactor behaviour).
+            return idx, None
+        return idx, None
+
+    @staticmethod
+    def _consume_mac_operand(tokens: list[str], idx: int) -> tuple[str | None, str | None, int]:
+        """Consume one MAC ACE operand: ``any`` | ``host <mac>`` | ``<mac> <mask>``.
+
+        Returns (address, mask, new_idx)."""
+        if idx >= len(tokens):
+            return None, None, idx
+        tok = tokens[idx]
+        if tok == "any":
+            return "any", None, idx + 1
+        if tok == "host":
+            idx += 1
+            addr = tokens[idx] if idx < len(tokens) else None
+            return addr, None, idx + 1
+        addr = tok
+        idx += 1
+        mask = None
+        if idx < len(tokens):
+            mask = tokens[idx]
+            idx += 1
+        return addr, mask, idx
+
+    def _parse_mac_acl_entry(
+        self, sequence: int | None, action: str, tokens: list[str]
+    ) -> "ACLEntry":
+        """Parse a MAC ACE body (``<src> <dst> [ethertype ...]``).
+
+        MAC ACLs match on L2 addresses/masks, not IP protocol/ports, so the
+        source/destination MACs (and their masks) populate the address fields;
+        any trailing tokens (ethertype, cos, etc.) go into ``flags``."""
+        idx = 0
+        source, source_wildcard, idx = self._consume_mac_operand(tokens, idx)
+        destination, destination_wildcard, idx = self._consume_mac_operand(tokens, idx)
+        return ACLEntry(
+            sequence=sequence,
+            action=action,
+            source=source,
+            source_wildcard=source_wildcard,
+            destination=destination,
+            destination_wildcard=destination_wildcard,
+            flags=list(tokens[idx:]),
         )
 
     def parse_community_lists(self) -> list[CommunityListConfig]:
@@ -10446,11 +10608,20 @@ class IOSParser(BaseParser):
         class_maps = []
 
         for cm_obj in parse.find_objects(r"^class-map\s+"):
-            m = re.match(r"^class-map\s+(?:(match-any|match-all)\s+)?(\S+)", cm_obj.text)
+            # An optional `type <qualifier>` (control-plane / qos / queuing / …)
+            # precedes the match-logic keyword and the name; skip the two type
+            # tokens, carry the qualifier, and capture the REAL name. Without
+            # this the qualifier token 'type' is mis-read as the class-map name
+            # (CCR-0064 / CCR-0089). The plain untyped form is unchanged.
+            m = re.match(
+                r"^class-map\s+(?:type\s+(\S+)\s+)?(?:(match-any|match-all)\s+)?(\S+)",
+                cm_obj.text,
+            )
             if not m:
                 continue
-            match_type = m.group(1) or "match-all"
-            name = m.group(2)
+            cm_type = m.group(1)
+            match_type = m.group(2) or "match-all"
+            name = m.group(3)
             raw_lines, line_numbers = self._get_raw_lines_and_line_numbers(cm_obj)
 
             matches = []
@@ -10469,6 +10640,7 @@ class IOSParser(BaseParser):
                 source_os=self.os_type,
                 line_numbers=line_numbers,
                 name=name,
+                type=cm_type,
                 match_type=match_type,
                 matches=matches,
             ))
@@ -10485,10 +10657,13 @@ class IOSParser(BaseParser):
         policy_maps = []
 
         for pm_obj in parse.find_objects(r"^policy-map\s+"):
-            m = re.match(r"^policy-map\s+(\S+)", pm_obj.text)
+            # Skip an optional `type <qualifier>` (control-plane / qos / …) so the
+            # real name is captured instead of the token 'type' (CCR-0064/-0089).
+            m = re.match(r"^policy-map\s+(?:type\s+(\S+)\s+)?(\S+)", pm_obj.text)
             if not m:
                 continue
-            name = m.group(1)
+            pm_type = m.group(1)
+            name = m.group(2)
             raw_lines, line_numbers = self._get_raw_lines_and_line_numbers(pm_obj)
 
             classes = []
@@ -10582,6 +10757,7 @@ class IOSParser(BaseParser):
                 source_os=self.os_type,
                 line_numbers=line_numbers,
                 name=name,
+                type=pm_type,
                 classes=classes,
             ))
 
@@ -10926,7 +11102,13 @@ class IOSParser(BaseParser):
             port = frequency = threshold_val = timeout = None
             vrf = tag = None
 
-            for c in obj.children:
+            # Walk ALL descendants, not just direct children: IOS emits the
+            # timing sub-parameters flat under `ip sla N` (siblings of the
+            # operation line), but NX-OS emits the operation as a config
+            # submode and nests `frequency`/`timeout`/`tag` one level deeper
+            # beneath it. `all_children` flattens both shapes so a single
+            # classification handles them (CCR-0091).
+            for c in obj.all_children:
                 ct = c.text.strip()
                 # Legacy "ip sla monitor" body: "type echo protocol ipIcmpEcho ADDR"
                 # normalizes to the modern icmp-echo operation.
@@ -10942,6 +11124,14 @@ class IOSParser(BaseParser):
                         op_type = op
                         parts = ct.split()
                         destination = parts[1] if len(parts) > 1 else None
+                        # UDP/TCP operations carry the destination port as the
+                        # numeric token immediately after the destination
+                        # (`udp-jitter <dst> <port>` / `udp-echo <dst> <port>` /
+                        # `tcp-connect <dst> <port>`). ICMP/DNS operations put a
+                        # keyword there instead, so guard on a bare digit token
+                        # and leave `port` None otherwise (CCR-0091).
+                        if len(parts) > 2 and parts[2].isdigit():
+                            port = int(parts[2])
                         # The operation line carries the source, and it names it
                         # EITHER by interface OR by address — the two are
                         # alternatives in one optional bracket group

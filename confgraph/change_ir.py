@@ -575,6 +575,7 @@ _IFACE_MEMBER_KEYS: dict[str, "Callable[[Any], str] | None"] = {
     "secondary_ips": None,
     "ipv6_addresses": None,
     "helper_addresses": None,
+    "dhcp_relay_addresses": None,
     "varp_addresses": None,
     "nhrp_nhs": None,
     "nhrp_map": None,
@@ -583,6 +584,16 @@ _IFACE_MEMBER_KEYS: dict[str, "Callable[[Any], str] | None"] = {
     "hsrp_groups": lambda g: str(g.group_number),
     "vrrp_groups": lambda g: str(g.group_number),
     "glbp_groups": lambda g: str(g.group_number),
+    # CCR-0092: NX-OS interface storm-control. A device emits one
+    # "storm-control <type> level <threshold>" line per traffic type, so it is a
+    # keyed per-member list (keyed by traffic_type) of the same shape as the FHRP
+    # group lists.
+    "storm_control": lambda sc: sc.traffic_type,
+    # CCR-0094: NX-OS per-interface NetFlow monitor application. A device emits
+    # one "ip flow monitor <name> <direction>" line per direction, so it is a
+    # keyed per-member list (keyed by direction) of the same shape as the
+    # storm-control list.
+    "flow_monitors": lambda fm: fm.direction,
 }
 
 # Interface member-removal tombstone kinds (NESTED_DELETION_RULES
@@ -2130,6 +2141,13 @@ _SINGLETON_MEMBER_KEYS: dict[str, dict[str, Callable[[Any], tuple[str, ...]]]] =
     },
     "netflow": {
         "destinations": lambda d: (str(d.address), str(d.port)),
+        # CCR-0094: Flexible NetFlow flow record / exporter / monitor blocks
+        # (NX-OS). Each is a top-level named object under the netflow
+        # singleton, so it is a per-member keyed list keyed by name — the same
+        # discipline as the dhcp pools / bfd templates member lists.
+        "flow_records": lambda r: (r.name,),
+        "flow_exporters": lambda e: (e.name,),
+        "flow_monitors": lambda m: (m.name,),
     },
     "multicast": {
         "pim_rp_addresses": lambda r: (str(r.rp_address), r.acl or ""),

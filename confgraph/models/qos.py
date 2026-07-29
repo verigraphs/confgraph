@@ -15,6 +15,10 @@ class ClassMapConfig(BaseConfigObject):
     """Class-map configuration."""
 
     name: str = Field(..., description="Class-map name")
+    type: str | None = Field(
+        default=None,
+        description="Type qualifier from 'class-map type <X> ...' (e.g. 'control-plane', 'qos', 'queuing'); None for the plain untyped form",
+    )
     match_type: str = Field(default="match-all", description="Match logic: match-all or match-any")
     matches: list[ClassMapMatch] = Field(default_factory=list, description="Match criteria")
 
@@ -75,7 +79,27 @@ class PolicyMapConfig(BaseConfigObject):
     """Policy-map configuration."""
 
     name: str = Field(..., description="Policy-map name")
+    type: str | None = Field(
+        default=None,
+        description="Type qualifier from 'policy-map type <X> ...' (e.g. 'control-plane', 'qos', 'queuing'); None for the plain untyped form",
+    )
     classes: list[PolicyMapClass] = Field(default_factory=list, description="Class entries")
 
     class Config:
         use_enum_values = True
+
+
+class ControlPlaneConfig(BaseModel):
+    """Control-plane (CoPP) binding — the 'control-plane' block.
+
+    Models the service-policy that attaches a control-plane policing (CoPP)
+    policy-map to the control plane, e.g. NX-OS::
+
+        control-plane
+          service-policy input PM_COPP
+    """
+
+    service_policy_input: str | None = Field(
+        default=None,
+        description="Name of the policy-map attached via 'service-policy input <PM>'",
+    )

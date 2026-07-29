@@ -108,6 +108,10 @@ class TestBoundary:
             # <ip>" line PER address, so it is a per-member list of the same
             # shape as helper_addresses, not a scalar.
             "varp_addresses",
+            # CCR-0090: NX-OS per-interface DHCP relay targets. A device emits
+            # one "ip dhcp relay address <ip>" line PER address, the same
+            # per-member union shape as helper_addresses/varp_addresses.
+            "dhcp_relay_addresses",
             "nhrp_nhs",
             "nhrp_map",
             "igmp_join_groups",
@@ -115,6 +119,14 @@ class TestBoundary:
             "hsrp_groups",
             "vrrp_groups",
             "glbp_groups",
+            # CCR-0092: NX-OS interface storm-control. A device emits one
+            # "storm-control <type> level <threshold>" line PER traffic type, a
+            # keyed per-member list (keyed by traffic_type) like the FHRP groups.
+            "storm_control",
+            # CCR-0094: NX-OS per-interface NetFlow application. A device emits
+            # one "ip flow monitor <name> <direction>" line PER direction, a
+            # keyed per-member list (keyed by direction) like storm_control.
+            "flow_monitors",
             "ospf_message_digest_keys",
         }
         # Pin flipped in place by WI-DB1-B1 (CCR Appendix AA): the registry

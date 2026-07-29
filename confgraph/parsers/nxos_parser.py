@@ -13,6 +13,14 @@ from confgraph.models.bgp import (
     BGPBestpathOptions,
 )
 from confgraph.models.ospf import OSPFConfig
+from confgraph.models.qos import ControlPlaneConfig
+from confgraph.models.interface import InterfaceFlowMonitor, StormControlLevel, VRRPGroup
+from confgraph.models.netflow import (
+    NetFlowConfig,
+    NetFlowExporter,
+    NetFlowMonitor,
+    NetFlowRecord,
+)
 from confgraph.models.static_route import StaticRoute
 from confgraph.parsers.base import _BASE_KNOWN_PATTERNS, apply_peer_group_command, _default_pg_data
 from confgraph.parsers.ios_parser import IOSParser
@@ -34,6 +42,9 @@ _NXOS_KNOWN_PATTERNS: list[str] = [
     r"^spanning-tree",
     r"^port-profile",
     r"^mpls",
+    r"^control-plane",
+    # CCR-0094: Flexible NetFlow top-level blocks (claimed by parse_netflow).
+    r"^flow\s+(record|exporter|monitor)\b",
 ]
 
 
@@ -142,6 +153,9 @@ class NXOSParser(IOSParser):
                     "rt_import": [],
                     "rt_export": [],
                     "rt_both": [],
+                    "name_servers": [],
+                    "domain_name": None,
+                    "domain_list": [],
                     "scalars": {},
                 }
             else:
@@ -169,6 +183,27 @@ class NXOSParser(IOSParser):
                     val = self._extract_match(text, r"route-target\s+both\s+(\S+)")
                     if val and val not in entry["rt_both"]:
                         entry["rt_both"].append(val)
+                elif text.startswith("ip name-server "):
+                    # VRF-scoped resolver(s) — attribute to THIS VRF, not global
+                    # DNS (CCR-0093). Multiple IPs may share one line; an optional
+                    # "vrf <name>" prefix is stripped as in the global scan.
+                    parts = text.split()[2:]
+                    if len(parts) >= 2 and parts[0].lower() == "vrf":
+                        parts = parts[2:]
+                    for server in parts:
+                        if server not in entry["name_servers"]:
+                            entry["name_servers"].append(server)
+                elif re.match(r"ip\s+domain(?:-|\s+)name\s+\S+", text):
+                    # VRF-scoped domain name (CCR-0093). First occurrence wins,
+                    # mirroring the global DNSConfig.domain_name semantics.
+                    dm = re.match(r"ip\s+domain(?:-|\s+)name\s+(\S+)", text)
+                    if dm and entry["domain_name"] is None:
+                        entry["domain_name"] = dm.group(1)
+                elif re.match(r"ip\s+domain(?:-|\s+)list\s+\S+", text):
+                    # VRF-scoped search domain(s) (CCR-0093).
+                    lm = re.match(r"ip\s+domain(?:-|\s+)list\s+(\S+)", text)
+                    if lm and lm.group(1) not in entry["domain_list"]:
+                        entry["domain_list"].append(lm.group(1))
                 else:
                     # description (direct child of `vrf context`) and
                     # import/export map (under address-family) — the shared VRF
@@ -187,6 +222,9 @@ class NXOSParser(IOSParser):
                     route_target_import=entry["rt_import"],
                     route_target_export=entry["rt_export"],
                     route_target_both=entry["rt_both"],
+                    name_servers=entry["name_servers"],
+                    domain_name=entry["domain_name"],
+                    domain_list=entry["domain_list"],
                     **entry["scalars"],
                 )
             )
@@ -253,8 +291,86 @@ class NXOSParser(IOSParser):
                 cmd = cmd_child.text.strip()
                 if cmd.startswith("address "):
                     cmd = "ip " + cmd[len("address "):]
+                elif cmd.startswith("advertisement-interval "):
+                    # NX-OS block spelling of the advertise timer; the shared
+                    # applier only knows the IOS "timers advertise N" vocab.
+                    cmd = "timers advertise " + cmd[len("advertisement-interval "):]
                 pairs.append((group_num, cmd))
         return pairs
+
+    def _parse_vrrp_groups(self, intf_obj) -> list:
+        """VRRPv2 groups (shared applier) plus NX-OS VRRPv3 address-family groups.
+
+        VRRPv3 (``vrrpv3 <grp> address-family {ipv4|ipv6}``) is a distinct
+        command family with an address-family dimension and (per device emit)
+        priority reordered before address; it is parsed key-by-key here and
+        merged into the same ``vrrp_groups`` list. VRRPv2 and VRRPv3 are
+        mutually exclusive on the interface, so the two never collide.
+        """
+        groups = super()._parse_vrrp_groups(intf_obj)
+        groups.extend(self._parse_vrrpv3_groups(intf_obj))
+        return groups
+
+    def _parse_vrrpv3_groups(self, intf_obj) -> list:
+        """Parse ``vrrpv3 <grp> address-family {ipv4|ipv6}`` blocks.
+
+        Device-verified emitted form (n9kv 10.5(5), CCR-0088)::
+
+            vrrpv3 31 address-family ipv4
+              priority 120
+              address 10.131.131.254 primary
+
+        Parsed by key, not position (the device emits priority before address).
+        """
+        v3_groups: list = []
+        header_re = r"^\s+vrrpv3\s+(\d+)\s+address-family\s+(\S+)"
+        for blk in intf_obj.find_child_objects(header_re):
+            hm = re.match(header_re, blk.text)
+            if not hm:
+                continue
+            group_num = int(hm.group(1))
+            afi = hm.group(2).strip()
+            data: dict = {
+                "group_number": group_num,
+                "version": 3,
+                "afi": afi,
+                "priority": None,
+                "preempt": False,
+                "virtual_ip": None,
+                "timers_advertise": None,
+                "authentication": None,
+                "track_objects": [],
+                "addresses": [],
+            }
+            for cmd_child in blk.children:
+                cmd = cmd_child.text.strip()
+                if cmd.startswith("address "):
+                    addr = cmd[len("address "):].strip()
+                    data["addresses"].append(addr)
+                    # Mirror the IPv4 primary into virtual_ip for VRRPv2 parity.
+                    if afi == "ipv4":
+                        first_tok = addr.split()[0] if addr.split() else ""
+                        is_primary = ("secondary" not in addr) and (
+                            data["virtual_ip"] is None
+                        )
+                        if is_primary:
+                            try:
+                                data["virtual_ip"] = IPv4Address(first_tok)
+                            except ValueError:
+                                pass
+                elif cmd.startswith("priority "):
+                    try:
+                        data["priority"] = int(cmd[len("priority "):].strip())
+                    except ValueError:
+                        pass
+                elif cmd == "preempt" or cmd.startswith("preempt "):
+                    data["preempt"] = True
+                # NOTE: the VRRPv3 advertise timer is intentionally NOT parsed
+                # here. NX-OS emits it as `timers advertise <ms>` (milliseconds,
+                # not the VRRPv2 `advertisement-interval <sec>` keyword) and that
+                # emitted form is doc-only, not capture-verified — see follow-up.
+            v3_groups.append(VRRPGroup(**data))
+        return v3_groups
 
     # -----------------------------------------------------------------------
     # Interfaces — CIDR notation (ip address X.X.X.X/24)
@@ -321,6 +437,25 @@ class NXOSParser(IOSParser):
                 if vpc_m:
                     intf_cfg.vpc_id = int(vpc_m.group(1))
 
+            # NX-OS DHCP relay targets: "ip dhcp relay address <ip>" is the
+            # per-interface, repeatable helper-address analogue (IOS emits it
+            # as "ip helper-address"). The IOSParser super() call does not know
+            # the NX-OS spelling, so collect each target here in config order.
+            for relay_ch in intf_obj.find_child_objects(
+                r"^\s+ip\s+dhcp\s+relay\s+address\s+"
+            ):
+                rm = re.match(
+                    r"^\s+ip\s+dhcp\s+relay\s+address\s+(\d+\.\d+\.\d+\.\d+)",
+                    relay_ch.text,
+                )
+                if rm:
+                    try:
+                        addr = IPv4Address(rm.group(1))
+                    except ValueError:
+                        continue
+                    if addr not in intf_cfg.dhcp_relay_addresses:
+                        intf_cfg.dhcp_relay_addresses.append(addr)
+
             # NX-OS OSPF: "ip router ospf PROC area AREA" (slightly different
             # from IOS "ip ospf PROC area AREA")
             ospf_router_children = intf_obj.find_child_objects(
@@ -334,6 +469,56 @@ class NXOSParser(IOSParser):
                 if m:
                     intf_cfg.ospf_process_id = int(m.group(1))
                     intf_cfg.ospf_area = m.group(2)
+
+            # NX-OS storm-control: "storm-control {broadcast|multicast|unicast}
+            # level <threshold>". The threshold is a bandwidth percentage by
+            # default (emitted "level 5.00"), or an absolute rate when a unit
+            # keyword precedes the value ("level pps <n>" / "level bps <n>").
+            # IOSParser's super() call marks the line known-but-unparsed (the
+            # interface known-child allowlist); collect it into the model here.
+            for sc_ch in intf_obj.find_child_objects(r"^\s+storm-control\s+"):
+                sc_m = re.match(
+                    r"^\s+storm-control\s+(broadcast|multicast|unicast)\s+level\s+"
+                    r"(?:(pps|bps)\s+)?(\S+)",
+                    sc_ch.text,
+                )
+                if not sc_m:
+                    continue
+                traffic_type, unit_kw, raw_level = sc_m.groups()
+                try:
+                    level_val = float(raw_level)
+                except ValueError:
+                    continue
+                unit = unit_kw if unit_kw else "percent"
+                if any(s.traffic_type == traffic_type for s in intf_cfg.storm_control):
+                    continue
+                intf_cfg.storm_control.append(
+                    StormControlLevel(
+                        traffic_type=traffic_type, level=level_val, unit=unit
+                    )
+                )
+
+            # NX-OS NetFlow application: "ip flow monitor <name> {input|output}"
+            # binds a flow monitor to the interface in one direction. One line
+            # per direction; the "^ip" known-child pattern marks it
+            # known-but-unparsed in the super() call, so collect it here. Only
+            # the IPv4 "input" direction is corpus-verified
+            # (syntax-corpus/nxos/netflow.yaml); "output" is parsed leniently.
+            for fm_ch in intf_obj.find_child_objects(
+                r"^\s+ip\s+flow\s+monitor\s+"
+            ):
+                fm_m = re.match(
+                    r"^\s+ip\s+flow\s+monitor\s+(\S+)\s+(input|output)\b",
+                    fm_ch.text,
+                )
+                if not fm_m:
+                    continue
+                mon_name, direction = fm_m.groups()
+                if any(fm.direction == direction for fm in intf_cfg.flow_monitors):
+                    continue
+                intf_cfg.flow_monitors.append(
+                    InterfaceFlowMonitor(monitor=mon_name, direction=direction)
+                )
 
         return interfaces
 
@@ -1232,6 +1417,8 @@ class NXOSParser(IOSParser):
                     # Parse sub-attributes from VNI member children
                     mcast_group = None
                     suppress_arp = False
+                    ingress_replication = None
+                    ingress_replication_peers: list[str] = []
                     for sub in child.children:
                         raw_lines.append(sub.text)
                         line_numbers.append(sub.linenum)
@@ -1239,14 +1426,31 @@ class NXOSParser(IOSParser):
                         mg = re.match(r"mcast-group\s+(\S+)", st)
                         if mg:
                             mcast_group = mg.group(1)
-                        elif st == "suppress-arp":
+                            continue
+                        if st == "suppress-arp":
                             suppress_arp = True
+                            continue
+                        ir = re.match(r"ingress-replication\s+protocol\s+(\S+)", st)
+                        if ir:
+                            ingress_replication = ir.group(1)
+                            continue
+                        # Static head-end replication: each remote VTEP is a
+                        # sibling 'peer-ip <ip>' line under 'member vni' (same
+                        # config-if-vni submode as the protocol line).
+                        # doc-only (NX-OS VXLAN Config Guide 10.5(x)); parsed
+                        # defensively, no verified fixture ships for it.
+                        pip = re.match(r"peer-ip\s+(\S+)", st)
+                        if pip:
+                            ingress_replication_peers.append(pip.group(1))
+                            continue
                     vni_mappings.append(VXLANVniMapping(
                         vni=vni,
                         vlan=vni_to_vlan.get(vni),
                         vrf="(L3)" if is_l3 else None,
                         mcast_group=mcast_group,
                         suppress_arp=suppress_arp,
+                        ingress_replication=ingress_replication,
+                        ingress_replication_peers=ingress_replication_peers,
                     ))
                     continue
 
@@ -1261,8 +1465,243 @@ class NXOSParser(IOSParser):
         )
 
     # -------------------------------------------------------------------
+    # EVPN control-plane
+    # -------------------------------------------------------------------
+
+    def parse_evpn(self) -> "EVPNConfig | None":
+        """Parse the top-level ``evpn`` MP-BGP EVPN control-plane block.
+
+        Handles the device-emitted L2VNI (MAC-VRF) bindings::
+
+            evpn
+              vni 90901 l2
+                rd auto
+                route-target import auto
+                route-target export auto
+
+        Device-emitted behaviour honoured (n9kv 10.5(5), CCR-0087):
+        - ``route-target both <rt>`` renders as separate ``import`` and
+          ``export`` lines — but the typed ``both`` form is expanded here too
+          (populating both lists) so the model is form-agnostic.
+        - ``auto`` DOES nvgen and is kept as the literal token; an operator
+          override emits the literal ``<rd>`` / ``<rt>`` value instead.
+        """
+        from confgraph.models.evpn import EVPNConfig, EVPNL2VNI
+
+        parse = self._get_parse_obj()
+        evpn_objs = parse.find_objects(r"^evpn\s*$")
+        if not evpn_objs:
+            return None
+
+        l2vnis: list[EVPNL2VNI] = []
+        raw_lines: list[str] = []
+        line_numbers: list[int] = []
+
+        for evpn_obj in evpn_objs:
+            raw_lines.append(evpn_obj.text)
+            line_numbers.append(evpn_obj.linenum)
+            for vni_child in evpn_obj.children:
+                raw_lines.append(vni_child.text)
+                line_numbers.append(vni_child.linenum)
+                # ``vni <n> l2`` binds an L2VNI; ``l3`` would be an L3VNI (VRF).
+                m = re.match(r"vni\s+(\d+)\s+l2\b", vni_child.text.strip())
+                if not m:
+                    continue
+                vni = int(m.group(1))
+                rd = None
+                rt_import: list[str] = []
+                rt_export: list[str] = []
+                for sub in vni_child.children:
+                    raw_lines.append(sub.text)
+                    line_numbers.append(sub.linenum)
+                    st = sub.text.strip()
+                    rd_m = re.match(r"rd\s+(\S+)", st)
+                    if rd_m:
+                        rd = rd_m.group(1)
+                        continue
+                    rt_m = re.match(r"route-target\s+(import|export|both)\s+(\S+)", st)
+                    if rt_m:
+                        direction, value = rt_m.group(1), rt_m.group(2)
+                        if direction in ("import", "both"):
+                            rt_import.append(value)
+                        if direction in ("export", "both"):
+                            rt_export.append(value)
+                l2vnis.append(EVPNL2VNI(
+                    vni=vni,
+                    rd=rd,
+                    route_target_import=rt_import,
+                    route_target_export=rt_export,
+                ))
+
+        return EVPNConfig(
+            object_id="evpn",
+            raw_lines=raw_lines,
+            source_os=self.os_type,
+            line_numbers=line_numbers,
+            l2vnis=l2vnis,
+        )
+
+    # -------------------------------------------------------------------
+    # NetFlow — flow record / flow exporter / flow monitor
+    # -------------------------------------------------------------------
+
+    def parse_netflow(self) -> "NetFlowConfig | None":
+        """Parse Flexible NetFlow flow record / exporter / monitor blocks.
+
+        NX-OS models NetFlow as three named top-level block types (unlike the
+        IOS ``ip flow-export`` singleton the base :meth:`parse_netflow`
+        handles)::
+
+            flow record <name>
+              match ipv4 source address
+              collect counter bytes
+            flow exporter <name>
+              destination <ip> [use-vrf <vrf>]
+              source <interface>
+              version 9
+            flow monitor <name>
+              record <record>
+              exporter <exporter>
+
+        Returns ``None`` when the device carries none of the three blocks, so
+        the ``netflow`` field stays absent on configs without Flexible
+        NetFlow. Syntax is doc-verified from
+        ``syntax-corpus/nxos/netflow.yaml`` (the emitted running-config form
+        is not yet hardware-captured — the n9kv 10.5(5) probe rejected
+        ``feature netflow``).
+        """
+        parse = self._get_parse_obj()
+
+        records: list[NetFlowRecord] = []
+        for obj in parse.find_objects(r"^flow\s+record\s+"):
+            name = self._extract_match(obj.text, r"^flow\s+record\s+(\S+)")
+            if not name:
+                continue
+            match_fields: list[str] = []
+            collect_fields: list[str] = []
+            for child in obj.children:
+                text = child.text.strip()
+                mm = re.match(r"^match\s+(.+)$", text)
+                if mm:
+                    match_fields.append(mm.group(1).strip())
+                    continue
+                cm = re.match(r"^collect\s+(.+)$", text)
+                if cm:
+                    collect_fields.append(cm.group(1).strip())
+            records.append(
+                NetFlowRecord(
+                    name=name,
+                    match_fields=match_fields,
+                    collect_fields=collect_fields,
+                )
+            )
+
+        exporters: list[NetFlowExporter] = []
+        for obj in parse.find_objects(r"^flow\s+exporter\s+"):
+            name = self._extract_match(obj.text, r"^flow\s+exporter\s+(\S+)")
+            if not name:
+                continue
+            destination = None
+            use_vrf = None
+            source = None
+            version = None
+            for child in obj.children:
+                text = child.text.strip()
+                dm = re.match(
+                    r"^destination\s+(\S+)(?:\s+use-vrf\s+(\S+))?", text
+                )
+                if dm:
+                    destination = dm.group(1)
+                    if dm.group(2):
+                        use_vrf = dm.group(2)
+                    continue
+                sm = re.match(r"^source\s+(\S+)", text)
+                if sm:
+                    source = sm.group(1)
+                    continue
+                vm = re.match(r"^version\s+(\d+)", text)
+                if vm:
+                    try:
+                        version = int(vm.group(1))
+                    except ValueError:
+                        pass
+            exporters.append(
+                NetFlowExporter(
+                    name=name,
+                    destination=destination,
+                    use_vrf=use_vrf,
+                    source=source,
+                    version=version,
+                )
+            )
+
+        monitors: list[NetFlowMonitor] = []
+        for obj in parse.find_objects(r"^flow\s+monitor\s+"):
+            name = self._extract_match(obj.text, r"^flow\s+monitor\s+(\S+)")
+            if not name:
+                continue
+            record = None
+            exporter = None
+            for child in obj.children:
+                text = child.text.strip()
+                rm = re.match(r"^record\s+(\S+)", text)
+                if rm:
+                    record = rm.group(1)
+                    continue
+                em = re.match(r"^exporter\s+(\S+)", text)
+                if em:
+                    exporter = em.group(1)
+            monitors.append(
+                NetFlowMonitor(name=name, record=record, exporter=exporter)
+            )
+
+        if not records and not exporters and not monitors:
+            return None
+
+        return NetFlowConfig(
+            object_id="netflow",
+            source_os=self.os_type,
+            flow_records=records,
+            flow_exporters=exporters,
+            flow_monitors=monitors,
+        )
+
+    # -------------------------------------------------------------------
     # VPC
     # -------------------------------------------------------------------
+
+    def parse_control_plane(self) -> "ControlPlaneConfig | None":
+        """Parse the ``control-plane`` (CoPP) service-policy binding.
+
+        Handles the bare CoPP header::
+
+            control-plane
+              service-policy input PM_COPP
+
+        Only the attaching ``service-policy input <PM>`` is modeled — the
+        policed traffic itself lives in the referenced ``policy-map type
+        control-plane`` (see parse_policy_maps). VDC scope is a separate
+        top-level ``vdc <name> id <n>`` block, not part of this header, and
+        is out of scope here.
+        """
+        parse = self._get_parse_obj()
+        cp_objs = parse.find_objects(r"^control-plane\s*$")
+        if not cp_objs:
+            return None
+
+        cp_obj = cp_objs[0]
+        service_policy_input = None
+        for child in cp_obj.children:
+            cm = re.match(r"^\s*service-policy\s+input\s+(\S+)", child.text)
+            if cm:
+                service_policy_input = cm.group(1)
+
+        if service_policy_input is None:
+            return None
+
+        return ControlPlaneConfig(
+            service_policy_input=service_policy_input,
+        )
 
     def parse_vpc(self) -> "VPCConfig | None":
         """Parse VPC domain configuration.
@@ -1678,90 +2117,12 @@ class NXOSParser(IOSParser):
             advertise_v2=advertise_v2,
         )
 
-    # -------------------------------------------------------------------
-    # DNS — scan vrf context blocks (N6)
-    # -------------------------------------------------------------------
-
-    def parse_dns(self):
-        """Parse DNS config, including entries inside ``vrf context`` blocks.
-
-        NX-OS places per-VRF DNS entries as children of ``vrf context NAME``
-        stanzas.  The inherited IOS ``parse_dns`` only scans global lines.
-        """
-        from confgraph.models.dns import DNSConfig
-
-        dns = super().parse_dns()
-
-        parse = self._get_parse_obj()
-        vrf_objs = parse.find_objects(r"^vrf\s+context\s+(\S+)")
-
-        extra_servers: list[str] = []
-        extra_domain_name: str | None = None
-        extra_domain_list: list[str] = []
-        extra_lookup_disabled = False
-        extra_raw: list[str] = []
-        extra_line_numbers: list[int] = []
-
-        for vrf_obj in vrf_objs:
-            for child in vrf_obj.children:
-                t = child.text.strip()
-
-                m = re.match(r"ip\s+name-server\s+(.*)", t)
-                if m:
-                    extra_raw.append(child.text)
-                    extra_line_numbers.append(child.linenum)
-                    parts = m.group(1).split()
-                    # Strip optional "vrf <name>" prefix
-                    if len(parts) >= 2 and parts[0].lower() == "vrf":
-                        parts = parts[2:]
-                    extra_servers.extend(parts)
-                    continue
-
-                m = re.match(r"ip\s+domain(?:-|\s+)name\s+(\S+)", t)
-                if m:
-                    extra_raw.append(child.text)
-                    extra_line_numbers.append(child.linenum)
-                    if extra_domain_name is None:
-                        extra_domain_name = m.group(1)
-                    continue
-
-                m = re.match(r"ip\s+domain(?:-|\s+)list\s+(\S+)", t)
-                if m:
-                    extra_raw.append(child.text)
-                    extra_line_numbers.append(child.linenum)
-                    extra_domain_list.append(m.group(1))
-                    continue
-
-                if re.match(r"no\s+ip\s+domain.lookup", t):
-                    extra_raw.append(child.text)
-                    extra_line_numbers.append(child.linenum)
-                    extra_lookup_disabled = True
-
-        if not extra_raw:
-            return dns
-
-        if dns is None:
-            dns = DNSConfig(
-                object_id="dns",
-                raw_lines=extra_raw,
-                source_os=self.os_type,
-                line_numbers=extra_line_numbers,
-                lookup_enabled=not extra_lookup_disabled,
-                domain_name=extra_domain_name,
-                domain_list=extra_domain_list,
-                name_servers=extra_servers,
-            )
-        else:
-            dns.raw_lines.extend(extra_raw)
-            dns.line_numbers.extend(extra_line_numbers)
-            dns.name_servers.extend(extra_servers)
-            if extra_domain_name and dns.domain_name is None:
-                dns.domain_name = extra_domain_name
-            dns.domain_list.extend(extra_domain_list)
-            if extra_lookup_disabled:
-                dns.lookup_enabled = False
-
-        return dns
+    # DNS — VRF-scoped DNS (`ip name-server` / `ip domain-name` /
+    # `ip domain-list` under `vrf context NAME`) is attributed to the VRF in
+    # ``parse_vrfs`` (VRFConfig.name_servers / domain_name / domain_list),
+    # NOT flattened into the global DNSConfig (CCR-0093). The inherited IOS
+    # ``parse_dns`` reads only top-level lines, which is exactly the global
+    # resolver set — so no NX-OS override is needed here.
 
     # -------------------------------------------------------------------
     # AAA — parse group server members (N2)

@@ -12,6 +12,7 @@ from confgraph.models.route_map import RouteMapConfig
 from confgraph.models.prefix_list import PrefixListConfig
 from confgraph.models.static_route import StaticRoute
 from confgraph.models.acl import ACLConfig
+from confgraph.models.object_group import ObjectGroup
 from confgraph.models.community_list import CommunityListConfig, ASPathListConfig
 from confgraph.models.base import OSType, UnrecognizedBlock
 from confgraph.models.eigrp import EIGRPConfig
@@ -21,7 +22,7 @@ from confgraph.models.snmp import SNMPConfig
 from confgraph.models.logging_config import SyslogConfig
 from confgraph.models.banner import BannerConfig
 from confgraph.models.line import LineConfig
-from confgraph.models.qos import ClassMapConfig, PolicyMapConfig
+from confgraph.models.qos import ClassMapConfig, PolicyMapConfig, ControlPlaneConfig
 from confgraph.models.nat import NATConfig
 from confgraph.models.crypto import CryptoConfig
 from confgraph.models.bfd import BFDConfig
@@ -31,6 +32,7 @@ from confgraph.models.object_tracking import ObjectTrack
 from confgraph.models.multicast import MulticastConfig
 from confgraph.models.mpls import MPLSConfig
 from confgraph.models.vxlan import VXLANConfig
+from confgraph.models.evpn import EVPNConfig
 from confgraph.models.vpc import VPCConfig
 from confgraph.models.panos_zone import PANOSZoneConfig
 from confgraph.models.aaa import AAAConfig
@@ -95,6 +97,10 @@ class ParsedConfig(BaseModel):
         default_factory=list,
         description="Access control lists",
     )
+    object_groups: list[ObjectGroup] = Field(
+        default_factory=list,
+        description="Named object-groups (address/port sets referenced by ACEs)",
+    )
     community_lists: list[CommunityListConfig] = Field(
         default_factory=list,
         description="BGP community lists",
@@ -139,6 +145,10 @@ class ParsedConfig(BaseModel):
         default_factory=list,
         description="QoS policy-map configurations",
     )
+    control_plane: ControlPlaneConfig | None = Field(
+        default=None,
+        description="Control-plane (CoPP) service-policy binding",
+    )
     nat: NATConfig | None = Field(
         default=None,
         description="NAT configuration",
@@ -174,6 +184,10 @@ class ParsedConfig(BaseModel):
     vxlan: "VXLANConfig | None" = Field(
         default=None,
         description="VXLAN/VTEP configuration",
+    )
+    evpn: "EVPNConfig | None" = Field(
+        default=None,
+        description="MP-BGP EVPN control-plane (top-level 'evpn' block: per-VNI L2VNI RD/RT)",
     )
     vpc: "VPCConfig | None" = Field(
         default=None,

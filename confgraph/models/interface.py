@@ -57,6 +57,68 @@ class VRRPGroup(BaseModel):
     track_objects: list[int] = Field(
         default_factory=list, description="Tracked object numbers"
     )
+    # VRRPv3 (NX-OS ``vrrpv3 <grp> address-family {ipv4|ipv6}``) dimensions.
+    # Additive: classic VRRPv2 groups leave these at their defaults (version
+    # None, afi None, addresses []). VRRPv3 groups set version=3 and afi, and
+    # record their per-AF virtual addresses (verbatim ``<ip> [primary|
+    # secondary]``) in ``addresses`` — for an IPv4 AF the primary is also
+    # mirrored into ``virtual_ip`` for parity with VRRPv2 consumers.
+    version: int | None = Field(
+        default=None,
+        description="VRRP version (3 for VRRPv3 address-family groups; None for classic VRRPv2)",
+    )
+    afi: str | None = Field(
+        default=None,
+        description="VRRPv3 address family ('ipv4' or 'ipv6'); None for classic VRRPv2",
+    )
+    addresses: list[str] = Field(
+        default_factory=list,
+        description="VRRPv3 per-AF virtual addresses, verbatim '<ip> [primary|secondary]'",
+    )
+
+
+class StormControlLevel(BaseModel):
+    """One interface storm-control suppression threshold, per traffic type.
+
+    NX-OS emits ``storm-control {broadcast|multicast|unicast} level <threshold>``
+    under an interface. The threshold is a percentage of port bandwidth by
+    default (emitted with fixed two-decimal formatting, e.g. ``level 5.00``), or
+    an absolute packets-per-second rate when the ``pps`` keyword is present
+    (``level pps <n>``). Each traffic type carries at most one level, so a
+    per-interface list keyed by ``traffic_type`` is the natural shape. ``unit`` is
+    a free string ('percent' or 'pps' on NX-OS 9000; a bits-per-second 'bps' form
+    exists on some other platforms).
+    """
+
+    traffic_type: str = Field(
+        ..., description="Traffic class: 'broadcast', 'multicast', or 'unicast'"
+    )
+    level: float = Field(..., description="Numeric suppression threshold value")
+    unit: str = Field(
+        default="percent",
+        description="Threshold unit: 'percent' (of bandwidth), 'pps', or 'bps'",
+    )
+
+
+class InterfaceFlowMonitor(BaseModel):
+    """A NetFlow flow-monitor applied to an interface, per direction.
+
+    NX-OS emits one line per direction under an interface::
+
+        ip flow monitor <name> input
+
+    Each direction carries at most one IPv4 flow monitor, so a per-interface
+    list keyed by ``direction`` is the natural shape (the same per-member
+    shape as the FHRP group / storm-control lists). Only the ``input``
+    direction is recorded in the doc-verified corpus
+    (``syntax-corpus/nxos/netflow.yaml``); ``output`` is parsed leniently but
+    is not corpus-backed / fixture-asserted.
+    """
+
+    monitor: str = Field(..., description="Flow monitor name bound to the interface")
+    direction: str = Field(
+        ..., description="Traffic direction the monitor is applied to: 'input' or 'output'"
+    )
 
 
 class GLBPGroup(BaseModel):
@@ -318,6 +380,15 @@ class InterfaceConfig(BaseConfigObject):
         default_factory=list,
         description="DHCP relay / IP helper addresses",
     )
+    # DHCP relay targets configured per interface. NX-OS emits these as
+    # ``ip dhcp relay address <ip>`` (repeatable); the IOS-family analogue is
+    # ``ip helper-address`` (currently landed in ``helper_addresses``). Kept
+    # generic so a future IOS re-home can converge here.
+    dhcp_relay_addresses: list[IPv4Address] = Field(
+        default_factory=list,
+        description="Per-interface DHCP relay target addresses "
+        "(NX-OS 'ip dhcp relay address <ip>')",
+    )
 
     # Tunnel attributes
     tunnel_source: str | None = Field(
@@ -393,6 +464,24 @@ class InterfaceConfig(BaseConfigObject):
     port_security_sticky: bool = Field(
         default=False,
         description="Sticky MAC learning enabled (switchport port-security mac-address sticky)",
+    )
+
+    # Storm-control (L2 broadcast/multicast/unicast suppression)
+    storm_control: list[StormControlLevel] = Field(
+        default_factory=list,
+        description=(
+            "Per-traffic-type storm-control suppression levels "
+            "(storm-control {broadcast|multicast|unicast} level <threshold>)"
+        ),
+    )
+
+    # NetFlow flow-monitor application (ip flow monitor <name> input)
+    flow_monitors: list[InterfaceFlowMonitor] = Field(
+        default_factory=list,
+        description=(
+            "NetFlow flow monitors applied to the interface, per direction "
+            "(ip flow monitor <name> {input|output})"
+        ),
     )
 
     # 802.1X
