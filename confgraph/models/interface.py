@@ -336,6 +336,26 @@ class InterfaceConfig(BaseConfigObject):
         default=None,
         description="IPsec profile name applied via 'tunnel protection ipsec profile <name>'",
     )
+    # PAN-OS BGP-over-IPSec-VPN underlay chain (CCR-0116). A PAN-OS tunnel.N
+    # interface rides an IPSec tunnel bound to an IKE gateway whose local-address
+    # is the physical egress interface; these carry that resolved binding so the
+    # dependency graph can chain tunnel.N -> physical egress and surface the
+    # IKE/IPSec hop. Additive and PAN-OS-only: other OSes leave them None.
+    tunnel_underlay_interface: str | None = Field(
+        default=None,
+        description=(
+            "Resolved physical egress interface the tunnel rides "
+            "(PAN-OS: ike gateway local-address/interface)"
+        ),
+    )
+    tunnel_ike_gateway: str | None = Field(
+        default=None,
+        description="IKE gateway name the tunnel's IPSec tunnel binds to (PAN-OS auto-key)",
+    )
+    tunnel_ike_crypto_profile: str | None = Field(
+        default=None,
+        description="IKE crypto profile name from the bound IKE gateway (PAN-OS)",
+    )
     tunnel_key: int | None = Field(
         default=None,
         description="GRE tunnel key",

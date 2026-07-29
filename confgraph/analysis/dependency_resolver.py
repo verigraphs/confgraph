@@ -309,6 +309,22 @@ class DependencyResolver:
                 links.append(self._link(
                     "interface", iface.name, "unnumbered_source", "interface", iface.unnumbered_source,
                 ))
+            # PAN-OS BGP-over-IPSec-VPN underlay (CCR-0116): a tunnel.N carrying a
+            # resolved physical egress depends on that egress interface, so the
+            # graph chains bgp_instance -> tunnel.N -> ethernet1/N.  Field-driven,
+            # so no OS branching: non-PAN-OS interfaces leave it None.
+            if iface.tunnel_underlay_interface:
+                links.append(self._link(
+                    "interface", iface.name, "tunnel_underlay",
+                    "interface", iface.tunnel_underlay_interface,
+                ))
+            # Surface the IPSec/IKE hop the tunnel rides as an edge to the
+            # per-device crypto node (only when crypto config was parsed, so no
+            # ghost node is invented).
+            if iface.tunnel_ike_gateway and self._config.crypto is not None:
+                links.append(self._link(
+                    "interface", iface.name, "tunnel_ike_gateway", "crypto", "crypto",
+                ))
             if iface.acl_in:
                 links.append(self._link("interface", iface.name, "acl_in", "acl", iface.acl_in))
             if iface.acl_out:
@@ -473,6 +489,10 @@ class DependencyResolver:
             "ospf_instance":  self._ospf_instances,
             "class_map":      self._class_maps,
             "policy_map":     self._policy_maps,
+            # The crypto config is a per-device singleton node named "crypto"
+            # (GraphBuilder). A tunnel→crypto underlay hop (CCR-0116) resolves
+            # iff that node exists.
+            "crypto":         {"crypto": self._config.crypto} if self._config.crypto else {},
         }.get(ref_type, {})
         return ref_name in index
 
