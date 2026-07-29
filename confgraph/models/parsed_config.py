@@ -21,7 +21,7 @@ from confgraph.models.snmp import SNMPConfig
 from confgraph.models.logging_config import SyslogConfig
 from confgraph.models.banner import BannerConfig
 from confgraph.models.line import LineConfig
-from confgraph.models.qos import ClassMapConfig, PolicyMapConfig
+from confgraph.models.qos import ClassMapConfig, PolicyMapConfig, ControlPlaneConfig
 from confgraph.models.nat import NATConfig
 from confgraph.models.crypto import CryptoConfig
 from confgraph.models.bfd import BFDConfig
@@ -139,6 +139,10 @@ class ParsedConfig(BaseModel):
     policy_maps: list[PolicyMapConfig] = Field(
         default_factory=list,
         description="QoS policy-map configurations",
+    )
+    control_plane: ControlPlaneConfig | None = Field(
+        default=None,
+        description="Control-plane (CoPP) service-policy binding",
     )
     nat: NATConfig | None = Field(
         default=None,

@@ -639,6 +639,7 @@ class BaseParser(ABC):
         ("lines",              "parse_lines"),
         ("class_maps",         "parse_class_maps"),
         ("policy_maps",        "parse_policy_maps"),
+        ("control_plane",      "parse_control_plane"),
         ("nat",                "parse_nat"),
         ("crypto",             "parse_crypto"),
         ("bfd",                "parse_bfd"),
@@ -663,6 +664,15 @@ class BaseParser(ABC):
         ("netflow",            "parse_netflow"),
         ("no_commands",        "parse_deletion_commands"),
     ]
+
+    def parse_control_plane(self):
+        """Parse the 'control-plane' (CoPP) service-policy binding.
+
+        Default no-op — only platforms that model control-plane policing
+        (NX-OS) override this. Returns None so the field stays absent
+        everywhere else.
+        """
+        return None
 
     def parse_deletion_commands(self) -> list[str]:
         """Parse top-level 'no' deletion commands into tombstone strings.

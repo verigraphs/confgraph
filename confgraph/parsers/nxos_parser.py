@@ -13,6 +13,7 @@ from confgraph.models.bgp import (
     BGPBestpathOptions,
 )
 from confgraph.models.ospf import OSPFConfig
+from confgraph.models.qos import ControlPlaneConfig
 from confgraph.models.interface import StormControlLevel, VRRPGroup
 from confgraph.models.static_route import StaticRoute
 from confgraph.parsers.base import _BASE_KNOWN_PATTERNS, apply_peer_group_command, _default_pg_data
@@ -35,6 +36,7 @@ _NXOS_KNOWN_PATTERNS: list[str] = [
     r"^spanning-tree",
     r"^port-profile",
     r"^mpls",
+    r"^control-plane",
 ]
 
 
@@ -1512,6 +1514,39 @@ class NXOSParser(IOSParser):
     # -------------------------------------------------------------------
     # VPC
     # -------------------------------------------------------------------
+
+    def parse_control_plane(self) -> "ControlPlaneConfig | None":
+        """Parse the ``control-plane`` (CoPP) service-policy binding.
+
+        Handles the bare CoPP header::
+
+            control-plane
+              service-policy input PM_COPP
+
+        Only the attaching ``service-policy input <PM>`` is modeled — the
+        policed traffic itself lives in the referenced ``policy-map type
+        control-plane`` (see parse_policy_maps). VDC scope is a separate
+        top-level ``vdc <name> id <n>`` block, not part of this header, and
+        is out of scope here.
+        """
+        parse = self._get_parse_obj()
+        cp_objs = parse.find_objects(r"^control-plane\s*$")
+        if not cp_objs:
+            return None
+
+        cp_obj = cp_objs[0]
+        service_policy_input = None
+        for child in cp_obj.children:
+            cm = re.match(r"^\s*service-policy\s+input\s+(\S+)", child.text)
+            if cm:
+                service_policy_input = cm.group(1)
+
+        if service_policy_input is None:
+            return None
+
+        return ControlPlaneConfig(
+            service_policy_input=service_policy_input,
+        )
 
     def parse_vpc(self) -> "VPCConfig | None":
         """Parse VPC domain configuration.

@@ -10450,11 +10450,20 @@ class IOSParser(BaseParser):
         class_maps = []
 
         for cm_obj in parse.find_objects(r"^class-map\s+"):
-            m = re.match(r"^class-map\s+(?:(match-any|match-all)\s+)?(\S+)", cm_obj.text)
+            # An optional `type <qualifier>` (control-plane / qos / queuing / …)
+            # precedes the match-logic keyword and the name; skip the two type
+            # tokens, carry the qualifier, and capture the REAL name. Without
+            # this the qualifier token 'type' is mis-read as the class-map name
+            # (CCR-0064 / CCR-0089). The plain untyped form is unchanged.
+            m = re.match(
+                r"^class-map\s+(?:type\s+(\S+)\s+)?(?:(match-any|match-all)\s+)?(\S+)",
+                cm_obj.text,
+            )
             if not m:
                 continue
-            match_type = m.group(1) or "match-all"
-            name = m.group(2)
+            cm_type = m.group(1)
+            match_type = m.group(2) or "match-all"
+            name = m.group(3)
             raw_lines, line_numbers = self._get_raw_lines_and_line_numbers(cm_obj)
 
             matches = []
@@ -10473,6 +10482,7 @@ class IOSParser(BaseParser):
                 source_os=self.os_type,
                 line_numbers=line_numbers,
                 name=name,
+                type=cm_type,
                 match_type=match_type,
                 matches=matches,
             ))
@@ -10489,10 +10499,13 @@ class IOSParser(BaseParser):
         policy_maps = []
 
         for pm_obj in parse.find_objects(r"^policy-map\s+"):
-            m = re.match(r"^policy-map\s+(\S+)", pm_obj.text)
+            # Skip an optional `type <qualifier>` (control-plane / qos / …) so the
+            # real name is captured instead of the token 'type' (CCR-0064/-0089).
+            m = re.match(r"^policy-map\s+(?:type\s+(\S+)\s+)?(\S+)", pm_obj.text)
             if not m:
                 continue
-            name = m.group(1)
+            pm_type = m.group(1)
+            name = m.group(2)
             raw_lines, line_numbers = self._get_raw_lines_and_line_numbers(pm_obj)
 
             classes = []
@@ -10586,6 +10599,7 @@ class IOSParser(BaseParser):
                 source_os=self.os_type,
                 line_numbers=line_numbers,
                 name=name,
+                type=pm_type,
                 classes=classes,
             ))
 
