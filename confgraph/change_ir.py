@@ -575,6 +575,7 @@ _IFACE_MEMBER_KEYS: dict[str, "Callable[[Any], str] | None"] = {
     "secondary_ips": None,
     "ipv6_addresses": None,
     "helper_addresses": None,
+    "dhcp_relay_addresses": None,
     "varp_addresses": None,
     "nhrp_nhs": None,
     "nhrp_map": None,

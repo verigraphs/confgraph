@@ -108,6 +108,10 @@ class TestBoundary:
             # <ip>" line PER address, so it is a per-member list of the same
             # shape as helper_addresses, not a scalar.
             "varp_addresses",
+            # CCR-0090: NX-OS per-interface DHCP relay targets. A device emits
+            # one "ip dhcp relay address <ip>" line PER address, the same
+            # per-member union shape as helper_addresses/varp_addresses.
+            "dhcp_relay_addresses",
             "nhrp_nhs",
             "nhrp_map",
             "igmp_join_groups",

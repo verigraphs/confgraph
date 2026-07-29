@@ -321,6 +321,25 @@ class NXOSParser(IOSParser):
                 if vpc_m:
                     intf_cfg.vpc_id = int(vpc_m.group(1))
 
+            # NX-OS DHCP relay targets: "ip dhcp relay address <ip>" is the
+            # per-interface, repeatable helper-address analogue (IOS emits it
+            # as "ip helper-address"). The IOSParser super() call does not know
+            # the NX-OS spelling, so collect each target here in config order.
+            for relay_ch in intf_obj.find_child_objects(
+                r"^\s+ip\s+dhcp\s+relay\s+address\s+"
+            ):
+                rm = re.match(
+                    r"^\s+ip\s+dhcp\s+relay\s+address\s+(\d+\.\d+\.\d+\.\d+)",
+                    relay_ch.text,
+                )
+                if rm:
+                    try:
+                        addr = IPv4Address(rm.group(1))
+                    except ValueError:
+                        continue
+                    if addr not in intf_cfg.dhcp_relay_addresses:
+                        intf_cfg.dhcp_relay_addresses.append(addr)
+
             # NX-OS OSPF: "ip router ospf PROC area AREA" (slightly different
             # from IOS "ip ospf PROC area AREA")
             ospf_router_children = intf_obj.find_child_objects(

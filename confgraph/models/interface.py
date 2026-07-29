@@ -318,6 +318,15 @@ class InterfaceConfig(BaseConfigObject):
         default_factory=list,
         description="DHCP relay / IP helper addresses",
     )
+    # DHCP relay targets configured per interface. NX-OS emits these as
+    # ``ip dhcp relay address <ip>`` (repeatable); the IOS-family analogue is
+    # ``ip helper-address`` (currently landed in ``helper_addresses``). Kept
+    # generic so a future IOS re-home can converge here.
+    dhcp_relay_addresses: list[IPv4Address] = Field(
+        default_factory=list,
+        description="Per-interface DHCP relay target addresses "
+        "(NX-OS 'ip dhcp relay address <ip>')",
+    )
 
     # Tunnel attributes
     tunnel_source: str | None = Field(
