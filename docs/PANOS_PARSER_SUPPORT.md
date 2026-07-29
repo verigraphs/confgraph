@@ -4,6 +4,8 @@
 
 The PAN-OS parser (`confgraph.parsers.panos_parser.PANOSParser`) parses Palo Alto Networks PAN-OS device configurations in XML format. Unlike all other parsers, it does **not** use `CiscoConfParse` — PAN-OS configurations are XML documents, not line-oriented text. Instead it uses a lightweight XML navigation helper (`confgraph.parsers.panos_xml`) built on Python's standard `xml.etree.ElementTree`.
 
+Two document layouts are read (CCR-0034 / CCR-0041): a **local firewall** export (`devices/entry/{deviceconfig,network,vsys/entry}`) and a **Panorama** export (device-group `pre`/`post`-rulebase, `shared` rulebase, and network/vsys config nested inside `template` entries). Layout is decided exactly once by `panos_xml.detect_layout`, which hands every parse method a layout-neutral view (device / vsys / policy scopes) so no method ever asks "am I Panorama?". A document in neither known layout raises `ParseError` rather than returning an empty model — "this firewall has no rules" and "this firewall's rules are in a place we don't read" must not look the same.
+
 **Class:** `confgraph.parsers.panos_parser.PANOSParser`
 **Inherits from:** `BaseParser`
 **XML helper:** `confgraph.parsers.panos_xml`
@@ -56,9 +58,9 @@ The PAN-OS parser (`confgraph.parsers.panos_parser.PANOSParser`) parses Palo Alt
 
 **Supported Attributes:**
 - Virtual router name → `VRFConfig.name`
-- Member interfaces (used for cross-referencing `virtual_router` on `InterfaceConfig`)
+- Member interfaces → `VRFConfig.interfaces` (the `<interface><member>` list that is a *direct* child of the VR entry — not the entry-keyed interface lists nested under `protocol/ospf/area`). This both populates the VRF↔interface edge and cross-references `virtual_router` on `InterfaceConfig`.
 
-**Parsing Status:** ✅ Implemented — `parse_vrfs()` handles `<network><virtual-router>` entries
+**Parsing Status:** ✅ Implemented — `parse_vrfs()` handles `<network><virtual-router>` entries across all device scopes
 
 ---
 
@@ -103,12 +105,24 @@ The PAN-OS parser (`confgraph.parsers.panos_parser.PANOSParser`) parses Palo Alt
 **Supported Attributes:**
 - Interface name, type classification
 - IPv4 primary address (CIDR, from `<layer3><ip><entry name="X/LEN"/>`)
-- IPv6 addresses
+- IPv6 addresses (from `<ipv6><addresses><entry>`)
 - Description (from `<comment>`)
-- Enabled/disabled state
-- MTU
+- Enabled/disabled state (`<link-state>down</link-state>` → disabled)
+- MTU (from `<layer3><mtu>` or `<mtu>`)
 - Zone assignment (`zone` field — cross-referenced from `<vsys><zone>`)
 - Virtual router assignment (`virtual_router` field — cross-referenced from `<network><virtual-router>`)
+- OSPF per-interface settings (cost, priority, hello, network type, passive) — these live inside the OSPF `<area>`, not on the interface object, so `parse_ospf()` carries them out in `OSPFArea.interface_settings` and `BaseParser._backfill_ospf_interface_settings` attributes them onto the `InterfaceConfig` (the one shared backfill every OS uses)
+
+**Tunnel underlay chain (CCR-0116):** A `tunnel.N` interface rides an IPSec tunnel (bound via `<tunnel-interface>`) whose IKE gateway's `local-address/interface` is the physical egress the tunnel actually depends on. `parse_interfaces()` resolves that chain onto the tunnel's `InterfaceConfig`:
+
+| Field | Source |
+|-------|--------|
+| `tunnel_ike_gateway` | IKE gateway named under the IPSec tunnel's `<auto-key><ike-gateway><entry name="…"/>` |
+| `tunnel_protection_profile` | `<auto-key><ipsec-crypto-profile>` (Phase-2 / IPSec profile) |
+| `tunnel_underlay_interface` | the bound IKE gateway's `network/ike/gateway/.../local-address/interface` (physical egress) |
+| `tunnel_ike_crypto_profile` | the bound IKE gateway's Phase-1 profile, read nested under `protocol/ikev{1,2}/ike-crypto-profile` |
+
+Only `<auto-key>` IPSec tunnels bind a gateway; manual-key and GlobalProtect-satellite tunnels have no IKE gateway and are skipped so no egress edge is invented. Binding degrades gracefully: a tunnel referencing a missing gateway still records what is known and simply leaves `tunnel_underlay_interface` unset (no tunnel→egress edge emitted).
 
 **Interface type classification:**
 
@@ -178,24 +192,62 @@ The PAN-OS parser (`confgraph.parsers.panos_parser.PANOSParser`) parses Palo Alt
 **PAN-OS-Specific Differences:**
 - BGP is scoped per virtual-router (not a global process)
 - All neighbors belong to a named `<peer-group>` — no flat `neighbor IP remote-as N` syntax
+- Remote AS is `<peer-as>`, a **direct child of the peer entry** — it is not spelled `remote-as` and is not under `<connection-options>`
+- Peer-group type is element-name-encoded (`<type><ebgp>…</ebgp></type>`); `type/{ebgp,ibgp}/export-nexthop` = `use-self` maps to `next_hop_self`
 - `<local-address><interface>` maps to `update_source` — enables BGP-over-tunnel graph edges
 - No address-family blocks; IPv4 unicast is implicit
-- Redistribution uses `<redistribution-rules>` with `<address-family-identifier>`
+- Neighbor authentication is a two-part relation: the peer's `connection-options/authentication` names an `<auth-profile>` under `<bgp>`; the secret lives in that profile (resolved to `password`)
+- Redistribution rules (`<redist-rules>`) are keyed by the name of a `<redist-profile>`; the source protocols live in that profile's `<filter><type><member>` list. `address-family-identifier` on the rule is `ipv4|ipv6` (an address family), never the protocol.
+- Import/export policy binds to peer-groups through each rule's `<used-by>` member list (see §3b)
 
 **Supported Attributes:**
 - Local ASN, router-ID
-- Peer groups with all their nested neighbors
-- Per-neighbor: peer IP, remote AS, description, shutdown state, update-source interface
-- Redistribution rules
-- VRF context from virtual-router name
+- Peer groups with all their nested neighbors; per peer-group `next_hop_self` and bound import/export route-maps
+- Per-neighbor: peer IP, remote AS, description, shutdown state, update-source interface, timers (`keep-alive-interval`/`hold-time`), `ebgp_multihop` (from `<multihop>` TTL), `maximum_prefix` (`<max-prefixes>`), MD5 password (resolved from auth-profile), `next_hop_self`, import/export route-maps
+- Redistribution rules resolved through redist-profiles (protocol + metric)
+- Process-wide `<routing-options>`: graceful restart (`graceful-restart/enable`, `stale-route-time`) and `med/always-compare-med`
+- VRF context from virtual-router name (`default` → global)
 
-**BGP over IPsec tunnels:** When `<local-address><interface>` references a tunnel interface, the graph draws:
+**BGP over IPsec tunnels:** When `<local-address><interface>` references a tunnel interface, the update-source edge plus the CCR-0116 tunnel-underlay binding chain the full path:
 ```
-bgp:65001 ──[update_source]──► iface:tunnel.1 ──[zone]──► zone:vpn-tunnels
+bgp:65001 ──[update_source]──► iface:tunnel.1 ──[tunnel_underlay]──► iface:ethernet1/4
+                                     └──────────[tunnel_ike_gateway]──► crypto
 ```
-This makes the full BGP → tunnel → IPsec dependency chain visible.
+This makes the full BGP → tunnel → physical egress → IPsec dependency chain visible.
 
-**Parsing Status:** ✅ Implemented — `parse_bgp()` handles `<protocol><bgp>` per virtual-router with peer-group/peer hierarchy and `update_source` capture
+**Parsing Status:** ✅ Implemented — `parse_bgp()` handles `<protocol><bgp>` per virtual-router with peer-group/peer hierarchy, `update_source` capture, auth-profile resolution, redist-profile resolution, and routing-options
+
+---
+
+### 3b. BGP Import/Export Policy → RouteMapConfig
+
+**XML structure:**
+```xml
+<bgp>
+  <policy>
+    <import>
+      <rules>
+        <entry name="PREFER-BRANCH">
+          <enable>yes</enable>
+          <used-by><member>BRANCH-VPN</member></used-by>
+          <match><address-prefix><entry name="10.100.0.0/16"/></address-prefix></match>
+          <action><allow><update><local-preference>200</local-preference></update></allow></action>
+        </entry>
+      </rules>
+    </import>
+    <export> … </export>
+  </policy>
+</bgp>
+```
+
+**PAN-OS-Specific Differences:**
+- PAN-OS has no `route-map NAME permit 10` object; a BGP import/export rule is normalized into a `RouteMapConfig` with a single sequence so a graph consumer cannot tell which vendor produced the policy node
+- `<action>` is element-name-as-value (`<allow>…</allow>` or `<deny/>`) → `permit` / `deny`
+- Match values are **inline**, not references to named objects: `match/address-prefix` (entry-keyed), `from-peer` (members), and regex/text matches (`as-path/regex`, `community/regex`, `extended-community/regex`, `med`, `route-table`). Inline patterns get a `-regex`-style `match_type` so the dependency resolver does not manufacture dangling references.
+- Set clauses come from `action/allow/update`: `local-preference`, `med` (→ metric), `weight`, `nexthop`, `origin`, `as-path-limit`, plus element-name-encoded `as-path`/`community` operations
+- Every named rule becomes a policy node (`parse_route_maps`), even a disabled one; only *enabled* rules bind to peer-groups via `<used-by>` (§3, `route_map_in`/`route_map_out`)
+
+**Parsing Status:** ✅ Implemented — `parse_route_maps()` maps `<bgp><policy><import|export><rules>` to `RouteMapConfig`. (`parse_prefix_lists()` returns `[]` — PAN-OS has no named prefix-list object; policy prefixes are inline on the policy node.)
 
 ---
 
@@ -232,17 +284,18 @@ This makes the full BGP → tunnel → IPsec dependency chain visible.
 
 **PAN-OS-Specific Differences:**
 - OSPF is scoped per virtual-router
-- No process-ID concept — parser uses `1` as a conventional placeholder
-- Interface membership is declared inside the OSPF area block
-- Redistribution uses `<export-rules>` entries
+- No process-ID concept — parser uses `1` as a conventional placeholder (it is confgraph's own value and is deliberately never asserted onto an interface)
+- Interface membership is declared inside the OSPF area block; each area interface entry carries the interface's own settings (`metric` = cost, `priority`, `hello-interval`, `link-type` = network type, `passive`) which are backfilled onto the `InterfaceConfig`
+- Area type is element-name-encoded (`<type><stub/></type>`). PAN-OS has no `no-summary` keyword: a stub/NSSA area whose `<accept-summary>` is `no` **is** the totally-stubby / totally-NSSA case (STUB→TOTALLY_STUB, NSSA→TOTALLY_NSSA)
+- Redistribution uses `<export-rules>`, keyed by redist-profile name (same resolution as BGP); `new-path-type` `ext-1`/`ext-2` → E1/E2 metric type
 
 **Supported Attributes:**
 - Router-ID
-- Areas with interface membership lists
-- Redistribution (export-rules)
+- Areas with type, interface membership lists, and per-interface settings; totally-stubby / totally-NSSA detection; ABR default-route cost (`type/{stub,nssa}/default-route/advertise/metric`)
+- Redistribution (export-rules resolved through redist-profiles: protocol, metric, metric-type, tag)
 - VRF context from virtual-router name
 
-**Parsing Status:** ✅ Implemented — `parse_ospf()` handles `<protocol><ospf>` per virtual-router
+**Parsing Status:** ✅ Implemented — `parse_ospf()` handles `<protocol><ospf>` per virtual-router with area types, per-interface settings, and redist-profile resolution
 
 ---
 
@@ -271,11 +324,11 @@ This makes the full BGP → tunnel → IPsec dependency chain visible.
 
 **Supported Attributes:**
 - Destination prefix (CIDR)
-- Next-hop IP or interface
-- Administrative distance (metric)
+- Next-hop IP or interface (`next_hop_interface` set when the route points out an interface)
+- Administrative distance (`<admin-dist>`; defaults to PAN-OS's 10 when absent) and route metric (`<metric>`) — the two are **distinct** fields, not conflated (CCR-0030)
 - VRF context from virtual-router name
 
-**Parsing Status:** ✅ Implemented — `parse_static_routes()` handles `<routing-table><ip><static-route>` per virtual-router
+**Parsing Status:** ✅ Implemented — `parse_static_routes()` handles `<routing-table><ip><static-route>` per virtual-router, separating `admin-dist` from `metric`
 
 ---
 
@@ -313,16 +366,19 @@ This makes the full BGP → tunnel → IPsec dependency chain visible.
 **PAN-OS-Specific Differences:**
 - Security policies are zone-based (`from`/`to` reference zone names, not interfaces)
 - Matching is by application identity (App-ID), not TCP/UDP port numbers
-- Mapped to `ACLConfig` with `acl_type="extended"` and `name="security-policy-{vsys}"`
-- Rule details (zone, source, destination, application) stored in `ACLEntry.remark`
+- Mapped to `ACLConfig` with `acl_type="extended"` and `name="security-policy-{scope}"` — one ACL per **policy scope** (a vsys locally, a device-group under Panorama)
+- A scope's rulebases arrive already ordered by the layout: locally the single vsys rulebase; under Panorama the resolved `shared-pre → DG-pre → DG-post → shared-post` chain. Ascending ACL sequence numbers therefore carry the firewall's evaluation order.
+- Rule details (rule name, zones, source, destination, application) stored in `ACLEntry.remark`
 - `allow` → `permit`; `deny` → `deny`
 
 **Supported Attributes:**
 - Rule name, action (permit/deny)
 - From/to zones, source/destination addresses, applications (captured in remark)
-- Per-vsys ACL object
+- One ACL object per policy scope, in evaluation order
 
-**Parsing Status:** ✅ Implemented — `parse_acls()` maps `<rulebase><security><rules>` to `ACLConfig`
+**Source-NAT address sets:** Each source-NAT rule additionally materializes an ACL of its own (named `nat-source-{rule}`) holding the address set that rule translates, so `NATDynamicEntry.acl` (see §7) resolves instead of dangling — the same rulebase→ACLConfig mapping already applied to security rules (CCR-0035 #7).
+
+**Parsing Status:** ✅ Implemented — `parse_acls()` maps `<rulebase><security><rules>` to `ACLConfig` per policy scope, plus one source-NAT ACL per source-translating NAT rule
 
 ---
 
@@ -358,15 +414,17 @@ This makes the full BGP → tunnel → IPsec dependency chain visible.
 ```
 
 **PAN-OS-Specific Differences:**
-- Source NAT (SNAT/PAT) and destination NAT (DNAT) are separate rule types in the same rulebase
-- PAN-OS does not reference external ACL objects for NAT — source addresses are inline in the rule
-- DNAT rules are captured as `NATStaticEntry`; SNAT rules are noted but not mapped to avoid false dangling references
+- Source NAT and destination NAT (DNAT) are separate translations in the same rule/rulebase; both are now modeled
+- `<source-translation>` has three mutually exclusive branches chosen by element name: `dynamic-ip-and-port` (PAT / overload), `dynamic-ip` (1:1 dynamic, no ports), and `static-ip`. `<translated-address>` is a **member list** under the two dynamic branches and a **text node** under `static-ip` — one element name, two shapes.
+- PAN-OS does not reference external ACL objects for NAT; source addresses are inline on the rule. `parse_acls()` materializes those inline sets as `nat-source-{rule}` ACLs so `NATDynamicEntry.acl` resolves (§6, CCR-0035 #7).
+- NAT rules are read per policy scope, so Panorama device-group NAT is covered
 
 **Supported Attributes:**
-- Static DNAT: original IP (from destination member), translated IP and port
-- Direction: `"outside"` for DNAT
+- Destination NAT → `NATStaticEntry` (original IP from destination member, translated IP and port, direction `"outside"`)
+- Source static NAT (`static-ip`) → `NATStaticEntry` (direction `"inside"`)
+- Source dynamic NAT → `NATDynamicEntry` (direction `"inside"`, `acl` pointing at the materialized `nat-source-{rule}` set, egress `interface`, pool, and `overload=True` for `dynamic-ip-and-port` / `False` for `dynamic-ip`)
 
-**Parsing Status:** ✅ Implemented — `parse_nat()` captures `<destination-translation>` entries as `NATStaticEntry`
+**Parsing Status:** ✅ Implemented — `parse_nat()` captures destination and static-source translations as `NATStaticEntry` and dynamic/PAT source translations as `NATDynamicEntry`
 
 ---
 
@@ -427,9 +485,11 @@ This makes the full BGP → tunnel → IPsec dependency chain visible.
 **Supported Attributes:**
 - IKE crypto profiles: encryption, hash, DH group, lifetime
 - IPsec crypto profiles: ESP encryption + authentication algorithms
-- IKE gateways: peer IP, local interface, crypto profile reference
+- IKE gateways: peer IP, and the Phase-1 crypto profile reference
 
-**Parsing Status:** ✅ Implemented — `parse_crypto()` handles `<ike><crypto-profiles>`, `<ike><gateway>`, and `<tunnel><ipsec>` blocks
+**IKE crypto profile location (CCR-0116):** A device emits the gateway's Phase-1 profile **nested under the negotiated IKE version** — `protocol/ikev2/ike-crypto-profile` or `protocol/ikev1/ike-crypto-profile` — not as a flat child of the gateway. `parse_crypto()` reads the nested shape first (falling back to a flat `<ike-crypto-profile>` only as lenient back-compat for hand-written configs); the previous flat-only read returned nothing on a real export. This is the same reader `parse_interfaces()` uses for the tunnel underlay chain, so the crypto map and the tunnel binding never disagree.
+
+**Parsing Status:** ✅ Implemented — `parse_crypto()` handles `<ike><crypto-profiles>`, `<ike><gateway>` (nested Phase-1 profile), and `<tunnel><ipsec>` blocks
 
 ---
 
@@ -490,23 +550,29 @@ PAN-OS configs produce a graph with the following node types:
 | `bgp_instance` | Green | BGP process per virtual-router |
 | `ospf_instance` | Green | OSPF process per virtual-router |
 | `static_route` | Green | Static routing entries |
-| `acl` | Amber | Security policy rulebase (zone-based) |
-| `nat` | Red | NAT policy (DNAT entries) |
+| `route_map` | Green | BGP import/export policy rules (policy nodes) |
+| `acl` | Amber | Security policy rulebase (zone-based) + source-NAT address sets |
+| `nat` | Red | NAT policy (DNAT + source/PAT entries) |
 | `crypto` | Red | IKE/IPsec configuration |
 | `zone` | Red | Security zones |
 
 **Key dependency chains visible in the graph:**
 
-- **BGP over IPsec tunnel:**
-  `bgp_instance ──► iface:tunnel.1 ──► zone:vpn-tunnels`
-  The `update_source` edge from BGP neighbor to tunnel interface makes this chain explicit.
+- **BGP over IPsec tunnel (CCR-0116):**
+  `bgp_instance ──[update_source]──► iface:tunnel.1 ──[tunnel_underlay]──► iface:ethernet1/4`
+  plus `iface:tunnel.1 ──[tunnel_ike_gateway]──► crypto`.
+  The update-source edge reaches the tunnel; the resolved underlay binding then chains the tunnel to its physical egress interface and to the crypto node, so the full BGP → tunnel → egress → IPsec path is explicit. (The crypto edge is only drawn when crypto config was parsed, so no ghost node is invented.)
 
 - **Zone → interface membership:**
   `zone:untrust ──► iface:ethernet1/1`
   Each zone shows which interfaces it contains.
 
-- **Crypto → interface:**
-  IKE gateways reference their local interface, connecting the crypto node to the interface graph.
+- **NAT → ACL:**
+  `nat ──► acl:nat-source-{rule}`
+  A source-NAT dynamic entry points at the materialized address-set ACL, so the edge resolves instead of dangling.
+
+- **BGP policy nodes:**
+  Enabled import/export rules bind to their peer-group via `route_map_in`/`route_map_out`, surfacing each policy rule as a `route_map` node.
 
 **Sidebar clusters available:** BGP, OSPF, NAT, Crypto/VPN, Zones
 
@@ -514,25 +580,36 @@ PAN-OS configs produce a graph with the following node types:
 
 ## Parser Architecture
 
-Unlike IOS-style parsers, PAN-OS uses a two-layer approach:
+Unlike IOS-style parsers, PAN-OS uses a layered approach:
 
 ```
 Config text (XML)
     │
     ▼
 panos_xml.parse_panos_xml()       Strip namespace declarations, ElementTree.fromstring()
-    ├── find_device()             <devices><entry>
-    ├── find_all_vsys()           <vsys><entry>
     ├── entries(parent, path)     findall("{path}/entry")
     ├── text_val(el, path)        find(path).text.strip()
-    └── members(el, path)         findall("{path}/member")
+    ├── members(el, path)         findall("{path}/member")
+    └── raw_xml(el)               indented tostring() for raw_config
     │
     ▼
-PANOSParser parse methods         Navigate XML tree, build model objects
-    │
+panos_xml.detect_layout()         Classify the document EXACTLY ONCE:
+    ├── local firewall  → devices/entry/{deviceconfig,network,vsys}
+    ├── Panorama        → device-group pre/post-rulebase + shared + template/config
+    └── neither         → raise UnrecognizedPANOSLayout → ParseError (no silent-empty model)
+    │                     Returns a layout-neutral PANOSLayout view:
+    │                       • device scopes  (own deviceconfig/network/vsys)
+    │                       • vsys scopes    (own zone)
+    │                       • policy scopes  (rulebase chains in evaluation order)
+    ▼
+PANOSParser parse methods         Consume the neutral scopes — never ask "am I Panorama?"
+    │                             Panorama device-group hierarchy (parent-dg) resolved
+    │                             from /config/readonly; template-stacks NOT read
     ▼
 ParsedConfig                      Standard model used by all OS types
 ```
+
+**Panorama specifics** (`_panorama_layout` / `_panorama_policies`): each device-group's effective rulebase chain is resolved to `shared-pre → ancestor-DG-pre → … → own-DG-pre → own-DG-post → … → shared-post`, using the parent-dg hierarchy emitted at `/config/readonly/...`. Template-stacks are deliberately **not** read (their config is assembled from member templates by an unstated priority); a template-stack-only document is an *unrecognized* layout and raises, rather than silently returning nothing.
 
 ---
 
@@ -540,32 +617,32 @@ ParsedConfig                      Standard model used by all OS types
 
 | Method | What it handles |
 |--------|-----------------|
-| `_extract_hostname()` | `<deviceconfig><system><hostname>` |
+| `_extract_hostname()` | `<deviceconfig><system><hostname>` across device scopes |
 | `_collect_unrecognized_blocks()` | Returns `[]` — CiscoConfParse not used |
-| `parse_vrfs()` | `<network><virtual-router>` entries |
-| `parse_interfaces()` | Ethernet, loopback, tunnel, AE interfaces with zone/VR cross-referencing |
-| `parse_bgp()` | `<protocol><bgp>` per virtual-router with peer-group/peer hierarchy |
-| `parse_ospf()` | `<protocol><ospf>` per virtual-router with area/interface blocks |
-| `parse_static_routes()` | `<routing-table><ip><static-route>` per virtual-router |
-| `parse_acls()` | `<rulebase><security><rules>` — zone-based security policies |
-| `parse_nat()` | `<rulebase><nat><rules>` — static DNAT entries |
-| `parse_crypto()` | IKE crypto profiles, IPsec profiles, IKE gateways |
+| `parse_vrfs()` | `<network><virtual-router>` entries + member interface list |
+| `parse_interfaces()` | Ethernet, loopback, tunnel, AE interfaces with zone/VR cross-referencing and the CCR-0116 tunnel-underlay binding |
+| `parse_bgp()` | `<protocol><bgp>` per virtual-router: peer-group/peer hierarchy, timers, multihop, auth-profile, redist-profiles, routing-options |
+| `parse_route_maps()` | `<bgp><policy><import\|export><rules>` → `RouteMapConfig` policy nodes |
+| `parse_prefix_lists()` | Returns `[]` — PAN-OS has no named prefix-list; policy prefixes are inline |
+| `parse_ospf()` | `<protocol><ospf>` per virtual-router: area types, per-interface settings, redist-profiles |
+| `parse_static_routes()` | `<routing-table><ip><static-route>` per virtual-router (admin-dist ≠ metric) |
+| `parse_acls()` | `<rulebase><security><rules>` per policy scope + source-NAT address-set ACLs |
+| `parse_nat()` | `<rulebase><nat><rules>` — DNAT + static/dynamic/PAT source NAT |
+| `parse_crypto()` | IKE crypto profiles, IPsec profiles, IKE gateways (nested Phase-1 profile) |
 | `parse_zones()` | `<vsys><zone>` entries across all virtual systems |
 
 ---
 
 ## Parser Limitations
 
-1. **IPv6 routing protocols** — IPv6 static routes and OSPFv3 are not parsed.
-2. **Multi-vsys policy** — Security and NAT policies are parsed per-vsys; inter-vsys policy is not modeled.
-3. **Panorama device groups** — Only device-local config is supported; Panorama shared/device-group rules are not parsed.
-4. **Application-ID (App-ID) semantics** — Security policy ACL entries capture application names as text in the remark field only; App-ID object definitions are not resolved.
-5. **Address objects / address groups** — Named address objects and groups referenced in security/NAT rules are not resolved to IP addresses.
-6. **Service objects** — Named service objects (port definitions) are not resolved.
-7. **Source NAT (SNAT/PAT)** — SNAT rules are detected but not modeled as `NATDynamicEntry` to avoid false dangling references (PAN-OS does not reference external ACL objects for source selection).
-8. **GlobalProtect VPN** — Not parsed.
-9. **Decryption policies** — Not parsed.
-10. **High Availability (HA)** — HA configuration is not parsed.
+1. **IPv6 routing protocols** — IPv6 static routes and OSPFv3 are not parsed. (BGP is IPv4-unicast; IPv6 redist-profiles are read for protocol names but there are no IPv6 BGP peerings.)
+2. **Template-stacks** — Panorama `template` config is read, but `template-stack` entries are not: a stack assembles its config from member templates by an unstated priority, so it is not resolved. A template-stack-*only* document is treated as an unrecognized layout and raises (rather than silently returning an empty model).
+3. **Application-ID (App-ID) semantics** — Security policy ACL entries capture application names as text in the remark field only; App-ID object definitions are not resolved.
+4. **Address objects / address groups** — Named address objects and groups referenced in security/NAT rules are not resolved to IP addresses (they are kept verbatim in the remark / source-NAT ACL).
+5. **Service objects** — Named service objects (port definitions) are not resolved.
+6. **GlobalProtect VPN** — Not parsed (GlobalProtect-satellite IPSec tunnels are recognized only insofar as they are *skipped* by the tunnel-underlay binding).
+7. **Decryption policies** — Not parsed.
+8. **High Availability (HA)** — HA configuration is not parsed.
 
 ---
 
@@ -582,9 +659,11 @@ Interfaces         8
 VRFs               1
 BGP instances      1
 OSPF instances     1
-ACLs               1
+ACLs               2
 Static routes      6
 ```
+
+(ACLs = 2: the vsys `security-policy-vsys1` rulebase plus one materialized `nat-source-{rule}` address-set ACL for the sample's source-NAT rule.)
 
 **Auto-detection signals** (used when `--os` is not provided):
 
@@ -615,5 +694,5 @@ confgraph map  samples/panos_sample.xml --os panos --lint
 
 ---
 
-**Last Updated:** 2026-04-22
+**Last Updated:** 2026-07-29
 **Parser Version:** 1.0.0

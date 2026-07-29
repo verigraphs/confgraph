@@ -30,17 +30,18 @@ vrf instance <name>
 ```
 
 **EOS-Specific Differences:**
-- Uses `vrf instance` instead of IOS `vrf definition`
-- Supports EVPN route-targets with `evpn` keyword
+- Uses `vrf instance` instead of IOS `vrf definition` (both spellings accepted)
+- On a real EOS switch the `vrf instance NAME` block carries only the name and description; RD and route-targets are printed inside `router bgp <asn>` → `vrf NAME` and are read from there, then attributed back onto the VRF
 - CIDR notation not used in VRF context
 
 **Supported Attributes:**
 - VRF name
-- Route distinguisher (RD)
-- Route-target import/export (with EVPN support)
+- Description
+- Route distinguisher (RD) — read from the `router bgp` VRF block and back-filled onto the VRF
+- Route-target import/export — read from the `router bgp` VRF block and back-filled onto the VRF
 - Route-map import/export
 
-**Parsing Status:** ✅ Overridden — `parse_vrfs()` handles `vrf instance` syntax and EVPN route-targets
+**Parsing Status:** ✅ Inherited — `parse_vrfs()` is no longer overridden. The header spelling (`vrf instance` / `vrf definition`) is supplied as data via `_VRF_HEADER_PATTERNS`; the body vocabulary (description, rd, route-target, route-map import/export) uses the shared `IOSParser.parse_vrfs` walk. RD/RT are sourced from the shared `router bgp` VRF-block traversal and attributed onto the `VRFConfig` by `BaseParser._backfill_vrf_rd_rt`.
 
 **Documentation Source:** EOS 4.35.1F - VRF Configuration Guide
 
@@ -65,10 +66,11 @@ interface <type><number>
 **Supported Attributes:**
 - Interface name and type
 - Description
-- IP address (IPv4/IPv6 with CIDR notation)
-- VRF membership
+- IP address (IPv4/IPv6 with CIDR notation), including CIDR secondary addresses (`ip address X.X.X.X/Y secondary`)
+- VRF membership (bare `vrf NAME`; the older `vrf forwarding` spelling is also accepted)
 - Administrative status (shutdown)
-- OSPF attributes (area, cost, network type, priority, authentication)
+- OSPF attributes (area via bare `ip ospf area <area>` with no process ID, cost, network type, priority, authentication)
+- VARP virtual (anycast-gateway) addresses — `ip virtual-router address <ip>`, accumulated one per line into `varp_addresses`
 - VRRP configuration
 - Tunnel parameters
 
@@ -76,7 +78,9 @@ interface <type><number>
 - Physical: Ethernet, Management
 - Logical: Loopback, Vlan, Tunnel, Port-Channel
 
-**Parsing Status:** ✅ Inherited from IOSParser with CIDR notation support
+**Whole-list reset (CCR-0113):** bare negations that reset an entire `default_factory` interface list are grounded and honored, including `no ip virtual-router address` clearing `varp_addresses`. These use the shared `_IFACE_WHOLE_LIST_RESET_PATTERNS` registry and reset the field to its factory default at finalization.
+
+**Parsing Status:** ✅ Overridden — `parse_interfaces()` extends the inherited walk with EOS CIDR primary/secondary IPv4, EOS `ip ospf area` (no process ID), and VARP virtual-router address accumulation. The interface VRF binding is supplied as data via `_IFACE_VRF_PATTERNS` (no method override).
 
 **Documentation Source:** EOS 4.35.1F - Interface Configuration Guide
 
@@ -101,8 +105,10 @@ router bgp <asn>
 ```
 
 **EOS-Specific Differences:**
-- Similar to IOS-XE address-family syntax
-- VRF BGP configured within `router bgp` block
+- VRF BGP configured within `router bgp` block as a `vrf NAME` sub-block (same block form as NX-OS and IOS-XR, not the IOS-XE `address-family ipv4 vrf NAME` form)
+- Neighbor verb aliases: EOS `peer group` (two words) maps to IOS `peer-group`; EOS `maximum-routes` maps to IOS `maximum-prefix`. These are two dictionary entries (`_BGP_CMD_ALIASES`) on the shared neighbor walk, not a forked walk
+- Best-path tie-break: EOS spells the router-id tie-break `bgp bestpath tie-break router-id` (IOS spells it `bgp bestpath compare-routerid`); both map to `bestpath_options.compare_routerid`. EOS rejects the IOS spelling. Handled by extending one spelling tuple (`_BGP_BESTPATH_SPELLINGS`); the shared bestpath walk covers both positive and negated forms
+- Process-level `maximum-paths [ecmp]` / `maximum-paths ibgp` and flat `aggregate-address` are emitted outside any `address-family` block and folded into the implicit IPv4-unicast family
 - Supports modern BGP features (graceful-restart, route-reflector-client)
 
 **Supported Attributes:**
@@ -110,12 +116,18 @@ router bgp <asn>
 - Neighbors (iBGP/eBGP)
 - Peer groups
 - Address families (IPv4/IPv6)
-- VRF instances
+- VRF instances (block form), including RD and route-targets
 - Route-maps (in/out)
 - Timers, authentication, route-reflector-client
+- Best-path options including `tie-break router-id`
 - Maximum-paths, maximum-routes
+- Flat `network` and `aggregate-address` statements at both global and VRF scope
 
-**Parsing Status:** ✅ Inherited from IOSParser
+**VRF parity (CCR-0114):** VRF-scoped flat `network` and `aggregate-address` lines (direct children of `vrf NAME`) now reach parity with the global instance path — flat networks land on the VRF's BGPConfig, and a flat aggregate is folded into the VRF's IPv4-unicast address-family. AF-nested networks/aggregates are read separately with no double-count.
+
+**VRF neighbor AF (CCR-0115):** the shared VRF-block walker fires the per-neighbor AF-policy hook, so VRF `address-family` block `neighbor X <policy>` lines are captured (previously dropped for EOS while the identical global block parsed).
+
+**Parsing Status:** ✅ Mostly inherited; the previously-forked EOS BGP walk was unified into the shared `IOSParser` walk. EOS contributes only data (`_BGP_CMD_ALIASES`, `_BGP_BESTPATH_SPELLINGS`) plus thin overrides: `_parse_bgp_vrf_instances()` (delegates to the shared block-form VRF traversal) and `_parse_bgp_process_level_af_settings()` (EOS process-level `maximum-paths`).
 
 **Documentation Source:** EOS 4.35.1F - Border Gateway Protocol (BGP)
 
@@ -369,7 +381,11 @@ router isis <instance-name>
 - Authentication
 - Timers (max-lsp-lifetime, lsp-refresh-interval, spf-interval)
 
-**Parsing Status:** ✅ EOS-specific implementation
+**EOS-Specific Differences:**
+- Interface IS-IS membership uses `isis enable <tag>` (IOS: `ip router isis <tag>`), supplied as data via `_ISIS_IFACE_ENABLE_PATTERNS`
+- EOS has no process-level `passive-interface` under `router isis` (the device rejects it); an interface declares itself passive with `isis passive`, read by the shared interface walk into `ISISInterface.passive` and back-filled into `ISISConfig.passive_interfaces`
+
+**Parsing Status:** ✅ Inherited — `parse_isis()` is no longer overridden. The instance body (net / is-type / redistribute / log-adjacency-changes / timers) is spelled identically to IOS; EOS's two dialects (interface membership spelling and where passive lives) are data on the shared `IOSParser.parse_isis` walk.
 
 **Documentation Source:** EOS 4.35.1F - IS-IS Configuration Guide
 
@@ -433,7 +449,7 @@ interface Vxlan1
 
 `line_numbers` are populated for all parsed lines.
 
-**Deletion tombstones:** `no vxlan vlan <id> vni <id>` and `no vxlan vrf <name> vni <id>` inside `interface Vxlan1` emit `field:vxlan:vni:<vni_id>` tombstones via `parse_deletion_commands()`.
+**Deletion tombstones:** `no vxlan vlan <id> vni <id>` and `no vxlan vrf <name> vni <id>` inside `interface Vxlan1` produce `field:vxlan:vni:<vni_id>` removals. Under the op-primary model (CCR-0110) these are native singleton-removal ChangeOps queued via `_queue_native_singleton_removal()`; the byte-exact legacy tombstone string is regenerated from the op rather than persisted in the deprecated `no_commands` channel.
 
 **Parsing Status:** ✅ EOS-specific implementation — `parse_vxlan()` reads from `interface Vxlan1`
 
@@ -500,7 +516,7 @@ mlag configuration
 
 `line_numbers` are populated for all parsed lines.
 
-**Deletion tombstones:** `no peer-address` inside `mlag configuration` emits `field:vpc:peer_keepalive_destination` via `parse_deletion_commands()`.
+**Deletion tombstones:** `no peer-address` inside `mlag configuration` produces a `field:vpc:peer_keepalive_destination` removal. As with VXLAN, this is a native singleton-removal ChangeOp (CCR-0110 op-primary); the legacy tombstone string is regenerated from the op, not persisted in `no_commands`.
 
 **Parsing Status:** ✅ EOS-specific implementation — `parse_vpc()` reads from `mlag configuration` block
 
@@ -518,7 +534,7 @@ The following protocols use IOS-identical syntax in EOS and are parsed via IOSPa
 | SNMP | ✅ Inherited from IOSParser |
 | Syslog | ✅ Inherited from IOSParser |
 | Banners | ✅ Inherited from IOSParser |
-| Line configs (con/vty) | ✅ Inherited from IOSParser |
+| Line / session configs | ✅ Shared line walk; EOS extends it (see note below) |
 | QoS (class-map/policy-map) | ✅ Inherited from IOSParser |
 | NAT | ✅ Inherited from IOSParser |
 | Crypto/IPsec | ✅ Inherited from IOSParser |
@@ -529,6 +545,8 @@ The following protocols use IOS-identical syntax in EOS and are parsed via IOSPa
 | Multicast (PIM/IGMP) | ✅ Inherited from IOSParser |
 | EIGRP | ✅ Inherited from IOSParser |
 | RIP | ✅ Inherited from IOSParser |
+
+**EOS management-line config (2026-07-14):** EOS has no numbered `line vty` block. The same concept — idle admin-session lifetime and its transport — is spelled as top-level `management ssh | console | telnet` blocks with an `idle-timeout <minutes>` child. These join the shared `parse_lines` walk via four data extensions (`_LINE_HEADER_PATTERNS`, `_LINE_TYPES`, `_LINE_EXEC_TIMEOUT_PATTERNS`, `_LINE_TRANSPORT_KEYWORDS`): `console` maps to the CONSOLE line type, `ssh`/`telnet` to VTY, and the block keyword becomes the `transport input` value. The header is anchored so the sibling `management api http-commands | gnmi | netconf` blocks are not swallowed.
 
 See [IOS_PARSER_SUPPORT.md](IOS_PARSER_SUPPORT.md) for full syntax and attribute details for each of these protocols.
 
@@ -568,19 +586,31 @@ The EOS parser inherits from `IOSParser` because:
 
 ### Overridden Methods
 
-1. **`parse_vrfs()`** - Handles `vrf instance` syntax and EVPN route-targets
+1. **`parse_interfaces()`** - Extends the inherited walk with EOS CIDR primary/secondary IPv4, EOS `ip ospf area` (no process ID), and VARP `ip virtual-router address` accumulation
 2. **`parse_prefix_lists()`** - Handles EOS hierarchical prefix-list syntax with CIDR notation
 3. **`parse_static_routes()`** - CIDR notation and egress-vrf support
 4. **`parse_acls()`** - Optional "standard" keyword and auto-detection
 5. **`parse_community_lists()`** - Regexp keyword instead of standard/expanded
 6. **`parse_as_path_lists()`** - Identical to IOS (included for completeness)
-7. **`parse_isis()`** - Modern instance-based IS-IS syntax
+7. **`parse_bfd()`** - EOS `router bfd` block form and flat `bfd slow-timer <ms>` (singular)
 8. **`parse_dns()`** - Merges VRF-scoped DNS entries from `vrf instance` blocks with global DNS config
-9. **`parse_vxlan()`** - Reads VXLAN config from `interface Vxlan1`; populates `line_numbers`
-10. **`parse_mpls()`** - Handles EOS `mpls ldp` hierarchical block; populates `line_numbers`
-11. **`parse_vpc()`** - Maps `mlag configuration` to `VPCConfig`; populates `line_numbers`
-12. **`parse_deletion_commands()`** - Adds EOS-specific VXLAN VNI and MLAG tombstones
-13. **`_extract_interface_vrf()`** - Uses `\s*$` end-of-line anchor to avoid matching `vrf`-prefixed sub-commands other than `vrf <name>`
+9. **`parse_multicast()`** - EOS block form (`router multicast` → `ipv4` → `routing`, `router pim sparse-mode` → `ipv4` → `rp address …`); merges any flat lines the inherited walk finds
+10. **`parse_vxlan()`** - Reads VXLAN config from `interface Vxlan1`; populates `line_numbers`
+11. **`parse_mpls()`** - Handles EOS `mpls ldp` hierarchical block; populates `line_numbers`
+12. **`parse_vpc()`** - Maps `mlag configuration` to `VPCConfig`; populates `line_numbers`
+13. **`parse_deletion_commands()`** - Adds EOS-specific VXLAN VNI and MLAG native singleton-removal ops (CCR-0110 op-primary)
+14. **`_parse_bgp_vrf_instances()`** - Delegates to the shared block-form VRF traversal (`_parse_bgp_vrf_blocks`) so EOS `router bgp` → `vrf NAME` blocks parse (unlike the IOS-XE `address-family ipv4 vrf` form)
+15. **`_parse_bgp_process_level_af_settings()`** - Reads EOS process-level `maximum-paths [ecmp]` / `maximum-paths ibgp`; folded into the IPv4-unicast family by the shared merge
+
+**No longer overridden (now data-driven on the shared walk):**
+
+- **`parse_vrfs()`** — header spelling is data (`_VRF_HEADER_PATTERNS`); RD/RT read from the `router bgp` VRF block and back-filled
+- **`parse_isis()`** — interface membership spelling and passive-interface placement are data on the shared walk
+- **`parse_bgp()` / BGP neighbor and peer-group walks** — EOS dialect is two aliases (`_BGP_CMD_ALIASES`) plus the bestpath spelling tuple (`_BGP_BESTPATH_SPELLINGS`)
+- **`parse_lines()`** — EOS `management ssh|console|telnet` blocks join via four table extensions
+- **`_extract_interface_vrf()`** — interface VRF binding is data (`_IFACE_VRF_PATTERNS`)
+
+**Data-driven dialect extensions (pattern-sets / lookup tables, not method overrides):** interface VRF (`_IFACE_VRF_PATTERNS`), VRF header (`_VRF_HEADER_PATTERNS`), OSPF process-wide BFD (`_OSPF_BFD_ALL_PATTERNS`), BGP bestpath spellings (`_BGP_BESTPATH_SPELLINGS`), BGP neighbor aliases (`_BGP_CMD_ALIASES`), interface BFD timers (`_IFACE_BFD_PATTERNS`), interface PIM mode (`_IFACE_PIM_MODE_PATTERNS`), syslog host (`_SYSLOG_HOST_PATTERNS`), DNS domain (`_DNS_DOMAIN_PATTERNS`), IS-IS interface enable (`_ISIS_IFACE_ENABLE_PATTERNS`), line/session config (`_LINE_HEADER_PATTERNS`, `_LINE_TYPES`, `_LINE_EXEC_TIMEOUT_PATTERNS`, `_LINE_TRANSPORT_KEYWORDS`), banners (`_BANNER_PATTERNS`), and whole-list interface reset (`_IFACE_WHOLE_LIST_RESET_PATTERNS`, incl. `varp_addresses`).
 
 ---
 
@@ -688,6 +718,6 @@ uv run python test_eos_parser.py
 
 ---
 
-**Last Updated:** 2026-06-22
+**Last Updated:** 2026-07-29
 **Parser Version:** 1.1.0
 **Documentation Version:** EOS 4.35.1F
