@@ -584,6 +584,11 @@ _IFACE_MEMBER_KEYS: dict[str, "Callable[[Any], str] | None"] = {
     "hsrp_groups": lambda g: str(g.group_number),
     "vrrp_groups": lambda g: str(g.group_number),
     "glbp_groups": lambda g: str(g.group_number),
+    # CCR-0092: NX-OS interface storm-control. A device emits one
+    # "storm-control <type> level <threshold>" line per traffic type, so it is a
+    # keyed per-member list (keyed by traffic_type) of the same shape as the FHRP
+    # group lists.
+    "storm_control": lambda sc: sc.traffic_type,
 }
 
 # Interface member-removal tombstone kinds (NESTED_DELETION_RULES

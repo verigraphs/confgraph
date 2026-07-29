@@ -1965,6 +1965,10 @@ class IOSParser(BaseParser):
         "ospf_message_digest_keys": lambda key_id: (
             rf"^\s+ip\s+ospf\s+message-digest-key\s+{key_id}\s"
         ),
+        # CCR-0092: NX-OS storm-control — one line per traffic type.
+        "storm_control": lambda sc: (
+            rf"^\s+storm-control\s+{re.escape(sc.traffic_type)}\s+level\b"
+        ),
     }
 
     # Family 3 (service entities): banner CLI keyword ↔ BannerConfig field

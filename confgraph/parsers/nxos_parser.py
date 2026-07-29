@@ -13,7 +13,7 @@ from confgraph.models.bgp import (
     BGPBestpathOptions,
 )
 from confgraph.models.ospf import OSPFConfig
-from confgraph.models.interface import VRRPGroup
+from confgraph.models.interface import StormControlLevel, VRRPGroup
 from confgraph.models.static_route import StaticRoute
 from confgraph.parsers.base import _BASE_KNOWN_PATTERNS, apply_peer_group_command, _default_pg_data
 from confgraph.parsers.ios_parser import IOSParser
@@ -432,6 +432,34 @@ class NXOSParser(IOSParser):
                 if m:
                     intf_cfg.ospf_process_id = int(m.group(1))
                     intf_cfg.ospf_area = m.group(2)
+
+            # NX-OS storm-control: "storm-control {broadcast|multicast|unicast}
+            # level <threshold>". The threshold is a bandwidth percentage by
+            # default (emitted "level 5.00"), or an absolute rate when a unit
+            # keyword precedes the value ("level pps <n>" / "level bps <n>").
+            # IOSParser's super() call marks the line known-but-unparsed (the
+            # interface known-child allowlist); collect it into the model here.
+            for sc_ch in intf_obj.find_child_objects(r"^\s+storm-control\s+"):
+                sc_m = re.match(
+                    r"^\s+storm-control\s+(broadcast|multicast|unicast)\s+level\s+"
+                    r"(?:(pps|bps)\s+)?(\S+)",
+                    sc_ch.text,
+                )
+                if not sc_m:
+                    continue
+                traffic_type, unit_kw, raw_level = sc_m.groups()
+                try:
+                    level_val = float(raw_level)
+                except ValueError:
+                    continue
+                unit = unit_kw if unit_kw else "percent"
+                if any(s.traffic_type == traffic_type for s in intf_cfg.storm_control):
+                    continue
+                intf_cfg.storm_control.append(
+                    StormControlLevel(
+                        traffic_type=traffic_type, level=level_val, unit=unit
+                    )
+                )
 
         return interfaces
 

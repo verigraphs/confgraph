@@ -119,6 +119,10 @@ class TestBoundary:
             "hsrp_groups",
             "vrrp_groups",
             "glbp_groups",
+            # CCR-0092: NX-OS interface storm-control. A device emits one
+            # "storm-control <type> level <threshold>" line PER traffic type, a
+            # keyed per-member list (keyed by traffic_type) like the FHRP groups.
+            "storm_control",
             "ospf_message_digest_keys",
         }
         # Pin flipped in place by WI-DB1-B1 (CCR Appendix AA): the registry

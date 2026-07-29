@@ -77,6 +77,29 @@ class VRRPGroup(BaseModel):
     )
 
 
+class StormControlLevel(BaseModel):
+    """One interface storm-control suppression threshold, per traffic type.
+
+    NX-OS emits ``storm-control {broadcast|multicast|unicast} level <threshold>``
+    under an interface. The threshold is a percentage of port bandwidth by
+    default (emitted with fixed two-decimal formatting, e.g. ``level 5.00``), or
+    an absolute packets-per-second rate when the ``pps`` keyword is present
+    (``level pps <n>``). Each traffic type carries at most one level, so a
+    per-interface list keyed by ``traffic_type`` is the natural shape. ``unit`` is
+    a free string ('percent' or 'pps' on NX-OS 9000; a bits-per-second 'bps' form
+    exists on some other platforms).
+    """
+
+    traffic_type: str = Field(
+        ..., description="Traffic class: 'broadcast', 'multicast', or 'unicast'"
+    )
+    level: float = Field(..., description="Numeric suppression threshold value")
+    unit: str = Field(
+        default="percent",
+        description="Threshold unit: 'percent' (of bandwidth), 'pps', or 'bps'",
+    )
+
+
 class GLBPGroup(BaseModel):
     """GLBP (Gateway Load Balancing Protocol) group configuration."""
 
@@ -420,6 +443,15 @@ class InterfaceConfig(BaseConfigObject):
     port_security_sticky: bool = Field(
         default=False,
         description="Sticky MAC learning enabled (switchport port-security mac-address sticky)",
+    )
+
+    # Storm-control (L2 broadcast/multicast/unicast suppression)
+    storm_control: list[StormControlLevel] = Field(
+        default_factory=list,
+        description=(
+            "Per-traffic-type storm-control suppression levels "
+            "(storm-control {broadcast|multicast|unicast} level <threshold>)"
+        ),
     )
 
     # 802.1X
