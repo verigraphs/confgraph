@@ -123,6 +123,10 @@ class TestBoundary:
             # "storm-control <type> level <threshold>" line PER traffic type, a
             # keyed per-member list (keyed by traffic_type) like the FHRP groups.
             "storm_control",
+            # CCR-0094: NX-OS per-interface NetFlow application. A device emits
+            # one "ip flow monitor <name> <direction>" line PER direction, a
+            # keyed per-member list (keyed by direction) like storm_control.
+            "flow_monitors",
             "ospf_message_digest_keys",
         }
         # Pin flipped in place by WI-DB1-B1 (CCR Appendix AA): the registry

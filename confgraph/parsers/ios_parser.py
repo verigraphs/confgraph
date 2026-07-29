@@ -1970,6 +1970,11 @@ class IOSParser(BaseParser):
         "storm_control": lambda sc: (
             rf"^\s+storm-control\s+{re.escape(sc.traffic_type)}\s+level\b"
         ),
+        # CCR-0094: NX-OS NetFlow application — one line per direction.
+        "flow_monitors": lambda fm: (
+            rf"^\s+ip\s+flow\s+monitor\s+{re.escape(fm.monitor)}\s+"
+            rf"{re.escape(fm.direction)}\b"
+        ),
     }
 
     # Family 3 (service entities): banner CLI keyword ↔ BannerConfig field

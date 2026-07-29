@@ -14,7 +14,13 @@ from confgraph.models.bgp import (
 )
 from confgraph.models.ospf import OSPFConfig
 from confgraph.models.qos import ControlPlaneConfig
-from confgraph.models.interface import StormControlLevel, VRRPGroup
+from confgraph.models.interface import InterfaceFlowMonitor, StormControlLevel, VRRPGroup
+from confgraph.models.netflow import (
+    NetFlowConfig,
+    NetFlowExporter,
+    NetFlowMonitor,
+    NetFlowRecord,
+)
 from confgraph.models.static_route import StaticRoute
 from confgraph.parsers.base import _BASE_KNOWN_PATTERNS, apply_peer_group_command, _default_pg_data
 from confgraph.parsers.ios_parser import IOSParser
@@ -37,6 +43,8 @@ _NXOS_KNOWN_PATTERNS: list[str] = [
     r"^port-profile",
     r"^mpls",
     r"^control-plane",
+    # CCR-0094: Flexible NetFlow top-level blocks (claimed by parse_netflow).
+    r"^flow\s+(record|exporter|monitor)\b",
 ]
 
 
@@ -488,6 +496,28 @@ class NXOSParser(IOSParser):
                     StormControlLevel(
                         traffic_type=traffic_type, level=level_val, unit=unit
                     )
+                )
+
+            # NX-OS NetFlow application: "ip flow monitor <name> {input|output}"
+            # binds a flow monitor to the interface in one direction. One line
+            # per direction; the "^ip" known-child pattern marks it
+            # known-but-unparsed in the super() call, so collect it here. Only
+            # the IPv4 "input" direction is corpus-verified
+            # (syntax-corpus/nxos/netflow.yaml); "output" is parsed leniently.
+            for fm_ch in intf_obj.find_child_objects(
+                r"^\s+ip\s+flow\s+monitor\s+"
+            ):
+                fm_m = re.match(
+                    r"^\s+ip\s+flow\s+monitor\s+(\S+)\s+(input|output)\b",
+                    fm_ch.text,
+                )
+                if not fm_m:
+                    continue
+                mon_name, direction = fm_m.groups()
+                if any(fm.direction == direction for fm in intf_cfg.flow_monitors):
+                    continue
+                intf_cfg.flow_monitors.append(
+                    InterfaceFlowMonitor(monitor=mon_name, direction=direction)
                 )
 
         return interfaces
@@ -1509,6 +1539,131 @@ class NXOSParser(IOSParser):
             source_os=self.os_type,
             line_numbers=line_numbers,
             l2vnis=l2vnis,
+        )
+
+    # -------------------------------------------------------------------
+    # NetFlow — flow record / flow exporter / flow monitor
+    # -------------------------------------------------------------------
+
+    def parse_netflow(self) -> "NetFlowConfig | None":
+        """Parse Flexible NetFlow flow record / exporter / monitor blocks.
+
+        NX-OS models NetFlow as three named top-level block types (unlike the
+        IOS ``ip flow-export`` singleton the base :meth:`parse_netflow`
+        handles)::
+
+            flow record <name>
+              match ipv4 source address
+              collect counter bytes
+            flow exporter <name>
+              destination <ip> [use-vrf <vrf>]
+              source <interface>
+              version 9
+            flow monitor <name>
+              record <record>
+              exporter <exporter>
+
+        Returns ``None`` when the device carries none of the three blocks, so
+        the ``netflow`` field stays absent on configs without Flexible
+        NetFlow. Syntax is doc-verified from
+        ``syntax-corpus/nxos/netflow.yaml`` (the emitted running-config form
+        is not yet hardware-captured — the n9kv 10.5(5) probe rejected
+        ``feature netflow``).
+        """
+        parse = self._get_parse_obj()
+
+        records: list[NetFlowRecord] = []
+        for obj in parse.find_objects(r"^flow\s+record\s+"):
+            name = self._extract_match(obj.text, r"^flow\s+record\s+(\S+)")
+            if not name:
+                continue
+            match_fields: list[str] = []
+            collect_fields: list[str] = []
+            for child in obj.children:
+                text = child.text.strip()
+                mm = re.match(r"^match\s+(.+)$", text)
+                if mm:
+                    match_fields.append(mm.group(1).strip())
+                    continue
+                cm = re.match(r"^collect\s+(.+)$", text)
+                if cm:
+                    collect_fields.append(cm.group(1).strip())
+            records.append(
+                NetFlowRecord(
+                    name=name,
+                    match_fields=match_fields,
+                    collect_fields=collect_fields,
+                )
+            )
+
+        exporters: list[NetFlowExporter] = []
+        for obj in parse.find_objects(r"^flow\s+exporter\s+"):
+            name = self._extract_match(obj.text, r"^flow\s+exporter\s+(\S+)")
+            if not name:
+                continue
+            destination = None
+            use_vrf = None
+            source = None
+            version = None
+            for child in obj.children:
+                text = child.text.strip()
+                dm = re.match(
+                    r"^destination\s+(\S+)(?:\s+use-vrf\s+(\S+))?", text
+                )
+                if dm:
+                    destination = dm.group(1)
+                    if dm.group(2):
+                        use_vrf = dm.group(2)
+                    continue
+                sm = re.match(r"^source\s+(\S+)", text)
+                if sm:
+                    source = sm.group(1)
+                    continue
+                vm = re.match(r"^version\s+(\d+)", text)
+                if vm:
+                    try:
+                        version = int(vm.group(1))
+                    except ValueError:
+                        pass
+            exporters.append(
+                NetFlowExporter(
+                    name=name,
+                    destination=destination,
+                    use_vrf=use_vrf,
+                    source=source,
+                    version=version,
+                )
+            )
+
+        monitors: list[NetFlowMonitor] = []
+        for obj in parse.find_objects(r"^flow\s+monitor\s+"):
+            name = self._extract_match(obj.text, r"^flow\s+monitor\s+(\S+)")
+            if not name:
+                continue
+            record = None
+            exporter = None
+            for child in obj.children:
+                text = child.text.strip()
+                rm = re.match(r"^record\s+(\S+)", text)
+                if rm:
+                    record = rm.group(1)
+                    continue
+                em = re.match(r"^exporter\s+(\S+)", text)
+                if em:
+                    exporter = em.group(1)
+            monitors.append(
+                NetFlowMonitor(name=name, record=record, exporter=exporter)
+            )
+
+        if not records and not exporters and not monitors:
+            return None
+
+        return NetFlowConfig(
+            object_id="netflow",
+            source_os=self.os_type,
+            flow_records=records,
+            flow_exporters=exporters,
+            flow_monitors=monitors,
         )
 
     # -------------------------------------------------------------------

@@ -100,6 +100,27 @@ class StormControlLevel(BaseModel):
     )
 
 
+class InterfaceFlowMonitor(BaseModel):
+    """A NetFlow flow-monitor applied to an interface, per direction.
+
+    NX-OS emits one line per direction under an interface::
+
+        ip flow monitor <name> input
+
+    Each direction carries at most one IPv4 flow monitor, so a per-interface
+    list keyed by ``direction`` is the natural shape (the same per-member
+    shape as the FHRP group / storm-control lists). Only the ``input``
+    direction is recorded in the doc-verified corpus
+    (``syntax-corpus/nxos/netflow.yaml``); ``output`` is parsed leniently but
+    is not corpus-backed / fixture-asserted.
+    """
+
+    monitor: str = Field(..., description="Flow monitor name bound to the interface")
+    direction: str = Field(
+        ..., description="Traffic direction the monitor is applied to: 'input' or 'output'"
+    )
+
+
 class GLBPGroup(BaseModel):
     """GLBP (Gateway Load Balancing Protocol) group configuration."""
 
@@ -451,6 +472,15 @@ class InterfaceConfig(BaseConfigObject):
         description=(
             "Per-traffic-type storm-control suppression levels "
             "(storm-control {broadcast|multicast|unicast} level <threshold>)"
+        ),
+    )
+
+    # NetFlow flow-monitor application (ip flow monitor <name> input)
+    flow_monitors: list[InterfaceFlowMonitor] = Field(
+        default_factory=list,
+        description=(
+            "NetFlow flow monitors applied to the interface, per direction "
+            "(ip flow monitor <name> {input|output})"
         ),
     )
 
