@@ -252,6 +252,89 @@ class PANOSParser(BaseParser):
     # 2. Interfaces
     # ------------------------------------------------------------------
 
+    def _ipsec_tunnel_bindings(self) -> dict[str, dict[str, str | None]]:
+        """``tunnel.N`` interface name → its auto-key IPSec-tunnel binding.
+
+        Walks ``network/tunnel/ipsec/entry``.  ``<tunnel-interface>`` is TEXT (the
+        ``tunnel.N`` the IPSec tunnel binds to).  The IKE gateway lives ONLY under
+        ``<auto-key><ike-gateway><entry name="…"/></ike-gateway></auto-key>`` and
+        is ENTRY-KEYED by ``@name`` (not text, not a member).  Manual-key and
+        global-protect-satellite IPSec tunnels have no ``<auto-key>`` and thus no
+        IKE gateway — those entries are skipped so no gateway/egress edge is
+        invented (CCR-0116).
+        """
+        bindings: dict[str, dict[str, str | None]] = {}
+        for scope in self._device_scopes():
+            net = scope.element.find("network")
+            if net is None:
+                continue
+            for ipsec in entries(net, "tunnel/ipsec"):
+                auto_key = ipsec.find("auto-key")
+                if auto_key is None:
+                    continue  # manual-key / gp-satellite: no IKE gateway to bind
+                tunnel_iface = text_val(ipsec, "tunnel-interface")
+                if not tunnel_iface:
+                    continue
+                gw_entry = auto_key.find("ike-gateway/entry")
+                bindings[tunnel_iface] = {
+                    "ike_gateway": gw_entry.get("name") if gw_entry is not None else None,
+                    "ipsec_crypto_profile": text_val(auto_key, "ipsec-crypto-profile"),
+                    "ipsec_tunnel": ipsec.get("name", ""),
+                }
+        return bindings
+
+    def _ike_gateways(self) -> dict[str, dict[str, str | None]]:
+        """IKE gateway name → {egress, peer_ip, version, ike_crypto_profile}.
+
+        ``local-address/interface`` is the PHYSICAL egress the gateway (and every
+        tunnel riding it) depends on.  The IKE crypto profile is nested under the
+        negotiated protocol version (``protocol/ikev2/ike-crypto-profile`` or
+        ``protocol/ikev1/ike-crypto-profile``) (CCR-0116).
+        """
+        gateways: dict[str, dict[str, str | None]] = {}
+        for scope in self._device_scopes():
+            net = scope.element.find("network")
+            if net is None:
+                continue
+            for gw in entries(net, "ike/gateway"):
+                name = gw.get("name", "")
+                if not name:
+                    continue
+                gateways[name] = {
+                    "egress": text_val(gw, "local-address/interface"),
+                    "peer_ip": text_val(gw, "peer-address/ip"),
+                    "version": text_val(gw, "protocol/version"),
+                    "ike_crypto_profile": (
+                        text_val(gw, "protocol/ikev2/ike-crypto-profile")
+                        or text_val(gw, "protocol/ikev1/ike-crypto-profile")
+                    ),
+                }
+        return gateways
+
+    @staticmethod
+    def _bind_tunnel_underlay(
+        ic: InterfaceConfig,
+        ipsec_bindings: dict[str, dict[str, str | None]],
+        ike_gateways: dict[str, dict[str, str | None]],
+    ) -> None:
+        """Attach the resolved IPSec/IKE/egress binding to a tunnel InterfaceConfig.
+
+        Degrades gracefully: an IPSec tunnel referencing a missing IKE gateway (or
+        a gateway with no local-address) still records what IS known (the gateway
+        name / IPSec profile); the egress simply stays ``None`` and no
+        tunnel→egress edge is emitted downstream (CCR-0116).
+        """
+        binding = ipsec_bindings.get(ic.name)
+        if not binding:
+            return
+        ic.tunnel_ike_gateway = binding["ike_gateway"]
+        if binding["ipsec_crypto_profile"]:
+            ic.tunnel_protection_profile = binding["ipsec_crypto_profile"]
+        gw = ike_gateways.get(binding["ike_gateway"]) if binding["ike_gateway"] else None
+        if gw:
+            ic.tunnel_underlay_interface = gw["egress"]
+            ic.tunnel_ike_crypto_profile = gw["ike_crypto_profile"]
+
     def parse_interfaces(self) -> list[InterfaceConfig]:
         # Build zone_of_iface map
         zone_of_iface: dict[str, str] = {}
@@ -276,6 +359,11 @@ class PANOSParser(BaseParser):
         # They are carried out of parse_ospf in OSPFArea.interface_settings and
         # attributed here by BaseParser._backfill_ospf_interface_settings — one
         # shared walk for every OS, not a private dict per parser ([[CCR-0038]]).
+
+        # IPSec-tunnel / IKE-gateway binding maps for the tunnel underlay chain
+        # (CCR-0116).  Built once here, consumed per tunnel interface below.
+        ipsec_bindings = self._ipsec_tunnel_bindings()
+        ike_gateways = self._ike_gateways()
 
         ifaces: list[InterfaceConfig] = []
 
@@ -341,11 +429,17 @@ class PANOSParser(BaseParser):
                 if lo_name:
                     ifaces.append(_build(lo, lo_name))
 
-            # Tunnel interfaces
+            # Tunnel interfaces.  A tunnel.N rides an IPSec tunnel (bound by
+            # <tunnel-interface>) whose IKE gateway's local-address is the
+            # physical egress; resolve that chain onto the InterfaceConfig so the
+            # dependency graph can reach tunnel.N -> egress (CCR-0116).
             for tun in entries(net, "interface/tunnel/units"):
                 tun_name = tun.get("name", "")
-                if tun_name:
-                    ifaces.append(_build(tun, tun_name))
+                if not tun_name:
+                    continue
+                ic = _build(tun, tun_name)
+                self._bind_tunnel_underlay(ic, ipsec_bindings, ike_gateways)
+                ifaces.append(ic)
 
             # Aggregate-ethernet (AE/LACP bond)
             for ae in entries(net, "interface/aggregate-ethernet"):
