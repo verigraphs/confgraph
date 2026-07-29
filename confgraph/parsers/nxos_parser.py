@@ -13,6 +13,7 @@ from confgraph.models.bgp import (
     BGPBestpathOptions,
 )
 from confgraph.models.ospf import OSPFConfig
+from confgraph.models.interface import VRRPGroup
 from confgraph.models.static_route import StaticRoute
 from confgraph.parsers.base import _BASE_KNOWN_PATTERNS, apply_peer_group_command, _default_pg_data
 from confgraph.parsers.ios_parser import IOSParser
@@ -253,8 +254,86 @@ class NXOSParser(IOSParser):
                 cmd = cmd_child.text.strip()
                 if cmd.startswith("address "):
                     cmd = "ip " + cmd[len("address "):]
+                elif cmd.startswith("advertisement-interval "):
+                    # NX-OS block spelling of the advertise timer; the shared
+                    # applier only knows the IOS "timers advertise N" vocab.
+                    cmd = "timers advertise " + cmd[len("advertisement-interval "):]
                 pairs.append((group_num, cmd))
         return pairs
+
+    def _parse_vrrp_groups(self, intf_obj) -> list:
+        """VRRPv2 groups (shared applier) plus NX-OS VRRPv3 address-family groups.
+
+        VRRPv3 (``vrrpv3 <grp> address-family {ipv4|ipv6}``) is a distinct
+        command family with an address-family dimension and (per device emit)
+        priority reordered before address; it is parsed key-by-key here and
+        merged into the same ``vrrp_groups`` list. VRRPv2 and VRRPv3 are
+        mutually exclusive on the interface, so the two never collide.
+        """
+        groups = super()._parse_vrrp_groups(intf_obj)
+        groups.extend(self._parse_vrrpv3_groups(intf_obj))
+        return groups
+
+    def _parse_vrrpv3_groups(self, intf_obj) -> list:
+        """Parse ``vrrpv3 <grp> address-family {ipv4|ipv6}`` blocks.
+
+        Device-verified emitted form (n9kv 10.5(5), CCR-0088)::
+
+            vrrpv3 31 address-family ipv4
+              priority 120
+              address 10.131.131.254 primary
+
+        Parsed by key, not position (the device emits priority before address).
+        """
+        v3_groups: list = []
+        header_re = r"^\s+vrrpv3\s+(\d+)\s+address-family\s+(\S+)"
+        for blk in intf_obj.find_child_objects(header_re):
+            hm = re.match(header_re, blk.text)
+            if not hm:
+                continue
+            group_num = int(hm.group(1))
+            afi = hm.group(2).strip()
+            data: dict = {
+                "group_number": group_num,
+                "version": 3,
+                "afi": afi,
+                "priority": None,
+                "preempt": False,
+                "virtual_ip": None,
+                "timers_advertise": None,
+                "authentication": None,
+                "track_objects": [],
+                "addresses": [],
+            }
+            for cmd_child in blk.children:
+                cmd = cmd_child.text.strip()
+                if cmd.startswith("address "):
+                    addr = cmd[len("address "):].strip()
+                    data["addresses"].append(addr)
+                    # Mirror the IPv4 primary into virtual_ip for VRRPv2 parity.
+                    if afi == "ipv4":
+                        first_tok = addr.split()[0] if addr.split() else ""
+                        is_primary = ("secondary" not in addr) and (
+                            data["virtual_ip"] is None
+                        )
+                        if is_primary:
+                            try:
+                                data["virtual_ip"] = IPv4Address(first_tok)
+                            except ValueError:
+                                pass
+                elif cmd.startswith("priority "):
+                    try:
+                        data["priority"] = int(cmd[len("priority "):].strip())
+                    except ValueError:
+                        pass
+                elif cmd == "preempt" or cmd.startswith("preempt "):
+                    data["preempt"] = True
+                # NOTE: the VRRPv3 advertise timer is intentionally NOT parsed
+                # here. NX-OS emits it as `timers advertise <ms>` (milliseconds,
+                # not the VRRPv2 `advertisement-interval <sec>` keyword) and that
+                # emitted form is doc-only, not capture-verified — see follow-up.
+            v3_groups.append(VRRPGroup(**data))
+        return v3_groups
 
     # -----------------------------------------------------------------------
     # Interfaces — CIDR notation (ip address X.X.X.X/24)

@@ -57,6 +57,24 @@ class VRRPGroup(BaseModel):
     track_objects: list[int] = Field(
         default_factory=list, description="Tracked object numbers"
     )
+    # VRRPv3 (NX-OS ``vrrpv3 <grp> address-family {ipv4|ipv6}``) dimensions.
+    # Additive: classic VRRPv2 groups leave these at their defaults (version
+    # None, afi None, addresses []). VRRPv3 groups set version=3 and afi, and
+    # record their per-AF virtual addresses (verbatim ``<ip> [primary|
+    # secondary]``) in ``addresses`` — for an IPv4 AF the primary is also
+    # mirrored into ``virtual_ip`` for parity with VRRPv2 consumers.
+    version: int | None = Field(
+        default=None,
+        description="VRRP version (3 for VRRPv3 address-family groups; None for classic VRRPv2)",
+    )
+    afi: str | None = Field(
+        default=None,
+        description="VRRPv3 address family ('ipv4' or 'ipv6'); None for classic VRRPv2",
+    )
+    addresses: list[str] = Field(
+        default_factory=list,
+        description="VRRPv3 per-AF virtual addresses, verbatim '<ip> [primary|secondary]'",
+    )
 
 
 class GLBPGroup(BaseModel):
