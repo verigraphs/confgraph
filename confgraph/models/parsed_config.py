@@ -31,6 +31,7 @@ from confgraph.models.object_tracking import ObjectTrack
 from confgraph.models.multicast import MulticastConfig
 from confgraph.models.mpls import MPLSConfig
 from confgraph.models.vxlan import VXLANConfig
+from confgraph.models.evpn import EVPNConfig
 from confgraph.models.vpc import VPCConfig
 from confgraph.models.panos_zone import PANOSZoneConfig
 from confgraph.models.aaa import AAAConfig
@@ -174,6 +175,10 @@ class ParsedConfig(BaseModel):
     vxlan: "VXLANConfig | None" = Field(
         default=None,
         description="VXLAN/VTEP configuration",
+    )
+    evpn: "EVPNConfig | None" = Field(
+        default=None,
+        description="MP-BGP EVPN control-plane (top-level 'evpn' block: per-VNI L2VNI RD/RT)",
     )
     vpc: "VPCConfig | None" = Field(
         default=None,

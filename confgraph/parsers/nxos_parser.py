@@ -1358,6 +1358,8 @@ class NXOSParser(IOSParser):
                     # Parse sub-attributes from VNI member children
                     mcast_group = None
                     suppress_arp = False
+                    ingress_replication = None
+                    ingress_replication_peers: list[str] = []
                     for sub in child.children:
                         raw_lines.append(sub.text)
                         line_numbers.append(sub.linenum)
@@ -1365,14 +1367,31 @@ class NXOSParser(IOSParser):
                         mg = re.match(r"mcast-group\s+(\S+)", st)
                         if mg:
                             mcast_group = mg.group(1)
-                        elif st == "suppress-arp":
+                            continue
+                        if st == "suppress-arp":
                             suppress_arp = True
+                            continue
+                        ir = re.match(r"ingress-replication\s+protocol\s+(\S+)", st)
+                        if ir:
+                            ingress_replication = ir.group(1)
+                            continue
+                        # Static head-end replication: each remote VTEP is a
+                        # sibling 'peer-ip <ip>' line under 'member vni' (same
+                        # config-if-vni submode as the protocol line).
+                        # doc-only (NX-OS VXLAN Config Guide 10.5(x)); parsed
+                        # defensively, no verified fixture ships for it.
+                        pip = re.match(r"peer-ip\s+(\S+)", st)
+                        if pip:
+                            ingress_replication_peers.append(pip.group(1))
+                            continue
                     vni_mappings.append(VXLANVniMapping(
                         vni=vni,
                         vlan=vni_to_vlan.get(vni),
                         vrf="(L3)" if is_l3 else None,
                         mcast_group=mcast_group,
                         suppress_arp=suppress_arp,
+                        ingress_replication=ingress_replication,
+                        ingress_replication_peers=ingress_replication_peers,
                     ))
                     continue
 
@@ -1384,6 +1403,83 @@ class NXOSParser(IOSParser):
             source_interface=source_interface,
             vni_mappings=vni_mappings,
             host_reachability=host_reachability,
+        )
+
+    # -------------------------------------------------------------------
+    # EVPN control-plane
+    # -------------------------------------------------------------------
+
+    def parse_evpn(self) -> "EVPNConfig | None":
+        """Parse the top-level ``evpn`` MP-BGP EVPN control-plane block.
+
+        Handles the device-emitted L2VNI (MAC-VRF) bindings::
+
+            evpn
+              vni 90901 l2
+                rd auto
+                route-target import auto
+                route-target export auto
+
+        Device-emitted behaviour honoured (n9kv 10.5(5), CCR-0087):
+        - ``route-target both <rt>`` renders as separate ``import`` and
+          ``export`` lines — but the typed ``both`` form is expanded here too
+          (populating both lists) so the model is form-agnostic.
+        - ``auto`` DOES nvgen and is kept as the literal token; an operator
+          override emits the literal ``<rd>`` / ``<rt>`` value instead.
+        """
+        from confgraph.models.evpn import EVPNConfig, EVPNL2VNI
+
+        parse = self._get_parse_obj()
+        evpn_objs = parse.find_objects(r"^evpn\s*$")
+        if not evpn_objs:
+            return None
+
+        l2vnis: list[EVPNL2VNI] = []
+        raw_lines: list[str] = []
+        line_numbers: list[int] = []
+
+        for evpn_obj in evpn_objs:
+            raw_lines.append(evpn_obj.text)
+            line_numbers.append(evpn_obj.linenum)
+            for vni_child in evpn_obj.children:
+                raw_lines.append(vni_child.text)
+                line_numbers.append(vni_child.linenum)
+                # ``vni <n> l2`` binds an L2VNI; ``l3`` would be an L3VNI (VRF).
+                m = re.match(r"vni\s+(\d+)\s+l2\b", vni_child.text.strip())
+                if not m:
+                    continue
+                vni = int(m.group(1))
+                rd = None
+                rt_import: list[str] = []
+                rt_export: list[str] = []
+                for sub in vni_child.children:
+                    raw_lines.append(sub.text)
+                    line_numbers.append(sub.linenum)
+                    st = sub.text.strip()
+                    rd_m = re.match(r"rd\s+(\S+)", st)
+                    if rd_m:
+                        rd = rd_m.group(1)
+                        continue
+                    rt_m = re.match(r"route-target\s+(import|export|both)\s+(\S+)", st)
+                    if rt_m:
+                        direction, value = rt_m.group(1), rt_m.group(2)
+                        if direction in ("import", "both"):
+                            rt_import.append(value)
+                        if direction in ("export", "both"):
+                            rt_export.append(value)
+                l2vnis.append(EVPNL2VNI(
+                    vni=vni,
+                    rd=rd,
+                    route_target_import=rt_import,
+                    route_target_export=rt_export,
+                ))
+
+        return EVPNConfig(
+            object_id="evpn",
+            raw_lines=raw_lines,
+            source_os=self.os_type,
+            line_numbers=line_numbers,
+            l2vnis=l2vnis,
         )
 
     # -------------------------------------------------------------------

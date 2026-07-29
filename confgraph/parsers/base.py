@@ -481,6 +481,10 @@ class BaseParser(ABC):
         """Parse VXLAN/VTEP configuration."""
         return None
 
+    def parse_evpn(self) -> "EVPNConfig | None":
+        """Parse the MP-BGP EVPN control-plane ('evpn' block)."""
+        return None
+
     def parse_vpc(self) -> "VPCConfig | None":
         """Parse VPC/MLAG configuration."""
         return None
@@ -644,6 +648,7 @@ class BaseParser(ABC):
         ("multicast",          "parse_multicast"),
         ("mpls",               "parse_mpls"),
         ("vxlan",              "parse_vxlan"),
+        ("evpn",               "parse_evpn"),
         ("vpc",                "parse_vpc"),
         ("zones",              "parse_zones"),
         ("aaa",                "parse_aaa"),

@@ -12,6 +12,18 @@ class VXLANVniMapping(BaseModel):
     vrf: str | None = Field(default=None, description="VRF mapped to this VNI (L3 VNI)")
     mcast_group: str | None = Field(default=None, description="Multicast group for BUM traffic replication")
     suppress_arp: bool = Field(default=False, description="ARP suppression enabled on this VNI")
+    ingress_replication: str | None = Field(
+        default=None,
+        description=(
+            "BUM replication mode for this VNI, from 'ingress-replication protocol <mode>' "
+            "under 'member vni' — 'bgp' (control-plane / BGP-EVPN) or 'static' (head-end). "
+            "None when the VNI uses multicast replication (mcast_group) instead."
+        ),
+    )
+    ingress_replication_peers: list[str] = Field(
+        default_factory=list,
+        description="Remote-VTEP peer IPs for static ingress replication (empty for bgp mode)",
+    )
 
 
 class VXLANConfig(BaseConfigObject):
