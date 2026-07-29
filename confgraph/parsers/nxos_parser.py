@@ -1469,41 +1469,97 @@ class NXOSParser(IOSParser):
     # -------------------------------------------------------------------
 
     def parse_evpn(self) -> "EVPNConfig | None":
-        """Parse the top-level ``evpn`` MP-BGP EVPN control-plane block.
+        """Parse the NX-OS MP-BGP EVPN control-plane (L2VNI + L3VNI).
 
-        Handles the device-emitted L2VNI (MAC-VRF) bindings::
+        Two control-plane surfaces feed the model:
 
-            evpn
-              vni 90901 l2
-                rd auto
-                route-target import auto
-                route-target export auto
+        1. The top-level ``evpn`` block — **L2VNI (MAC-VRF) only**::
+
+               evpn
+                 vni 90901 l2          # L2VNI (MAC-VRF)
+                   rd auto
+                   route-target import auto
+                   route-target export auto
+
+           The top-level ``evpn`` block carries only L2VNIs; there is NO
+           ``vni <n> l3`` form here (vendor doc + validator re-fetch). L2VNIs go
+           to :attr:`EVPNConfig.l2vnis`; this path is byte-identical to CCR-0087.
+
+        2. The **canonical L3VNI control-plane** under ``vrf context`` (CCR-0118),
+           where the L3VNI's tenant-VRF RD / route-targets actually live::
+
+               vrf context TENANT
+                 vni 50001                                   # L3VNI ↔ VRF join
+                 rd 65001:50001
+                 address-family ipv4 unicast
+                   route-target both 65001:50001 evpn        # trailing `evpn`
+                 address-family ipv6 unicast
+                   route-target both 65001:50001 evpn
+
+           The ``vni <n>`` declaration (traditional; the new SVI-less mode spells
+           it ``vni <n> L3``) ties the L3VNI to its tenant VRF. The trailing
+           ``evpn`` keyword marks the L3VNI/EVPN route-targets — captured
+           DISTINCTLY here and joined by VNI; plain ``route-target`` lines (no
+           ``evpn`` suffix) are the L3VPN RTs and are left entirely to
+           :meth:`parse_vrfs` (untouched — no hijack).
+
+        The NVE binding ``member vni <n> associate-vrf`` (parsed by
+        :meth:`parse_vxlan`, which flags the mapping ``vrf == "(L3)"``) is reused
+        as the ``associate_vrf`` signal — that VNI is fabric-associated as an
+        L3VNI.
+
+        JOIN: one :class:`EVPNL3VNI` per VNI number. ``rd``, route-targets and
+        ``vrf`` come from the ``vrf context`` source (``both`` → both lists,
+        ``auto`` kept literal); ``associate_vrf`` from the NVE signal. The L3VNI
+        never draws rd/route-targets from the ``evpn`` block (no such form).
 
         Device-emitted behaviour honoured (n9kv 10.5(5), CCR-0087):
-        - ``route-target both <rt>`` renders as separate ``import`` and
-          ``export`` lines — but the typed ``both`` form is expanded here too
-          (populating both lists) so the model is form-agnostic.
-        - ``auto`` DOES nvgen and is kept as the literal token; an operator
-          override emits the literal ``<rd>`` / ``<rt>`` value instead.
+        - ``route-target both <rt>`` populates BOTH lists; ``auto`` is kept as the
+          literal token.
+
+        DOC-GROUNDED CAVEAT (CCR-0118): the L2VNI form is device-verified; the
+        L3VNI's ``vrf context`` emitted ``rd`` / ``route-target ... evpn`` block is
+        NOT captured on the 9000v — grounded in the Cisco Nexus 9000 VXLAN Config
+        Guide 10.5(x) (promotable later). Fields are optional so partial
+        declarations still parse.
         """
-        from confgraph.models.evpn import EVPNConfig, EVPNL2VNI
+        from confgraph.models.evpn import EVPNConfig, EVPNL2VNI, EVPNL3VNI
 
         parse = self._get_parse_obj()
         evpn_objs = parse.find_objects(r"^evpn\s*$")
-        if not evpn_objs:
-            return None
 
         l2vnis: list[EVPNL2VNI] = []
         raw_lines: list[str] = []
         line_numbers: list[int] = []
+        # L3VNI accumulator keyed by VNI number — merged across the three sources.
+        l3_by_vni: dict[int, dict] = {}
 
+        def _l3_entry(vni: int) -> dict:
+            return l3_by_vni.setdefault(
+                vni,
+                {"rd": None, "rt_import": [], "rt_export": [], "vrf": None,
+                 "associate_vrf": False},
+            )
+
+        def _add_rt(bucket: list[str], value: str) -> None:
+            if value not in bucket:
+                bucket.append(value)
+
+        # --- Source 1: the top-level `evpn` block (L2VNI ONLY) -----------------
+        # The top-level `evpn` block carries only L2VNIs (`vni <n> l2`). The
+        # vendor doc (and the validator's re-fetch) confirm there is NO
+        # `vni <n> l3` form here — the L3VNI control-plane lives under
+        # `vrf context` (Source 2). An `l3` keyword under `evpn` is therefore not
+        # a device-emitted form and is deliberately ignored. This path is
+        # byte-identical to CCR-0087.
         for evpn_obj in evpn_objs:
             raw_lines.append(evpn_obj.text)
             line_numbers.append(evpn_obj.linenum)
             for vni_child in evpn_obj.children:
                 raw_lines.append(vni_child.text)
                 line_numbers.append(vni_child.linenum)
-                # ``vni <n> l2`` binds an L2VNI; ``l3`` would be an L3VNI (VRF).
+                # ``vni <n> l2`` binds an L2VNI (MAC-VRF); ``l3`` would be an
+                # L3VNI, but that form does not exist under `evpn` (see above).
                 m = re.match(r"vni\s+(\d+)\s+l2\b", vni_child.text.strip())
                 if not m:
                     continue
@@ -1533,12 +1589,79 @@ class NXOSParser(IOSParser):
                     route_target_export=rt_export,
                 ))
 
+        # --- Source 2: the canonical `vrf context` L3VNI control-plane ----------
+        # An L3VNI is declared with `vni <n>` directly under `vrf context NAME`;
+        # its RD and the `evpn`-suffixed route-targets (under `address-family`)
+        # are the tenant-VRF EVPN control-plane. Plain (non-`evpn`) RTs are left
+        # to parse_vrfs — matched distinctly here by the trailing `evpn` token.
+        for vrf_obj in parse.find_objects(r"^vrf\s+context\s+(\S+)"):
+            vrf_name = self._extract_match(vrf_obj.text, r"^vrf\s+context\s+(\S+)")
+            if not vrf_name:
+                continue
+            vni_children = vrf_obj.find_child_objects(r"^\s+vni\s+(\d+)\b")
+            if not vni_children:
+                continue  # no L3VNI declared in this VRF context
+            for vni_ch in vni_children:
+                vm = re.match(r"vni\s+(\d+)\b", vni_ch.text.strip())
+                if not vm:
+                    continue
+                vni = int(vm.group(1))
+                entry = _l3_entry(vni)
+                entry["vrf"] = vrf_name
+                raw_lines.append(vni_ch.text)
+                line_numbers.append(vni_ch.linenum)
+                # RD directly under `vrf context` (shared L3VPN/L3VNI RD).
+                rd_ch = vrf_obj.find_child_objects(r"^\s+rd\s+(\S+)")
+                if rd_ch and entry["rd"] is None:
+                    entry["rd"] = self._extract_match(rd_ch[0].text, r"^\s+rd\s+(\S+)")
+                # `evpn`-suffixed route-targets under any address-family child.
+                for child in vrf_obj.all_children:
+                    ct = child.text.strip()
+                    rt_m = re.match(
+                        r"route-target\s+(both|import|export)\s+(\S+)\s+evpn\b", ct
+                    )
+                    if not rt_m:
+                        continue
+                    direction, value = rt_m.group(1), rt_m.group(2)
+                    if direction in ("import", "both"):
+                        _add_rt(entry["rt_import"], value)
+                    if direction in ("export", "both"):
+                        _add_rt(entry["rt_export"], value)
+                    raw_lines.append(child.text)
+                    line_numbers.append(child.linenum)
+
+        # --- Source 3: NVE `member vni <n> associate-vrf` (reuse parse_vxlan) ---
+        # parse_vxlan already flags an L3VNI membership as `vrf == "(L3)"`; reuse
+        # that signal rather than re-parsing the NVE line. Enriches known L3VNIs
+        # only (an associate-vrf line alone does not synthesise a control-plane).
+        vxlan = self.parse_vxlan()
+        if vxlan is not None:
+            for mapping in vxlan.vni_mappings:
+                if mapping.vrf == "(L3)" and mapping.vni in l3_by_vni:
+                    l3_by_vni[mapping.vni]["associate_vrf"] = True
+
+        if not evpn_objs and not l3_by_vni:
+            return None
+
+        l3vnis: list[EVPNL3VNI] = [
+            EVPNL3VNI(
+                vni=vni,
+                rd=data["rd"],
+                route_target_import=data["rt_import"],
+                route_target_export=data["rt_export"],
+                vrf=data["vrf"],
+                associate_vrf=data["associate_vrf"],
+            )
+            for vni, data in l3_by_vni.items()
+        ]
+
         return EVPNConfig(
             object_id="evpn",
             raw_lines=raw_lines,
             source_os=self.os_type,
             line_numbers=line_numbers,
             l2vnis=l2vnis,
+            l3vnis=l3vnis,
         )
 
     # -------------------------------------------------------------------
