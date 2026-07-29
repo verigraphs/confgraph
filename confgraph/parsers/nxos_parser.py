@@ -1473,23 +1473,17 @@ class NXOSParser(IOSParser):
 
         Two control-plane surfaces feed the model:
 
-        1. The top-level ``evpn`` block — L2VNI (MAC-VRF) and, where present, the
-           ``vni <n> l3`` L3VNI form::
+        1. The top-level ``evpn`` block — **L2VNI (MAC-VRF) only**::
 
                evpn
                  vni 90901 l2          # L2VNI (MAC-VRF)
                    rd auto
                    route-target import auto
                    route-target export auto
-                 vni 50001 l3          # L3VNI (routing / tenant-VRF VNI)
-                   rd auto
-                   route-target import auto
-                   route-target export auto
 
-           Here the ``l2`` / ``l3`` keyword is the sole discriminator: both share
-           one ``rd`` / ``route-target`` grammar, parsed once and routed by
-           keyword — a single discriminator, not a duplicated branch. L2VNIs go
-           to :attr:`EVPNConfig.l2vnis`; L3VNIs feed the join below.
+           The top-level ``evpn`` block carries only L2VNIs; there is NO
+           ``vni <n> l3`` form here (vendor doc + validator re-fetch). L2VNIs go
+           to :attr:`EVPNConfig.l2vnis`; this path is byte-identical to CCR-0087.
 
         2. The **canonical L3VNI control-plane** under ``vrf context`` (CCR-0118),
            where the L3VNI's tenant-VRF RD / route-targets actually live::
@@ -1502,32 +1496,32 @@ class NXOSParser(IOSParser):
                  address-family ipv6 unicast
                    route-target both 65001:50001 evpn
 
-           The trailing ``evpn`` keyword marks these as the L3VNI/EVPN
-           route-targets — captured DISTINCTLY here and joined by VNI; plain
-           ``route-target`` lines (no ``evpn`` suffix) are the L3VPN RTs and are
-           left entirely to :meth:`parse_vrfs` (untouched — no hijack).
+           The ``vni <n>`` declaration (traditional; the new SVI-less mode spells
+           it ``vni <n> L3``) ties the L3VNI to its tenant VRF. The trailing
+           ``evpn`` keyword marks the L3VNI/EVPN route-targets — captured
+           DISTINCTLY here and joined by VNI; plain ``route-target`` lines (no
+           ``evpn`` suffix) are the L3VPN RTs and are left entirely to
+           :meth:`parse_vrfs` (untouched — no hijack).
 
         The NVE binding ``member vni <n> associate-vrf`` (parsed by
         :meth:`parse_vxlan`, which flags the mapping ``vrf == "(L3)"``) is reused
         as the ``associate_vrf`` signal — that VNI is fabric-associated as an
         L3VNI.
 
-        JOIN: one :class:`EVPNL3VNI` per VNI number, merged across all three
-        sources. ``rd`` first-wins (evpn block, then vrf context); route-targets
-        are unioned (``both`` → both lists, ``auto`` kept literal); ``vrf`` comes
-        from the ``vrf context`` declaration; ``associate_vrf`` from the NVE
-        signal. The common real case is vrf-context-only.
+        JOIN: one :class:`EVPNL3VNI` per VNI number. ``rd``, route-targets and
+        ``vrf`` come from the ``vrf context`` source (``both`` → both lists,
+        ``auto`` kept literal); ``associate_vrf`` from the NVE signal. The L3VNI
+        never draws rd/route-targets from the ``evpn`` block (no such form).
 
         Device-emitted behaviour honoured (n9kv 10.5(5), CCR-0087):
         - ``route-target both <rt>`` populates BOTH lists; ``auto`` is kept as the
           literal token.
 
         DOC-GROUNDED CAVEAT (CCR-0118): the L2VNI form is device-verified; the
-        L3VNI's emitted ``rd`` / ``route-target`` block (both the ``evpn/vni l3``
-        and the ``vrf context`` shapes) is NOT captured on the 9000v — grounded in
-        the Cisco Nexus 9000 VXLAN Config Guide 10.5(x) + the L2VNI analogy
-        (promotable later). Fields are optional so partial declarations still
-        parse.
+        L3VNI's ``vrf context`` emitted ``rd`` / ``route-target ... evpn`` block is
+        NOT captured on the 9000v — grounded in the Cisco Nexus 9000 VXLAN Config
+        Guide 10.5(x) (promotable later). Fields are optional so partial
+        declarations still parse.
         """
         from confgraph.models.evpn import EVPNConfig, EVPNL2VNI, EVPNL3VNI
 
@@ -1551,21 +1545,25 @@ class NXOSParser(IOSParser):
             if value not in bucket:
                 bucket.append(value)
 
-        # --- Source 1: the top-level `evpn` block (L2VNI + `vni <n> l3`) --------
+        # --- Source 1: the top-level `evpn` block (L2VNI ONLY) -----------------
+        # The top-level `evpn` block carries only L2VNIs (`vni <n> l2`). The
+        # vendor doc (and the validator's re-fetch) confirm there is NO
+        # `vni <n> l3` form here — the L3VNI control-plane lives under
+        # `vrf context` (Source 2). An `l3` keyword under `evpn` is therefore not
+        # a device-emitted form and is deliberately ignored. This path is
+        # byte-identical to CCR-0087.
         for evpn_obj in evpn_objs:
             raw_lines.append(evpn_obj.text)
             line_numbers.append(evpn_obj.linenum)
             for vni_child in evpn_obj.children:
                 raw_lines.append(vni_child.text)
                 line_numbers.append(vni_child.linenum)
-                # ``vni <n> l2`` binds an L2VNI (MAC-VRF); ``vni <n> l3`` binds
-                # an L3VNI (routing / tenant-VRF VNI). Same rd/route-target
-                # grammar — the l2/l3 keyword is the only discriminator.
-                m = re.match(r"vni\s+(\d+)\s+(l2|l3)\b", vni_child.text.strip())
+                # ``vni <n> l2`` binds an L2VNI (MAC-VRF); ``l3`` would be an
+                # L3VNI, but that form does not exist under `evpn` (see above).
+                m = re.match(r"vni\s+(\d+)\s+l2\b", vni_child.text.strip())
                 if not m:
                     continue
                 vni = int(m.group(1))
-                vni_type = m.group(2)
                 rd = None
                 rt_import: list[str] = []
                 rt_export: list[str] = []
@@ -1584,21 +1582,12 @@ class NXOSParser(IOSParser):
                             rt_import.append(value)
                         if direction in ("export", "both"):
                             rt_export.append(value)
-                if vni_type == "l2":
-                    l2vnis.append(EVPNL2VNI(
-                        vni=vni,
-                        rd=rd,
-                        route_target_import=rt_import,
-                        route_target_export=rt_export,
-                    ))
-                else:
-                    entry = _l3_entry(vni)
-                    if entry["rd"] is None:
-                        entry["rd"] = rd
-                    for v in rt_import:
-                        _add_rt(entry["rt_import"], v)
-                    for v in rt_export:
-                        _add_rt(entry["rt_export"], v)
+                l2vnis.append(EVPNL2VNI(
+                    vni=vni,
+                    rd=rd,
+                    route_target_import=rt_import,
+                    route_target_export=rt_export,
+                ))
 
         # --- Source 2: the canonical `vrf context` L3VNI control-plane ----------
         # An L3VNI is declared with `vni <n>` directly under `vrf context NAME`;

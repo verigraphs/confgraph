@@ -46,36 +46,32 @@ class EVPNL2VNI(BaseModel):
 
 
 class EVPNL3VNI(BaseModel):
-    """Per-L3VNI (routing / tenant-VRF VNI) binding under the top-level ``evpn`` block.
+    """Per-L3VNI (routing / tenant-VRF VNI) EVPN control-plane binding.
 
-    Models the L3VNI counterpart of :class:`EVPNL2VNI`::
+    The NX-OS L3VNI control-plane lives under ``vrf context`` (NOT under the
+    top-level ``evpn`` block, which carries L2VNIs only)::
 
-        evpn
-          vni <n> l3
-            rd { auto | <rd> }
-            route-target import { auto | <rt> }
-            route-target export { auto | <rt> }
+        vrf context <name>
+          vni <n>                                # traditional; new mode: `vni <n> L3`
+          rd { auto | <rd> }
+          address-family ipv4 unicast
+            route-target { both | import | export } { auto | <rt> } evpn
+          address-family ipv6 unicast
+            route-target { both | import | export } { auto | <rt> } evpn
 
-    The ``l3`` keyword (vs ``l2``) is the only structural discriminator: the
-    ``rd`` / ``route-target`` grammar and the ``route-target both``-expansion /
-    literal-``auto`` conventions are identical to the L2VNI form, so this reuses
-    the exact same field shapes.
-
-    The canonical NX-OS L3VNI control-plane actually lives under
-    ``vrf context <name>`` (``vni <n>`` declaration, ``rd``, and per-address-family
-    ``route-target ... evpn``); ``NXOSParser.parse_evpn`` JOINS that with the
-    ``evpn / vni <n> l3`` block (if any) and the NVE ``member vni <n>
-    associate-vrf`` signal into ONE entry per VNI. ``vrf`` carries the tenant VRF
-    from the ``vrf context`` declaration; ``associate_vrf`` records the NVE
-    binding.
+    ``NXOSParser.parse_evpn`` JOINS this ``vrf context`` declaration with the NVE
+    ``member vni <n> associate-vrf`` signal into ONE entry per VNI. ``vrf`` carries
+    the tenant VRF from the ``vrf context`` declaration; ``rd`` and the
+    ``evpn``-suffixed route-targets are its EVPN RD/RTs (``route-target both`` →
+    both lists, literal ``auto`` preserved); ``associate_vrf`` records the NVE
+    binding. Field shapes mirror :class:`EVPNL2VNI`.
 
     DOC-GROUNDED CAVEAT (CCR-0118): unlike the L2VNI form (device-verified on
-    n9kv 10.5(5), CCR-0087), the L3VNI's emitted ``rd`` / ``route-target`` block
-    (both the ``evpn / vni l3`` and the ``vrf context`` shapes) was NOT captured
-    on the 9000v. It is grounded in the Cisco Nexus 9000 VXLAN Config Guide
-    10.5(x) + the L2VNI analogy, not a device readback — promotable to
-    verified-capture once captured. Fields are therefore all optional so a bare
-    ``vni <n> l3`` declaration (or a vrf-context-only L3VNI) also parses.
+    n9kv 10.5(5), CCR-0087), the L3VNI's ``vrf context`` emitted ``rd`` /
+    ``route-target ... evpn`` block was NOT captured on the 9000v. It is grounded
+    in the Cisco Nexus 9000 VXLAN Config Guide 10.5(x), not a device readback —
+    promotable to verified-capture once captured. Fields are all optional so a
+    partial (e.g. vni-only) declaration still parses.
     """
 
     vni: int = Field(..., description="L3 VXLAN Network Identifier (routing / tenant-VRF VNI)")
