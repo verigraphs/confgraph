@@ -31,6 +31,40 @@ The parser handles the unified configuration syntax shared across IOS and IOS-XE
 - **BGP Configuration:** Address-family based configuration for IPv4, IPv6, VPNv4, L2VPN
 - **OSPF:** Traditional `router ospf <process-id>` syntax (IOS-style)
 
+### Cross-Version Command Dialects (CCR-0031)
+
+Where a single logical command has more than one accepted spelling across IOS
+versions (and across the wider Cisco family), the parser matches all of them
+through **pattern sets** — one data table per command, every dialect exposing the
+same normalized named groups so all spellings fold into the same field. This
+replaces the older one-regex-per-form approach. Dialect coverage that the IOS
+parser reads today includes:
+
+- **VRF block header:** `vrf definition <name>` (IOS-XE) and `ip vrf <name>` (classic IOS)
+- **Interface VRF binding:** `vrf forwarding <name>` (IOS-XE) and `ip vrf forwarding <name>` (classic)
+- **Static routes:** traditional `DEST MASK NH` and CIDR `DEST/PLEN NH` forms
+- **Prefix-lists:** `seq <n>` form and the no-seq shorthand
+- **OSPF process header:** numeric process id and string process tag
+- **Line block header** and **exec-timeout** child spellings
+- **Syslog server line:** VRF named after the host (`logging host <ip> vrf <name>`)
+
+### Shared Base Parser / Nested Sub-Block Traversal (CCR-0032)
+
+The IOS parser is the **shared base class** that the NX-OS, IOS-XR, and EOS
+parsers inherit; several 2026-07 refactors consolidated behavior that used to be
+duplicated per OS into one shared implementation the base owns. For IOS itself
+these are structure changes, not output changes, except where noted below:
+
+- **One nested-block traversal** (`_iter_router_vrf_blocks`) is the single descent
+  point for `router <proto> → vrf <name>` sub-blocks, walked with direct-children
+  matching so global-scope neighbors/areas/redistribute lines are never swept into
+  a VRF instance.
+- **One VRF body vocabulary** (`_VRF_SCALAR_PATTERNS` / `_apply_vrf_body_line`)
+  reads VRF body lines — this is where per-VRF `description` and
+  `route-map <name> import|export` now come from (previously missing).
+- **One OSPF interface back-fill** and **one shared line walk** are described in
+  their respective sections below.
+
 ---
 
 ## Parsing Coverage by Protocol
@@ -52,11 +86,21 @@ vrf definition <name>
 
 #### Parsed Attributes
 - ✅ VRF name
+- ✅ Description (from the shared VRF body vocabulary — CCR-0038 Theme 1)
 - ✅ Route Distinguisher (RD)
 - ✅ Route Targets (import/export/both)
-- ✅ Import/Export route-maps
+- ✅ Import/Export route-maps (`route-map <name> import|export`)
 - ✅ IPv4/IPv6 address families
 - ⚠️  **Not yet:** VPN ID (NX-OS specific)
+
+#### RD / Route-Target Back-fill from BGP (CCR-0059)
+
+- A VRF's L3VPN identity may be declared inside the BGP process rather than in the
+  VRF definition. When RD or route-targets are read under `router bgp <asn>` for a
+  VRF, the shared base walk `_backfill_vrf_rd_rt` attributes them back onto the
+  matching `VRFConfig`, so a consumer asking a VRF for its route-targets does not
+  have to know which block the operator wrote them in. A value the VRF definition
+  itself set is never overwritten by a back-filled one.
 
 ---
 
@@ -77,7 +121,8 @@ vrf definition <name>
 - ✅ VRF assignment (`vrf forwarding`)
 - ✅ IP unnumbered
 - ✅ MTU, bandwidth
-- ✅ DHCP helper addresses
+- ✅ DHCP helper addresses (`ip helper-address`)
+  - **Field home:** IOS `ip helper-address` lands in `InterfaceConfig.helper_addresses`. The generic `InterfaceConfig.dhcp_relay_addresses` field exists (added for the NX-OS `ip dhcp relay address <ip>` form and intended as the eventual shared home) but IOS does **not** yet populate it — helper-address currently stays on `helper_addresses`.
 
 **Layer 2:**
 - ✅ Switchport mode (access/trunk)
@@ -108,6 +153,24 @@ vrf definition <name>
 **CDP/LLDP:**
 - ✅ CDP enable/disable
 - ✅ LLDP transmit/receive
+
+#### Whole-List Reset of Interface List Fields (CCR-0113)
+
+- A **bare** (operand-less) negation of an interface list field resets the entire
+  list to its factory default, distinct from an operand-bearing member removal
+  (`no ip helper-address 10.0.0.1`) which drops a single member. When a whole-list
+  reset is recognized, the parser emits a whole-list reset `ChangeOp` for that
+  `default_factory` interface field and clears the parsed model list — the model
+  clear is coupled to the op emission (single source of truth), so the parsed
+  state and the op stream always agree.
+- The IOS-relevant bare whole-list reset spellings are:
+  - `trunk_allowed_vlans` — `no switchport trunk allowed vlan` (cisco-ios only)
+  - `ipv6_addresses` — `no ipv6 address` (removes all manually configured IPv6 addresses)
+- Other list fields (`helper_addresses`, HSRP/VRRP/GLBP groups, secondary IPs,
+  OSPF message-digest keys, NHRP, IGMP joins, …) have **no** vendor-established
+  bare whole-list negation on IOS — their `no` form requires the member key and is
+  handled member-by-member. (`no ip helper-address` with no address is the EOS
+  empty-list spelling; on IOS the `no` form always carries an address.)
 
 ---
 
@@ -253,6 +316,11 @@ router ospf <process-id>
 #### OSPF Passive Interface Back-fill
 
 - The base parser's `parse()` method back-fills `InterfaceConfig.ospf_passive` from OSPF passive-interface lists after all blocks are parsed. Back-fill is scoped to interfaces already participating in the OSPF process, preventing false positives on L2-only ports.
+
+#### OSPF Interface-Settings Back-fill (CCR-0038 Theme 2)
+
+- A second shared base walk, `_backfill_ospf_interface_settings`, exists to carry OSPF settings that some vendors configure **inside** the routing process (`router ospf 1 → area 0 → interface Gi0/0/0/0 → cost 100`) back onto `InterfaceConfig` (e.g. `ospf_cost`, `ospf_area`). This unifies the field home across the Cisco family.
+- **On IOS this walk is a no-op:** IOS configures OSPF directly on the interface (`ip ospf cost`, `ip ospf priority`, …), which the parser reads at the interface block, so IOS never populates the process-scoped `interface_settings` structure the walk consumes. A value the interface block set is never clobbered by a back-filled one.
 
 #### OSPF Areas
 ```
@@ -592,12 +660,16 @@ line vty 0 4
 ```
 
 #### Parsed Attributes
-- ✅ Line type and range (con/vty/aux)
+- ✅ Line type and range (con/vty/aux/tty)
 - ✅ Exec-timeout
 - ✅ Logging synchronous
 - ✅ Access-class
 - ✅ Transport input/output
 - ✅ Login method
+
+#### Notes
+
+- Line parsing is driven by **one shared line walk** (CCR-0038 Theme 4) keyed off `_LINE_HEADER_PATTERNS`. The IOS header dialect requires the mandatory line number (`line vty 0 4`, `line con 0`); other OSes that do not number lines add their own header spelling to the pattern set and reuse the identical body walk. IOS output is unchanged.
 
 ---
 
@@ -605,17 +677,18 @@ line vty 0 4
 
 #### Configuration Syntax
 ```
-class-map match-any <name>
+class-map [type <qualifier>] match-any <name>
   match dscp <value>
   match access-group name <acl>
   match protocol <protocol>
 
-policy-map <name>
+policy-map [type <qualifier>] <name>
   class <class-name>
     bandwidth percent <pct>
     priority percent <pct>
     set dscp <value>
-    police rate <bps>
+    police <bps> [<burst> [<excess-burst>]]
+    police cir <n> {pps|kbps|mbps|gbps|bps} [bc <n> [{packets|bytes|ms}]]
 ```
 
 #### Parsed Attributes
@@ -623,6 +696,25 @@ policy-map <name>
 - ✅ Match clauses (DSCP, ACL, protocol, IP precedence)
 - ✅ Policy-map name
 - ✅ Class entries (class name, bandwidth, priority, police, set actions)
+
+#### Typed class-map / policy-map Names (CCR-0089, shared base)
+
+- The shared `parse_class_maps` / `parse_policy_maps` skip an optional
+  `type <qualifier>` (control-plane / qos / queuing / …) that precedes the name,
+  so the **real** name is captured instead of the token `type`. The qualifier is
+  retained on `ClassMapConfig.type` / `PolicyMapConfig.type` (`None` for the plain
+  untyped form). The untyped `class-map <name>` / `policy-map <name>` form is
+  unchanged.
+
+#### CoPP / Police Units (CCR-0119, shared base)
+
+- Police parsing recognizes the CIR-with-units form
+  `police cir <n> {pps|kbps|mbps|gbps|bps} [bc <n> [{packets|bytes|ms}]]` in
+  addition to the legacy bare `police <bps>` form. The rate/burst units are
+  retained on `PolicyMapPolice.rate_unit` / `PolicyMapPolice.burst_unit`; both are
+  `None` for the legacy bare form (rate = bps, burst = bytes by default). The unit
+  token is required to match the CIR form, so the legacy unit-less spelling is
+  never misread.
 
 ---
 
@@ -758,6 +850,36 @@ ip pim bsr-candidate <intf>
 
 ---
 
+### 27. Configuration Deletion / Negation (Change-IR)
+
+The IOS parser is **op-primary**: every removal or negation (`no …` line, whole
+interface delete, neighbor field reset, static-route withdrawal, VRF/VLAN delete,
+etc.) is emitted as a native `ChangeOp` on `ParsedConfig.change_ops` with real
+provenance (source line + line number). This is the supported way to read change
+intent from a parse.
+
+#### Legacy tombstone strings retired (CCR-0110 Phase E)
+
+- The deprecated legacy tombstone string containers are **no longer populated** by
+  the IOS parser:
+  - `InterfaceConfig.no_commands` is now **empty** (`[]`).
+  - `BGPConfig.no_commands` is now **empty** (`[]`) — BGP neighbor removals and
+    field resets are emitted as native ops instead of `neighbor:…` /
+    `field:neighbor:…` strings.
+- `ParsedConfig.no_commands` is **essentially empty**, carrying only **three
+  residual derived-only tombstones** that have no native op behind them (the
+  string itself carries the deletion):
+  - the whole-process `no router bgp <asn>` delete (`process:bgp:<asn>`)
+  - the two OSPF area-type resets (`field:ospf:<pid>:area:<n>:stub_reset` and
+    `…:nssa_reset`)
+  - All other OSPF-area deletion variants, and every other removal, are op-backed
+    and emit **no** string.
+- **Migration:** read change intent from `ParsedConfig.change_ops` (Change-IR),
+  not the `no_commands` string containers. The fields remain on the model (empty)
+  until removed at the next major version.
+
+---
+
 ## Parser Limitations and Future Enhancements
 
 ### Current Limitations
@@ -849,12 +971,15 @@ uv run python test_ios_parser_detailed.py
 - [Cisco IOS IP Routing: BGP Command Reference](https://www.cisco.com/c/en/us/td/docs/ios/iproute_bgp/command/reference/irg_book.html)
 
 ### Parser Implementation
-- **Library:** ciscoconfparse2 0.9.16
+- **Library:** ciscoconfparse2 >= 0.9.16
 - **Python:** 3.10+
 - **Data Models:** Pydantic 2.x
+- **Role:** The IOS parser is the **shared base class** the NX-OS, IOS-XR, and EOS parsers inherit. Several 2026-07 refactors (VRF body vocabulary, nested `router → vrf` traversal, OSPF interface/line back-fill walks, cross-version command dialects, class-map/policy-map typed names, CoPP police units) live in this base and are shared across the family.
+- **Change model:** op-primary — removals are native `ChangeOp`s on `ParsedConfig.change_ops`; the legacy `no_commands` string containers are deprecated and emptied (CCR-0110).
 
 ---
 
-**Last Updated:** 2026-06-22
-**Parser Version:** 1.1.0
+**Last Updated:** 2026-07-29
+**Parser Version:** 1.2.0
+**confgraph Package:** 0.3.6
 **Maintainer:** Configz Development Team
