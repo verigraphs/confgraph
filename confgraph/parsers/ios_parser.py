@@ -11882,8 +11882,12 @@ class IOSParser(BaseParser):
         for obj in domain_objs:
             _record(obj)
             t = obj.text.strip()
-            # "ip domain list DOMAIN" / "domain list DOMAIN"
-            m = re.match(r"^(?:ip\s+)?domain\s+list\s+(\S+)", t)
+            # "ip domain list DOMAIN" (IOS spaced) / "ip domain-list DOMAIN"
+            # (NX-OS hyphenated, CCR-0117) / "domain list DOMAIN" (IOS-XR).
+            # Accept hyphen OR space between "domain" and "list", mirroring the
+            # spelling-tolerant VRF-scoped scan in NXOSParser.parse_vrfs
+            # (CCR-0093); the IOS spaced form parses byte-identically.
+            m = re.match(r"^(?:ip\s+)?domain(?:-|\s+)list\s+(\S+)", t)
             if m:
                 domain_list.append(m.group(1))
 
