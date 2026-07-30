@@ -179,7 +179,7 @@ Notes:
 Notes:
 - **EOS DNS override** merges per-`vrf instance` DNS entries with global DNS.
 - **NX-OS DNS** is *not* overridden — the inherited `parse_dns()` handles global resolvers incl. the hyphenated `ip domain-list` (CCR-0117); per-`vrf context` DNS (name-servers / domain-name / domain-list) is attributed onto the VRF inside `parse_vrfs()` (CCR-0093), not flattened into global DNS.
-- **NX-OS DHCP** pools stay inherited; per-interface `ip dhcp relay address <ip>` (the NX-OS analogue of `ip helper-address`) is parsed onto `InterfaceConfig.dhcp_relay_addresses` (CCR-0090) — an interface field, see High Availability / Interface-Level.
+- **NX-OS DHCP** pools stay inherited; per-interface `ip dhcp relay address <ip>` (the NX-OS analogue of `ip helper-address`) is parsed onto `InterfaceConfig.helper_addresses` (CCR-0090, re-homed by CCR-0129 — one shared cross-OS field) — an interface field, see High Availability / Interface-Level.
 
 ### High Availability (Interface-Level)
 
@@ -194,7 +194,7 @@ Notes:
 - LACP system-priority parsed globally; per-interface channel-group and min-links on InterfaceConfig
 - **NX-OS HSRP/VRRP (CCR-0088)** are native overrides: NX-OS emits indented `hsrp <N>` / `vrrp <N>` sub-blocks (collected alongside the flat IOS `standby`/`vrrp` forms), plus **VRRPv3 address-family groups** (`vrrpv3 <grp> address-family {ipv4|ipv6}` → `VRRPGroup` version 3) and `advertisement-interval`.
 - **NX-OS storm-control (CCR-0092):** `storm-control {broadcast|multicast|unicast} level [pps|bps] <threshold>` → `InterfaceConfig.storm_control`.
-- **NX-OS per-interface DHCP relay (CCR-0090):** `ip dhcp relay address <ip>` → `InterfaceConfig.dhcp_relay_addresses`.
+- **NX-OS per-interface DHCP relay (CCR-0090, re-homed CCR-0129):** `ip dhcp relay address <ip>` → `InterfaceConfig.helper_addresses`, the same field as IOS `ip helper-address`.
 - EOS VARP anycast-gateway (`ip virtual-router address`) → `InterfaceConfig.varp_addresses`.
 - JunOS and PAN-OS do not model FHRP (HSRP/VRRP).
 

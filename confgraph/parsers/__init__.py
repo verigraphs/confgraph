@@ -28,7 +28,13 @@ from confgraph.parsers.iosxr_parser import IOSXRParser
 from confgraph.parsers.junos_parser import JunOSParser
 from confgraph.parsers.panos_parser import PANOSParser
 
-PARSER_BEHAVIOR_VERSION: int = 1
+# 2 (CCR-0129): NX-OS ``ip dhcp relay address`` re-homed from the retired
+# ``InterfaceConfig.dhcp_relay_addresses`` onto ``helper_addresses``.  A bump is not
+# strictly REQUIRED by the rule above (the field removal also moves the ParsedConfig
+# JSON schema, which the platform parse cache keys on independently), but
+# confgraph-entrp's gate ``digest_key()`` carries pbv with NO schema component, so this
+# is the only signal that moves there — and over-keying is the documented posture.
+PARSER_BEHAVIOR_VERSION: int = 2
 
 __all__ = [
     "BaseParser",
