@@ -51,8 +51,8 @@ from confgraph.models.static_route import StaticRoute
 from confgraph.models.acl import ACLConfig, ACLEntry
 from confgraph.models.nat import NATConfig, NATDynamicEntry, NATStaticEntry
 from confgraph.models.crypto import (
-    CryptoConfig, IKEv1Policy, IKEv2Proposal, IKEv2Policy,
-    IPSecTransformSet, CryptoMapEntry, CryptoMap,
+    CryptoConfig, IKECryptoProfile, IKEGateway, IKEv1Policy, IKEv2Proposal,
+    IKEv2Policy, IPSecTransformSet, CryptoMapEntry, CryptoMap,
 )
 from confgraph.models.panos_zone import PANOSZoneConfig
 
@@ -302,14 +302,23 @@ class PANOSParser(BaseParser):
             or text_val(gw, "ike-crypto-profile")
         )
 
-    def _ike_gateways(self) -> dict[str, dict[str, str | None]]:
-        """IKE gateway name → {egress, peer_ip, version, ike_crypto_profile}.
+    def _ike_gateways(self) -> dict[str, IKEGateway]:
+        """IKE gateway name → the named :class:`IKEGateway` (CCR-0116/CCR-0139).
 
         ``local-address/interface`` is the PHYSICAL egress the gateway (and every
         tunnel riding it) depends on.  The IKE crypto profile read is shared with
         ``parse_crypto`` via ``_ike_crypto_profile`` (CCR-0116).
+
+        THE single reader of gateway attributes (CCR-0139): it feeds both the
+        named ``crypto.ike_gateways`` list and ``_bind_tunnel_underlay``'s copies
+        onto the tunnel interfaces, which is what makes the IKEGateway copy
+        invariant structural rather than merely asserted.  Nameless entries are
+        skipped — an entry with no ``@name`` has no identity a reference could
+        resolve against (it still reaches the anonymous ``CryptoMapEntry`` rows
+        in :meth:`parse_crypto`).  A duplicate name collapses last-wins, which is
+        the namespace semantics a reference resolves through.
         """
-        gateways: dict[str, dict[str, str | None]] = {}
+        gateways: dict[str, IKEGateway] = {}
         for scope in self._device_scopes():
             net = scope.element.find("network")
             if net is None:
@@ -318,19 +327,20 @@ class PANOSParser(BaseParser):
                 name = gw.get("name", "")
                 if not name:
                     continue
-                gateways[name] = {
-                    "egress": text_val(gw, "local-address/interface"),
-                    "peer_ip": text_val(gw, "peer-address/ip"),
-                    "version": text_val(gw, "protocol/version"),
-                    "ike_crypto_profile": self._ike_crypto_profile(gw),
-                }
+                gateways[name] = IKEGateway(
+                    name=name,
+                    egress_interface=text_val(gw, "local-address/interface"),
+                    peer_address=text_val(gw, "peer-address/ip"),
+                    ike_version=text_val(gw, "protocol/version"),
+                    ike_crypto_profile=self._ike_crypto_profile(gw),
+                )
         return gateways
 
     @staticmethod
     def _bind_tunnel_underlay(
         ic: InterfaceConfig,
         ipsec_bindings: dict[str, dict[str, str | None]],
-        ike_gateways: dict[str, dict[str, str | None]],
+        ike_gateways: dict[str, IKEGateway],
     ) -> None:
         """Attach the resolved IPSec/IKE/egress binding to a tunnel InterfaceConfig.
 
@@ -338,6 +348,10 @@ class PANOSParser(BaseParser):
         a gateway with no local-address) still records what IS known (the gateway
         name / IPSec profile); the egress simply stays ``None`` and no
         tunnel→egress edge is emitted downstream (CCR-0116).
+
+        The two fields taken from the gateway are COPIES of that gateway's own
+        fields — the invariant documented on ``InterfaceConfig``
+        (CCR-0139/CCR-0130 S4).  Keep this the ONLY writer of them.
         """
         binding = ipsec_bindings.get(ic.name)
         if not binding:
@@ -347,8 +361,8 @@ class PANOSParser(BaseParser):
             ic.tunnel_protection_profile = binding["ipsec_crypto_profile"]
         gw = ike_gateways.get(binding["ike_gateway"]) if binding["ike_gateway"] else None
         if gw:
-            ic.tunnel_underlay_interface = gw["egress"]
-            ic.tunnel_ike_crypto_profile = gw["ike_crypto_profile"]
+            ic.tunnel_underlay_interface = gw.egress_interface
+            ic.tunnel_ike_crypto_profile = gw.ike_crypto_profile
 
     def parse_interfaces(self) -> list[InterfaceConfig]:
         # Build zone_of_iface map
@@ -1156,6 +1170,11 @@ class PANOSParser(BaseParser):
         ikev2_policies: list[IKEv2Policy] = []
         transform_sets: list[IPSecTransformSet] = []
         crypto_map_entries: list[CryptoMapEntry] = []
+        # CCR-0139: the named IKE crypto profiles, built from the SAME walk as
+        # the flattened IKEv1Policy rows below so the two can never disagree.
+        # The named IKE gateways come from _ike_gateways() (the single gateway
+        # reader) after the loop.
+        ike_crypto_profiles: list[IKECryptoProfile] = []
 
         priority = 10
         seq = 10
@@ -1164,7 +1183,8 @@ class PANOSParser(BaseParser):
             if net is None:
                 continue
 
-            # IKE crypto profiles → IKEv1 policies
+            # IKE crypto profiles → IKEv1 policies (anonymous) + named
+            # IKECryptoProfile objects (CCR-0139).
             for profile in entries(net, "ike/crypto-profiles/ike-crypto-profiles"):
                 enc_list = members(profile, "encryption")
                 hash_list = members(profile, "hash")
@@ -1174,18 +1194,34 @@ class PANOSParser(BaseParser):
                 if lifetime_str and lifetime_str.isdigit():
                     lifetime = int(lifetime_str) * 3600
 
+                encryption = enc_list[0] if enc_list else None
+                hash_alg = hash_list[0] if hash_list else None
+                dh_group = (
+                    int(dh_group_list[0].replace("group", ""))
+                    if dh_group_list and dh_group_list[0].replace("group", "").isdigit()
+                    else None
+                )
+
                 ikev1_policies.append(IKEv1Policy(
                     priority=priority,
-                    encryption=enc_list[0] if enc_list else None,
-                    hash=hash_list[0] if hash_list else None,
-                    group=(
-                        int(dh_group_list[0].replace("group", ""))
-                        if dh_group_list and dh_group_list[0].replace("group", "").isdigit()
-                        else None
-                    ),
+                    encryption=encryption,
+                    hash=hash_alg,
+                    group=dh_group,
                     lifetime=lifetime,
                 ))
                 priority += 10
+
+                # Named twin.  Nameless entries are skipped (nothing can
+                # reference them) but keep their anonymous row above.
+                profile_name = profile.get("name", "")
+                if profile_name:
+                    ike_crypto_profiles.append(IKECryptoProfile(
+                        name=profile_name,
+                        encryption=encryption,
+                        hash=hash_alg,
+                        group=dh_group,
+                        lifetime=lifetime,
+                    ))
 
             # IPsec crypto profiles → transform sets
             for profile in entries(net, "ike/crypto-profiles/ipsec-crypto-profiles"):
@@ -1214,6 +1250,11 @@ class PANOSParser(BaseParser):
                 ))
                 seq += 10
 
+        # The "is there any crypto at all" test stays on the three original
+        # lists: a named object can only exist alongside its anonymous twin (a
+        # named gateway also produced a crypto-map entry; a named profile also
+        # produced an IKEv1Policy), so the new lists can never be the only
+        # non-empty ones.  Pinned by test_named_objects_never_outlive_the_guard.
         if not ikev1_policies and not transform_sets and not crypto_map_entries:
             return None
 
@@ -1232,6 +1273,15 @@ class PANOSParser(BaseParser):
             ikev2_policies=ikev2_policies,
             transform_sets=transform_sets,
             crypto_maps=crypto_maps,
+            ike_crypto_profiles=ike_crypto_profiles,
+            # CCR-0139: named gateways from the single gateway reader — the one
+            # _bind_tunnel_underlay takes the tunnel interfaces' copies from, so
+            # the copy invariant holds by construction.  The flattened
+            # CryptoMapEntry rows above keep their own element walk on purpose:
+            # they are positional (synthesized sequence numbers) and must stay
+            # byte-identical, including for nameless/duplicate entries the
+            # name-keyed reader collapses.
+            ike_gateways=list(self._ike_gateways().values()),
         )
 
     # ------------------------------------------------------------------

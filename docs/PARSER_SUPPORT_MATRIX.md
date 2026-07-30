@@ -167,7 +167,7 @@ Notes:
 - AAA parses authentication/authorization/accounting method-lists, TACACS+/RADIUS servers (NX-OS override parses `aaa group server` child `server` members)
 - PAN-OS zones parsed from XML `vsys` → `zone` elements
 - **PAN-OS NAT** models both destination-NAT (`NATStaticEntry`) and source NAT — static, dynamic, and PAT (`NATDynamicEntry`), with the source address set materialized as a `nat-source-{rule}` ACL so the reference resolves.
-- **PAN-OS crypto** models IKE crypto profiles, IPsec profiles, and IKE gateways (Phase-1 profile read from the nested `protocol/ikev{1,2}/ike-crypto-profile` shape, CCR-0116), feeding the BGP-over-IPSec tunnel-underlay chain.
+- **PAN-OS crypto** models IKE crypto profiles, IPsec profiles, and IKE gateways (Phase-1 profile read from the nested `protocol/ikev{1,2}/ike-crypto-profile` shape, CCR-0116), feeding the BGP-over-IPSec tunnel-underlay chain. IKE gateways and IKE crypto profiles are also modeled **by name** as `IKEGateway` / `IKECryptoProfile` (CCR-0139), alongside the flattened `CryptoMapEntry` / `IKEv1Policy` forms — a named object is what a reference to it can resolve against.
 
 ### Services
 
