@@ -34,11 +34,11 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install confgraph + regexploit
-        run: uv pip install --system -e ".[redos]"
-
+      # `uv run --extra redos` resolves confgraph + regexploit into uv's managed
+      # project env and runs there. (Not `uv pip install --system`: setup-uv
+      # provisions a uv-managed interpreter that refuses --system installs.)
       - name: ReDoS gate
-        run: python tools/redos_scan.py --check
+        run: uv run --extra redos python tools/redos_scan.py --check
 
       - name: Upload scan artifact
         if: always()
