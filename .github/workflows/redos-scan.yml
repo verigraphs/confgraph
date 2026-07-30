@@ -1,0 +1,48 @@
+name: redos-scan
+
+# CCR-0126: scan the parser regexes for catastrophic backtracking with a real
+# analyser (regexploit) and fail on a NEWLY introduced pathological pattern.
+# The current baseline is clean (0 findings over 784 patterns); this gate keeps
+# it that way. Runs on every change to the parsers or the scan itself, plus a
+# weekly sweep and manual dispatch. All within this repo — no secrets needed.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "confgraph/parsers/**"
+      - "tools/redos_scan.py"
+      - "tools/redos_baseline.json"
+      - ".github/workflows/redos-scan.yml"
+  pull_request:
+    paths:
+      - "confgraph/parsers/**"
+      - "tools/redos_scan.py"
+      - "tools/redos_baseline.json"
+      - ".github/workflows/redos-scan.yml"
+  schedule:
+    - cron: "0 8 * * 1"          # Mondays 08:00 UTC
+  workflow_dispatch:
+
+jobs:
+  redos:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install confgraph + regexploit
+        run: uv pip install --system -e ".[redos]"
+
+      - name: ReDoS gate
+        run: python tools/redos_scan.py --check
+
+      - name: Upload scan artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: redos-scan
+          path: tools/redos_scan.json

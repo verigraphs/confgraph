@@ -40,6 +40,8 @@ confgraph = "confgraph.cli:main"
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
+# ReDoS scan of the parser regexes (CCR-0126) — tools/redos_scan.py
+redos = ["regexploit"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["confgraph"]
