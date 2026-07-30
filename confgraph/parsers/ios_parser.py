@@ -11813,7 +11813,7 @@ class IOSParser(BaseParser):
             line_numbers.append(obj.linenum)
             m = re.match(r"ip\s+tacacs\s+source-interface\s+(\S+)", obj.text.strip())
             if m:
-                tacacs_src_iface = m.group(1)
+                tacacs_src_iface = normalize_interface_name(m.group(1))
 
         radius_src_iface: str | None = None
         for obj in radius_src_objs:
@@ -11821,7 +11821,7 @@ class IOSParser(BaseParser):
             line_numbers.append(obj.linenum)
             m = re.match(r"ip\s+radius\s+source-interface\s+(\S+)", obj.text.strip())
             if m:
-                radius_src_iface = m.group(1)
+                radius_src_iface = normalize_interface_name(m.group(1))
 
         local_auth = any("local" in al.methods for al in auth_lists)
 
