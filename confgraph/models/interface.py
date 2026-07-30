@@ -414,11 +414,30 @@ class InterfaceConfig(BaseConfigObject):
     # is the physical egress interface; these carry that resolved binding so the
     # dependency graph can chain tunnel.N -> physical egress and surface the
     # IKE/IPSec hop. Additive and PAN-OS-only: other OSes leave them None.
+    #
+    # COPY INVARIANT (CCR-0139, from the CCR-0130 design review S4 requirement).
+    # `tunnel_underlay_interface` and `tunnel_ike_crypto_profile` are parse-time
+    # COPIES of the bound IKEGateway's egress and profile reference
+    # respectively: `PANOSParser._bind_tunnel_underlay` reads them off the
+    # `crypto.ike_gateways` entry named by `tunnel_ike_gateway` and re-resolves
+    # both on every parse. The gateway object OWNS those two facts.
+    #   Consequence a future parser change must not break: for a
+    #   gateway-bound tunnel these two fields ALWAYS equal that gateway's
+    #   `egress_interface` / `ike_crypto_profile`. A mismatch is a parser bug,
+    #   never a user-facing config finding — which is what licenses CCR-0130's
+    #   edge-ownership rule (the gateway edge owns egress existence; the copy
+    #   here is a consistency check). If you make either field settable from
+    #   somewhere other than the bound gateway, this invariant dies and that
+    #   ownership rule has to be redesigned.
+    #   `tunnel_ike_gateway` is NOT a copy — it is the reference the two copies
+    #   were resolved THROUGH, and it stays populated even when the gateway is
+    #   missing (so "gateway deleted" stays distinguishable from "gateway
+    #   degraded": the name survives, the copies go None).
     tunnel_underlay_interface: str | None = Field(
         default=None,
         description=(
             "Resolved physical egress interface the tunnel rides "
-            "(PAN-OS: ike gateway local-address/interface)"
+            "(PAN-OS: parse-time COPY of the bound IKEGateway.egress_interface)"
         ),
     )
     tunnel_ike_gateway: str | None = Field(
@@ -427,7 +446,10 @@ class InterfaceConfig(BaseConfigObject):
     )
     tunnel_ike_crypto_profile: str | None = Field(
         default=None,
-        description="IKE crypto profile name from the bound IKE gateway (PAN-OS)",
+        description=(
+            "IKE crypto profile name (PAN-OS: parse-time COPY of the bound "
+            "IKEGateway.ike_crypto_profile)"
+        ),
     )
     tunnel_key: int | None = Field(
         default=None,

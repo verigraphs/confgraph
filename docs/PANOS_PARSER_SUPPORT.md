@@ -479,13 +479,26 @@ This makes the full BGP → tunnel → physical egress → IPsec dependency chai
 **PAN-OS-Specific Differences:**
 - IKE crypto profiles → `IKEv1Policy` (PAN-OS abstracts IKEv1/v2 similarly)
 - IPsec crypto profiles → `IPSecTransformSet`
-- IKE gateways → `CryptoMapEntry` (one entry per remote peer)
+- IKE gateways → `IKEGateway` (named, CCR-0139) **and** `CryptoMapEntry` (the older flattened form, one entry per remote peer)
 - All gateways are collected into a single `CryptoMap` named `"PANOS-IPSEC"`
 
 **Supported Attributes:**
-- IKE crypto profiles: encryption, hash, DH group, lifetime
+- IKE crypto profiles: name, encryption, hash, DH group, lifetime
 - IPsec crypto profiles: ESP encryption + authentication algorithms
-- IKE gateways: peer IP, and the Phase-1 crypto profile reference
+- IKE gateways: name, physical egress interface, peer IP, IKE version, and the Phase-1 crypto profile reference
+
+**Named objects (CCR-0139):** `crypto.ike_gateways` and `crypto.ike_crypto_profiles` carry the two middle links of the tunnel chain **by name**, alongside the anonymous forms above (which are unchanged — this is additive, and their consumers were untouched). The names are what make a reference resolvable: without them, deleting an IKE crypto profile object a gateway still points at is invisible, and a broken link cannot be named.
+
+| Named object | Fields |
+|---|---|
+| `IKEGateway` | `name`, `egress_interface` (`local-address/interface`), `peer_address` (`peer-address/ip`), `ike_version` (`protocol/version`), `ike_crypto_profile` |
+| `IKECryptoProfile` | `name`, `encryption`, `hash`, `group`, `lifetime` |
+
+Both are PAN-OS-only: the IOS family has no named IKE gateways or IKE crypto profiles (its ISAKMP policies are keyed by priority), so its parsers leave both lists empty. `IKECryptoProfile` deliberately omits `IKEv1Policy`'s `priority` (PAN-OS has no policy priority — the flattened form synthesizes one from walk order) and `authentication` (never read). Entries with no `@name` are skipped from the named lists — nothing can reference them — and still produce their anonymous rows.
+
+`_ike_gateways()` is the single reader of gateway attributes, feeding both the named list and the tunnel-interface binding, so a tunnel's `tunnel_underlay_interface` / `tunnel_ike_crypto_profile` are always copies of the bound gateway's own `egress_interface` / `ike_crypto_profile` (the copy invariant stated on those model fields).
+
+**Known gap — profile lifetime units:** a device emits an IKE crypto profile's lifetime as exactly one of `lifetime/{seconds,minutes,hours,days}`; `parse_crypto()` reads only `hours`, so the other three parse to `lifetime = None` (both the named object and its flattened twin). Recorded in `syntax-corpus/panos/ipsec.yaml: ike-crypto-profile`.
 
 **IKE crypto profile location (CCR-0116):** A device emits the gateway's Phase-1 profile **nested under the negotiated IKE version** — `protocol/ikev2/ike-crypto-profile` or `protocol/ikev1/ike-crypto-profile` — not as a flat child of the gateway. `parse_crypto()` reads the nested shape first (falling back to a flat `<ike-crypto-profile>` only as lenient back-compat for hand-written configs); the previous flat-only read returned nothing on a real export. This is the same reader `parse_interfaces()` uses for the tunnel underlay chain, so the crypto map and the tunnel binding never disagree.
 
