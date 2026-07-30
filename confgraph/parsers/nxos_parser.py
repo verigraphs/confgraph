@@ -441,6 +441,10 @@ class NXOSParser(IOSParser):
             # per-interface, repeatable helper-address analogue (IOS emits it
             # as "ip helper-address"). The IOSParser super() call does not know
             # the NX-OS spelling, so collect each target here in config order.
+            # CCR-0129: both spellings land in the SAME field — one operational
+            # fact, one field — so every helper_addresses consumer (the DHCP
+            # relay assessor, the relay-loop check, the merge union, the
+            # Change-IR member ops) covers NX-OS with no per-OS special case.
             for relay_ch in intf_obj.find_child_objects(
                 r"^\s+ip\s+dhcp\s+relay\s+address\s+"
             ):
@@ -453,8 +457,8 @@ class NXOSParser(IOSParser):
                         addr = IPv4Address(rm.group(1))
                     except ValueError:
                         continue
-                    if addr not in intf_cfg.dhcp_relay_addresses:
-                        intf_cfg.dhcp_relay_addresses.append(addr)
+                    if addr not in intf_cfg.helper_addresses:
+                        intf_cfg.helper_addresses.append(addr)
 
             # NX-OS OSPF: "ip router ospf PROC area AREA" (slightly different
             # from IOS "ip ospf PROC area AREA")

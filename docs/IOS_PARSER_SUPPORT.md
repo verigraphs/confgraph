@@ -122,7 +122,7 @@ vrf definition <name>
 - ✅ IP unnumbered
 - ✅ MTU, bandwidth
 - ✅ DHCP helper addresses (`ip helper-address`)
-  - **Field home:** IOS `ip helper-address` lands in `InterfaceConfig.helper_addresses`. The generic `InterfaceConfig.dhcp_relay_addresses` field exists (added for the NX-OS `ip dhcp relay address <ip>` form and intended as the eventual shared home) but IOS does **not** yet populate it — helper-address currently stays on `helper_addresses`.
+  - **Field home (CCR-0129):** `InterfaceConfig.helper_addresses` is the single cross-OS home for per-interface DHCP relay targets. IOS `ip helper-address` and NX-OS `ip dhcp relay address <ip>` both land there. The separate `dhcp_relay_addresses` field that CCR-0090 added for the NX-OS spelling has been REMOVED — one operational fact, one field, so no consumer has to union two fields.
 
 **Layer 2:**
 - ✅ Switchport mode (access/trunk)

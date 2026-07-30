@@ -82,7 +82,7 @@ interface <type><number>
 - **OSPF membership:** `ip router ospf PROC area AREA` instead of `ip ospf PROC area AREA`
 - **STP portfast** (CCR-0076): `spanning-tree port type edge` is NX-OS's rename of IOS `spanning-tree portfast` → `InterfaceConfig.stp_portfast`; `... type normal` sets it False
 - **Storm-control** (CCR-0092): `storm-control {broadcast|multicast|unicast} level <threshold>` → `InterfaceConfig.storm_control` (list of `StormControlLevel` with `traffic_type`, `level`, `unit` — percent by default, or `pps`/`bps` when the unit keyword precedes the value)
-- **DHCP relay** (CCR-0090): per-interface `ip dhcp relay address <ip>` (the NX-OS analogue of IOS `ip helper-address`) → `InterfaceConfig.dhcp_relay_addresses` (repeatable, config order)
+- **DHCP relay** (CCR-0090, re-homed by CCR-0129): per-interface `ip dhcp relay address <ip>` (the NX-OS analogue of IOS `ip helper-address`) → `InterfaceConfig.helper_addresses` (repeatable, config order) — the SHARED cross-OS field for this one fact, so NX-OS relay changes reach the same DHCP assessor and relay-loop check as the IOS spelling. The CCR-0090 `dhcp_relay_addresses` field was removed. Note the member NEGATION `no ip dhcp relay address <ip>` is still parse-blind (CCR-0135)
 - **NetFlow binding** (CCR-0094): `ip flow monitor <name> {input|output}` → `InterfaceConfig.flow_monitors` (list of `InterfaceFlowMonitor` with `monitor` + `direction`; IPv4 `input` is corpus-verified, `output` parsed leniently)
 
 **Supported Attributes:**

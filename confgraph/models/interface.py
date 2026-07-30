@@ -375,19 +375,21 @@ class InterfaceConfig(BaseConfigObject):
         description="Suppress OSPF MTU mismatch check on this interface (ip ospf mtu-ignore)",
     )
 
-    # Helper addresses
+    # Per-interface DHCP relay targets — the SHARED cross-OS home for the one
+    # operational fact "DHCP requests on this interface are relayed to these
+    # servers", whichever spelling the vendor uses (CCR-0129):
+    #   IOS/IOS-XE/EOS  ``ip helper-address <ip>``      (repeatable)
+    #   NX-OS           ``ip dhcp relay address <ip>``  (repeatable)
+    # CCR-0090 originally landed the NX-OS spelling in a separate
+    # ``dhcp_relay_addresses`` field; CCR-0129 re-homed it here and REMOVED that
+    # field, because two fields for one fact made every consumer responsible for
+    # remembering to union them (the concrete symptom: an NX-OS relay removal
+    # simulated as no-impact while the identical IOS change was flagged).
+    # A new vendor spelling for this fact belongs HERE — do not add a sibling.
     helper_addresses: list[IPv4Address] = Field(
         default_factory=list,
-        description="DHCP relay / IP helper addresses",
-    )
-    # DHCP relay targets configured per interface. NX-OS emits these as
-    # ``ip dhcp relay address <ip>`` (repeatable); the IOS-family analogue is
-    # ``ip helper-address`` (currently landed in ``helper_addresses``). Kept
-    # generic so a future IOS re-home can converge here.
-    dhcp_relay_addresses: list[IPv4Address] = Field(
-        default_factory=list,
-        description="Per-interface DHCP relay target addresses "
-        "(NX-OS 'ip dhcp relay address <ip>')",
+        description="Per-interface DHCP relay target addresses, all OS spellings "
+        "(IOS 'ip helper-address', NX-OS 'ip dhcp relay address')",
     )
 
     # Tunnel attributes

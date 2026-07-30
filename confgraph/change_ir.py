@@ -574,8 +574,10 @@ def interface_list_replace_fields() -> frozenset[str]:
 _IFACE_MEMBER_KEYS: dict[str, "Callable[[Any], str] | None"] = {
     "secondary_ips": None,
     "ipv6_addresses": None,
+    # CCR-0129: the single cross-OS home for per-interface DHCP relay targets
+    # (IOS ``ip helper-address`` + NX-OS ``ip dhcp relay address``).  The
+    # separate ``dhcp_relay_addresses`` entry retired with the field.
     "helper_addresses": None,
-    "dhcp_relay_addresses": None,
     "varp_addresses": None,
     "nhrp_nhs": None,
     "nhrp_map": None,
