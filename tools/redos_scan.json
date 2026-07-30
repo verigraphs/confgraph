@@ -1,0 +1,8 @@
+{
+  "tool": "regexploit",
+  "patterns_scanned": 784,
+  "union_compositions": 29,
+  "unparseable": 0,
+  "finding_count": 0,
+  "findings": []
+}
