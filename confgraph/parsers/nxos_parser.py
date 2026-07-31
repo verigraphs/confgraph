@@ -2065,7 +2065,187 @@ class NXOSParser(IOSParser):
                                 _vpc_ts, child
                             )
 
+        # --- EVPN control-plane removals (CCR-0145) --------------------------
+        # Context-aware ``no`` forms under the ``evpn`` block (L2VNI) and under
+        # ``vrf context`` (L3VNI).  The device renders every removal by OMISSION
+        # (never a ``no`` line — capture 2026-07-30 n9kv 10.5(5)); these
+        # tombstones therefore serve PROPOSAL text only.  Three-level nesting
+        # (``evpn / vni N l2 / no route-target …``) and the L3VNI's VNI-on-a-
+        # sibling-line shape are why this is a bespoke walk, not a flat
+        # NESTED_DELETION_RULES entry.  All ops fall through both change-IR modes
+        # to the engine's ``field:evpn:…`` deletion handlers (CCR-0145 entrp
+        # half); the change-IR verbs are the ``_TOP_TOMBSTONE_VERBS`` rows.
+        self._parse_evpn_deletions(parse)
+
         return tombstones
+
+    # NX-OS RT line under an ``evpn / vni N l2`` block or a ``vrf context``
+    # address-family: ``[no] route-target import|export|both <rt> [evpn]``.
+    # The trailing ``evpn`` token is matched CASE-INSENSITIVELY (CCR-0145 F3, WI-E2):
+    # the NX-OS CLI accepts ``EVPN``, and a case-only mismatch used to fail this
+    # anchored match outright — dropping the removal ENTIRELY, including the vrfs
+    # half (the inherited plain vrfs patterns end ``(\\S+)\\s*$``, so an
+    # ``... X EVPN`` line does not reach them either).  Callers must ``lower()``
+    # group(3) before comparing.  The POSITIVE parse (``parse_evpn``, the
+    # ``route-target ... evpn`` capture) stays case-sensitive — widening it would
+    # move parse output, which this WI may not do; residual disclosed.
+    _EVPN_RT_REMOVAL = re.compile(
+        r"^no\s+route-target\s+(import|export|both)\s+(\S+)(?:\s+((?i:evpn)))?\s*$"
+    )
+
+    # ``no rd [<value>]`` under an ``evpn / vni N l2`` block or a ``vrf context``.
+    # The optional value is CONSTRAINED to the RD grammar — ``auto`` or a
+    # colon-bearing ``ASN2:NN`` / ``ASN4:NN`` / ``IPV4:NN`` (CCR-0145 V-2): the
+    # former ``(?:\s+\S+)?`` accepted ANY single trailing token, so ``no rd
+    # bogus`` cleared a real RD.  That was inert before the WI-E2 replay landed
+    # and state-changing after it — the §6.2 grammar-token-in-value-position
+    # class.  A wrong-but-well-formed value (``no rd 65432:999`` against a
+    # different configured RD) still fires: value-blind negation is a separate,
+    # pre-existing, disclosed class, not this fix's business.
+    _RD_REMOVAL = re.compile(r"^no\s+rd(?:\s+(?:auto|\S+:\S+))?\s*$")
+
+    def _parse_evpn_deletions(self, parse) -> None:
+        """Queue native ops for EVPN L2VNI/L3VNI ``no`` removals (CCR-0145).
+
+        Emission map (VNI = ``N``, RT value = ``X``, direction = ``D``):
+
+        * ``evpn / vni N l2 / no route-target D X``
+          -> ``field:evpn:l2vnis:N:route_target_D:X`` (LIST_REMOVE; ``both``
+          clears both lists in the engine accessor).
+        * ``evpn / vni N l2 / no rd``        -> ``field:evpn:l2vnis:N:rd`` (UNSET).
+        * ``evpn / no vni N l2|l3``          -> ``field:evpn:l2vnis|l3vnis:N``
+          (OBJECT_DELETE).  ``l3`` under ``evpn`` is not a device-emitted
+          positive form (L3VNIs live under ``vrf context``); the tombstone is
+          accepted permissively so a proposal that spells it still reaches a
+          removal — disclosed.
+
+        L3VNI (under ``vrf context NAME``; VNI from the sibling positive
+        ``vni N`` line) is the N1 copy-coherence surface — one device line
+        populates BOTH ``VRFConfig.route_target_*`` (parse_vrfs ignores the
+        trailing ``evpn`` token) and the authoritative ``EVPNL3VNI.route_target_*``
+        (parse_evpn keys off ``vni``).  The ``evpn``-suffixed removal is a
+        DUAL-TOMBSTONE clearing both copies:
+
+        * ``vrf context NAME / … / no route-target D X evpn``
+          -> ``field:evpn:l3vnis:N:route_target_D:X`` (evpn copy) AND
+          ``field:vrfs:NAME:route_target_D:X`` (vrfs copy — always, matching
+          what parse_vrfs captured).
+        * ``vrf context NAME / no rd``  -> ``field:evpn:l3vnis:N:rd`` (evpn copy
+          only; the ``field:vrfs:NAME:rd`` twin is already emitted by the
+          inherited vrfs NESTED_DELETION_RULES walk).
+
+        BY-VRF FALLBACK (CCR-0145 V-1).  The VNI above comes from a sibling
+        POSITIVE ``vni N`` line, but product proposals are PARTIAL SNIPPETS —
+        the common real shape is a ``vrf context`` block containing ONLY the
+        ``no`` line, with no ``vni N`` to read.  Keying on a VNI the snippet
+        never mentions would emit the vrfs half alone and leave the two parsed
+        copies incoherent — precisely the N1 harm this CCR exists to close.  So
+        when no VNI is in scope the evpn half is emitted VRF-NAME-keyed instead:
+
+        * ``field:evpn:l3vnis_by_vrf:NAME:route_target_D:X``
+        * ``field:evpn:l3vnis_by_vrf:NAME:rd``
+
+        The engine resolves those against the BASELINE's L3VNIs by ``.vrf``
+        match (it has the full config; the proposal does not).  Both keyings
+        emit the SAME dual-tombstone pair, so copy coherence no longer depends
+        on how much context the author happened to restate.
+
+        The whole-VNI delete keeps requiring an explicit number: ``no vni N``
+        names its own key, so there is nothing to fall back from.
+        * ``vrf context NAME / no vni N`` -> ``field:evpn:l3vnis:N``
+          (OBJECT_DELETE; evpn copy only — ``VRFConfig`` has no vni field).
+
+        The PLAIN (non-``evpn``) ``no route-target D X`` under ``vrf context`` is
+        NOT touched here (it is L3VPN, handled by the inherited vrfs walk); the
+        ``_EVPN_RT_REMOVAL`` capture requires the trailing ``evpn`` token in the
+        vrf-context branch, and the inherited plain patterns end ``(\\S+)\\s*$``
+        so they never fire on an ``evpn``-suffixed line — the two never overlap.
+        """
+        # --- L2VNI: the top-level `evpn` block -----------------------------
+        for evpn_obj in parse.find_objects(r"^evpn\s*$"):
+            for vni_child in evpn_obj.children:
+                ct = vni_child.text.strip()
+                # Whole-VNI removal: `no vni N l2|l3` (direct evpn child).
+                # END-ANCHORED (CCR-0145 F2, WI-E2): a bare ``\b`` let trailing
+                # garbage (`no vni 5 l2 bogus`) fire a real OBJECT_DELETE.  The
+                # device form takes no further tokens, so anything after the
+                # l2|l3 keyword means the line is not this command.
+                dm = re.match(r"^no\s+vni\s+(\d+)\s+(l2|l3)\s*$", ct)
+                if dm:
+                    coll = "l2vnis" if dm.group(2) == "l2" else "l3vnis"
+                    self._queue_native_keyed_removal(
+                        f"field:evpn:{coll}:{dm.group(1)}", vni_child
+                    )
+                    continue
+                # Per-entry removals nested under `vni N l2`.
+                vm = re.match(r"^vni\s+(\d+)\s+l2\b", ct)
+                if not vm:
+                    continue
+                vni = vm.group(1)
+                for sub in vni_child.children:
+                    st = sub.text.strip()
+                    rtm = self._EVPN_RT_REMOVAL.match(st)
+                    if rtm and rtm.group(3) is None:  # no `evpn` suffix under evpn block
+                        self._queue_native_keyed_removal(
+                            f"field:evpn:l2vnis:{vni}:route_target_{rtm.group(1)}:{rtm.group(2)}",
+                            sub,
+                        )
+                        continue
+                    if self._RD_REMOVAL.match(st):
+                        self._queue_native_keyed_removal(
+                            f"field:evpn:l2vnis:{vni}:rd", sub
+                        )
+
+        # --- L3VNI: the `vrf context` control-plane ------------------------
+        for vrf_obj in parse.find_objects(r"^vrf\s+context\s+(\S+)"):
+            vrf_name = self._extract_match(vrf_obj.text, r"^vrf\s+context\s+(\S+)")
+            if not vrf_name:
+                continue
+            # The L3VNI VNI is the sibling POSITIVE `vni N` line (not `no vni`).
+            l3_vni = None
+            for child in vrf_obj.all_children:
+                vpm = re.match(r"^vni\s+(\d+)\b", child.text.strip())
+                if vpm:
+                    l3_vni = vpm.group(1)
+                    break
+            for child in vrf_obj.all_children:
+                ct = child.text.strip()
+                # Whole-L3VNI removal: `no vni N` (traditional) or `no vni N L3`
+                # (SVI-less mode) under vrf context — evpn copy only.
+                nvm = re.match(r"^no\s+vni\s+(\d+)(?:\s+[lL]3)?\s*$", ct)
+                if nvm:
+                    self._queue_native_keyed_removal(
+                        f"field:evpn:l3vnis:{nvm.group(1)}", child
+                    )
+                    continue
+                # rd reset: the vrfs twin is emitted by the inherited walk; add
+                # the authoritative evpn copy.  VNI-keyed when the proposal
+                # declares one, else VRF-NAME-keyed (see the by-vrf note below).
+                if self._RD_REMOVAL.match(ct):
+                    self._queue_native_keyed_removal(
+                        f"field:evpn:l3vnis:{l3_vni}:rd" if l3_vni is not None
+                        else f"field:evpn:l3vnis_by_vrf:{vrf_name}:rd",
+                        child,
+                    )
+                    continue
+                # evpn-suffixed RT removal: DUAL-TOMBSTONE (both parsed copies).
+                rtm = self._EVPN_RT_REMOVAL.match(ct)
+                if rtm and (rtm.group(3) or "").lower() == "evpn":
+                    direction, value = rtm.group(1), rtm.group(2)
+                    # vrfs copy — parse_vrfs stored X under route_target_<D>,
+                    # ignoring the trailing `evpn`; clear it (native vrf channel).
+                    self._queue_native_vrf_removal(
+                        f"field:vrfs:{vrf_name}:route_target_{direction}:{value}",
+                        child,
+                    )
+                    # Authoritative EVPN copy.
+                    self._queue_native_keyed_removal(
+                        f"field:evpn:l3vnis:{l3_vni}:route_target_{direction}:{value}"
+                        if l3_vni is not None
+                        else f"field:evpn:l3vnis_by_vrf:{vrf_name}"
+                             f":route_target_{direction}:{value}",
+                        child,
+                    )
 
     def parse_mpls(self) -> "MPLSConfig | None":
         """Parse MPLS/LDP from NX-OS hierarchical ``mpls ldp configuration`` block.

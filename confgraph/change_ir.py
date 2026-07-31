@@ -295,6 +295,35 @@ _TOP_TOMBSTONE_VERBS: tuple[tuple[re.Pattern[str], Verb], ...] = (
     (re.compile(r"^field:vrfs:[^:]+:route_target_(import|export|both):"), Verb.LIST_REMOVE),
     (re.compile(r"^field:vrfs:[^:]+:rd$"), Verb.UNSET),
     (re.compile(r"^field:vrfs:[^:]+$"), Verb.OBJECT_DELETE),
+    # EVPN control-plane shapes (CCR-0145) — mirror the vrfs block: per-entry RT
+    # removals, rd reset, and whole-VNI delete under the keyed ``l2vnis``/``l3vnis``
+    # collections.  The VNI segment is numeric (``[^:]+`` — colon-free); the RT
+    # value tail may itself contain a colon (``65001:100``) and is caught by the
+    # ``route_target_(import|export|both):`` prefix.  ``both`` clears both lists in
+    # the engine accessor (vrfs precedent).  Order specific->generic (RT, rd,
+    # then whole-entry) so ``…:rd$`` and the whole-entry delete stay distinct.
+    (
+        re.compile(
+            r"^field:evpn:(l2vnis|l3vnis):[^:]+:route_target_(import|export|both):"
+        ),
+        Verb.LIST_REMOVE,
+    ),
+    (re.compile(r"^field:evpn:(l2vnis|l3vnis):[^:]+:rd$"), Verb.UNSET),
+    (re.compile(r"^field:evpn:(l2vnis|l3vnis):[^:]+$"), Verb.OBJECT_DELETE),
+    # BY-VRF fallback (CCR-0145 V-1): the same two verbs, VRF-NAME-keyed, emitted
+    # when a PARTIAL-SNIPPET proposal carries no ``vni N`` to key on.  The engine
+    # resolves the name against the baseline's L3VNIs by ``.vrf``.  Deliberately
+    # NO whole-entry OBJECT_DELETE row: ``no vni N`` always names its own key, so
+    # the delete never needs a fallback.  These cannot collide with the
+    # VNI-keyed rows above — ``l3vnis_by_vrf`` is not ``l3vnis`` followed by
+    # ``:`` — and the RT value tail rejoins exactly as it does there.
+    (
+        re.compile(
+            r"^field:evpn:l3vnis_by_vrf:[^:]+:route_target_(import|export|both):"
+        ),
+        Verb.LIST_REMOVE,
+    ),
+    (re.compile(r"^field:evpn:l3vnis_by_vrf:[^:]+:rd$"), Verb.UNSET),
     # Service entity removals — WI-8 (top-level keyed collections)
     (re.compile(r"^field:ip_sla_operations:\d+$"), Verb.OBJECT_DELETE),
     (re.compile(r"^field:object_tracks:\d+$"), Verb.OBJECT_DELETE),
@@ -436,6 +465,30 @@ _COLON_VALUE_SHAPES: tuple = (
     ((_TS_L("field"), _TS_L("vrfs"), _TS_ANY, _TS_L("route_target_import")), 0),
     ((_TS_L("field"), _TS_L("vrfs"), _TS_ANY, _TS_L("route_target_export")), 0),
     ((_TS_L("field"), _TS_L("vrfs"), _TS_ANY, _TS_L("route_target_both")), 0),
+    # field channel — EVPN per-VNI RTs (CCR-0145): value tail after the keyed
+    # collection + VNI.  Six rows because the engine's single _FIELD_TABLE row
+    # spells the collection as an ALT and the direction as a SUFFIX, and the
+    # cross-source pin compares the EXPANDED literal signatures (the vrfs
+    # precedent above: three confgraph rows against one SUFFIX engine row).
+    ((_TS_L("field"), _TS_L("evpn"), _TS_L("l2vnis"), _TS_ANY,
+      _TS_L("route_target_import")), 0),
+    ((_TS_L("field"), _TS_L("evpn"), _TS_L("l2vnis"), _TS_ANY,
+      _TS_L("route_target_export")), 0),
+    ((_TS_L("field"), _TS_L("evpn"), _TS_L("l2vnis"), _TS_ANY,
+      _TS_L("route_target_both")), 0),
+    ((_TS_L("field"), _TS_L("evpn"), _TS_L("l3vnis"), _TS_ANY,
+      _TS_L("route_target_import")), 0),
+    ((_TS_L("field"), _TS_L("evpn"), _TS_L("l3vnis"), _TS_ANY,
+      _TS_L("route_target_export")), 0),
+    ((_TS_L("field"), _TS_L("evpn"), _TS_L("l3vnis"), _TS_ANY,
+      _TS_L("route_target_both")), 0),
+    # BY-VRF fallback (CCR-0145 V-1) — identical value position, VRF-NAME key.
+    ((_TS_L("field"), _TS_L("evpn"), _TS_L("l3vnis_by_vrf"), _TS_ANY,
+      _TS_L("route_target_import")), 0),
+    ((_TS_L("field"), _TS_L("evpn"), _TS_L("l3vnis_by_vrf"), _TS_ANY,
+      _TS_L("route_target_export")), 0),
+    ((_TS_L("field"), _TS_L("evpn"), _TS_L("l3vnis_by_vrf"), _TS_ANY,
+      _TS_L("route_target_both")), 0),
     # field channel — value span (IPv6 host) with a trailing NUM port.
     ((_TS_L("field"), _TS_L("netflow"), _TS_L("destination")), 1),
     # top-level static channel — nh tail (dest is IPv4-only == colon-free).
@@ -1154,6 +1207,18 @@ def is_native_bgp_op(op: "ChangeOp") -> bool:
           rejoins ``path[3:]`` into the legacy tombstone string.
     - ``UNSET ("bgp_instance", asn, vrf, "field", "neighbor", peer…, field)``
           per-neighbor / peer-group field reset (``no neighbor X <attr>``).
+    - ``LIST_REMOVE ("bgp_instance", asn, vrf, "field", "neighbor"|"peer_group",
+          <name>, "address_family", afi, safi)`` — ops-only per-neighbor /
+          peer-group AF DEACTIVATION (``no address-family <afi> [<safi>]``
+          inside a neighbor / ``template peer`` block, or the flat IOS
+          ``no neighbor X address-family …``; CCR-0148).  No legacy twin.
+          ``<name>`` is the peer IP kept as ONE segment (the CCR-0110 E6
+          value-collapse convention) or the peer-group name; the literal
+          ``address_family`` marker separates that variable, colon-bearing
+          name from the trailing (afi, safi) key.  ``safi`` is ``""`` when the
+          line named only an afi — the replay then matches on afi ALONE (the
+          IOS ``address-family ipv4`` spelling parses to safi ``"unicast"``,
+          so an exact ``""`` match would never fire).
 
     Family 5b (peer-groups + instance-level networks — CCR Appendix I):
 
