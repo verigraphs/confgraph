@@ -34,7 +34,13 @@ from confgraph.parsers.panos_parser import PANOSParser
 # JSON schema, which the platform parse cache keys on independently), but
 # confgraph-entrp's gate ``digest_key()`` carries pbv with NO schema component, so this
 # is the only signal that moves there — and over-keying is the documented posture.
-PARSER_BEHAVIOR_VERSION: int = 2
+# 3 (CCR-0146): IOS/IOS-XE ``no bgp default ipv4-unicast`` now parses onto the new
+# ``BGPConfig.default_ipv4_unicast`` field — observable parse output moves (a config
+# that disables the default now yields False instead of the silent old True).  Same
+# posture as the CCR-0129 bump: the new field also moves the ParsedConfig JSON schema
+# (so the platform parse cache invalidates independently and a bump is not strictly
+# required), but entrp's schema-less ``digest_key()`` only moves on pbv, so we bump.
+PARSER_BEHAVIOR_VERSION: int = 3
 
 __all__ = [
     "BaseParser",

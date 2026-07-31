@@ -3875,6 +3875,20 @@ class IOSParser(BaseParser):
             return [("default_metric", int(m.group(1)))]
         if re.match(r"^no\s+default-metric(\s+\d+)?\s*$", t):
             return [("default_metric", None)]
+        # CCR-0146: IOS/IOS-XE ``[no] bgp default ipv4-unicast`` (tri-state
+        # True-default — absence == the model default True; the affirmative line
+        # never nvgens, so ``no`` is the only form running-config emits, but the
+        # positive spelling is accepted for proposal text).  The ``bgp`` prefix is
+        # REQUIRED; the ``ipv4-unicast\s*$`` anchor keeps it from firing on
+        # ``bgp default local-preference`` (over-trigger discipline).  NOTE:
+        # subclass parsers (NX-OS/EOS/XR) inherit this classifier, so the IOS
+        # spelling WOULD parse there too — NX-OS/XR are unaffected in practice
+        # only because their running-config never emits this spelling
+        # (device-invalid input class, §6.1 disclosed), not because of any guard.
+        if re.match(r"^bgp\s+default\s+ipv4-unicast\s*$", t):
+            return [("default_ipv4_unicast", True)]
+        if re.match(r"^no\s+bgp\s+default\s+ipv4-unicast\s*$", t):
+            return [("default_ipv4_unicast", False)]
         return []
 
     @staticmethod
@@ -4783,6 +4797,7 @@ class IOSParser(BaseParser):
                 "deterministic_med": False,
                 "dampening": False,
                 "default_metric": None,
+                "default_ipv4_unicast": True,  # CCR-0146 (IOS tri-state True-default)
             }
             for child in bgp_obj.children:
                 for fld, val in self._bgp_instance_scalar22_updates(child.text):
