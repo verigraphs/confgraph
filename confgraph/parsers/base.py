@@ -99,7 +99,11 @@ from confgraph.models.route_map import RouteMapConfig
 from confgraph.models.prefix_list import PrefixListConfig
 from confgraph.models.static_route import StaticRoute
 from confgraph.models.acl import ACLConfig
-from confgraph.models.community_list import CommunityListConfig, ASPathListConfig
+from confgraph.models.community_list import (
+    CommunityListConfig,
+    ExtCommunityListConfig,
+    ASPathListConfig,
+)
 from confgraph.models.isis import ISISConfig
 from confgraph.models.eigrp import EIGRPConfig
 from confgraph.models.rip import RIPConfig
@@ -147,6 +151,7 @@ _BASE_KNOWN_PATTERNS: list[str] = [
     r"^ip route",
     r"^ipv6 route",
     r"^ip community-list",
+    r"^ip extcommunity-list",
     r"^ip as-path access-list",
     # Management
     r"^ntp",
@@ -403,6 +408,16 @@ class BaseParser(ABC):
         """
         return []
 
+    def parse_extcommunity_lists(self) -> list[ExtCommunityListConfig]:
+        """Parse BGP extended-community list configurations.
+
+        Returns:
+            List of ExtCommunityListConfig objects
+
+        Note: This is optional - returns empty list by default.
+        """
+        return []
+
     def parse_as_path_lists(self) -> list[ASPathListConfig]:
         """Parse BGP AS-path access-list configurations.
 
@@ -640,6 +655,7 @@ class BaseParser(ABC):
         ("acls",               "parse_acls"),
         ("object_groups",      "parse_object_groups"),
         ("community_lists",    "parse_community_lists"),
+        ("extcommunity_lists", "parse_extcommunity_lists"),
         ("as_path_lists",      "parse_as_path_lists"),
         ("ntp",                "parse_ntp"),
         ("snmp",               "parse_snmp"),
