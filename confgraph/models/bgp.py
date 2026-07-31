@@ -466,6 +466,22 @@ class BGPConfig(BaseConfigObject):
     fast_external_fallover: bool = Field(
         default=True, description="Reset EBGP sessions immediately on link failure"
     )
+    default_ipv4_unicast: bool = Field(
+        default=True,
+        description=(
+            "IOS/IOS-XE: the IPv4-unicast address family is auto-activated for "
+            "every `neighbor remote-as` (command default = enabled). Set False by "
+            "`no bgp default ipv4-unicast`, after which each neighbor's IPv4 AF "
+            "activation is explicit (NX-OS-style). Absence of the line == the "
+            "default (True): the affirmative `bgp default ipv4-unicast` never "
+            "renders in running-config, so only the `no` form is ever seen. "
+            "SCOPE GUARD for consumers: this field is meaningful ONLY for "
+            "IOS-family configs — on NX-OS/IOS-XR activation is always "
+            "explicit and this default-True carries no operational meaning; "
+            "read it only under an IOS/IOS-XE source_os branch (an unguarded "
+            "read would recreate the ipv4-default-on false positive on NX-OS)."
+        ),
+    )
     deterministic_med: bool = Field(
         default=False, description="Enable deterministic MED comparison"
     )

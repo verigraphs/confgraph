@@ -56,6 +56,8 @@ from confgraph.models.object_group import ObjectGroup, ObjectGroupMember
 from confgraph.models.community_list import (
     CommunityListConfig,
     CommunityListEntry,
+    ExtCommunityListConfig,
+    ExtCommunityListEntry,
     ASPathListConfig,
     ASPathListEntry,
 )
@@ -486,6 +488,25 @@ class IOSParser(BaseParser):
         r"^ip\s+community-list\s+(?P<type>standard|expanded)\s+(?P<name>\S+)\s+"
         r"(?P<action>permit|deny)\s+(?P<comm>.+)$",
         r"^ip\s+community-list\s+(?P<name>\d+)\s+(?P<action>permit|deny)\s+(?P<comm>.+)$",
+    )
+
+    # Extended-community list line (CCR-0147). Three dialects, mirroring
+    # community-list: the named/keyword'd ``standard`` and ``expanded`` forms
+    # (both IOS and NX-OS), and the IOS legacy NUMBERED form with no keyword
+    # (``ip extcommunity-list 1 permit rt 64512:10`` — the number range implies
+    # the type: 1-99 standard, 100-500 expanded). The optional ``seq <N>`` group
+    # absorbs the sequence number NX-OS injects on readback (the CCR-0064
+    # lesson: the device emits a form the typed line never had). ``standard``
+    # carries typed VALUES (rt/soo, plus NX-OS ``4byteas-generic`` / ``rmac``);
+    # ``expanded`` carries a regexp. Identifier: IOS numbered-or-named, NX-OS
+    # named-only — a numeric name on NX-OS is grammar-impossible but harmless.
+    _EXTCOMMLIST_PATTERNS = PatternSet(
+        r"^ip\s+extcommunity-list\s+(?P<type>standard)\s+(?P<name>\S+)\s+"
+        r"(?:seq\s+(?P<seq>\d+)\s+)?(?P<action>permit|deny)\s+(?P<body>.+)$",
+        r"^ip\s+extcommunity-list\s+(?P<type>expanded)\s+(?P<name>\S+)\s+"
+        r"(?:seq\s+(?P<seq>\d+)\s+)?(?P<action>permit|deny)\s+(?P<body>.+)$",
+        r"^ip\s+extcommunity-list\s+(?P<name>\d+)\s+"
+        r"(?:seq\s+(?P<seq>\d+)\s+)?(?P<action>permit|deny)\s+(?P<body>.+)$",
     )
 
     # IP SLA operation header: modern "ip sla N" and legacy "ip sla monitor N".
@@ -3875,6 +3896,20 @@ class IOSParser(BaseParser):
             return [("default_metric", int(m.group(1)))]
         if re.match(r"^no\s+default-metric(\s+\d+)?\s*$", t):
             return [("default_metric", None)]
+        # CCR-0146: IOS/IOS-XE ``[no] bgp default ipv4-unicast`` (tri-state
+        # True-default — absence == the model default True; the affirmative line
+        # never nvgens, so ``no`` is the only form running-config emits, but the
+        # positive spelling is accepted for proposal text).  The ``bgp`` prefix is
+        # REQUIRED; the ``ipv4-unicast\s*$`` anchor keeps it from firing on
+        # ``bgp default local-preference`` (over-trigger discipline).  NOTE:
+        # subclass parsers (NX-OS/EOS/XR) inherit this classifier, so the IOS
+        # spelling WOULD parse there too — NX-OS/XR are unaffected in practice
+        # only because their running-config never emits this spelling
+        # (device-invalid input class, §6.1 disclosed), not because of any guard.
+        if re.match(r"^bgp\s+default\s+ipv4-unicast\s*$", t):
+            return [("default_ipv4_unicast", True)]
+        if re.match(r"^no\s+bgp\s+default\s+ipv4-unicast\s*$", t):
+            return [("default_ipv4_unicast", False)]
         return []
 
     @staticmethod
@@ -4783,6 +4818,7 @@ class IOSParser(BaseParser):
                 "deterministic_med": False,
                 "dampening": False,
                 "default_metric": None,
+                "default_ipv4_unicast": True,  # CCR-0146 (IOS tri-state True-default)
             }
             for child in bgp_obj.children:
                 for fld, val in self._bgp_instance_scalar22_updates(child.text):
@@ -8155,6 +8191,24 @@ class IOSParser(BaseParser):
                 self._queue_native_keyed_removal(
                         f"field:as_path_lists:{m.group(1)}", obj
                     )
+        # CCR-0147: extended-community list whole-object deletes.  Same
+        # incomplete-CLI guard as the community-list walk above (§6.2
+        # keyword-in-name-position): the optional ``standard|expanded`` group
+        # would backtrack and bind the keyword / action word as the list NAME
+        # on a device-rejected incomplete line (``no ip extcommunity-list
+        # standard``, ``… standard permit``), silently deleting a baseline
+        # object.  Reject grammar tokens in the name slot — a list literally
+        # named ``standard|expanded|permit|deny`` becomes undeletable by
+        # negation (disclosed trade-off, never wrongly deleted).
+        for obj in parse.find_objects(r"^no\s+ip\s+extcommunity-list\s+"):
+            m = re.search(
+                r"^no\s+ip\s+extcommunity-list\s+(?:(?:standard|expanded)\s+)?(\S+)\s*$",
+                obj.text,
+            )
+            if m and m.group(1) not in ("standard", "expanded", "permit", "deny"):
+                self._queue_native_keyed_removal(
+                        f"field:extcommunity_lists:{m.group(1)}", obj
+                    )
 
         # --- WI-DB1-B2 (CCR Appendix AB): NAT keyed-entry removals ---
         # The 8b ``field:dhcp:pool:`` shape — native LIST_REMOVE +
@@ -9226,6 +9280,109 @@ class IOSParser(BaseParser):
             )
 
         return community_lists
+
+    # Standard-list value keywords. ``4byteas-generic`` is followed by a
+    # transitive|non-transitive discriminator then the value; ``rt``/``soo``/
+    # ``rmac`` each take a single value token.
+    _EXTCOMM_VALUE_KEYWORDS = ("rt", "soo", "rmac", "4byteas-generic")
+
+    def _parse_extcomm_standard_values(self, body: str) -> list[str]:
+        """Tokenize a standard-list value body into typed value specs.
+
+        One statement may carry several extended-community values (logical AND
+        — the NX-OS grammar's trailing ``+``); each is normalized to a
+        ``<keyword> <value>`` string preserving the type so the engine can tell
+        an rt from an soo. Unknown tokens are kept standalone rather than
+        dropped (an honest passthrough beats silent data loss).
+        """
+        toks = body.split()
+        specs: list[str] = []
+        i = 0
+        while i < len(toks):
+            kw = toks[i]
+            if (
+                kw == "4byteas-generic"
+                and i + 2 < len(toks)
+                and toks[i + 1] in ("transitive", "non-transitive")
+            ):
+                specs.append(f"{kw} {toks[i + 1]} {toks[i + 2]}")
+                i += 3
+            elif kw in ("rt", "soo", "rmac") and i + 1 < len(toks):
+                specs.append(f"{kw} {toks[i + 1]}")
+                i += 2
+            else:
+                specs.append(kw)
+                i += 1
+        return specs
+
+    def parse_extcommunity_lists(self) -> list[ExtCommunityListConfig]:
+        """Parse BGP extended-community list (``ip extcommunity-list``) configs.
+
+        Handles both the no-seq typed form and the ``seq <N>`` form NX-OS
+        injects on readback (CCR-0064). Standard lists yield typed VALUES;
+        expanded lists yield a REGEXP. Shared by IOS and NX-OS (NX-OS is
+        named-only — accepted transparently by the same grammar).
+        """
+        extcommunity_lists = []
+        parse = self._get_parse_obj()
+
+        ecl_objs = parse.find_objects(self._EXTCOMMLIST_PATTERNS.union)
+
+        # Group by list name (entries accrete across statements).
+        ecl_dict: dict[str, dict] = {}
+
+        for ecl_obj in ecl_objs:
+            match = self._EXTCOMMLIST_PATTERNS.match(ecl_obj.text)
+            if not match:
+                continue
+
+            g = match.groupdict()
+            name = g["name"]
+            list_type = g.get("type")
+            if not list_type:
+                # IOS legacy numbered form: 1-99 standard, 100-500 expanded.
+                list_type = (
+                    "standard" if name.isdigit() and int(name) <= 99 else "expanded"
+                )
+            action = g["action"]
+            body = g["body"].strip()
+
+            if name not in ecl_dict:
+                ecl_dict[name] = {
+                    "name": name,
+                    "list_type": list_type,
+                    "entries": [],
+                    "raw_lines": [],
+                    "line_numbers": [],
+                }
+
+            raw_lines, line_numbers = self._get_raw_lines_and_line_numbers(ecl_obj)
+            ecl_dict[name]["raw_lines"].extend(raw_lines)
+            ecl_dict[name]["line_numbers"].extend(line_numbers)
+
+            if list_type == "expanded":
+                entry = ExtCommunityListEntry(action=action, regex=body)
+            else:
+                entry = ExtCommunityListEntry(
+                    action=action,
+                    values=self._parse_extcomm_standard_values(body),
+                )
+            ecl_dict[name]["entries"].append(entry)
+
+        for ecl_data in ecl_dict.values():
+            extcommunity_lists.append(
+                ExtCommunityListConfig(
+                    object_id=f"extcommunity_list_{ecl_data['name']}",
+                    raw_lines=ecl_data["raw_lines"],
+                    source_os=self.os_type,
+                    line_numbers=ecl_data["line_numbers"],
+                    name=ecl_data["name"],
+                    list_type=ecl_data["list_type"],
+                    entries=ecl_data["entries"],
+                )
+            )
+
+        return extcommunity_lists
 
     def parse_as_path_lists(self) -> list[ASPathListConfig]:
         """Parse BGP AS-path access-list configurations."""
