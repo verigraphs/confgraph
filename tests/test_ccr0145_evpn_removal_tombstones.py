@@ -19,6 +19,8 @@ Verb mapping (change_ir ``_TOP_TOMBSTONE_VERBS``): RT removals -> LIST_REMOVE,
 
 from __future__ import annotations
 
+import pytest
+
 from confgraph.change_ir import Verb, derive_ops, encode_legacy_shim
 from confgraph.parsers.nxos_parser import NXOSParser
 
@@ -162,9 +164,22 @@ class TestFalseMatchBothDirections:
         assert "field:evpn:l3vnis:70000:route_target_export:65001:8" in ts
         assert "field:vrfs:TEN:route_target_export:65001:8" in ts
 
-    def test_evpn_suffixed_without_vni_clears_vrfs_copy_only(self):
-        # No ``vni N`` => no L3VNI parsed => the value lives only in VRFConfig;
-        # the removal clears that single copy.
+    def test_evpn_suffixed_without_vni_uses_the_by_vrf_keying(self):
+        """EXPECTATION CHANGED IN WI-E2 (validation V-1) — deliberately.
+
+        This test previously asserted that with no ``vni N`` in scope the
+        removal clears the VRFConfig copy ONLY and emits no ``field:evpn:``
+        tombstone at all.  That reasoning ("no vni line, so no L3VNI") holds
+        only for a WHOLE-CONFIG parse.  Product proposals are PARTIAL SNIPPETS,
+        where the L3VNI exists in the BASELINE and the snippet simply does not
+        restate it — so the old behaviour left the authoritative EVPN copy
+        stale while the shadow copy was cleared: the very N1 incoherence this
+        CCR exists to close, reachable from the most ordinary input shape.
+
+        The EVPN half is now emitted VRF-NAME-keyed, and the engine resolves it
+        against the baseline's L3VNIs by ``vrf``.  The VNI-KEYED form is still
+        (correctly) absent — that part of the original assertion stands.
+        """
         cfg = (
             "vrf context NOVNI\n"
             "  address-family ipv4 unicast\n"
@@ -172,7 +187,9 @@ class TestFalseMatchBothDirections:
         )
         ts = _tombstones(cfg)
         assert "field:vrfs:NOVNI:route_target_both:65001:9" in ts
-        assert not any(t.startswith("field:evpn:") for t in ts), ts
+        assert "field:evpn:l3vnis_by_vrf:NOVNI:route_target_both:65001:9" in ts
+        # No VNI was in scope, so no VNI-keyed tombstone may be invented.
+        assert not any(t.startswith("field:evpn:l3vnis:") for t in ts), ts
 
 
 # ---------------------------------------------------------------------------
@@ -266,3 +283,97 @@ class TestOverTriggerAndCaseHandling:
         ts = _tombstones(cfg)
         assert "field:vrfs:TEN:route_target_both:65001:7" in ts
         assert not any(t.startswith("field:evpn:") for t in ts), ts
+
+
+# ---------------------------------------------------------------------------
+# WI-E2 round 2 — the BY-VRF fallback (V-1) and the ``no rd`` value slot (V-2).
+# ---------------------------------------------------------------------------
+
+class TestByVrfFallback:
+    """Product proposals are PARTIAL SNIPPETS, so the common real shape is a
+    ``vrf context`` block carrying only the ``no`` line — no sibling ``vni N``
+    to key the EVPN half on.  Keying on an absent VNI emitted the vrfs half
+    ALONE and left the two parsed copies incoherent: the exact N1 harm, reached
+    from ordinary input.  The EVPN half is now VRF-NAME-keyed when no VNI is in
+    scope, and the engine resolves it against the baseline's L3VNIs by ``vrf``.
+    """
+
+    SNIPPET_RT = (
+        "vrf context TEN\n  address-family ipv4 unicast\n"
+        "    no route-target both 65001:7 evpn\n"
+    )
+
+    def test_rt_removal_without_a_vni_emits_both_halves(self):
+        ts = _tombstones(self.SNIPPET_RT)
+        assert "field:vrfs:TEN:route_target_both:65001:7" in ts
+        assert "field:evpn:l3vnis_by_vrf:TEN:route_target_both:65001:7" in ts
+
+    def test_rd_removal_without_a_vni_emits_both_halves(self):
+        ts = _tombstones("vrf context TEN\n  no rd\n")
+        assert "field:vrfs:TEN:rd" in ts
+        assert "field:evpn:l3vnis_by_vrf:TEN:rd" in ts
+
+    def test_a_declared_vni_still_takes_the_vni_keying(self):
+        """The fallback is a fallback — when the VNI IS in scope the precise
+        keying wins, so nothing about the previous behaviour changes."""
+        ts = _tombstones(
+            "vrf context TEN\n  vni 70000\n  address-family ipv4 unicast\n"
+            "    no route-target both 65001:7 evpn\n"
+        )
+        assert "field:evpn:l3vnis:70000:route_target_both:65001:7" in ts
+        assert not any("l3vnis_by_vrf" in t for t in ts), ts
+
+    def test_verb_mapping_matches_the_vni_keyed_forms(self):
+        verbs = _verb_by_path(self.SNIPPET_RT)
+        assert verbs["field:evpn:l3vnis_by_vrf:TEN:route_target_both:65001:7"] \
+            is Verb.LIST_REMOVE
+        assert _verb_by_path("vrf context TEN\n  no rd\n")[
+            "field:evpn:l3vnis_by_vrf:TEN:rd"] is Verb.UNSET
+
+    def test_rt_value_tail_collapses_like_the_vni_keyed_form(self):
+        paths = [tuple(op.path) for op in derive_ops(NXOSParser(
+            "vrf context TEN\n  address-family ipv4 unicast\n"
+            "    no route-target import 64086.59905:20011 evpn\n"
+        ).parse()) if op.verb is Verb.LIST_REMOVE]
+        assert paths == [
+            ("field", "vrfs", "TEN", "route_target_import", "64086.59905:20011"),
+            ("field", "evpn", "l3vnis_by_vrf", "TEN",
+             "route_target_import", "64086.59905:20011"),
+        ]
+
+    def test_plain_removal_without_a_vni_stays_vrfs_only(self):
+        """The fallback must not widen the plain/evpn split."""
+        ts = _tombstones(
+            "vrf context TEN\n  address-family ipv4 unicast\n"
+            "    no route-target both 65001:7\n"
+        )
+        assert "field:vrfs:TEN:route_target_both:65001:7" in ts
+        assert not any(t.startswith("field:evpn:") for t in ts), ts
+
+    def test_whole_vni_delete_has_no_by_vrf_form(self):
+        """``no vni N`` names its own key — nothing to fall back from."""
+        ts = _tombstones("vrf context TEN\n  no vni 70000\n")
+        assert "field:evpn:l3vnis:70000" in ts
+        assert not any("l3vnis_by_vrf" in t for t in ts), ts
+
+
+class TestRdValueSlot:
+    """V-2: the optional value after ``no rd`` was ``\\S+`` — ANY single token —
+    so ``no rd bogus`` emitted a real reset.  It is now constrained to the RD
+    grammar (``auto`` or a colon-bearing ASN2:NN / ASN4:NN / IPV4:NN)."""
+
+    @pytest.mark.parametrize(
+        "line,fires",
+        [
+            ("no rd", True),
+            ("no rd auto", True),
+            ("no rd 65000:66", True),
+            ("no rd 4200000001:10", True),
+            ("no rd 10.0.0.1:5", True),
+            ("no rd bogus", False),
+            ("no rd permit", False),
+        ],
+    )
+    def test_value_slot_is_grammar_constrained(self, line, fires):
+        ts = _tombstones(f"evpn\n  vni 920010 l2\n    {line}\n")
+        assert (("field:evpn:l2vnis:920010:rd" in ts) is fires), ts

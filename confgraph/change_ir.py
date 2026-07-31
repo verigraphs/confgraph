@@ -310,6 +310,20 @@ _TOP_TOMBSTONE_VERBS: tuple[tuple[re.Pattern[str], Verb], ...] = (
     ),
     (re.compile(r"^field:evpn:(l2vnis|l3vnis):[^:]+:rd$"), Verb.UNSET),
     (re.compile(r"^field:evpn:(l2vnis|l3vnis):[^:]+$"), Verb.OBJECT_DELETE),
+    # BY-VRF fallback (CCR-0145 V-1): the same two verbs, VRF-NAME-keyed, emitted
+    # when a PARTIAL-SNIPPET proposal carries no ``vni N`` to key on.  The engine
+    # resolves the name against the baseline's L3VNIs by ``.vrf``.  Deliberately
+    # NO whole-entry OBJECT_DELETE row: ``no vni N`` always names its own key, so
+    # the delete never needs a fallback.  These cannot collide with the
+    # VNI-keyed rows above — ``l3vnis_by_vrf`` is not ``l3vnis`` followed by
+    # ``:`` — and the RT value tail rejoins exactly as it does there.
+    (
+        re.compile(
+            r"^field:evpn:l3vnis_by_vrf:[^:]+:route_target_(import|export|both):"
+        ),
+        Verb.LIST_REMOVE,
+    ),
+    (re.compile(r"^field:evpn:l3vnis_by_vrf:[^:]+:rd$"), Verb.UNSET),
     # Service entity removals — WI-8 (top-level keyed collections)
     (re.compile(r"^field:ip_sla_operations:\d+$"), Verb.OBJECT_DELETE),
     (re.compile(r"^field:object_tracks:\d+$"), Verb.OBJECT_DELETE),
@@ -467,6 +481,13 @@ _COLON_VALUE_SHAPES: tuple = (
     ((_TS_L("field"), _TS_L("evpn"), _TS_L("l3vnis"), _TS_ANY,
       _TS_L("route_target_export")), 0),
     ((_TS_L("field"), _TS_L("evpn"), _TS_L("l3vnis"), _TS_ANY,
+      _TS_L("route_target_both")), 0),
+    # BY-VRF fallback (CCR-0145 V-1) — identical value position, VRF-NAME key.
+    ((_TS_L("field"), _TS_L("evpn"), _TS_L("l3vnis_by_vrf"), _TS_ANY,
+      _TS_L("route_target_import")), 0),
+    ((_TS_L("field"), _TS_L("evpn"), _TS_L("l3vnis_by_vrf"), _TS_ANY,
+      _TS_L("route_target_export")), 0),
+    ((_TS_L("field"), _TS_L("evpn"), _TS_L("l3vnis_by_vrf"), _TS_ANY,
       _TS_L("route_target_both")), 0),
     # field channel — value span (IPv6 host) with a trailing NUM port.
     ((_TS_L("field"), _TS_L("netflow"), _TS_L("destination")), 1),
