@@ -6055,6 +6055,20 @@ class IOSParser(BaseParser):
             _emit(f"neighbor:{peer}")
             return
 
+        # Per-neighbor address-family DEACTIVATION — ``no address-family <afi>
+        # [<safi>]`` inside a ``neighbor <ip>`` block (NX-OS nests it; routed
+        # here from ``_emit_bgp_neighbor_submode_negations``), or the flat
+        # ``no neighbor X address-family …`` spelling.  Removes the whole keyed
+        # (afi, safi) AF entry (CCR-0148) — an ops-only LIST_REMOVE built
+        # DIRECTLY (the tombstone-string codec cannot place the trailing
+        # afi/safi after a variable-length, colon-bearing IPv6 peer).
+        afm = re.match(r"address-family\s+(\S+)(?:\s+(\S+))?\s*$", attr)
+        if afm:
+            self._emit_bgp_neighbor_af_removal(
+                peer, "neighbor", afm.group(1), afm.group(2) or "", node, asn, vrf
+            )
+            return
+
         # Directional policy objects: attribute is keyword + name + direction
         if attr.startswith("route-map "):
             field = "route_map_in" if attr.endswith(" in") else "route_map_out" if attr.endswith(" out") else None
@@ -6087,6 +6101,56 @@ class IOSParser(BaseParser):
                 _emit(f"field:neighbor:{peer}:{field_name}")
                 break
         # Unrecognised attribute — skip silently (never a full-removal tombstone)
+
+    def _emit_bgp_neighbor_af_removal(
+        self,
+        name: str,
+        scope: str,
+        afi: str,
+        safi: str,
+        node,
+        asn: int,
+        vrf: str | None,
+    ) -> None:
+        """Queue the ops-only LIST_REMOVE for a per-neighbor / peer-group AF
+        deactivation — ``no address-family <afi> [<safi>]`` (CCR-0148).
+
+        *scope* is ``"neighbor"`` (``<name>`` = peer IP, kept as ONE segment per
+        the CCR-0110 E6 value-collapse convention) or ``"peer_group"``
+        (``<name>`` = peer-group / ``template peer`` name).  *safi* is ``""`` when
+        the removal names only an ``afi``.  The op removes the keyed (afi, safi)
+        entry from the neighbor's / peer-group's ``address_families`` at merge
+        (the CCR-0148 entrp replay half).
+
+        NO legacy twin: NX-OS renders this removal by OMISSION — the device never
+        emits ``no address-family`` into running-config (capture
+        2026-07-30-n9kv-10.5.5) — so the legacy string channel never observes it,
+        ``encode_legacy`` emits nothing, and legacy-mode artifacts stay
+        byte-identical.  The op serves PROPOSAL text.  Mirrors the family-5b
+        ``no network`` ops-only LIST_REMOVE discipline.
+        """
+        from confgraph.change_ir import ChangeOp, Verb
+
+        self._pending_native_bgp_ops.append(
+            ChangeOp(
+                verb=Verb.LIST_REMOVE,
+                path=(
+                    "bgp_instance",
+                    str(asn),
+                    vrf or "",
+                    "field",
+                    scope,
+                    name,
+                    "address_family",
+                    afi,
+                    safi,
+                ),
+                value=None,
+                source_line=node.text.strip(),
+                line_no=node.linenum,
+                origin="native",
+            )
+        )
 
     def _emit_bgp_neighbor_submode_negations(
         self,
