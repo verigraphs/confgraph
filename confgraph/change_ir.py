@@ -451,6 +451,23 @@ _COLON_VALUE_SHAPES: tuple = (
     ((_TS_L("field"), _TS_L("vrfs"), _TS_ANY, _TS_L("route_target_import")), 0),
     ((_TS_L("field"), _TS_L("vrfs"), _TS_ANY, _TS_L("route_target_export")), 0),
     ((_TS_L("field"), _TS_L("vrfs"), _TS_ANY, _TS_L("route_target_both")), 0),
+    # field channel — EVPN per-VNI RTs (CCR-0145): value tail after the keyed
+    # collection + VNI.  Six rows because the engine's single _FIELD_TABLE row
+    # spells the collection as an ALT and the direction as a SUFFIX, and the
+    # cross-source pin compares the EXPANDED literal signatures (the vrfs
+    # precedent above: three confgraph rows against one SUFFIX engine row).
+    ((_TS_L("field"), _TS_L("evpn"), _TS_L("l2vnis"), _TS_ANY,
+      _TS_L("route_target_import")), 0),
+    ((_TS_L("field"), _TS_L("evpn"), _TS_L("l2vnis"), _TS_ANY,
+      _TS_L("route_target_export")), 0),
+    ((_TS_L("field"), _TS_L("evpn"), _TS_L("l2vnis"), _TS_ANY,
+      _TS_L("route_target_both")), 0),
+    ((_TS_L("field"), _TS_L("evpn"), _TS_L("l3vnis"), _TS_ANY,
+      _TS_L("route_target_import")), 0),
+    ((_TS_L("field"), _TS_L("evpn"), _TS_L("l3vnis"), _TS_ANY,
+      _TS_L("route_target_export")), 0),
+    ((_TS_L("field"), _TS_L("evpn"), _TS_L("l3vnis"), _TS_ANY,
+      _TS_L("route_target_both")), 0),
     # field channel — value span (IPv6 host) with a trailing NUM port.
     ((_TS_L("field"), _TS_L("netflow"), _TS_L("destination")), 1),
     # top-level static channel — nh tail (dest is IPv4-only == colon-free).
@@ -1169,6 +1186,18 @@ def is_native_bgp_op(op: "ChangeOp") -> bool:
           rejoins ``path[3:]`` into the legacy tombstone string.
     - ``UNSET ("bgp_instance", asn, vrf, "field", "neighbor", peer…, field)``
           per-neighbor / peer-group field reset (``no neighbor X <attr>``).
+    - ``LIST_REMOVE ("bgp_instance", asn, vrf, "field", "neighbor"|"peer_group",
+          <name>, "address_family", afi, safi)`` — ops-only per-neighbor /
+          peer-group AF DEACTIVATION (``no address-family <afi> [<safi>]``
+          inside a neighbor / ``template peer`` block, or the flat IOS
+          ``no neighbor X address-family …``; CCR-0148).  No legacy twin.
+          ``<name>`` is the peer IP kept as ONE segment (the CCR-0110 E6
+          value-collapse convention) or the peer-group name; the literal
+          ``address_family`` marker separates that variable, colon-bearing
+          name from the trailing (afi, safi) key.  ``safi`` is ``""`` when the
+          line named only an afi — the replay then matches on afi ALONE (the
+          IOS ``address-family ipv4`` spelling parses to safi ``"unicast"``,
+          so an exact ``""`` match would never fire).
 
     Family 5b (peer-groups + instance-level networks — CCR Appendix I):
 

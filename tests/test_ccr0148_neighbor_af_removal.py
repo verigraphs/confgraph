@@ -234,3 +234,74 @@ class TestCodec:
         pc = _parse(TestPeerGroupContext.TEMPLATE)
         arts = encode_legacy(derive_ops(pc))
         assert arts.bgp_no_commands == {}
+
+
+# ---------------------------------------------------------------------------
+# WI-E2 addition — the flat IOS spelling's SCOPE resolution (validation F2).
+# ---------------------------------------------------------------------------
+
+class TestFlatIOSScopeResolution:
+    """``no neighbor <X> address-family …`` (the FLAT IOS spelling) shares one
+    namespace between neighbors and peer-groups.  It used to emit
+    ``scope="neighbor"`` unconditionally, so a GROUP name landed in the peer slot
+    where the engine replay looks up a peer IP — a keyed no-match, i.e. a silent
+    no-op that looked applied.  WI-E2 resolves the scope with the SAME helper the
+    ``peer-group`` attribute one branch below already uses (a non-IP token in the
+    neighbor namespace is unambiguously a group).
+
+    The NX-OS NESTED forms do not pass through that site — ``nxos_parser`` calls
+    ``_emit_bgp_neighbor_af_removal`` with an explicit scope — so only the flat
+    spelling is re-scoped (pinned by the nested cases elsewhere in this file).
+    """
+
+    @staticmethod
+    def _flat(config: str):
+        from confgraph.parsers.ios_parser import IOSParser
+
+        pc = IOSParser(config).parse()
+        return [op for op in (pc.native_change_ops or [])
+                if is_native_bgp_neighbor_af_removal_op(op)]
+
+    def test_peer_group_name_scopes_to_peer_group(self):
+        ops = self._flat(
+            "router bgp 65000\n neighbor PG peer-group\n"
+            " no neighbor PG address-family ipv4\n"
+        )
+        assert len(ops) == 1
+        assert ops[0].path[4] == "peer_group"
+        assert ops[0].path[5] == "PG"
+
+    def test_a_peer_ip_still_scopes_to_neighbor(self):
+        ops = self._flat(
+            "router bgp 65000\n no neighbor 10.0.0.1 address-family ipv4\n"
+        )
+        assert len(ops) == 1
+        assert ops[0].path[4] == "neighbor"
+        assert ops[0].path[5] == "10.0.0.1"
+
+    def test_an_ipv6_peer_still_scopes_to_neighbor_and_stays_collapsed(self):
+        ops = self._flat(
+            "router bgp 65000\n no neighbor 2001:db8::1 address-family ipv6\n"
+        )
+        assert len(ops) == 1
+        assert ops[0].path[4] == "neighbor"
+        assert ops[0].path[5] == "2001:db8::1"   # ONE segment (CCR-0110 E6)
+
+    def test_afi_only_removal_carries_an_empty_safi(self):
+        """The flat spelling names no safi; the engine replay therefore matches
+        on afi ALONE (the IOS ``address-family ipv4`` spelling parses to safi
+        ``"unicast"``, so an exact ``""`` match would never fire)."""
+        ops = self._flat(
+            "router bgp 65000\n no neighbor 10.0.0.1 address-family ipv4\n"
+        )
+        assert ops[0].path[-2:] == ("ipv4", "")
+
+    def test_still_no_legacy_twin_for_the_flat_spelling(self):
+        from confgraph.parsers.ios_parser import IOSParser
+
+        pc = IOSParser(
+            "router bgp 65000\n neighbor PG peer-group\n"
+            " no neighbor PG address-family ipv4\n"
+        ).parse()
+        arts = encode_legacy(derive_ops(pc))
+        assert arts.bgp_no_commands == {}

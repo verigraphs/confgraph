@@ -181,6 +181,88 @@ class TestFalseMatchBothDirections:
 
 def test_roundtrip_byte_exact_colon_valued_rt():
     # The RT value carries its own colon; ``":".join(op.path)`` must reproduce
-    # the tombstone byte-for-byte (native path stays split, join is the inverse).
+    # the tombstone byte-for-byte.  WI-E2 added the ``_COLON_VALUE_SHAPES`` rows
+    # that COLLAPSE the RT tail into one segment, and the join is the inverse of
+    # both forms — which is exactly why the flip is byte-invariant here.
     cfg = "evpn\n  vni 920010 l2\n    no route-target import 65001:100\n"
     assert "field:evpn:l2vnis:920010:route_target_import:65001:100" in _tombstones(cfg)
+
+
+# ---------------------------------------------------------------------------
+# WI-E2 additions — the paired colon-collapse rows and the two F2/F3 fixes.
+# ---------------------------------------------------------------------------
+
+class TestNativePathCollapse:
+    """The EVPN ``_COLON_VALUE_SHAPES`` rows (WI-E2) keep the colon-valued RT
+    tail as ONE op-path segment — the SET convention (CCR-0110 E6).
+
+    These rows are HALF of a cross-repo pair: the engine's matching
+    ``_FIELD_TABLE`` TAIL rows must land in the SAME change, or the entrp
+    cross-source pin (``tests/deletion_dispatch/test_native_path_convention.py``)
+    fails naming both files.  Pinned here too, so a one-sided revert of the
+    confgraph half is caught in THIS repo.
+    """
+
+    def _paths(self, cfg: str) -> list[tuple]:
+        return [tuple(op.path) for op in derive_ops(NXOSParser(cfg).parse())
+                if op.verb is Verb.LIST_REMOVE]
+
+    def test_l2vni_rt_value_is_one_segment(self):
+        cfg = ("evpn\n  vni 920010 l2\n"
+               "    no route-target import 65001:100\n"
+               "    no route-target export 4200000001:10\n")
+        assert self._paths(cfg) == [
+            ("field", "evpn", "l2vnis", "920010", "route_target_import", "65001:100"),
+            ("field", "evpn", "l2vnis", "920010", "route_target_export", "4200000001:10"),
+        ]
+
+    def test_l3vni_dual_tombstone_both_halves_collapse(self):
+        cfg = ("vrf context TEN\n  vni 70000\n"
+               "  address-family ipv4 unicast\n"
+               "    no route-target both 64086.59905:20010 evpn\n")
+        assert self._paths(cfg) == [
+            ("field", "vrfs", "TEN", "route_target_both", "64086.59905:20010"),
+            ("field", "evpn", "l3vnis", "70000", "route_target_both", "64086.59905:20010"),
+        ]
+
+    def test_rd_and_whole_entry_shapes_are_unaffected(self):
+        # Colon-free values: no row matches, so split already equals collapsed.
+        paths = {tuple(op.path) for op in
+                 derive_ops(NXOSParser("evpn\n  vni 920010 l2\n    no rd\n"
+                                       "  no vni 920011 l2\n").parse())}
+        assert ("field", "evpn", "l2vnis", "920010", "rd") in paths
+        assert ("field", "evpn", "l2vnis", "920011") in paths
+
+
+class TestOverTriggerAndCaseHandling:
+    def test_no_vni_with_trailing_garbage_fires_nothing(self):
+        """F2 (WI-E2): the ``no vni N l2|l3`` regex is END-ANCHORED now.  A bare
+        ``\\b`` let a trailing token still fire a real OBJECT_DELETE — the
+        grammar-token-in-name-position over-trigger class."""
+        ts = _tombstones("evpn\n  no vni 920011 l2 bogus\n")
+        assert not any(t.startswith("field:evpn:") for t in ts), ts
+
+    def test_no_vni_exact_form_still_fires(self):
+        """Non-vacuity control for the anchor above."""
+        assert "field:evpn:l2vnis:920011" in _tombstones("evpn\n  no vni 920011 l2\n")
+
+    def test_uppercase_evpn_suffix_emits_both_tombstones(self):
+        """F3 (WI-E2): the trailing token is case-insensitive now.  ``EVPN`` used
+        to fail the anchored match outright and drop BOTH halves silently — the
+        inherited plain vrfs patterns end ``(\\S+)\\s*$`` so they never saw the
+        line either, making a removal look applied when nothing was."""
+        cfg = ("vrf context TEN\n  vni 70000\n"
+               "  address-family ipv4 unicast\n"
+               "    no route-target both 65001:7 EVPN\n")
+        ts = _tombstones(cfg)
+        assert "field:vrfs:TEN:route_target_both:65001:7" in ts
+        assert "field:evpn:l3vnis:70000:route_target_both:65001:7" in ts
+
+    def test_a_plain_removal_is_still_vrfs_only(self):
+        """The case fix must not turn a PLAIN (L3VPN) removal into an EVPN one."""
+        cfg = ("vrf context TEN\n  vni 70000\n"
+               "  address-family ipv4 unicast\n"
+               "    no route-target both 65001:7\n")
+        ts = _tombstones(cfg)
+        assert "field:vrfs:TEN:route_target_both:65001:7" in ts
+        assert not any(t.startswith("field:evpn:") for t in ts), ts

@@ -2081,8 +2081,16 @@ class NXOSParser(IOSParser):
 
     # NX-OS RT line under an ``evpn / vni N l2`` block or a ``vrf context``
     # address-family: ``[no] route-target import|export|both <rt> [evpn]``.
+    # The trailing ``evpn`` token is matched CASE-INSENSITIVELY (CCR-0145 F3, WI-E2):
+    # the NX-OS CLI accepts ``EVPN``, and a case-only mismatch used to fail this
+    # anchored match outright — dropping the removal ENTIRELY, including the vrfs
+    # half (the inherited plain vrfs patterns end ``(\\S+)\\s*$``, so an
+    # ``... X EVPN`` line does not reach them either).  Callers must ``lower()``
+    # group(3) before comparing.  The POSITIVE parse (``parse_evpn``, the
+    # ``route-target ... evpn`` capture) stays case-sensitive — widening it would
+    # move parse output, which this WI may not do; residual disclosed.
     _EVPN_RT_REMOVAL = re.compile(
-        r"^no\s+route-target\s+(import|export|both)\s+(\S+)(?:\s+(evpn))?\s*$"
+        r"^no\s+route-target\s+(import|export|both)\s+(\S+)(?:\s+((?i:evpn)))?\s*$"
     )
 
     def _parse_evpn_deletions(self, parse) -> None:
@@ -2128,7 +2136,11 @@ class NXOSParser(IOSParser):
             for vni_child in evpn_obj.children:
                 ct = vni_child.text.strip()
                 # Whole-VNI removal: `no vni N l2|l3` (direct evpn child).
-                dm = re.match(r"^no\s+vni\s+(\d+)\s+(l2|l3)\b", ct)
+                # END-ANCHORED (CCR-0145 F2, WI-E2): a bare ``\b`` let trailing
+                # garbage (`no vni 5 l2 bogus`) fire a real OBJECT_DELETE.  The
+                # device form takes no further tokens, so anything after the
+                # l2|l3 keyword means the line is not this command.
+                dm = re.match(r"^no\s+vni\s+(\d+)\s+(l2|l3)\s*$", ct)
                 if dm:
                     coll = "l2vnis" if dm.group(2) == "l2" else "l3vnis"
                     self._queue_native_keyed_removal(
@@ -2185,7 +2197,7 @@ class NXOSParser(IOSParser):
                     continue
                 # evpn-suffixed RT removal: DUAL-TOMBSTONE (both parsed copies).
                 rtm = self._EVPN_RT_REMOVAL.match(ct)
-                if rtm and rtm.group(3) == "evpn":
+                if rtm and (rtm.group(3) or "").lower() == "evpn":
                     direction, value = rtm.group(1), rtm.group(2)
                     # vrfs copy — parse_vrfs stored X under route_target_<D>,
                     # ignoring the trailing `evpn`; clear it (native vrf channel).

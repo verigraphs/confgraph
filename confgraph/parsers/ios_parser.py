@@ -6100,8 +6100,24 @@ class IOSParser(BaseParser):
         # afi/safi after a variable-length, colon-bearing IPv6 peer).
         afm = re.match(r"address-family\s+(\S+)(?:\s+(\S+))?\s*$", attr)
         if afm:
+            # SCOPE resolution (CCR-0148 validation F2, fixed in WI-E2): the FLAT
+            # IOS spelling shares one namespace between neighbors and
+            # peer-groups, so ``no neighbor PG address-family ipv4`` arrives here
+            # with a GROUP name in the peer slot.  Emitting scope="neighbor" for
+            # it put the group name where the replay looks up a peer IP — a keyed
+            # no-match, i.e. a silent no-op.  Resolve it exactly as the
+            # ``peer-group`` attribute below does (a non-IP token in the neighbor
+            # namespace is unambiguously a group).  The NX-OS NESTED forms do not
+            # pass through here — nxos_parser calls
+            # ``_emit_bgp_neighbor_af_removal`` with an explicit scope — so this
+            # only re-scopes the flat spelling.
+            scope = (
+                "peer_group"
+                if self._is_bgp_peer_group_ref(peer, pg_names)
+                else "neighbor"
+            )
             self._emit_bgp_neighbor_af_removal(
-                peer, "neighbor", afm.group(1), afm.group(2) or "", node, asn, vrf
+                peer, scope, afm.group(1), afm.group(2) or "", node, asn, vrf
             )
             return
 
