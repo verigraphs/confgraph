@@ -316,6 +316,7 @@ _TOP_TOMBSTONE_VERBS: tuple[tuple[re.Pattern[str], Verb], ...] = (
     (re.compile(r"^field:class_maps:[^:]+$"), Verb.OBJECT_DELETE),
     (re.compile(r"^field:policy_maps:[^:]+$"), Verb.OBJECT_DELETE),
     (re.compile(r"^field:community_lists:[^:]+$"), Verb.OBJECT_DELETE),
+    (re.compile(r"^field:extcommunity_lists:[^:]+$"), Verb.OBJECT_DELETE),  # CCR-0147
     (re.compile(r"^field:as_path_lists:[^:]+$"), Verb.OBJECT_DELETE),
     # Generic scalar-field reset — MUST BE LAST among field: shapes.  Serves
     # field:banners:<field>, field:vpc:<field>, field:vxlan:host_reachability, …
@@ -2811,6 +2812,7 @@ _TOP_LIST_KEYS: dict[str, Callable[[Any], tuple[str, ...]]] = {
     "prefix_lists": lambda p: (p.name,),
     "acls": lambda a: (a.name,),
     "community_lists": lambda c: (c.name,),
+    "extcommunity_lists": lambda c: (c.name,),  # CCR-0147
     "as_path_lists": lambda a: (a.name,),
     "static_routes": lambda r: (r.vrf or "", str(r.destination), _static_nh_key(r)),
     "lines": _line_key,

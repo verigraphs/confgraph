@@ -13,7 +13,11 @@ from confgraph.models.prefix_list import PrefixListConfig
 from confgraph.models.static_route import StaticRoute
 from confgraph.models.acl import ACLConfig
 from confgraph.models.object_group import ObjectGroup
-from confgraph.models.community_list import CommunityListConfig, ASPathListConfig
+from confgraph.models.community_list import (
+    CommunityListConfig,
+    ExtCommunityListConfig,
+    ASPathListConfig,
+)
 from confgraph.models.base import OSType, UnrecognizedBlock
 from confgraph.models.eigrp import EIGRPConfig
 from confgraph.models.rip import RIPConfig
@@ -104,6 +108,10 @@ class ParsedConfig(BaseModel):
     community_lists: list[CommunityListConfig] = Field(
         default_factory=list,
         description="BGP community lists",
+    )
+    extcommunity_lists: list[ExtCommunityListConfig] = Field(
+        default_factory=list,
+        description="BGP extended-community lists (ip extcommunity-list standard|expanded)",
     )
     as_path_lists: list[ASPathListConfig] = Field(
         default_factory=list,
@@ -339,6 +347,13 @@ class ParsedConfig(BaseModel):
         for cl in self.community_lists:
             if cl.name == name:
                 return cl
+        return None
+
+    def get_extcommunity_list_by_name(self, name: str) -> ExtCommunityListConfig | None:
+        """Get extended-community list by name."""
+        for ecl in self.extcommunity_lists:
+            if ecl.name == name:
+                return ecl
         return None
 
     def get_as_path_list_by_name(self, name: str) -> ASPathListConfig | None:
