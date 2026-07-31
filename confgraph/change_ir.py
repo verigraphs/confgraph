@@ -1136,7 +1136,9 @@ def is_native_bgp_op(op: "ChangeOp") -> bool:
           ``enforce_first_as`` / ``fast_external_fallover`` (tri-state
           True-defaults), ``deterministic_med``, ``dampening``,
           ``default_metric`` — line-detected SET-to-post-line-state, CCR
-          Appendix Z).  value = the scalar.
+          Appendix Z; plus CCR-0146 ``default_ipv4_unicast`` (IOS tri-state
+          True-default, ``no bgp default ipv4-unicast``, same mechanism).
+          value = the scalar.
     - ``SET ("bgp_instances", asn, vrf, "bestpath", <option_field>)``
           one ``bgp bestpath …`` option → the ``bestpath_options`` sub-object.
     - ``SET ("bgp_instances", asn, vrf, "redistribute", <proto>, <pid>)``
