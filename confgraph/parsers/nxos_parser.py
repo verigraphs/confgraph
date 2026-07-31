@@ -861,6 +861,29 @@ class NXOSParser(IOSParser):
                 if re.match(r"^\s+address-family\s+", child.text):
                     _walk_no_lines(child)
 
+        # Peer-group / template-peer address-family DEACTIVATION (CCR-0148):
+        # ``no address-family <afi> [<safi>]`` under a ``template peer NAME``
+        # block removes the whole keyed (afi, safi) AF entry from the
+        # peer-group.  Direct children of the template block only
+        # (``find_child_objects``), scope="peer_group" so the entrp replay keys
+        # into ``BGPPeerGroup.address_families`` rather than a neighbor's.
+        for tmpl_obj in bgp_or_af_obj.find_child_objects(
+            r"^\s+template\s+peer\s+\S+\s*$"
+        ):
+            tm = re.match(r"^\s+template\s+peer\s+(\S+)\s*$", tmpl_obj.text)
+            if not tm:
+                continue
+            pg_name = tm.group(1)
+            for child in tmpl_obj.children:
+                am = re.match(
+                    r"^\s+no\s+address-family\s+(\S+)(?:\s+(\S+))?\s*$", child.text
+                )
+                if am:
+                    self._emit_bgp_neighbor_af_removal(
+                        pg_name, "peer_group", am.group(1), am.group(2) or "",
+                        child, asn, vrf,
+                    )
+
     def _parse_bgp_neighbors(self, bgp_obj) -> list["BGPNeighbor"]:
         """Parse BGP neighbors, adding NX-OS nested-block / ``inherit peer`` support.
 

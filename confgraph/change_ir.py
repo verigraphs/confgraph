@@ -126,6 +126,7 @@ __all__ = [
     "is_native_bgp_network_removal_op",
     "is_native_bgp_af_aggregate_removal_op",
     "is_native_bgp_af_network_removal_op",
+    "is_native_bgp_neighbor_af_removal_op",
     "is_native_bgp_instance_create_op",
     "isis_interface_key",
     "isis_redistribute_key",
@@ -1043,6 +1044,48 @@ def is_native_bgp_af_network_removal_op(op: "ChangeOp") -> bool:
     )
 
 
+def _is_bgp_neighbor_af_removal(path: tuple[str, ...]) -> bool:
+    """True for the family-5a ops-only per-neighbor / peer-group AF removal path.
+
+    ``("bgp_instance", asn, vrf, "field", "neighbor"|"peer_group", <name>,
+    "address_family", afi, safi)`` — a LIST_REMOVE with NO legacy twin
+    (``encode_legacy`` emits nothing).  ``<name>`` is the peer IP (collapsed to
+    ONE segment per the CCR-0110 E6 convention) or the peer-group / ``template
+    peer`` name; ``safi`` is ``""`` when the removal names only an ``afi``.  The
+    ``address_family`` literal marker separates the (variable, IPv6-colon-bearing)
+    name from the trailing (afi, safi) key.
+
+    Ops-only because NX-OS renders this deactivation by OMISSION — a real device
+    never emits ``no address-family`` into running-config (capture
+    2026-07-30-n9kv-10.5.5) — so the legacy string channel never observes it and
+    legacy-mode artifacts stay byte-identical.  The engine merge replay is the
+    CCR-0148 entrp half.
+    """
+    return (
+        len(path) == 9
+        and path[0] == "bgp_instance"
+        and path[3] == "field"
+        and path[4] in ("neighbor", "peer_group")
+        and path[6] == "address_family"
+    )
+
+
+def is_native_bgp_neighbor_af_removal_op(op: "ChangeOp") -> bool:
+    """True iff *op* is the family-5a ops-only per-neighbor / peer-group AF removal.
+
+    ``no address-family <afi> [<safi>]`` inside a ``neighbor <ip>`` or
+    ``template peer`` / peer-group block (CCR-0148).  Consumed by
+    :func:`encode_legacy` to emit NOTHING (no legacy twin), so ops mode gains a
+    per-neighbor AF-deactivation capability legacy cannot see while legacy-mode
+    artifacts stay byte-identical.
+    """
+    return (
+        getattr(op, "origin", "derived") == "native"
+        and op.verb is Verb.LIST_REMOVE
+        and _is_bgp_neighbor_af_removal(op.path)
+    )
+
+
 def is_native_bgp_instance_create_op(op: "ChangeOp") -> bool:
     """True iff *op* is the family-5c-B.2 whole-instance CREATE op.
 
@@ -1240,6 +1283,7 @@ def is_native_bgp_op(op: "ChangeOp") -> bool:
             _is_bgp_network_removal(path)
             or _is_bgp_af_aggregate_removal(path)
             or _is_bgp_af_network_removal(path)
+            or _is_bgp_neighbor_af_removal(path)
         )
     return False
 
@@ -3159,13 +3203,16 @@ def encode_legacy(ops: ChangeSet) -> LegacyArtifacts:
             artifacts.unrecognized_blocks.append(op.value)
             continue
         # Family-5b ops-only ``no network`` / family-5c-B.1 ops-only AF
-        # ``no aggregate-address``: NO legacy twin (both lines are silently
-        # dropped by every legacy parser today) — emit nothing so legacy-mode
-        # artifacts stay byte-identical.
+        # ``no aggregate-address`` / family-5a ops-only per-neighbor|peer-group
+        # ``no address-family`` (CCR-0148): NO legacy twin — each line is either
+        # silently dropped by every legacy parser today or (the AF removal) never
+        # emitted into running-config by the device — so emit nothing and keep
+        # legacy-mode artifacts byte-identical.
         if (
             is_native_bgp_network_removal_op(op)
             or is_native_bgp_af_aggregate_removal_op(op)
             or is_native_bgp_af_network_removal_op(op)
+            or is_native_bgp_neighbor_af_removal_op(op)
         ):
             continue
         # Family-6a ops-only ``no net`` (CCR Appendix M): NO legacy twin (the
