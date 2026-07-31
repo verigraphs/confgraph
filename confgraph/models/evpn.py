@@ -66,12 +66,26 @@ class EVPNL3VNI(BaseModel):
     both lists, literal ``auto`` preserved); ``associate_vrf`` records the NVE
     binding. Field shapes mirror :class:`EVPNL2VNI`.
 
+    COPY-INVARIANT (CCR-0145 N1, the CCR-0130 M1 pattern): the ``evpn``-suffixed
+    ``rd`` / ``route-target ... evpn`` lines under ``vrf context`` populate TWO
+    parsed copies — this model (keyed by ``vni``, DISTINGUISHED as EVPN) and
+    :class:`~confgraph.models.vrf.VRFConfig` (keyed by name, which captures the
+    same values because :meth:`NXOSParser.parse_vrfs` ignores the trailing
+    ``evpn`` token). ``EVPNL3VNI.route_target_*`` / ``rd`` are the AUTHORITATIVE
+    copy for all EVPN engine reads; the ``VRFConfig`` twin is a parse-consistency
+    shadow (they must agree for any ``... evpn`` line). Deletions preserve the
+    invariant: an ``evpn``-suffixed ``no route-target`` / ``no rd`` proposal emits
+    a DUAL tombstone clearing BOTH copies (parser
+    ``_parse_evpn_deletions`` — ``field:evpn:l3vnis:N:...`` + ``field:vrfs:NAME:...``).
+
     DOC-GROUNDED CAVEAT (CCR-0118): unlike the L2VNI form (device-verified on
     n9kv 10.5(5), CCR-0087), the L3VNI's ``vrf context`` emitted ``rd`` /
     ``route-target ... evpn`` block was NOT captured on the 9000v. It is grounded
     in the Cisco Nexus 9000 VXLAN Config Guide 10.5(x), not a device readback —
-    promotable to verified-capture once captured. Fields are all optional so a
-    partial (e.g. vni-only) declaration still parses.
+    promotable to verified-capture once captured. The removal spellings ARE
+    device-verified (n9kv 10.5(5), 2026-07-30 capture: every removal renders by
+    OMISSION, so the ``no`` forms only ever appear in proposal text). Fields are
+    all optional so a partial (e.g. vni-only) declaration still parses.
     """
 
     vni: int = Field(..., description="L3 VXLAN Network Identifier (routing / tenant-VRF VNI)")

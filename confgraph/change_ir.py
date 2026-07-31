@@ -294,6 +294,21 @@ _TOP_TOMBSTONE_VERBS: tuple[tuple[re.Pattern[str], Verb], ...] = (
     (re.compile(r"^field:vrfs:[^:]+:route_target_(import|export|both):"), Verb.LIST_REMOVE),
     (re.compile(r"^field:vrfs:[^:]+:rd$"), Verb.UNSET),
     (re.compile(r"^field:vrfs:[^:]+$"), Verb.OBJECT_DELETE),
+    # EVPN control-plane shapes (CCR-0145) — mirror the vrfs block: per-entry RT
+    # removals, rd reset, and whole-VNI delete under the keyed ``l2vnis``/``l3vnis``
+    # collections.  The VNI segment is numeric (``[^:]+`` — colon-free); the RT
+    # value tail may itself contain a colon (``65001:100``) and is caught by the
+    # ``route_target_(import|export|both):`` prefix.  ``both`` clears both lists in
+    # the engine accessor (vrfs precedent).  Order specific->generic (RT, rd,
+    # then whole-entry) so ``…:rd$`` and the whole-entry delete stay distinct.
+    (
+        re.compile(
+            r"^field:evpn:(l2vnis|l3vnis):[^:]+:route_target_(import|export|both):"
+        ),
+        Verb.LIST_REMOVE,
+    ),
+    (re.compile(r"^field:evpn:(l2vnis|l3vnis):[^:]+:rd$"), Verb.UNSET),
+    (re.compile(r"^field:evpn:(l2vnis|l3vnis):[^:]+$"), Verb.OBJECT_DELETE),
     # Service entity removals — WI-8 (top-level keyed collections)
     (re.compile(r"^field:ip_sla_operations:\d+$"), Verb.OBJECT_DELETE),
     (re.compile(r"^field:object_tracks:\d+$"), Verb.OBJECT_DELETE),

@@ -11,6 +11,17 @@ class VRFConfig(BaseConfigObject):
     - Interfaces (vrf member/vrf forwarding)
     - BGP (address-family vrf)
     - OSPF (vrf context)
+
+    COPY-INVARIANT (CCR-0145 N1): on NX-OS, an ``evpn``-suffixed
+    ``route-target ... evpn`` / ``rd`` line under ``vrf context`` also feeds
+    :class:`~confgraph.models.evpn.EVPNL3VNI` — :meth:`NXOSParser.parse_vrfs`
+    captures the value here (ignoring the trailing ``evpn`` token) while
+    :meth:`NXOSParser.parse_evpn` captures it there (keyed by ``vni``). The
+    ``EVPNL3VNI`` copy is AUTHORITATIVE for EVPN engine reads; the values held
+    here are a parse-consistency shadow of those RTs (and must agree). Plain
+    (non-``evpn``) RTs are L3VPN and live ONLY here. Removals honour the split:
+    an ``evpn``-suffixed ``no`` clears both copies (dual-tombstone); a plain
+    ``no route-target`` clears only this copy.
     """
 
     name: str = Field(
