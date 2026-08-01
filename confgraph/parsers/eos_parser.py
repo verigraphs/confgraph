@@ -4,8 +4,14 @@ import re
 from ipaddress import IPv4Address, IPv4Interface, IPv4Network, IPv6Address, IPv6Interface, IPv6Network
 
 from confgraph.parsers.ios_parser import IOSParser
-from confgraph.parsers.base import PatternSet, _BASE_KNOWN_PATTERNS, _BASE_BEST_GUESS_KEYWORDS
-from confgraph.models.base import OSType
+from confgraph.parsers.base import (
+    PatternSet,
+    _BASE_KNOWN_PATTERNS,
+    _BASE_BEST_GUESS_KEYWORDS,
+    apply_peer_group_command,
+    _default_pg_data,
+)
+from confgraph.models.base import OSType, UnrecognizedBlock
 from confgraph.models.line import LineType
 from confgraph.models.bgp import BGPConfig, BGPNeighborAF
 from confgraph.models.prefix_list import PrefixListConfig, PrefixListEntry
@@ -1012,37 +1018,79 @@ class EOSParser(IOSParser):
             return False
         return has_evpn_rt
 
-    def _eos_evpn_activated_targets(self, bgp_obj) -> set[str]:
-        """Peer-group names / neighbor IPs activated under ``address-family evpn``.
+    def _eos_evpn_af_neighbor_policies(self, bgp_obj):
+        """Read every peer-policy line inside EOS ``address-family evpn``.
 
-        EOS activates the overlay with ``neighbor <x> activate`` inside the single
-        ``address-family evpn`` block under ``router bgp`` (``<x>`` is usually the
-        EVPN peer group). The shared ipv4/ipv6 AF walker
-        (``_apply_bgp_af_neighbor_policies``) matches only ``address-family ipv4|ipv6``
-        and keys on neighbor IPs, so neither the ``evpn`` token nor a peer-group
-        target is reached by it — hence this EOS-scoped collector.
+        EOS states the overlay AF as the single-token ``address-family evpn``
+        block under ``router bgp``, and emits both the activation
+        (``neighbor <x> activate``) and the per-hop policy attachments
+        (``neighbor <x> route-map <rm> in|out``, and the rest of the peer-policy
+        vocabulary) inside it. ``<x>`` is the EVPN peer group or a direct neighbor
+        IP. The shared ipv4/ipv6 AF walker (``_apply_bgp_af_neighbor_policies``)
+        matches only ``address-family ipv4|ipv6`` and keys on neighbor IPs, so
+        neither the ``evpn`` token nor a peer-group target is reached by it —
+        hence this EOS-scoped collector.
+
+        Returns ``(policies, activated, unrecognized)``:
+
+        * ``policies`` — ``{target: pg_data}``; ``pg_data`` is the SHARED
+          peer-command dict, filled by ``apply_peer_group_command``, so
+          route-map / prefix-list / filter-list in|out and every other base AF
+          policy key is read HERE in one place, never re-spelled (CCR-0044 guard).
+        * ``activated`` — targets that carried an explicit ``activate`` line.
+        * ``unrecognized`` — raw child lines the shared vocabulary did not claim,
+          so the block never drops content silently — the double-miss CCR-0162
+          closes (dropped AND not surfaced).
         """
-        targets: set[str] = set()
+        policies: dict[str, dict] = {}
+        activated: set[str] = set()
+        unrecognized: list[str] = []
+
+        def _target_data(target: str) -> dict:
+            if target not in policies:
+                data = _default_pg_data(target)
+                data.pop("name", None)
+                policies[target] = data
+            return policies[target]
+
         for af in bgp_obj.find_child_objects(r"^\s+address-family\s+evpn\s*$"):
-            for child in af.find_child_objects(r"^\s+neighbor\s+\S+\s+activate\s*$"):
-                m = re.search(r"^\s+neighbor\s+(\S+)\s+activate\s*$", child.text)
+            for child in af.children:  # direct children of the evpn AF block
+                text = child.text.strip()
+                if not text or text.startswith("!"):
+                    continue
+                # `no ...` withdrawals belong to the tombstone path, never to the
+                # unrecognized channel — mirror the base child-line walk.
+                if text == "no" or text.startswith("no "):
+                    continue
+                m = re.match(r"^neighbor\s+(\S+)\s+(.+?)\s*$", text)
                 if m:
-                    targets.add(m.group(1))
-        return targets
+                    target, cmd = m.group(1), m.group(2)
+                    if cmd == "activate":
+                        activated.add(target)
+                        _target_data(target)  # ensure an entry even if policy-free
+                        continue
+                    if apply_peer_group_command(_target_data(target), cmd):
+                        continue
+                # a non-neighbor line, or a neighbor command the shared vocabulary
+                # does not know → disclose it, do not drop it.
+                unrecognized.append(child.text)
+
+        return policies, activated, unrecognized
 
     def parse_bgp(self) -> list[BGPConfig]:
-        """Shared BGP parse, plus EOS ``address-family evpn`` overlay activation.
+        """Shared BGP parse, plus EOS ``address-family evpn`` overlay policy.
 
         A THIN wrapper — every field is parsed by the inherited
         ``IOSParser.parse_bgp`` (the neighbor / peer-group walks stay shared, so
         the CCR-0044 anti-fork guard holds). It then attaches the one thing the
         shared walk cannot express: EOS's single-token ``address-family evpn``
-        activation, applied to the activated PEER GROUP (the usual EVPN target)
-        or a directly-activated IP neighbor, as
-        ``BGPNeighborAF(afi="l2vpn", safi="evpn")`` (afi-token decision above).
-        The shared ipv4/ipv6 AF walk (``_apply_bgp_af_neighbor_policies``) reaches
-        neither the ``evpn`` token nor peer-group targets, so this fills that gap
-        without re-implementing anything (CCR-0157).
+        block, applied to the activated/policy-bearing PEER GROUP (the usual EVPN
+        target) or a direct IP neighbor, as ``BGPNeighborAF(afi="l2vpn",
+        safi="evpn")`` (afi-token decision above) carrying the block's route-map
+        (and other peer-policy) attachments. The shared ipv4/ipv6 AF walk
+        (``_apply_bgp_af_neighbor_policies``) reaches neither the ``evpn`` token
+        nor peer-group targets, so this fills that gap by REUSING the shared
+        peer-command vocabulary, not re-implementing it (CCR-0157 / CCR-0162).
         """
         bgp_instances = super().parse_bgp()
         parse = self._get_parse_obj()
@@ -1051,8 +1099,9 @@ class EOSParser(IOSParser):
             asn_str = self._extract_match(bgp_obj.text, r"^router\s+bgp\s+(\d+)")
             if not asn_str:
                 continue
-            activated = self._eos_evpn_activated_targets(bgp_obj)
-            if not activated:
+            policies, activated, _unrecognized = self._eos_evpn_af_neighbor_policies(bgp_obj)
+            targets = set(policies) | activated
+            if not targets:
                 continue
             asn = int(asn_str)
             # `address-family evpn` sits at the global process level; apply to the
@@ -1061,24 +1110,84 @@ class EOSParser(IOSParser):
                 if inst.asn != asn or inst.vrf is not None:
                     continue
                 for pg in inst.peer_groups:
-                    if pg.name in activated and not self._has_evpn_af(pg):
-                        pg.address_families.append(
-                            BGPNeighborAF(afi="l2vpn", safi="evpn")
+                    if pg.name in targets:
+                        self._eos_attach_evpn_af(
+                            pg, policies.get(pg.name), pg.name in activated
                         )
                 for nb in inst.neighbors:
-                    if str(nb.peer_ip) in activated and not self._has_evpn_af(nb):
-                        nb.address_families.append(
-                            BGPNeighborAF(afi="l2vpn", safi="evpn")
+                    key = str(nb.peer_ip)
+                    if key in targets:
+                        self._eos_attach_evpn_af(
+                            nb, policies.get(key), key in activated
                         )
         return bgp_instances
 
-    @staticmethod
-    def _has_evpn_af(target) -> bool:
-        """True if a neighbor / peer group already carries the l2vpn/evpn AF."""
-        return any(
-            af.afi == "l2vpn" and af.safi == "evpn"
-            for af in target.address_families
+    def _eos_attach_evpn_af(self, target, pg_data, activated: bool) -> None:
+        """Attach (or enrich) the ``l2vpn/evpn`` AF entry on a peer-group/neighbor.
+
+        ``activated`` records whether an explicit ``neighbor <x> activate`` line
+        appeared: the AF entry's ``activate`` reflects exactly that (EOS emits
+        ``activate`` when the overlay AF is on), so a policy-only appearance does
+        not invent activation state the config never showed (CCR-0162 item 2).
+
+        Only policy fields the config actually set are copied — a bare
+        activation still yields the CCR-0157 shape (route_map_* = None). The
+        vocabulary writes peer-level keys (remote_as, timers, …) with no AF
+        meaning; the ``BGPNeighborAF.model_fields`` filter drops them, so the
+        shared vocabulary can grow without touching this call site.
+        """
+        defaults = _default_pg_data("")
+        fields = {}
+        if pg_data:
+            fields = {
+                k: v
+                for k, v in pg_data.items()
+                if k in BGPNeighborAF.model_fields
+                and k not in ("afi", "safi")
+                and v != defaults.get(k)
+            }
+
+        existing = next(
+            (af for af in target.address_families
+             if af.afi == "l2vpn" and af.safi == "evpn"),
+            None,
         )
+        if existing is None:
+            target.address_families.append(
+                BGPNeighborAF(afi="l2vpn", safi="evpn", activate=activated, **fields)
+            )
+        else:
+            for k, v in fields.items():
+                setattr(existing, k, v)
+            if activated:
+                existing.activate = True
+
+    def _collect_unrecognized_child_lines(self, obj, header: str):
+        """Extend the base direct-child walk into ``address-family evpn``.
+
+        The framework's registry walk inspects only DIRECT children of a claimed
+        top-level block, so lines nested inside the ``router bgp`` →
+        ``address-family evpn`` sub-block are never reached by it — the exact
+        silent-drop channel CCR-0162 closes. For a ``router bgp`` block, descend
+        one level and disclose anything the EVPN AF policy walk did not consume,
+        reusing the SAME collector ``parse_bgp`` uses so "what is recognized" is
+        defined in exactly one place.
+        """
+        flagged = super()._collect_unrecognized_child_lines(obj, header)
+        if re.match(r"^router\s+bgp\b", header):
+            _policies, _activated, unrecognized = self._eos_evpn_af_neighbor_policies(obj)
+            for raw in unrecognized:
+                line = raw.strip()
+                flagged.append(UnrecognizedBlock(
+                    block_header=f"{header} > {line}",
+                    raw_lines=[raw],
+                    best_guess=next(
+                        (label for kw, label in self._BEST_GUESS_KEYWORDS
+                         if kw in line.lower()),
+                        None,
+                    ),
+                ))
+        return flagged
 
     # EOS's process-level ``maximum-paths`` is a process-wide multipath limit — it
     # applies to every address-family, not only the implicit IPv4-unicast one (which
