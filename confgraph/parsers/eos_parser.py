@@ -7,7 +7,7 @@ from confgraph.parsers.ios_parser import IOSParser
 from confgraph.parsers.base import PatternSet, _BASE_KNOWN_PATTERNS, _BASE_BEST_GUESS_KEYWORDS
 from confgraph.models.base import OSType
 from confgraph.models.line import LineType
-from confgraph.models.bgp import BGPConfig
+from confgraph.models.bgp import BGPConfig, BGPNeighborAF
 from confgraph.models.prefix_list import PrefixListConfig, PrefixListEntry
 from confgraph.models.static_route import StaticRoute
 from confgraph.models.acl import ACLConfig, ACLEntry
@@ -34,6 +34,23 @@ class EOSParser(IOSParser):
 
     # Replace IOS "vrf definition" with EOS "vrf instance".
     # Add EOS-specific top-level keywords that are handled by parse_* methods.
+    # EOS states the EVPN L2VNI (MAC-VRF) as a ``vlan <id>`` sub-block DIRECTLY
+    # under ``router bgp`` (device capture, cEOS 4.36.1F — see parse_evpn). That
+    # is the ONE EOS-only child form the shared IOS ``router bgp`` child registry
+    # (``_IOS_KNOWN_CHILD_PATTERNS``) does not list, so without this it lands in
+    # ``unrecognized_blocks``. The pattern is anchored to EXACTLY the bare numeric
+    # MAC-VRF header (``^vlan\s+\d+\s*$``) that ``parse_evpn`` consumes — a broad
+    # ``^vlan\b`` would suppress unrecognized-flagging for ``vlan``-prefixed forms
+    # we do NOT parse (``vlan-aware-bundle NAME``, malformed ``vlan`` lines),
+    # turning a visible gap into an invisible one (the bleed the CCR warns of). The
+    # sibling EVPN sub-blocks (``vrf NAME``, ``address-family evpn``) already match
+    # the inherited ``^vrf`` / ``^address-family`` patterns. Extend only the
+    # ``router bgp`` group; every other block group is inherited unchanged (CCR-0157).
+    _KNOWN_CHILD_PATTERNS: list[tuple[str, list[str]]] = [
+        (blk, pats + [r"^vlan\s+\d+\s*$"]) if blk.startswith(r"^router\s+bgp") else (blk, pats)
+        for blk, pats in IOSParser._KNOWN_CHILD_PATTERNS
+    ]
+
     _KNOWN_TOP_LEVEL_PATTERNS: list[str] = [
         p for p in _BASE_KNOWN_PATTERNS if p != r"^vrf definition"
     ] + [
@@ -912,8 +929,156 @@ class EOSParser(IOSParser):
         which is why the whole VRF instance was previously dropped. Delegates to
         the shared block-form traversal ``_parse_bgp_vrf_blocks`` (CCR-0032),
         reusing the EOS neighbor parser for the VRF neighbors.
+
+        EOS EVPN L3VNI exception (CCR-0157): a ``router bgp <asn> > vrf NAME``
+        block that carries ONLY the EVPN control-plane (an ``rd`` and
+        ``route-target ... evpn`` lines, nothing else) is the L3VNI declaration —
+        it is consumed by :meth:`parse_evpn`, not an L3VPN BGP routing instance.
+        Emitting a ``BGPConfig`` for it mis-split BGP into a phantom second
+        instance. Such EVPN-only blocks are dropped here; a real tenant VRF that
+        also carries neighbors / networks / redistribute / an ``address-family``
+        (symmetric-IRB) still yields its instance AND its L3VNI.
         """
-        return self._parse_bgp_vrf_blocks(bgp_obj, asn)
+        evpn_only = {
+            name
+            for name, vrf_obj in self._iter_router_vrf_blocks(bgp_obj)
+            if self._eos_vrf_block_is_evpn_only(vrf_obj)
+        }
+        return [
+            inst
+            for inst in self._parse_bgp_vrf_blocks(bgp_obj, asn)
+            if inst.vrf not in evpn_only
+        ]
+
+    # ---- EOS EVPN control-plane (under `router bgp`) — CCR-0157 -------------
+    #
+    # afi-token DECISION (locked, CCR-0157): EOS spells the overlay AF as the
+    # single token ``address-family evpn``, where NX-OS/IOS emit ``l2vpn evpn``.
+    # The activation is NORMALIZED to ``BGPNeighborAF(afi="l2vpn", safi="evpn")``
+    # so the vendor-neutral model and the engine's per-neighbor EVPN-AF facts
+    # match what NX-OS produces — one EVPN-AF shape across vendors.
+
+    @staticmethod
+    def _eos_vrf_evpn_route_targets(vrf_obj):
+        """Return ``(rd, rt_import, rt_export, has_evpn_rt)`` for a bgp vrf block.
+
+        EOS L3VNI route-targets carry the ``evpn`` keyword BETWEEN the direction
+        and the value — ``route-target import evpn <rt>`` — unlike NX-OS, which
+        trails it (``route-target both <rt> evpn``). Only the ``evpn``-suffixed
+        lines are EVPN control-plane; plain ``route-target import <rt>`` lines are
+        L3VPN and are left to the shared VRF path.
+        """
+        rd = None
+        rt_import: list[str] = []
+        rt_export: list[str] = []
+        has_evpn_rt = False
+        for child in vrf_obj.all_children:
+            st = child.text.strip()
+            rd_m = re.match(r"rd\s+(\S+)", st)
+            if rd_m and rd is None:
+                rd = rd_m.group(1)
+                continue
+            rt_m = re.match(
+                r"route-target\s+(both|import|export)\s+evpn\s+(\S+)", st
+            )
+            if rt_m:
+                has_evpn_rt = True
+                direction, value = rt_m.group(1), rt_m.group(2)
+                if direction in ("import", "both") and value not in rt_import:
+                    rt_import.append(value)
+                if direction in ("export", "both") and value not in rt_export:
+                    rt_export.append(value)
+        return rd, rt_import, rt_export, has_evpn_rt
+
+    def _eos_vrf_block_is_evpn_only(self, vrf_obj) -> bool:
+        """True when a ``router bgp > vrf NAME`` block is JUST an EVPN L3VNI.
+
+        EVPN-only means every direct child is an ``rd`` or an
+        ``route-target ... evpn`` line (comments ignored). Any other content
+        (neighbor / network / redistribute / address-family / a plain non-evpn
+        route-target / router-id …) means it is a real L3VPN BGP instance and is
+        kept. Used to suppress the phantom second BGP instance (CCR-0157).
+        """
+        has_evpn_rt = False
+        for child in vrf_obj.children:
+            st = child.text.strip()
+            if not st or st.startswith("!"):
+                continue
+            if re.match(r"rd\s+\S+\s*$", st):
+                continue
+            if re.match(r"route-target\s+(both|import|export)\s+evpn\s+\S+\s*$", st):
+                has_evpn_rt = True
+                continue
+            return False
+        return has_evpn_rt
+
+    def _eos_evpn_activated_targets(self, bgp_obj) -> set[str]:
+        """Peer-group names / neighbor IPs activated under ``address-family evpn``.
+
+        EOS activates the overlay with ``neighbor <x> activate`` inside the single
+        ``address-family evpn`` block under ``router bgp`` (``<x>`` is usually the
+        EVPN peer group). The shared ipv4/ipv6 AF walker
+        (``_apply_bgp_af_neighbor_policies``) matches only ``address-family ipv4|ipv6``
+        and keys on neighbor IPs, so neither the ``evpn`` token nor a peer-group
+        target is reached by it — hence this EOS-scoped collector.
+        """
+        targets: set[str] = set()
+        for af in bgp_obj.find_child_objects(r"^\s+address-family\s+evpn\s*$"):
+            for child in af.find_child_objects(r"^\s+neighbor\s+\S+\s+activate\s*$"):
+                m = re.search(r"^\s+neighbor\s+(\S+)\s+activate\s*$", child.text)
+                if m:
+                    targets.add(m.group(1))
+        return targets
+
+    def parse_bgp(self) -> list[BGPConfig]:
+        """Shared BGP parse, plus EOS ``address-family evpn`` overlay activation.
+
+        A THIN wrapper — every field is parsed by the inherited
+        ``IOSParser.parse_bgp`` (the neighbor / peer-group walks stay shared, so
+        the CCR-0044 anti-fork guard holds). It then attaches the one thing the
+        shared walk cannot express: EOS's single-token ``address-family evpn``
+        activation, applied to the activated PEER GROUP (the usual EVPN target)
+        or a directly-activated IP neighbor, as
+        ``BGPNeighborAF(afi="l2vpn", safi="evpn")`` (afi-token decision above).
+        The shared ipv4/ipv6 AF walk (``_apply_bgp_af_neighbor_policies``) reaches
+        neither the ``evpn`` token nor peer-group targets, so this fills that gap
+        without re-implementing anything (CCR-0157).
+        """
+        bgp_instances = super().parse_bgp()
+        parse = self._get_parse_obj()
+
+        for bgp_obj in parse.find_objects(r"^router\s+bgp\s+(\d+)"):
+            asn_str = self._extract_match(bgp_obj.text, r"^router\s+bgp\s+(\d+)")
+            if not asn_str:
+                continue
+            activated = self._eos_evpn_activated_targets(bgp_obj)
+            if not activated:
+                continue
+            asn = int(asn_str)
+            # `address-family evpn` sits at the global process level; apply to the
+            # matching global instance (vrf is None).
+            for inst in bgp_instances:
+                if inst.asn != asn or inst.vrf is not None:
+                    continue
+                for pg in inst.peer_groups:
+                    if pg.name in activated and not self._has_evpn_af(pg):
+                        pg.address_families.append(
+                            BGPNeighborAF(afi="l2vpn", safi="evpn")
+                        )
+                for nb in inst.neighbors:
+                    if str(nb.peer_ip) in activated and not self._has_evpn_af(nb):
+                        nb.address_families.append(
+                            BGPNeighborAF(afi="l2vpn", safi="evpn")
+                        )
+        return bgp_instances
+
+    @staticmethod
+    def _has_evpn_af(target) -> bool:
+        """True if a neighbor / peer group already carries the l2vpn/evpn AF."""
+        return any(
+            af.afi == "l2vpn" and af.safi == "evpn"
+            for af in target.address_families
+        )
 
     # EOS's process-level ``maximum-paths`` is a process-wide multipath limit — it
     # applies to every address-family, not only the implicit IPv4-unicast one (which
@@ -1318,6 +1483,151 @@ class EOSParser(IOSParser):
             vni_mappings=vni_mappings,
             flood_vtep_list=flood_vteps,
             learn_restrict=learn_restrict,
+        )
+
+    # -------------------------------------------------------------------
+    # EVPN control-plane — EOS states it UNDER `router bgp` (CCR-0157)
+    # -------------------------------------------------------------------
+
+    def parse_evpn(self) -> "EVPNConfig | None":
+        """Parse the Arista EOS MP-BGP EVPN control-plane (L2VNI + L3VNI).
+
+        EOS is structurally UNLIKE NX-OS: there is no top-level ``evpn`` block.
+        Both VNI families are declared as sub-blocks under ``router bgp``, and the
+        VNI number itself lives on ``interface Vxlan1`` — so each family is JOINED
+        to a VXLAN mapping (device capture, cEOS 4.36.1F)::
+
+            router bgp 65101
+               vlan 10                         # L2VNI (MAC-VRF), keyed by VLAN id
+                  rd 1.1.1.1:10010
+                  route-target both 10010:10010    # NO `evpn` keyword
+               vrf ZZ-TENANT                   # L3VNI, keyed by tenant VRF name
+                  rd 1.1.1.1:50001
+                  route-target import evpn 50001:50001   # `evpn` BEFORE the value
+                  route-target export evpn 50001:50001
+            interface Vxlan1
+               vxlan vlan 10 vni 10010         # VLAN 10  -> L2VNI 10010
+               vxlan vrf ZZ-TENANT vni 50001   # ZZ-TENANT -> L3VNI 50001
+
+        L2VNI join: the ``vlan <id>`` sub-block's VNI comes from the matching
+        ``vxlan vlan <id> vni <n>`` mapping (``parse_vxlan``). ``EVPNL2VNI.vni`` is
+        a required int, so a ``vlan`` sub-block with no VXLAN mapping is SKIPPED
+        rather than fabricated. ``route-target both`` populates BOTH lists.
+
+        L3VNI join / discriminator: a ``vrf NAME`` sub-block is an EVPN L3VNI when
+        it carries at least one ``route-target ... evpn`` line — that ``evpn``
+        keyword is the marker that the VRF participates in the EVPN control-plane,
+        exactly as NX-OS's trailing ``evpn`` token distinguishes EVPN RTs from
+        plain L3VPN RTs. A plain L3VPN VRF (``route-target import <rt>`` with no
+        ``evpn`` keyword) is NOT an L3VNI, even if it happens to have a VXLAN VRF
+        binding. The VNI comes from the ``vxlan vrf NAME vni <n>`` mapping, and
+        that binding IS the EOS L3VNI↔fabric association (EOS has no NX-OS-style
+        ``member vni ... associate-vrf`` line), so it also sets ``associate_vrf``.
+
+        afi-token: the overlay activation (``address-family evpn`` +
+        ``neighbor X activate``) is parsed onto the BGP peer group / neighbor as
+        ``BGPNeighborAF(afi="l2vpn", safi="evpn")`` — see the decision recorded on
+        the BGP section above; it is not represented in :class:`EVPNConfig`.
+
+        Returns ``None`` when there is no EVPN config at all, so a non-EVPN EOS
+        config keeps ``evpn`` absent.
+        """
+        from confgraph.models.evpn import EVPNConfig, EVPNL2VNI, EVPNL3VNI
+
+        parse = self._get_parse_obj()
+        bgp_objs = parse.find_objects(r"^router\s+bgp\s+\d+")
+        if not bgp_objs:
+            return None
+
+        # VNI joins from interface Vxlan1 (parse_vxlan records the real vrf name).
+        vlan_to_vni: dict[int, int] = {}
+        vrf_to_vni: dict[str, int] = {}
+        vxlan = self.parse_vxlan()
+        if vxlan is not None:
+            for mapping in vxlan.vni_mappings:
+                if mapping.vlan is not None:
+                    vlan_to_vni.setdefault(mapping.vlan, mapping.vni)
+                elif mapping.vrf is not None:
+                    vrf_to_vni.setdefault(mapping.vrf, mapping.vni)
+
+        l2vnis: list[EVPNL2VNI] = []
+        l3vnis: list[EVPNL3VNI] = []
+        raw_lines: list[str] = []
+        line_numbers: list[int] = []
+        has_af_evpn = False
+
+        for bgp_obj in bgp_objs:
+            # --- L2VNI: `vlan <id>` sub-blocks (MAC-VRF) ---------------------
+            for vlan_obj in bgp_obj.find_child_objects(r"^\s+vlan\s+\d+\s*$"):
+                vid = self._extract_match(vlan_obj.text, r"^\s+vlan\s+(\d+)")
+                if vid is None:
+                    continue
+                vni = vlan_to_vni.get(int(vid))
+                if vni is None:
+                    continue  # no VXLAN mapping — cannot fabricate a required VNI
+                rd = None
+                rt_import: list[str] = []
+                rt_export: list[str] = []
+                raw_lines.append(vlan_obj.text)
+                line_numbers.append(vlan_obj.linenum)
+                for sub in vlan_obj.children:
+                    st = sub.text.strip()
+                    rd_m = re.match(r"rd\s+(\S+)", st)
+                    if rd_m and rd is None:
+                        rd = rd_m.group(1)
+                        raw_lines.append(sub.text)
+                        line_numbers.append(sub.linenum)
+                        continue
+                    rt_m = re.match(r"route-target\s+(both|import|export)\s+(\S+)", st)
+                    if rt_m:
+                        direction, value = rt_m.group(1), rt_m.group(2)
+                        if direction in ("import", "both") and value not in rt_import:
+                            rt_import.append(value)
+                        if direction in ("export", "both") and value not in rt_export:
+                            rt_export.append(value)
+                        raw_lines.append(sub.text)
+                        line_numbers.append(sub.linenum)
+                l2vnis.append(EVPNL2VNI(
+                    vni=vni,
+                    rd=rd,
+                    route_target_import=rt_import,
+                    route_target_export=rt_export,
+                ))
+
+            # --- L3VNI: `vrf <name>` sub-blocks carrying `... evpn` RTs -------
+            for vrf_name, vrf_obj in self._iter_router_vrf_blocks(bgp_obj):
+                rd, rt_import, rt_export, has_evpn_rt = \
+                    self._eos_vrf_evpn_route_targets(vrf_obj)
+                if not has_evpn_rt:
+                    continue  # plain L3VPN VRF, not an EVPN L3VNI
+                vni = vrf_to_vni.get(vrf_name)
+                if vni is None:
+                    continue  # no VXLAN mapping — cannot fabricate a required VNI
+                raw_lines.append(vrf_obj.text)
+                line_numbers.append(vrf_obj.linenum)
+                l3vnis.append(EVPNL3VNI(
+                    vni=vni,
+                    rd=rd,
+                    route_target_import=rt_import,
+                    route_target_export=rt_export,
+                    vrf=vrf_name,
+                    associate_vrf=True,
+                ))
+
+            # --- Overlay activation presence (`address-family evpn`) ---------
+            if bgp_obj.find_child_objects(r"^\s+address-family\s+evpn\s*$"):
+                has_af_evpn = True
+
+        if not l2vnis and not l3vnis and not has_af_evpn:
+            return None
+
+        return EVPNConfig(
+            object_id="evpn",
+            raw_lines=raw_lines,
+            source_os=self.os_type,
+            line_numbers=line_numbers,
+            l2vnis=l2vnis,
+            l3vnis=l3vnis,
         )
 
     # -------------------------------------------------------------------
