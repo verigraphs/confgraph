@@ -13,6 +13,7 @@ from confgraph.parsers.base import (
 )
 from confgraph.models.base import OSType, UnrecognizedBlock
 from confgraph.models.line import LineType
+from confgraph.models.ospf import OSPFConfig
 from confgraph.models.bgp import BGPConfig, BGPNeighborAF
 from confgraph.models.prefix_list import PrefixListConfig, PrefixListEntry
 from confgraph.models.static_route import StaticRoute
@@ -327,7 +328,86 @@ class EOSParser(IOSParser):
                 if addr not in intf_cfg.varp_addresses:
                     intf_cfg.varp_addresses.append(addr)
 
+        # CCR-0164: EOS's `ip ospf area <id>` carries no process id by design,
+        # so the interface's ``ospf_process_id`` stays None and the engine's
+        # OSPF enrollment gate (which requires a process id) never enrolls the
+        # interface even though ``ospf_area`` is set. When the config has
+        # EXACTLY ONE ``router ospf <id>`` instance, bind that single process id
+        # onto the participating (``ospf_area`` set) interfaces that have no
+        # process id. GUARD: with zero or multiple instances there is no way to
+        # know which process an area-only interface belongs to, so leave it None
+        # — multi-instance disambiguation is the (frozen) entrp half of the CCR.
+        ospf_pids: list[int | str] = []
+        for proc_obj in parse.find_objects(r"^router\s+ospf\s+\d+\b"):
+            pm = re.match(r"^router\s+ospf\s+(\S+)", proc_obj.text)
+            if pm:
+                pid_str = pm.group(1)
+                ospf_pids.append(int(pid_str) if pid_str.isdigit() else pid_str)
+        if len(ospf_pids) == 1:
+            single_pid = ospf_pids[0]
+            for intf_cfg in interfaces:
+                if intf_cfg.ospf_area is not None and intf_cfg.ospf_process_id is None:
+                    intf_cfg.ospf_process_id = single_pid
+
         return interfaces
+
+    def parse_ospf(self) -> list[OSPFConfig]:
+        """Parse OSPF, adding EOS's prefix-form ``network`` statements.
+
+        EOS emits ``network <prefix> area <id>`` under ``router ospf`` in CIDR
+        slash notation — two tokens (prefix, area-id) around ``area`` — whereas
+        the inherited IOS walk matches only the classic three-token
+        ``network <addr> <wildcard> area <id>`` form
+        (syntax-corpus/eos/ospf.yaml: network-area, verified-capture cEOS
+        4.36.1F). The IOS regex never matches the EOS spelling, so the statement
+        was silently DROPPED — and it did not even surface in
+        ``unrecognized_blocks`` because ``network`` is a claimed child of
+        ``router ospf`` (_IOS_KNOWN_CHILD_PATTERNS). Parse the prefix form into
+        the SAME ``OSPFConfig.network_statements`` shape the IOS wildcard form
+        fills — a ``(IPv4Network, area-id)`` tuple — so the engine's network
+        overlap enrollment (igp.py) and any goldens stay consistent. The
+        inherited three-token walk is left intact for mixed configs.
+        """
+        ospf_instances = super().parse_ospf()
+
+        parse = self._get_parse_obj()
+        by_pid: dict[int | str, OSPFConfig] = {
+            inst.process_id: inst for inst in ospf_instances
+        }
+
+        for ospf_obj in parse.find_objects(self._OSPF_PROC_PATTERNS.union):
+            hdr = self._OSPF_PROC_PATTERNS.match(ospf_obj.text)
+            pid_str = hdr.group("pid") if hdr else None
+            if not pid_str:
+                continue
+            pid: int | str = int(pid_str) if pid_str.isdigit() else pid_str
+            inst = by_pid.get(pid)
+            if inst is None:
+                continue
+            existing = set(inst.network_statements)
+            # Prefix form only: exactly ``network <prefix> area <id>`` (the
+            # trailing ``$`` keeps this disjoint from the inherited three-token
+            # wildcard form, which has an extra token before ``area``).
+            for nc in ospf_obj.find_child_objects(
+                r"^\s+network\s+\S+\s+area\s+\S+\s*$"
+            ):
+                m = re.match(r"^\s+network\s+(\S+)\s+area\s+(\S+)\s*$", nc.text)
+                if not m:
+                    continue
+                prefix_str, area_id = m.group(1), m.group(2)
+                try:
+                    net = IPv4Network(prefix_str, strict=False)
+                except ValueError:
+                    # A device-emitted CIDR prefix always parses; this guards
+                    # malformed input only. Leave it unrepresented rather than
+                    # fabricate a statement — it is not silently claimed here.
+                    continue
+                stmt = (net, area_id)
+                if stmt not in existing:
+                    inst.network_statements.append(stmt)
+                    existing.add(stmt)
+
+        return ospf_instances
 
     # VRFs — no override. The header spelling ("vrf instance") is data
     # (_VRF_HEADER_PATTERNS above) and the body vocabulary — description, rd,
