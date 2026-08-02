@@ -45,6 +45,11 @@ _NXOS_KNOWN_PATTERNS: list[str] = [
     r"^control-plane",
     # CCR-0094: Flexible NetFlow top-level blocks (claimed by parse_netflow).
     r"^flow\s+(record|exporter|monitor)\b",
+    # CCR-0155: the top-level ``evpn`` block is PARSED (parse_evpn → L2VNIs),
+    # so it must be claimed — recording it as unrecognized too made a report
+    # say "evpn analyzed" and "unrecognized config present" about the same
+    # lines, and pushed its raw text into digest family F6 alongside F9.
+    r"^evpn\s*$",
 ]
 
 
@@ -58,6 +63,17 @@ class NXOSParser(IOSParser):
     """
 
     _KNOWN_TOP_LEVEL_PATTERNS: list[str] = _NXOS_KNOWN_PATTERNS
+
+    # CCR-0155: claiming ``evpn`` at top level must not silence UNPARSED
+    # lines inside it — register its known direct children so anything else
+    # still discloses ("evpn > <line>").  parse_evpn consumes only
+    # ``vni <n> l2`` sub-blocks here (rd/route-target are grandchildren,
+    # which the collector does not descend into).
+    _KNOWN_CHILD_PATTERNS: list[tuple[str, list[str]]] = (
+        IOSParser._KNOWN_CHILD_PATTERNS + [
+            (r"^evpn\s*$", [r"^vni\s+\d+\s+l2\b"]),
+        ]
+    )
 
     # CCR-0038 Theme 1 — the NX-OS dialect of the shared VRF body vocabulary.
     # The CLI token that applies a route-map to VRF import/export is the bare
@@ -965,8 +981,20 @@ class NXOSParser(IOSParser):
 
             nd = self._parse_nxos_neighbor_children(nb_obj)
 
-            # Skip if no remote-as, no peer-group, and not a shutdown stub
-            if nd["remote_as"] is None and nd["peer_group"] is None and not nd["shutdown"]:
+            # CCR-0159: keep any block that carries PARSED CONTENT even
+            # without remote-as/peer-group — proposal snippets legitimately
+            # omit remote-as when attaching policy to an EXISTING neighbor
+            # (on a real device the snippet applies to it; device-verified
+            # reality check in the CCR).  remote_as="inherited" below is the
+            # established non-clobbering stub: the merge skips it
+            # (merger.py field-level exception) and topology treats it as
+            # unresolved.  Only a truly EMPTY bare ``neighbor <ip>`` stub is
+            # still dropped (unchanged pre-CCR behavior).
+            has_content = bool(nd["address_families"]) or any(
+                v for k, v in nd.items() if k != "address_families"
+            )
+            if (nd["remote_as"] is None and nd["peer_group"] is None
+                    and not nd["shutdown"] and not has_content):
                 continue
 
             remote_as = nd["remote_as"] if nd["remote_as"] is not None else "inherited"
