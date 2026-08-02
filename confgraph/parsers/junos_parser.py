@@ -1034,6 +1034,7 @@ class JunOSParser(BaseParser):
                 af = BGPNeighborAF(
                     afi=afi,
                     safi="unicast",
+                    activate=True,  # CCR-0165: JunOS family presence = active
                     route_map_in=rm_in,
                     route_map_out=rm_out,
                 )

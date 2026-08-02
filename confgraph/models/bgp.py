@@ -91,7 +91,20 @@ class BGPNeighborAF(BaseModel):
     safi: str = Field(
         ..., description="Sub-address family identifier (e.g., 'unicast', 'multicast')"
     )
-    activate: bool = Field(default=True, description="Activate this address family")
+    activate: bool | None = Field(
+        default=None,
+        description=(
+            "Activate this address family. TRI-STATE (CCR-0165): True = "
+            "explicitly activated (or the OS convention where the AF block's "
+            "presence activates — NX-OS/IOS-XR/JunOS parsers assert True "
+            "themselves); None = NOT STATED in the parsed text (an EOS "
+            "policy-only AF line in a partial snippet) — a merge must never "
+            "let None overwrite a stated baseline value; False = explicitly "
+            "deactivated. Consumers read activation as bool(activate), so an "
+            "unstated entry in a FULL config reads not-activated (the EOS "
+            "multi-agent device truth)."
+        ),
+    )
     send_community: bool | str | None = Field(
         default=None,
         description="Send community attribute (True/False/'extended'/'both'/None=not configured)",

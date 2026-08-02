@@ -40,7 +40,14 @@ from confgraph.parsers.panos_parser import PANOSParser
 # posture as the CCR-0129 bump: the new field also moves the ParsedConfig JSON schema
 # (so the platform parse cache invalidates independently and a bump is not strictly
 # required), but entrp's schema-less ``digest_key()`` only moves on pbv, so we bump.
-PARSER_BEHAVIOR_VERSION: int = 3
+# 4 (CCR-0165): ``BGPNeighborAF.activate`` is tri-state — EOS policy-only AF
+# entries now parse activate=None (unstated) instead of False, and the
+# block-presence OSes assert True explicitly. Schema also moves (bool -> bool|None),
+# but entrp's schema-less ``digest_key()`` only moves on pbv — same posture as 2/3.
+# Also under 4: the shared IOS/EOS AF walk no longer emits an EMPTY BGPNeighborAF
+# for a peer whose only AF-block lines are vocabulary-invisible (13 such commands
+# measured) — deliberate; a real config's ``activate`` line keeps the entry.
+PARSER_BEHAVIOR_VERSION: int = 4
 
 __all__ = [
     "BaseParser",

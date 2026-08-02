@@ -812,6 +812,10 @@ class NXOSParser(IOSParser):
             elif cmd == "default-originate":
                 af["default_originate"] = True
 
+        # CCR-0165: NX-OS has no ``activate`` line — the AF block's presence
+        # activates the family. Assert it explicitly (model default is now
+        # None = unstated).
+        af.setdefault("activate", True)
         return BGPNeighborAF(afi=afi, safi=safi, **af)
 
     def _emit_bgp_neighbor_submode_negations(

@@ -7221,9 +7221,15 @@ class IOSParser(BaseParser):
                     data = _default_pg_data(peer)
                     data.pop("name", None)
                     data.update({
-                        # Default True — consistent with BGPNeighborAF model default.
-                        # Only 'no neighbor X activate' overrides this to False.
-                        "activate": True,
+                        # CCR-0165 (validation F1): UNSTATED, not True. This walk
+                        # cannot distinguish "AF block present" from "activation
+                        # stated"; seeding True made a policy-only proposal
+                        # silently RE-ACTIVATE an explicitly deactivated AF once
+                        # the model default became None. Explicit lines still set
+                        # True (`neighbor X activate`) / False (`no neighbor X
+                        # activate`); the per-OS device default is resolved AT
+                        # READ TIME (entrp simulator._neighbor_af_activate).
+                        "activate": None,
                         "default_originate_route_map": None,
                         "maximum_prefix_warning_only": False,
                         "advertise_map": None,
@@ -7288,7 +7294,7 @@ class IOSParser(BaseParser):
                 # Only attach if there is at least one non-default field.
                 # activate=False (explicit deactivation) counts as meaningful
                 # even though it is falsy.
-                has_content = any(v for v in data.values() if v) or not data.get("activate", True)
+                has_content = any(v for v in data.values() if v) or data.get("activate") is False
                 if not has_content:
                     continue
                 # Keep only what BGPNeighborAF models. The shared vocabulary also
