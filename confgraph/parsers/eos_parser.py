@@ -4,9 +4,16 @@ import re
 from ipaddress import IPv4Address, IPv4Interface, IPv4Network, IPv6Address, IPv6Interface, IPv6Network
 
 from confgraph.parsers.ios_parser import IOSParser
-from confgraph.parsers.base import PatternSet, _BASE_KNOWN_PATTERNS, _BASE_BEST_GUESS_KEYWORDS
-from confgraph.models.base import OSType
+from confgraph.parsers.base import (
+    PatternSet,
+    _BASE_KNOWN_PATTERNS,
+    _BASE_BEST_GUESS_KEYWORDS,
+    apply_peer_group_command,
+    _default_pg_data,
+)
+from confgraph.models.base import OSType, UnrecognizedBlock
 from confgraph.models.line import LineType
+from confgraph.models.ospf import OSPFConfig
 from confgraph.models.bgp import BGPConfig, BGPNeighborAF
 from confgraph.models.prefix_list import PrefixListConfig, PrefixListEntry
 from confgraph.models.static_route import StaticRoute
@@ -321,7 +328,86 @@ class EOSParser(IOSParser):
                 if addr not in intf_cfg.varp_addresses:
                     intf_cfg.varp_addresses.append(addr)
 
+        # CCR-0164: EOS's `ip ospf area <id>` carries no process id by design,
+        # so the interface's ``ospf_process_id`` stays None and the engine's
+        # OSPF enrollment gate (which requires a process id) never enrolls the
+        # interface even though ``ospf_area`` is set. When the config has
+        # EXACTLY ONE ``router ospf <id>`` instance, bind that single process id
+        # onto the participating (``ospf_area`` set) interfaces that have no
+        # process id. GUARD: with zero or multiple instances there is no way to
+        # know which process an area-only interface belongs to, so leave it None
+        # — multi-instance disambiguation is the (frozen) entrp half of the CCR.
+        ospf_pids: list[int | str] = []
+        for proc_obj in parse.find_objects(r"^router\s+ospf\s+\d+\b"):
+            pm = re.match(r"^router\s+ospf\s+(\S+)", proc_obj.text)
+            if pm:
+                pid_str = pm.group(1)
+                ospf_pids.append(int(pid_str) if pid_str.isdigit() else pid_str)
+        if len(ospf_pids) == 1:
+            single_pid = ospf_pids[0]
+            for intf_cfg in interfaces:
+                if intf_cfg.ospf_area is not None and intf_cfg.ospf_process_id is None:
+                    intf_cfg.ospf_process_id = single_pid
+
         return interfaces
+
+    def parse_ospf(self) -> list[OSPFConfig]:
+        """Parse OSPF, adding EOS's prefix-form ``network`` statements.
+
+        EOS emits ``network <prefix> area <id>`` under ``router ospf`` in CIDR
+        slash notation — two tokens (prefix, area-id) around ``area`` — whereas
+        the inherited IOS walk matches only the classic three-token
+        ``network <addr> <wildcard> area <id>`` form
+        (syntax-corpus/eos/ospf.yaml: network-area, verified-capture cEOS
+        4.36.1F). The IOS regex never matches the EOS spelling, so the statement
+        was silently DROPPED — and it did not even surface in
+        ``unrecognized_blocks`` because ``network`` is a claimed child of
+        ``router ospf`` (_IOS_KNOWN_CHILD_PATTERNS). Parse the prefix form into
+        the SAME ``OSPFConfig.network_statements`` shape the IOS wildcard form
+        fills — a ``(IPv4Network, area-id)`` tuple — so the engine's network
+        overlap enrollment (igp.py) and any goldens stay consistent. The
+        inherited three-token walk is left intact for mixed configs.
+        """
+        ospf_instances = super().parse_ospf()
+
+        parse = self._get_parse_obj()
+        by_pid: dict[int | str, OSPFConfig] = {
+            inst.process_id: inst for inst in ospf_instances
+        }
+
+        for ospf_obj in parse.find_objects(self._OSPF_PROC_PATTERNS.union):
+            hdr = self._OSPF_PROC_PATTERNS.match(ospf_obj.text)
+            pid_str = hdr.group("pid") if hdr else None
+            if not pid_str:
+                continue
+            pid: int | str = int(pid_str) if pid_str.isdigit() else pid_str
+            inst = by_pid.get(pid)
+            if inst is None:
+                continue
+            existing = set(inst.network_statements)
+            # Prefix form only: exactly ``network <prefix> area <id>`` (the
+            # trailing ``$`` keeps this disjoint from the inherited three-token
+            # wildcard form, which has an extra token before ``area``).
+            for nc in ospf_obj.find_child_objects(
+                r"^\s+network\s+\S+\s+area\s+\S+\s*$"
+            ):
+                m = re.match(r"^\s+network\s+(\S+)\s+area\s+(\S+)\s*$", nc.text)
+                if not m:
+                    continue
+                prefix_str, area_id = m.group(1), m.group(2)
+                try:
+                    net = IPv4Network(prefix_str, strict=False)
+                except ValueError:
+                    # A device-emitted CIDR prefix always parses; this guards
+                    # malformed input only. Leave it unrepresented rather than
+                    # fabricate a statement — it is not silently claimed here.
+                    continue
+                stmt = (net, area_id)
+                if stmt not in existing:
+                    inst.network_statements.append(stmt)
+                    existing.add(stmt)
+
+        return ospf_instances
 
     # VRFs — no override. The header spelling ("vrf instance") is data
     # (_VRF_HEADER_PATTERNS above) and the body vocabulary — description, rd,
@@ -1012,37 +1098,81 @@ class EOSParser(IOSParser):
             return False
         return has_evpn_rt
 
-    def _eos_evpn_activated_targets(self, bgp_obj) -> set[str]:
-        """Peer-group names / neighbor IPs activated under ``address-family evpn``.
+    def _eos_evpn_af_neighbor_policies(self, bgp_obj):
+        """Read every peer-policy line inside EOS ``address-family evpn``.
 
-        EOS activates the overlay with ``neighbor <x> activate`` inside the single
-        ``address-family evpn`` block under ``router bgp`` (``<x>`` is usually the
-        EVPN peer group). The shared ipv4/ipv6 AF walker
-        (``_apply_bgp_af_neighbor_policies``) matches only ``address-family ipv4|ipv6``
-        and keys on neighbor IPs, so neither the ``evpn`` token nor a peer-group
-        target is reached by it — hence this EOS-scoped collector.
+        EOS states the overlay AF as the single-token ``address-family evpn``
+        block under ``router bgp``, and emits both the activation
+        (``neighbor <x> activate``) and the per-hop policy attachments
+        (``neighbor <x> route-map <rm> in|out``, and the rest of the peer-policy
+        vocabulary) inside it. ``<x>`` is the EVPN peer group or a direct neighbor
+        IP. The shared ipv4/ipv6 AF walker (``_apply_bgp_af_neighbor_policies``)
+        matches only ``address-family ipv4|ipv6`` and keys on neighbor IPs, so
+        neither the ``evpn`` token nor a peer-group target is reached by it —
+        hence this EOS-scoped collector.
+
+        Returns ``(policies, activated, unrecognized)``:
+
+        * ``policies`` — ``{target: pg_data}``; ``pg_data`` is the SHARED
+          peer-command dict, filled by ``apply_peer_group_command``, so
+          route-map / prefix-list / filter-list in|out and every other base AF
+          policy key is read HERE in one place, never re-spelled (CCR-0044 guard).
+        * ``activated`` — targets that carried an explicit ``activate`` line.
+        * ``unrecognized`` — raw child lines the shared vocabulary did not claim,
+          so the block never drops content silently — the double-miss CCR-0162
+          closes (dropped AND not surfaced).
         """
-        targets: set[str] = set()
+        policies: dict[str, dict] = {}
+        activated: set[str] = set()
+        unrecognized: list[str] = []
+
+        def _target_data(target: str) -> dict:
+            if target not in policies:
+                data = _default_pg_data(target)
+                data.pop("name", None)
+                policies[target] = data
+            return policies[target]
+
         for af in bgp_obj.find_child_objects(r"^\s+address-family\s+evpn\s*$"):
-            for child in af.find_child_objects(r"^\s+neighbor\s+\S+\s+activate\s*$"):
-                m = re.search(r"^\s+neighbor\s+(\S+)\s+activate\s*$", child.text)
+            for child in af.children:  # direct children of the evpn AF block
+                text = child.text.strip()
+                if not text or text.startswith("!"):
+                    continue
+                # `no ...` / `default ...` withdrawals belong to the tombstone path,
+                # never to the unrecognized channel — mirror the base child-line
+                # walk (``default`` is the CCR-0161 alias of ``no`` for EVPN
+                # removals; the deletion walk emits its AF-removal tombstone).
+                if text in ("no", "default") or text.startswith(("no ", "default ")):
+                    continue
+                m = re.match(r"^neighbor\s+(\S+)\s+(.+?)\s*$", text)
                 if m:
-                    targets.add(m.group(1))
-        return targets
+                    target, cmd = m.group(1), m.group(2)
+                    if cmd == "activate":
+                        activated.add(target)
+                        _target_data(target)  # ensure an entry even if policy-free
+                        continue
+                    if apply_peer_group_command(_target_data(target), cmd):
+                        continue
+                # a non-neighbor line, or a neighbor command the shared vocabulary
+                # does not know → disclose it, do not drop it.
+                unrecognized.append(child.text)
+
+        return policies, activated, unrecognized
 
     def parse_bgp(self) -> list[BGPConfig]:
-        """Shared BGP parse, plus EOS ``address-family evpn`` overlay activation.
+        """Shared BGP parse, plus EOS ``address-family evpn`` overlay policy.
 
         A THIN wrapper — every field is parsed by the inherited
         ``IOSParser.parse_bgp`` (the neighbor / peer-group walks stay shared, so
         the CCR-0044 anti-fork guard holds). It then attaches the one thing the
         shared walk cannot express: EOS's single-token ``address-family evpn``
-        activation, applied to the activated PEER GROUP (the usual EVPN target)
-        or a directly-activated IP neighbor, as
-        ``BGPNeighborAF(afi="l2vpn", safi="evpn")`` (afi-token decision above).
-        The shared ipv4/ipv6 AF walk (``_apply_bgp_af_neighbor_policies``) reaches
-        neither the ``evpn`` token nor peer-group targets, so this fills that gap
-        without re-implementing anything (CCR-0157).
+        block, applied to the activated/policy-bearing PEER GROUP (the usual EVPN
+        target) or a direct IP neighbor, as ``BGPNeighborAF(afi="l2vpn",
+        safi="evpn")`` (afi-token decision above) carrying the block's route-map
+        (and other peer-policy) attachments. The shared ipv4/ipv6 AF walk
+        (``_apply_bgp_af_neighbor_policies``) reaches neither the ``evpn`` token
+        nor peer-group targets, so this fills that gap by REUSING the shared
+        peer-command vocabulary, not re-implementing it (CCR-0157 / CCR-0162).
         """
         bgp_instances = super().parse_bgp()
         parse = self._get_parse_obj()
@@ -1051,8 +1181,9 @@ class EOSParser(IOSParser):
             asn_str = self._extract_match(bgp_obj.text, r"^router\s+bgp\s+(\d+)")
             if not asn_str:
                 continue
-            activated = self._eos_evpn_activated_targets(bgp_obj)
-            if not activated:
+            policies, activated, _unrecognized = self._eos_evpn_af_neighbor_policies(bgp_obj)
+            targets = set(policies) | activated
+            if not targets:
                 continue
             asn = int(asn_str)
             # `address-family evpn` sits at the global process level; apply to the
@@ -1061,24 +1192,84 @@ class EOSParser(IOSParser):
                 if inst.asn != asn or inst.vrf is not None:
                     continue
                 for pg in inst.peer_groups:
-                    if pg.name in activated and not self._has_evpn_af(pg):
-                        pg.address_families.append(
-                            BGPNeighborAF(afi="l2vpn", safi="evpn")
+                    if pg.name in targets:
+                        self._eos_attach_evpn_af(
+                            pg, policies.get(pg.name), pg.name in activated
                         )
                 for nb in inst.neighbors:
-                    if str(nb.peer_ip) in activated and not self._has_evpn_af(nb):
-                        nb.address_families.append(
-                            BGPNeighborAF(afi="l2vpn", safi="evpn")
+                    key = str(nb.peer_ip)
+                    if key in targets:
+                        self._eos_attach_evpn_af(
+                            nb, policies.get(key), key in activated
                         )
         return bgp_instances
 
-    @staticmethod
-    def _has_evpn_af(target) -> bool:
-        """True if a neighbor / peer group already carries the l2vpn/evpn AF."""
-        return any(
-            af.afi == "l2vpn" and af.safi == "evpn"
-            for af in target.address_families
+    def _eos_attach_evpn_af(self, target, pg_data, activated: bool) -> None:
+        """Attach (or enrich) the ``l2vpn/evpn`` AF entry on a peer-group/neighbor.
+
+        ``activated`` records whether an explicit ``neighbor <x> activate`` line
+        appeared: the AF entry's ``activate`` reflects exactly that (EOS emits
+        ``activate`` when the overlay AF is on), so a policy-only appearance does
+        not invent activation state the config never showed (CCR-0162 item 2).
+
+        Only policy fields the config actually set are copied — a bare
+        activation still yields the CCR-0157 shape (route_map_* = None). The
+        vocabulary writes peer-level keys (remote_as, timers, …) with no AF
+        meaning; the ``BGPNeighborAF.model_fields`` filter drops them, so the
+        shared vocabulary can grow without touching this call site.
+        """
+        defaults = _default_pg_data("")
+        fields = {}
+        if pg_data:
+            fields = {
+                k: v
+                for k, v in pg_data.items()
+                if k in BGPNeighborAF.model_fields
+                and k not in ("afi", "safi")
+                and v != defaults.get(k)
+            }
+
+        existing = next(
+            (af for af in target.address_families
+             if af.afi == "l2vpn" and af.safi == "evpn"),
+            None,
         )
+        if existing is None:
+            target.address_families.append(
+                BGPNeighborAF(afi="l2vpn", safi="evpn", activate=activated, **fields)
+            )
+        else:
+            for k, v in fields.items():
+                setattr(existing, k, v)
+            if activated:
+                existing.activate = True
+
+    def _collect_unrecognized_child_lines(self, obj, header: str):
+        """Extend the base direct-child walk into ``address-family evpn``.
+
+        The framework's registry walk inspects only DIRECT children of a claimed
+        top-level block, so lines nested inside the ``router bgp`` →
+        ``address-family evpn`` sub-block are never reached by it — the exact
+        silent-drop channel CCR-0162 closes. For a ``router bgp`` block, descend
+        one level and disclose anything the EVPN AF policy walk did not consume,
+        reusing the SAME collector ``parse_bgp`` uses so "what is recognized" is
+        defined in exactly one place.
+        """
+        flagged = super()._collect_unrecognized_child_lines(obj, header)
+        if re.match(r"^router\s+bgp\b", header):
+            _policies, _activated, unrecognized = self._eos_evpn_af_neighbor_policies(obj)
+            for raw in unrecognized:
+                line = raw.strip()
+                flagged.append(UnrecognizedBlock(
+                    block_header=f"{header} > {line}",
+                    raw_lines=[raw],
+                    best_guess=next(
+                        (label for kw, label in self._BEST_GUESS_KEYWORDS
+                         if kw in line.lower()),
+                        None,
+                    ),
+                ))
+        return flagged
 
     # EOS's process-level ``maximum-paths`` is a process-wide multipath limit — it
     # applies to every address-family, not only the implicit IPv4-unicast one (which
@@ -1759,7 +1950,228 @@ class EOSParser(IOSParser):
                             "field:vpc:peer_keepalive_destination", child
                         )
 
+        # --- EVPN control-plane removals under `router bgp` (CCR-0161) ---
+        # L2VNI (``vlan <id>``), L3VNI (``vrf <name>``) and overlay-AF
+        # deactivations.  Every EOS EVPN removal but ``no neighbor <x> activate``
+        # renders by OMISSION (capture 2026-08-01 cEOS 4.36.1F), so these
+        # tombstones serve PROPOSAL text; the emitted ``no neighbor activate`` line
+        # is handled here too via the shared CCR-0148 AF-removal channel.
+        self._parse_eos_evpn_deletions(parse)
+
         return tombstones
+
+    # EOS EVPN removal-form patterns (CCR-0161) — device-verified on cEOS 4.36.1F
+    # (capture 2026-08-01-ceos-4.36.1F-evpn-deletion-forms.txt).  Every pattern is
+    # END-ANCHORED (``\s*$``) so trailing garbage (``no vlan 10 bogus``,
+    # ``default rd bananas``) fires NO tombstone — the CCR-0145 F2/V-2 hardening
+    # replayed.
+    #
+    # ``default`` is an ALIAS of ``no`` (leading ``(?:no|default)\s+``).  The device
+    # confirms every value-bearing removal here accepts BOTH spellings with the
+    # SAME effect (``default route-target both <rt>`` == ``no route-target both
+    # <rt>``, removal by omission — capture 2026-08-01), so both must emit the
+    # IDENTICAL tombstone.  Only these value-bearing forms are aliased: a
+    # VALUELESS ``default route-target`` is an all-reset (different semantic), out
+    # of scope and deliberately not matched.
+
+    # L2VNI RT under ``router bgp / vlan <id>``: NO trailing ``evpn`` keyword and
+    # ``route-target both`` is kept unexpanded (device-confirmed).
+    _EOS_L2VNI_RT_REMOVAL = re.compile(
+        r"^(?:no|default)\s+route-target\s+(both|import|export)\s+(\S+)\s*$"
+    )
+    # L3VNI RT under ``router bgp / vrf <name>``: the ``evpn`` keyword sits BETWEEN
+    # the direction and the value (unlike NX-OS's trailing ``evpn``).  A plain
+    # ``no route-target import <rt>`` (no ``evpn``) is L3VPN — it does not match here
+    # and is left to the inherited path, never claimed as an EVPN removal.
+    _EOS_L3VNI_RT_REMOVAL = re.compile(
+        r"^(?:no|default)\s+route-target\s+(both|import|export)\s+evpn\s+(\S+)\s*$"
+    )
+    # ``no|default rd [<value>]`` — the optional value is CONSTRAINED to the RD
+    # grammar (``auto`` or a colon-bearing ASN2:NN / ASN4:NN / IPV4:NN), so
+    # ``default rd bananas`` does not clear a real RD (CCR-0145 V-2,
+    # grammar-token-in-value-position).
+    _EOS_RD_REMOVAL = re.compile(
+        r"^(?:no|default)\s+rd(?:\s+(?:auto|\S+:\S+))?\s*$"
+    )
+    # Whole-object deletes as DIRECT children of ``router bgp`` (end-anchored).
+    _EOS_VLAN_REMOVAL = re.compile(r"^(?:no|default)\s+vlan\s+(\d+)\s*$")
+    _EOS_VRF_REMOVAL = re.compile(r"^(?:no|default)\s+vrf\s+(\S+)\s*$")
+    # Overlay deactivation under ``address-family evpn`` — the ONE removal EOS
+    # emits as a literal ``no`` line rather than by omission (``default`` accepted
+    # equivalently, device-confirmed).
+    _EOS_NEIGHBOR_DEACTIVATE = re.compile(
+        r"^(?:no|default)\s+neighbor\s+(\S+)\s+activate\s*$"
+    )
+    # EVPN evidence in a ``router bgp / vrf <name>`` block: any ``route-target …
+    # evpn …`` line (positive, ``no``, OR ``default``).  Discriminates an EVPN
+    # L3VNI block from a plain-L3VPN BGP VRF instance for the ``no|default rd``
+    # case, which carries no ``evpn`` marker of its own.  Mirrors
+    # ``_eos_vrf_block_is_evpn_only`` / ``_eos_vrf_evpn_route_targets`` (CCR-0157
+    # discriminator).
+    _EOS_VRF_EVPN_EVIDENCE = re.compile(
+        r"^(?:(?:no|default)\s+)?route-target\s+(?:both|import|export)\s+evpn\s+\S+\s*$"
+    )
+
+    @staticmethod
+    def _eos_af_removal_scope(name: str) -> str:
+        """``"neighbor"`` when *name* parses as an IP, else ``"peer_group"``.
+
+        EOS ``address-family evpn`` activates either a peer group (the usual EVPN
+        target) or a direct IP neighbor; the removal must key into the matching
+        collection.  A removal snippet may not restate the peer-group definition,
+        so the IP-vs-name shape of ``<x>`` itself is the discriminator (the same
+        signal ``parse_bgp``'s positive path ultimately keys on).
+        """
+        from ipaddress import ip_address
+
+        try:
+            ip_address(name)
+            return "neighbor"
+        except ValueError:
+            return "peer_group"
+
+    def _parse_eos_evpn_deletions(self, parse) -> None:
+        """Queue native ops for EOS EVPN L2VNI/L3VNI/overlay ``no`` removals.
+
+        Emission map (VNI = ``N``, VLAN = ``V``, tenant VRF = ``NAME``, RT = ``X``,
+        direction = ``D``), all under ``router bgp <asn>``:
+
+        L2VNI (``vlan <id>`` sub-block, keyed by VLAN; VNI joined from
+        ``interface Vxlan1`` ``vxlan vlan <id> vni <n>``):
+
+        * ``vlan V / no route-target D X`` (no ``evpn`` kw)
+          -> ``field:evpn:l2vnis:N:route_target_D:X`` when the VLAN resolves to a
+          VNI, else ``field:evpn:l2vnis_by_vlan:V:route_target_D:X`` (LIST_REMOVE;
+          ``both`` clears both lists in the engine accessor).
+        * ``vlan V / no rd``  -> ``…:rd`` (UNSET) with the same VNI/VLAN keying.
+        * ``no vlan V`` (direct child) -> ``field:evpn:l2vnis:N`` /
+          ``field:evpn:l2vnis_by_vlan:V`` (OBJECT_DELETE).
+
+        L3VNI (``vrf <name>`` sub-block, keyed by tenant VRF — the VNI lives on
+        ``interface Vxlan1`` and is not restated on the removal, so these are
+        VRF-NAME-keyed and the engine resolves them against the baseline's L3VNIs
+        by ``.vrf``, exactly like the NX-OS ``l3vnis_by_vrf`` fallback):
+
+        * ``vrf NAME / no route-target D evpn X`` -> ``field:evpn:l3vnis_by_vrf:
+          NAME:route_target_D:X`` (LIST_REMOVE).  The ``evpn`` keyword IS the
+          discriminator; a plain ``no route-target D X`` is L3VPN and is not
+          matched here.
+        * ``vrf NAME / no rd``, but ONLY when the block carries EVPN evidence (a
+          ``route-target … evpn`` line, positive or negated) -> ``field:evpn:
+          l3vnis_by_vrf:NAME:rd`` (UNSET).  A plain-L3VPN VRF's ``no rd`` has no
+          ``evpn`` marker and is left to the inherited path.
+        * ``no vrf NAME`` (direct child) -> ``field:evpn:l3vnis_by_vrf:NAME``
+          (OBJECT_DELETE), emitted unconditionally — the delete line carries no
+          block to inspect, and the engine's by-vrf resolution is itself the
+          discriminator (a non-L3VNI VRF finds no L3VNI and the delete no-ops).
+
+        Overlay (``address-family evpn`` sub-block):
+
+        * ``no neighbor <x> activate`` -> the CCR-0148 per-neighbor/peer-group AF
+          removal op for ``(l2vpn, evpn)`` (``_emit_bgp_neighbor_af_removal``),
+          scope decided by the IP-vs-name shape of ``<x>``.
+
+        All ``field:evpn:…`` tombstones fall through change-IR to the engine's
+        deletion handlers; the ``l2vnis_by_vlan`` shapes and the
+        ``l3vnis_by_vrf`` whole-delete are the CCR-0161 additions to
+        ``_TOP_TOMBSTONE_VERBS``.  Native BGP ops are initialised by ``parse_bgp``
+        (runs earlier); guard defensively in case of an early-return parse.
+        """
+        if not hasattr(self, "_pending_native_bgp_ops"):
+            self._pending_native_bgp_ops = []
+
+        # VLAN->VNI joins from interface Vxlan1 — may be ABSENT in a partial
+        # snippet, in which case the removal falls back to VLAN-id keying.
+        vlan_to_vni: dict[int, int] = {}
+        vxlan = self.parse_vxlan()
+        if vxlan is not None:
+            for mapping in vxlan.vni_mappings:
+                if mapping.vlan is not None:
+                    vlan_to_vni.setdefault(mapping.vlan, mapping.vni)
+
+        for bgp_obj in parse.find_objects(r"^router\s+bgp\s+(\d+)"):
+            asn_str = self._extract_match(bgp_obj.text, r"^router\s+bgp\s+(\d+)")
+            if not asn_str:
+                continue
+            asn = int(asn_str)
+
+            # --- whole-object deletes (direct children of `router bgp`) ---
+            for child in bgp_obj.children:
+                ct = child.text.strip()
+                m = self._EOS_VLAN_REMOVAL.match(ct)
+                if m:
+                    vlan = m.group(1)
+                    vni = vlan_to_vni.get(int(vlan))
+                    self._queue_native_keyed_removal(
+                        f"field:evpn:l2vnis:{vni}" if vni is not None
+                        else f"field:evpn:l2vnis_by_vlan:{vlan}",
+                        child,
+                    )
+                    continue
+                m = self._EOS_VRF_REMOVAL.match(ct)
+                if m:
+                    self._queue_native_keyed_removal(
+                        f"field:evpn:l3vnis_by_vrf:{m.group(1)}", child
+                    )
+
+            # --- L2VNI RT/rd removals nested under `vlan <id>` sub-blocks ---
+            for vlan_obj in bgp_obj.find_child_objects(r"^\s+vlan\s+\d+\s*$"):
+                vid = self._extract_match(vlan_obj.text, r"^\s+vlan\s+(\d+)")
+                if vid is None:
+                    continue
+                vni = vlan_to_vni.get(int(vid))
+                key = (
+                    f"field:evpn:l2vnis:{vni}" if vni is not None
+                    else f"field:evpn:l2vnis_by_vlan:{vid}"
+                )
+                for sub in vlan_obj.children:
+                    st = sub.text.strip()
+                    rtm = self._EOS_L2VNI_RT_REMOVAL.match(st)
+                    if rtm:
+                        self._queue_native_keyed_removal(
+                            f"{key}:route_target_{rtm.group(1)}:{rtm.group(2)}",
+                            sub,
+                        )
+                        continue
+                    if self._EOS_RD_REMOVAL.match(st):
+                        self._queue_native_keyed_removal(f"{key}:rd", sub)
+
+            # --- L3VNI RT/rd removals nested under `vrf <name>` sub-blocks ---
+            for vrf_name, vrf_obj in self._iter_router_vrf_blocks(bgp_obj):
+                block_is_evpn = any(
+                    self._EOS_VRF_EVPN_EVIDENCE.match(c.text.strip())
+                    for c in vrf_obj.children
+                )
+                for sub in vrf_obj.children:
+                    st = sub.text.strip()
+                    rtm = self._EOS_L3VNI_RT_REMOVAL.match(st)
+                    if rtm:
+                        self._queue_native_keyed_removal(
+                            f"field:evpn:l3vnis_by_vrf:{vrf_name}"
+                            f":route_target_{rtm.group(1)}:{rtm.group(2)}",
+                            sub,
+                        )
+                        continue
+                    if block_is_evpn and self._EOS_RD_REMOVAL.match(st):
+                        self._queue_native_keyed_removal(
+                            f"field:evpn:l3vnis_by_vrf:{vrf_name}:rd", sub
+                        )
+
+            # --- overlay deactivation under `address-family evpn` ---
+            for af in bgp_obj.find_child_objects(r"^\s+address-family\s+evpn\s*$"):
+                for sub in af.children:
+                    m = self._EOS_NEIGHBOR_DEACTIVATE.match(sub.text.strip())
+                    if m:
+                        name = m.group(1)
+                        self._emit_bgp_neighbor_af_removal(
+                            name,
+                            self._eos_af_removal_scope(name),
+                            "l2vpn",
+                            "evpn",
+                            sub,
+                            asn,
+                            None,
+                        )
 
     # -------------------------------------------------------------------
     # MLAG → VPCConfig

@@ -1048,7 +1048,7 @@ class BaseParser(ABC):
 # Shared BGP peer-group attribute parser
 # ---------------------------------------------------------------------------
 
-def apply_peer_group_command(pg_data: dict, command: str) -> None:
+def apply_peer_group_command(pg_data: dict, command: str) -> bool:
     """Apply a single BGP peer-group attribute line to *pg_data* in-place.
 
     *command* is the attribute text after the peer-group name — e.g.
@@ -1059,6 +1059,14 @@ def apply_peer_group_command(pg_data: dict, command: str) -> None:
 
     *pg_data* must already have all BGPPeerGroup fields initialised to their
     defaults (None / False) before the first call.
+
+    Returns ``True`` if *command* matched a known peer-command keyword (even if
+    its value was malformed and no field was written), ``False`` otherwise. This
+    makes the vocabulary the single authority on what counts as a recognized
+    peer/AF policy line, so callers that must disclose unparsed content (EOS's
+    ``address-family evpn`` unrecognized channel, CCR-0162) read recognition
+    from here rather than re-listing the keywords. Existing callers ignore the
+    return and are unaffected.
     """
     import re as _re
 
@@ -1171,6 +1179,11 @@ def apply_peer_group_command(pg_data: dict, command: str) -> None:
                 pass
             pg_data["local_as_no_prepend"] = "no-prepend" in la_parts
             pg_data["local_as_replace_as"] = "replace-as" in la_parts
+
+    else:
+        return False
+
+    return True
 
 
 def _default_pg_data(name: str) -> dict:
