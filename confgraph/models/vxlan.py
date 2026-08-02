@@ -10,6 +10,28 @@ class VXLANVniMapping(BaseModel):
     vni: int = Field(..., description="VXLAN Network Identifier")
     vlan: int | None = Field(default=None, description="VLAN ID mapped to this VNI (L2 VNI)")
     vrf: str | None = Field(default=None, description="VRF mapped to this VNI (L3 VNI)")
+    binding_declared: bool = Field(
+        default=False,
+        description=(
+            "True when the config line ITSELF binds the subject (vlan or vrf) to "
+            "this VNI — EOS 'vxlan vlan <id> vni <n>' / 'vxlan vrf <name> vni <n>' "
+            "on interface Vxlan1, where the device enforces one VNI per subject "
+            "and re-typing the line REPLACES the binding. False when the subject "
+            "was JOINED onto the entry by the parser from another block (NX-OS "
+            "vn-segment → nve member): a join artifact is not "
+            "subject-authoritative and consumers must not treat it as a "
+            "declaration (CCR-0166)."
+        ),
+    )
+    associate_vrf: bool = Field(
+        default=False,
+        description=(
+            "NX-OS 'member vni <n> associate-vrf': this VNI is an L3VNI whose "
+            "VRF binding lives elsewhere ('vrf context ... vni <n>'). Typed "
+            "replacement for the retired '(L3)' vrf sentinel (CCR-0166); vrf "
+            "stays None on these entries."
+        ),
+    )
     mcast_group: str | None = Field(default=None, description="Multicast group for BUM traffic replication")
     suppress_arp: bool = Field(default=False, description="ARP suppression enabled on this VNI")
     ingress_replication: str | None = Field(

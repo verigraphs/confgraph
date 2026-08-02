@@ -114,7 +114,10 @@ class TestN3VXLANCompleteness:
             "  member vni 50001 associate-vrf\n"
         )
         assert pc.vxlan is not None
-        assert pc.vxlan.vni_mappings[0].vrf == "(L3)"
+        # CCR-0166: the "(L3)" vrf sentinel is retired — L3-ness is the typed
+        # associate_vrf flag; vrf stays None.
+        assert pc.vxlan.vni_mappings[0].vrf is None
+        assert pc.vxlan.vni_mappings[0].associate_vrf is True
         assert pc.vxlan.vni_mappings[0].vlan is None
 
     def test_no_vn_segment_vlan_is_none(self):
