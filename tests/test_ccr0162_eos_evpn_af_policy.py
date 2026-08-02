@@ -150,4 +150,7 @@ def test_policy_only_peer_group_gets_af_without_inventing_activation():
     pg = next(pg for pg in bgp.peer_groups if pg.name == "EVPN-OVERLAY")
     af = _evpn_af(pg)
     assert af.route_map_out == "RM-EVPN-OUT"
-    assert af.activate is False
+    # CCR-0165 tri-state: a policy-only line leaves activation UNSTATED
+    # (None), not deactivated (False) — the intent of this test (no invented
+    # activation) is unchanged; the two-state False was the CCR-0165 defect.
+    assert af.activate is None

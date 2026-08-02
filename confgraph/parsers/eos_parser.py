@@ -1236,7 +1236,11 @@ class EOSParser(IOSParser):
         )
         if existing is None:
             target.address_families.append(
-                BGPNeighborAF(afi="l2vpn", safi="evpn", activate=activated, **fields)
+                # CCR-0165: a policy-only line leaves activation UNSTATED (None) so a
+                # partial-snippet restate cannot merge as a deactivation; an
+                # explicit ``activate`` line asserts True.
+                BGPNeighborAF(afi="l2vpn", safi="evpn",
+                              activate=True if activated else None, **fields)
             )
         else:
             for k, v in fields.items():
