@@ -1477,7 +1477,11 @@ class NXOSParser(IOSParser):
                     vni_mappings.append(VXLANVniMapping(
                         vni=vni,
                         vlan=vni_to_vlan.get(vni),
-                        vrf="(L3)" if is_l3 else None,
+                        # vlan is a vn-segment JOIN, not a declaration on this
+                        # line — binding_declared stays False (CCR-0166).
+                        # associate_vrf replaces the retired "(L3)" vrf
+                        # sentinel; vrf stays None.
+                        associate_vrf=is_l3,
                         mcast_group=mcast_group,
                         suppress_arp=suppress_arp,
                         ingress_replication=ingress_replication,
@@ -1535,9 +1539,9 @@ class NXOSParser(IOSParser):
            :meth:`parse_vrfs` (untouched — no hijack).
 
         The NVE binding ``member vni <n> associate-vrf`` (parsed by
-        :meth:`parse_vxlan`, which flags the mapping ``vrf == "(L3)"``) is reused
-        as the ``associate_vrf`` signal — that VNI is fabric-associated as an
-        L3VNI.
+        :meth:`parse_vxlan`, which sets the mapping's typed ``associate_vrf``
+        flag — CCR-0166, formerly the ``"(L3)"`` vrf sentinel) is reused as the
+        ``associate_vrf`` signal — that VNI is fabric-associated as an L3VNI.
 
         JOIN: one :class:`EVPNL3VNI` per VNI number. ``rd``, route-targets and
         ``vrf`` come from the ``vrf context`` source (``both`` → both lists,
@@ -1662,13 +1666,15 @@ class NXOSParser(IOSParser):
                     line_numbers.append(child.linenum)
 
         # --- Source 3: NVE `member vni <n> associate-vrf` (reuse parse_vxlan) ---
-        # parse_vxlan already flags an L3VNI membership as `vrf == "(L3)"`; reuse
-        # that signal rather than re-parsing the NVE line. Enriches known L3VNIs
-        # only (an associate-vrf line alone does not synthesise a control-plane).
+        # parse_vxlan already flags an L3VNI membership via the typed
+        # `associate_vrf` field (CCR-0166; formerly the "(L3)" vrf sentinel);
+        # reuse that signal rather than re-parsing the NVE line. Enriches known
+        # L3VNIs only (an associate-vrf line alone does not synthesise a
+        # control-plane).
         vxlan = self.parse_vxlan()
         if vxlan is not None:
             for mapping in vxlan.vni_mappings:
-                if mapping.vrf == "(L3)" and mapping.vni in l3_by_vni:
+                if mapping.associate_vrf and mapping.vni in l3_by_vni:
                     l3_by_vni[mapping.vni]["associate_vrf"] = True
 
         if not evpn_objs and not l3_by_vni:

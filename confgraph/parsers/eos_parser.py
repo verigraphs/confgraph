@@ -1644,11 +1644,16 @@ class EOSParser(IOSParser):
                 udp_port = int(m.group(1))
                 continue
 
-            # "vxlan vlan N vni M" and EOS >= 4.27 "vxlan vlan add N vni M"
+            # "vxlan vlan N vni M" and EOS >= 4.27 "vxlan vlan add N vni M".
+            # binding_declared: the line ITSELF is the device's binding of the
+            # subject to the VNI (one VNI per vlan/vrf; re-typing replaces) —
+            # unlike the NX-OS vn-segment JOIN, which is a parser artifact
+            # (CCR-0166).
             m = re.match(r"vxlan\s+vlan\s+(?:add\s+)?(\d+)\s+vni\s+(\d+)", t)
             if m:
                 vni_mappings.append(VXLANVniMapping(
                     vni=int(m.group(2)), vlan=int(m.group(1)),
+                    binding_declared=True,
                 ))
                 continue
 
@@ -1656,6 +1661,7 @@ class EOSParser(IOSParser):
             if m:
                 vni_mappings.append(VXLANVniMapping(
                     vni=int(m.group(2)), vrf=m.group(1),
+                    binding_declared=True,
                 ))
                 continue
 

@@ -47,7 +47,14 @@ from confgraph.parsers.panos_parser import PANOSParser
 # Also under 4: the shared IOS/EOS AF walk no longer emits an EMPTY BGPNeighborAF
 # for a peer whose only AF-block lines are vocabulary-invisible (13 such commands
 # measured) — deliberate; a real config's ``activate`` line keeps the entry.
-PARSER_BEHAVIOR_VERSION: int = 4
+# 5 (CCR-0166): ``VXLANVniMapping`` distinguishes DECLARED bindings from parser
+# joins — new ``binding_declared`` (True on EOS's two Vxlan1 binding forms) and
+# ``associate_vrf`` (typed; NX-OS L3VNI membership) fields, and the NX-OS
+# ``"(L3)"`` vrf sentinel is RETIRED (those entries now parse vrf=None,
+# associate_vrf=True). Observable parse output moves for every NX-OS VTEP with
+# an associate-vrf member; schema also moves, but entrp's schema-less
+# ``digest_key()`` only moves on pbv — same posture as 2/3/4.
+PARSER_BEHAVIOR_VERSION: int = 5
 
 __all__ = [
     "BaseParser",

@@ -231,7 +231,7 @@ interface nve1
 - Per-VNI multicast group
 - Per-VNI ARP suppression
 - Per-VNI ingress-replication mode (CCR-0087): `ingress-replication protocol bgp` → `VXLANVniMapping.ingress_replication`; static head-end `peer-ip <ip>` lines → `ingress_replication_peers` (doc-grounded, parsed defensively)
-- L3 VNI (`associate-vrf`; the mapping is flagged `vrf == "(L3)"` and reused by `parse_evpn()`)
+- L3 VNI (`associate-vrf`; the mapping carries the typed `VXLANVniMapping.associate_vrf` flag — CCR-0166, the `"(L3)"` vrf sentinel is retired — and is reused by `parse_evpn()`)
 
 **Parsing Status:** ✅ Overridden — `parse_vxlan()` handles NVE interfaces, `vn-segment` VLAN mappings, and ingress-replication mode
 
@@ -266,7 +266,7 @@ interface nve1
 **NX-OS-Specific Behavior (CCR-0087, CCR-0118):**
 - **L2VNI (MAC-VRF)** lives under the top-level `evpn` block as `vni <n> l2` → `EVPNConfig.l2vnis` (`EVPNL2VNI`: rd + route-target import/export). There is **no** `vni <n> l3` form under `evpn`.
 - **L3VNI** control-plane lives under `vrf context`: the `vni <n>` declaration (SVI-less mode spells it `vni <n> L3`) ties the L3VNI to its tenant VRF; the shared `rd` and the **`evpn`-suffixed** per-AF route-targets (`route-target both <rt> evpn`) are its EVPN RD/RTs → `EVPNConfig.l3vnis` (`EVPNL3VNI`). Plain (non-`evpn`) route-targets are left entirely to `parse_vrfs`.
-- The NVE `member vni <n> associate-vrf` binding (from `parse_vxlan`, mapping flagged `vrf == "(L3)"`) sets `EVPNL3VNI.associate_vrf`. L3VNIs are joined one-per-VNI across the `vrf context` source and the NVE signal.
+- The NVE `member vni <n> associate-vrf` binding (from `parse_vxlan`, mapping's typed `associate_vrf` flag — CCR-0166) sets `EVPNL3VNI.associate_vrf`. L3VNIs are joined one-per-VNI across the `vrf context` source and the NVE signal.
 - `route-target both <rt>` populates **both** import and export lists; literal `auto` is preserved.
 
 **Doc-grounded caveat (CCR-0118):** the L2VNI form is device-verified (n9kv 10.5(5)); the L3VNI `vrf context` `rd` / `route-target ... evpn` block is grounded in the Cisco Nexus 9000 VXLAN Config Guide 10.5(x), not a device readback. All fields are optional so partial (e.g. vni-only) declarations still parse.
