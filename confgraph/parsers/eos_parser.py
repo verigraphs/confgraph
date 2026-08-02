@@ -1138,9 +1138,11 @@ class EOSParser(IOSParser):
                 text = child.text.strip()
                 if not text or text.startswith("!"):
                     continue
-                # `no ...` withdrawals belong to the tombstone path, never to the
-                # unrecognized channel — mirror the base child-line walk.
-                if text == "no" or text.startswith("no "):
+                # `no ...` / `default ...` withdrawals belong to the tombstone path,
+                # never to the unrecognized channel — mirror the base child-line
+                # walk (``default`` is the CCR-0161 alias of ``no`` for EVPN
+                # removals; the deletion walk emits its AF-removal tombstone).
+                if text in ("no", "default") or text.startswith(("no ", "default ")):
                     continue
                 m = re.match(r"^neighbor\s+(\S+)\s+(.+?)\s*$", text)
                 if m:
@@ -1948,7 +1950,228 @@ class EOSParser(IOSParser):
                             "field:vpc:peer_keepalive_destination", child
                         )
 
+        # --- EVPN control-plane removals under `router bgp` (CCR-0161) ---
+        # L2VNI (``vlan <id>``), L3VNI (``vrf <name>``) and overlay-AF
+        # deactivations.  Every EOS EVPN removal but ``no neighbor <x> activate``
+        # renders by OMISSION (capture 2026-08-01 cEOS 4.36.1F), so these
+        # tombstones serve PROPOSAL text; the emitted ``no neighbor activate`` line
+        # is handled here too via the shared CCR-0148 AF-removal channel.
+        self._parse_eos_evpn_deletions(parse)
+
         return tombstones
+
+    # EOS EVPN removal-form patterns (CCR-0161) — device-verified on cEOS 4.36.1F
+    # (capture 2026-08-01-ceos-4.36.1F-evpn-deletion-forms.txt).  Every pattern is
+    # END-ANCHORED (``\s*$``) so trailing garbage (``no vlan 10 bogus``,
+    # ``default rd bananas``) fires NO tombstone — the CCR-0145 F2/V-2 hardening
+    # replayed.
+    #
+    # ``default`` is an ALIAS of ``no`` (leading ``(?:no|default)\s+``).  The device
+    # confirms every value-bearing removal here accepts BOTH spellings with the
+    # SAME effect (``default route-target both <rt>`` == ``no route-target both
+    # <rt>``, removal by omission — capture 2026-08-01), so both must emit the
+    # IDENTICAL tombstone.  Only these value-bearing forms are aliased: a
+    # VALUELESS ``default route-target`` is an all-reset (different semantic), out
+    # of scope and deliberately not matched.
+
+    # L2VNI RT under ``router bgp / vlan <id>``: NO trailing ``evpn`` keyword and
+    # ``route-target both`` is kept unexpanded (device-confirmed).
+    _EOS_L2VNI_RT_REMOVAL = re.compile(
+        r"^(?:no|default)\s+route-target\s+(both|import|export)\s+(\S+)\s*$"
+    )
+    # L3VNI RT under ``router bgp / vrf <name>``: the ``evpn`` keyword sits BETWEEN
+    # the direction and the value (unlike NX-OS's trailing ``evpn``).  A plain
+    # ``no route-target import <rt>`` (no ``evpn``) is L3VPN — it does not match here
+    # and is left to the inherited path, never claimed as an EVPN removal.
+    _EOS_L3VNI_RT_REMOVAL = re.compile(
+        r"^(?:no|default)\s+route-target\s+(both|import|export)\s+evpn\s+(\S+)\s*$"
+    )
+    # ``no|default rd [<value>]`` — the optional value is CONSTRAINED to the RD
+    # grammar (``auto`` or a colon-bearing ASN2:NN / ASN4:NN / IPV4:NN), so
+    # ``default rd bananas`` does not clear a real RD (CCR-0145 V-2,
+    # grammar-token-in-value-position).
+    _EOS_RD_REMOVAL = re.compile(
+        r"^(?:no|default)\s+rd(?:\s+(?:auto|\S+:\S+))?\s*$"
+    )
+    # Whole-object deletes as DIRECT children of ``router bgp`` (end-anchored).
+    _EOS_VLAN_REMOVAL = re.compile(r"^(?:no|default)\s+vlan\s+(\d+)\s*$")
+    _EOS_VRF_REMOVAL = re.compile(r"^(?:no|default)\s+vrf\s+(\S+)\s*$")
+    # Overlay deactivation under ``address-family evpn`` — the ONE removal EOS
+    # emits as a literal ``no`` line rather than by omission (``default`` accepted
+    # equivalently, device-confirmed).
+    _EOS_NEIGHBOR_DEACTIVATE = re.compile(
+        r"^(?:no|default)\s+neighbor\s+(\S+)\s+activate\s*$"
+    )
+    # EVPN evidence in a ``router bgp / vrf <name>`` block: any ``route-target …
+    # evpn …`` line (positive, ``no``, OR ``default``).  Discriminates an EVPN
+    # L3VNI block from a plain-L3VPN BGP VRF instance for the ``no|default rd``
+    # case, which carries no ``evpn`` marker of its own.  Mirrors
+    # ``_eos_vrf_block_is_evpn_only`` / ``_eos_vrf_evpn_route_targets`` (CCR-0157
+    # discriminator).
+    _EOS_VRF_EVPN_EVIDENCE = re.compile(
+        r"^(?:(?:no|default)\s+)?route-target\s+(?:both|import|export)\s+evpn\s+\S+\s*$"
+    )
+
+    @staticmethod
+    def _eos_af_removal_scope(name: str) -> str:
+        """``"neighbor"`` when *name* parses as an IP, else ``"peer_group"``.
+
+        EOS ``address-family evpn`` activates either a peer group (the usual EVPN
+        target) or a direct IP neighbor; the removal must key into the matching
+        collection.  A removal snippet may not restate the peer-group definition,
+        so the IP-vs-name shape of ``<x>`` itself is the discriminator (the same
+        signal ``parse_bgp``'s positive path ultimately keys on).
+        """
+        from ipaddress import ip_address
+
+        try:
+            ip_address(name)
+            return "neighbor"
+        except ValueError:
+            return "peer_group"
+
+    def _parse_eos_evpn_deletions(self, parse) -> None:
+        """Queue native ops for EOS EVPN L2VNI/L3VNI/overlay ``no`` removals.
+
+        Emission map (VNI = ``N``, VLAN = ``V``, tenant VRF = ``NAME``, RT = ``X``,
+        direction = ``D``), all under ``router bgp <asn>``:
+
+        L2VNI (``vlan <id>`` sub-block, keyed by VLAN; VNI joined from
+        ``interface Vxlan1`` ``vxlan vlan <id> vni <n>``):
+
+        * ``vlan V / no route-target D X`` (no ``evpn`` kw)
+          -> ``field:evpn:l2vnis:N:route_target_D:X`` when the VLAN resolves to a
+          VNI, else ``field:evpn:l2vnis_by_vlan:V:route_target_D:X`` (LIST_REMOVE;
+          ``both`` clears both lists in the engine accessor).
+        * ``vlan V / no rd``  -> ``…:rd`` (UNSET) with the same VNI/VLAN keying.
+        * ``no vlan V`` (direct child) -> ``field:evpn:l2vnis:N`` /
+          ``field:evpn:l2vnis_by_vlan:V`` (OBJECT_DELETE).
+
+        L3VNI (``vrf <name>`` sub-block, keyed by tenant VRF — the VNI lives on
+        ``interface Vxlan1`` and is not restated on the removal, so these are
+        VRF-NAME-keyed and the engine resolves them against the baseline's L3VNIs
+        by ``.vrf``, exactly like the NX-OS ``l3vnis_by_vrf`` fallback):
+
+        * ``vrf NAME / no route-target D evpn X`` -> ``field:evpn:l3vnis_by_vrf:
+          NAME:route_target_D:X`` (LIST_REMOVE).  The ``evpn`` keyword IS the
+          discriminator; a plain ``no route-target D X`` is L3VPN and is not
+          matched here.
+        * ``vrf NAME / no rd``, but ONLY when the block carries EVPN evidence (a
+          ``route-target … evpn`` line, positive or negated) -> ``field:evpn:
+          l3vnis_by_vrf:NAME:rd`` (UNSET).  A plain-L3VPN VRF's ``no rd`` has no
+          ``evpn`` marker and is left to the inherited path.
+        * ``no vrf NAME`` (direct child) -> ``field:evpn:l3vnis_by_vrf:NAME``
+          (OBJECT_DELETE), emitted unconditionally — the delete line carries no
+          block to inspect, and the engine's by-vrf resolution is itself the
+          discriminator (a non-L3VNI VRF finds no L3VNI and the delete no-ops).
+
+        Overlay (``address-family evpn`` sub-block):
+
+        * ``no neighbor <x> activate`` -> the CCR-0148 per-neighbor/peer-group AF
+          removal op for ``(l2vpn, evpn)`` (``_emit_bgp_neighbor_af_removal``),
+          scope decided by the IP-vs-name shape of ``<x>``.
+
+        All ``field:evpn:…`` tombstones fall through change-IR to the engine's
+        deletion handlers; the ``l2vnis_by_vlan`` shapes and the
+        ``l3vnis_by_vrf`` whole-delete are the CCR-0161 additions to
+        ``_TOP_TOMBSTONE_VERBS``.  Native BGP ops are initialised by ``parse_bgp``
+        (runs earlier); guard defensively in case of an early-return parse.
+        """
+        if not hasattr(self, "_pending_native_bgp_ops"):
+            self._pending_native_bgp_ops = []
+
+        # VLAN->VNI joins from interface Vxlan1 — may be ABSENT in a partial
+        # snippet, in which case the removal falls back to VLAN-id keying.
+        vlan_to_vni: dict[int, int] = {}
+        vxlan = self.parse_vxlan()
+        if vxlan is not None:
+            for mapping in vxlan.vni_mappings:
+                if mapping.vlan is not None:
+                    vlan_to_vni.setdefault(mapping.vlan, mapping.vni)
+
+        for bgp_obj in parse.find_objects(r"^router\s+bgp\s+(\d+)"):
+            asn_str = self._extract_match(bgp_obj.text, r"^router\s+bgp\s+(\d+)")
+            if not asn_str:
+                continue
+            asn = int(asn_str)
+
+            # --- whole-object deletes (direct children of `router bgp`) ---
+            for child in bgp_obj.children:
+                ct = child.text.strip()
+                m = self._EOS_VLAN_REMOVAL.match(ct)
+                if m:
+                    vlan = m.group(1)
+                    vni = vlan_to_vni.get(int(vlan))
+                    self._queue_native_keyed_removal(
+                        f"field:evpn:l2vnis:{vni}" if vni is not None
+                        else f"field:evpn:l2vnis_by_vlan:{vlan}",
+                        child,
+                    )
+                    continue
+                m = self._EOS_VRF_REMOVAL.match(ct)
+                if m:
+                    self._queue_native_keyed_removal(
+                        f"field:evpn:l3vnis_by_vrf:{m.group(1)}", child
+                    )
+
+            # --- L2VNI RT/rd removals nested under `vlan <id>` sub-blocks ---
+            for vlan_obj in bgp_obj.find_child_objects(r"^\s+vlan\s+\d+\s*$"):
+                vid = self._extract_match(vlan_obj.text, r"^\s+vlan\s+(\d+)")
+                if vid is None:
+                    continue
+                vni = vlan_to_vni.get(int(vid))
+                key = (
+                    f"field:evpn:l2vnis:{vni}" if vni is not None
+                    else f"field:evpn:l2vnis_by_vlan:{vid}"
+                )
+                for sub in vlan_obj.children:
+                    st = sub.text.strip()
+                    rtm = self._EOS_L2VNI_RT_REMOVAL.match(st)
+                    if rtm:
+                        self._queue_native_keyed_removal(
+                            f"{key}:route_target_{rtm.group(1)}:{rtm.group(2)}",
+                            sub,
+                        )
+                        continue
+                    if self._EOS_RD_REMOVAL.match(st):
+                        self._queue_native_keyed_removal(f"{key}:rd", sub)
+
+            # --- L3VNI RT/rd removals nested under `vrf <name>` sub-blocks ---
+            for vrf_name, vrf_obj in self._iter_router_vrf_blocks(bgp_obj):
+                block_is_evpn = any(
+                    self._EOS_VRF_EVPN_EVIDENCE.match(c.text.strip())
+                    for c in vrf_obj.children
+                )
+                for sub in vrf_obj.children:
+                    st = sub.text.strip()
+                    rtm = self._EOS_L3VNI_RT_REMOVAL.match(st)
+                    if rtm:
+                        self._queue_native_keyed_removal(
+                            f"field:evpn:l3vnis_by_vrf:{vrf_name}"
+                            f":route_target_{rtm.group(1)}:{rtm.group(2)}",
+                            sub,
+                        )
+                        continue
+                    if block_is_evpn and self._EOS_RD_REMOVAL.match(st):
+                        self._queue_native_keyed_removal(
+                            f"field:evpn:l3vnis_by_vrf:{vrf_name}:rd", sub
+                        )
+
+            # --- overlay deactivation under `address-family evpn` ---
+            for af in bgp_obj.find_child_objects(r"^\s+address-family\s+evpn\s*$"):
+                for sub in af.children:
+                    m = self._EOS_NEIGHBOR_DEACTIVATE.match(sub.text.strip())
+                    if m:
+                        name = m.group(1)
+                        self._emit_bgp_neighbor_af_removal(
+                            name,
+                            self._eos_af_removal_scope(name),
+                            "l2vpn",
+                            "evpn",
+                            sub,
+                            asn,
+                            None,
+                        )
 
     # -------------------------------------------------------------------
     # MLAG → VPCConfig

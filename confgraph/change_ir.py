@@ -324,6 +324,33 @@ _TOP_TOMBSTONE_VERBS: tuple[tuple[re.Pattern[str], Verb], ...] = (
         Verb.LIST_REMOVE,
     ),
     (re.compile(r"^field:evpn:l3vnis_by_vrf:[^:]+:rd$"), Verb.UNSET),
+    # Whole-L3VNI delete, VRF-NAME-keyed (CCR-0161): EOS ``router bgp / no vrf
+    # NAME`` names the removed L3VNI by tenant VRF, not by VNI (the VNI lives on
+    # ``interface Vxlan1``, absent from the delete line).  The engine resolves the
+    # name against the baseline's L3VNIs by ``.vrf``; a plain-L3VPN VRF finds no
+    # L3VNI and the delete is a no-op.  The existing ``l3vnis_by_vrf`` rows above
+    # are RT/rd only — this is the whole-entry row they lacked.  Disjoint from the
+    # ``l3vnis`` VNI-keyed OBJECT_DELETE (``l3vnis_by_vrf`` is not ``l3vnis`` + ``:``);
+    # MUST follow the ``:rd$``/``route_target_`` rows (specific -> generic).
+    (re.compile(r"^field:evpn:l3vnis_by_vrf:[^:]+$"), Verb.OBJECT_DELETE),
+    # BY-VLAN fallback (CCR-0161): the EOS L2VNI mirror of the ``l3vnis_by_vrf``
+    # by-vrf fallback.  An EOS L2VNI is keyed by VLAN id under ``router bgp / vlan
+    # <id>``; its VNI is bound on ``interface Vxlan1`` (``vxlan vlan <id> vni <n>``).
+    # When a PARTIAL-SNIPPET proposal carries the ``no route-target``/``no rd``/``no
+    # vlan`` without that Vxlan1 mapping, the VNI cannot be resolved, so the removal
+    # is VLAN-keyed and the engine resolves it against the baseline's L2VNIs by the
+    # VLAN binding.  The VLAN segment is numeric (colon-free); the RT value tail may
+    # carry a colon.  Cannot collide with the VNI-keyed ``l2vnis`` rows above
+    # (``l2vnis_by_vlan`` is not ``l2vnis`` followed by ``:``).  Order specific ->
+    # generic (RT, rd, then whole-entry).
+    (
+        re.compile(
+            r"^field:evpn:l2vnis_by_vlan:[^:]+:route_target_(import|export|both):"
+        ),
+        Verb.LIST_REMOVE,
+    ),
+    (re.compile(r"^field:evpn:l2vnis_by_vlan:[^:]+:rd$"), Verb.UNSET),
+    (re.compile(r"^field:evpn:l2vnis_by_vlan:[^:]+$"), Verb.OBJECT_DELETE),
     # Service entity removals — WI-8 (top-level keyed collections)
     (re.compile(r"^field:ip_sla_operations:\d+$"), Verb.OBJECT_DELETE),
     (re.compile(r"^field:object_tracks:\d+$"), Verb.OBJECT_DELETE),
@@ -488,6 +515,15 @@ _COLON_VALUE_SHAPES: tuple = (
     ((_TS_L("field"), _TS_L("evpn"), _TS_L("l3vnis_by_vrf"), _TS_ANY,
       _TS_L("route_target_export")), 0),
     ((_TS_L("field"), _TS_L("evpn"), _TS_L("l3vnis_by_vrf"), _TS_ANY,
+      _TS_L("route_target_both")), 0),
+    # BY-VLAN fallback (CCR-0161) — the EOS L2VNI mirror, VLAN-id key.  Same value
+    # position (RT tail after the keyed collection + VLAN); the VLAN segment is
+    # numeric, so only the colon-bearing RT value needs collapsing.
+    ((_TS_L("field"), _TS_L("evpn"), _TS_L("l2vnis_by_vlan"), _TS_ANY,
+      _TS_L("route_target_import")), 0),
+    ((_TS_L("field"), _TS_L("evpn"), _TS_L("l2vnis_by_vlan"), _TS_ANY,
+      _TS_L("route_target_export")), 0),
+    ((_TS_L("field"), _TS_L("evpn"), _TS_L("l2vnis_by_vlan"), _TS_ANY,
       _TS_L("route_target_both")), 0),
     # field channel — value span (IPv6 host) with a trailing NUM port.
     ((_TS_L("field"), _TS_L("netflow"), _TS_L("destination")), 1),
