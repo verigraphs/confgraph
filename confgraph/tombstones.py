@@ -286,4 +286,21 @@ NESTED_DELETION_RULES: list[NestedDeletionRule] = [
         child_groups=["group"],
         template="interface:{name}:igmp_static_groups:{group}",
     ),
+    # CoPP binding removal (CCR-0168)
+    # Proposal: ``no service-policy input PM_COPP`` inside ``control-plane``
+    # Tombstone: ``field:control_plane:service_policy_input``
+    # The captured policy-map name anchors the grammar ONLY — a scalar reset
+    # is unconditional (as on the device), so the template drops it.  The
+    # entrp side needs NO new accessor row: the CCR-0110 reflective
+    # catch-all (``_access_scalar_field_reset``, LAST row of _FIELD_TABLE)
+    # already resolves ``control_plane:service_policy_input`` by
+    # model_fields lookup — adding a specific row would shadow a working
+    # generic handler (design review, CCR-0168 revision).
+    NestedDeletionRule(
+        parent_pattern=r"^control-plane\s*$",
+        parent_groups=[],
+        child_pattern=r"^no\s+service-policy\s+input\s+(\S+)\s*$",
+        child_groups=["pm"],
+        template="control_plane:service_policy_input",
+    ),
 ]
