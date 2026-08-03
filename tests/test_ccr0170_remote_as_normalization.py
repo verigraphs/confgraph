@@ -152,9 +152,13 @@ class TestBoundsAndSpelling:
             normalize_remote_as("4294967296")
 
     def test_unicode_digits_rejected(self):
-        """Validation finding 9: ASCII digits only."""
+        """Validation finding 9 + R2-1: ASCII digits only — BOTH arms."""
         with pytest.raises(ValueError):
             normalize_remote_as("٦٥٠٠٢")
+        with pytest.raises(ValueError):
+            normalize_remote_as("٦٥.١")   # asdot arm (\\d is Unicode-aware)
+        with pytest.raises(ValueError):
+            normalize_remote_as("١.١")
 
 
 class TestInheritedPeerType:
@@ -174,3 +178,22 @@ class TestInheritedPeerType:
         (n,) = pc.bgp_instances[0].neighbors
         assert n.remote_as is None
         assert n.remote_as_source == "external"
+
+
+    def test_member_own_type_wins_over_template_type(self):
+        """R2-2 gate pin: the elif is gated on the member still being
+        source='inherited' — a member DECLARING its own peer type must
+        not have it overwritten by the template's."""
+        pc = _parse(
+            "hostname n1\n"
+            "feature bgp\n"
+            "router bgp 65001\n"
+            "  template peer EXT\n"
+            "    remote-as external\n"
+            "  neighbor 10.0.0.2\n"
+            "    remote-as internal\n"
+            "    inherit peer EXT\n",
+            "nxos",
+        )
+        (n,) = pc.bgp_instances[0].neighbors
+        assert n.remote_as_source == "internal"

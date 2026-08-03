@@ -9,7 +9,8 @@ from pydantic import BaseModel, Field, field_validator
 from confgraph.models.base import BaseConfigObject
 
 # asdot AS-number spelling (RFC 5396): "A.B" with both halves 16-bit.
-_ASDOT = re.compile(r"^(\d{1,5})\.(\d{1,5})$")
+# [0-9] not \d — \d is Unicode-aware (validation R2-1; ASCII only).
+_ASDOT = re.compile(r"^([0-9]{1,5})\.([0-9]{1,5})$")
 
 
 def normalize_remote_as(v):
