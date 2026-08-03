@@ -202,7 +202,7 @@ routing-instances {
 - `local-address` is resolved to an interface name for `update_source` (parser-side, using interface IP reverse lookup, done in the `parse()` override; an unresolvable address is left unset)
 - VRF BGP lives inside `routing-instances NAME { protocols { bgp { } } }`
 - No flat `neighbor IP remote-as N` syntax — always block-style within a group
-- iBGP neighbors (`type internal`) with no explicit `peer-as` inherit `remote_as` from the device ASN (not the string `"internal"`)
+- iBGP neighbors (`type internal`) with no explicit `peer-as` inherit `remote_as` from the device ASN, with `remote_as_source: "internal"` recording the peer-type provenance (CCR-0170)
 - **Three-level attribute inheritance:** session attributes are legal at `bgp` (instance), `group`, and `neighbor` levels; a peer inherits whatever it does not override. A single table-driven extractor (`_bgp_attrs` + `_bgp_inherit`) flattens instance → group → neighbor, last level winning. A `description` is the exception — it describes the object it is written on and is NOT inherited.
 
 **Supported Attributes:**

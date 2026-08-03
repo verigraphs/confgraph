@@ -22,7 +22,7 @@ from confgraph.models.netflow import (
     NetFlowRecord,
 )
 from confgraph.models.static_route import StaticRoute
-from confgraph.parsers.base import _BASE_KNOWN_PATTERNS, apply_peer_group_command, _default_pg_data
+from confgraph.parsers.base import _BASE_KNOWN_PATTERNS, apply_peer_group_command, _default_pg_data, parse_remote_as_token
 from confgraph.parsers.ios_parser import IOSParser
 from confgraph.parsers.iosxr_parser import _AFTransparentBlock
 
@@ -631,7 +631,8 @@ class NXOSParser(IOSParser):
         from confgraph.models.bgp import BGPTimers
 
         nd: dict = {
-            "remote_as": None, "peer_group": None, "description": None,
+            "remote_as": None, "remote_as_source": None,
+            "peer_group": None, "description": None,
             "update_source": None, "ebgp_multihop": None, "password": None,
             "password_encryption_type": None,
             "route_map_in": None, "route_map_out": None,
@@ -661,10 +662,9 @@ class NXOSParser(IOSParser):
                 continue
             if cmd.startswith("remote-as "):
                 val = cmd.replace("remote-as ", "").strip()
-                try:
-                    nd["remote_as"] = int(val)
-                except ValueError:
-                    nd["remote_as"] = val
+                nd["remote_as"], nd["remote_as_source"] = (
+                    parse_remote_as_token(val)
+                )
             elif cmd.startswith("description "):
                 nd["description"] = cmd.replace("description ", "").strip()
             elif cmd.startswith("update-source "):
@@ -985,24 +985,34 @@ class NXOSParser(IOSParser):
             # without remote-as/peer-group — proposal snippets legitimately
             # omit remote-as when attaching policy to an EXISTING neighbor
             # (on a real device the snippet applies to it; device-verified
-            # reality check in the CCR).  remote_as="inherited" below is the
-            # established non-clobbering stub: the merge skips it
+            # reality check in the CCR).  remote_as=None with
+            # source="inherited" below is the established non-clobbering
+            # stub (CCR-0170): the merge skips it
             # (merger.py field-level exception) and topology treats it as
             # unresolved.  Only a truly EMPTY bare ``neighbor <ip>`` stub is
             # still dropped (unchanged pre-CCR behavior).
             has_content = bool(nd["address_families"]) or any(
                 v for k, v in nd.items() if k != "address_families"
             )
-            if (nd["remote_as"] is None and nd["peer_group"] is None
+            if (nd["remote_as"] is None and nd["remote_as_source"] is None
+                    and nd["peer_group"] is None
                     and not nd["shutdown"] and not has_content):
                 continue
 
-            remote_as = nd["remote_as"] if nd["remote_as"] is not None else "inherited"
+            # No remote-as stated -> None with source="inherited"
+            # (CCR-0170 — the string sentinel retired).
+            remote_as = nd["remote_as"]
+            remote_as_source = (
+                nd["remote_as_source"]
+                if remote_as is not None or nd["remote_as_source"]
+                else "inherited"
+            )
 
             seen_ips.add(peer_ip_str)
             neighbors.append(BGPNeighbor(
                 peer_ip=peer_ip,
                 remote_as=remote_as,
+                remote_as_source=remote_as_source,
                 peer_group=nd["peer_group"],
                 description=nd["description"],
                 update_source=nd["update_source"],
@@ -1054,7 +1064,9 @@ class NXOSParser(IOSParser):
                     neighbor.prefix_list_in = pg.prefix_list_in
                 if neighbor.prefix_list_out is None and pg.prefix_list_out:
                     neighbor.prefix_list_out = pg.prefix_list_out
-                if neighbor.remote_as in (None, "inherited") and pg.remote_as is not None:
+                # CCR-0170: inheritance fills the VALUE only; the
+                # parse-time provenance (source="inherited") stays.
+                if neighbor.remote_as is None and pg.remote_as is not None:
                     neighbor.remote_as = pg.remote_as
                 if neighbor.update_source is None and pg.update_source:
                     neighbor.update_source = pg.update_source

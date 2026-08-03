@@ -34,7 +34,10 @@ class TestPolicyAttachSnippetSurvives:
         )
         (nbr,) = pc.bgp_instances[0].neighbors
         assert str(nbr.peer_ip) == "10.0.0.2"
-        assert nbr.remote_as == "inherited"
+        # CCR-0170: the "inherited" sentinel retired — the stub is
+        # remote_as=None with provenance on remote_as_source.
+        assert nbr.remote_as is None
+        assert nbr.remote_as_source == "inherited"
         af = next(a for a in nbr.address_families
                   if (a.afi, a.safi) == ("l2vpn", "evpn"))
         assert af.route_map_out == "RM-OUT"
@@ -48,7 +51,8 @@ class TestPolicyAttachSnippetSurvives:
             "    description spine-uplink\n"
         )
         (nbr,) = pc.bgp_instances[0].neighbors
-        assert nbr.remote_as == "inherited"
+        assert nbr.remote_as is None
+        assert nbr.remote_as_source == "inherited"
         assert nbr.description == "spine-uplink"
 
     def test_empty_stub_is_still_dropped(self):

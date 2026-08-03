@@ -62,8 +62,11 @@ class TestSingleAFDescent:
         assert n.prefix_list_in == "PREFIX_FILTER"
 
     def test_remote_as_external(self):
+        # CCR-0170: peer-TYPE spellings carry no AS number — None with
+        # the type preserved on remote_as_source.
         n = _neighbor(_parse(self.CONFIG), "10.10.1.2")
-        assert n.remote_as == "external"
+        assert n.remote_as is None
+        assert n.remote_as_source == "external"
 
 
 # ---------------------------------------------------------------------------

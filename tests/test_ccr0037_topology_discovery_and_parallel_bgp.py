@@ -518,9 +518,11 @@ end
         "core-x": IOSParser(core.format(host="core-x", asn=65300)).parse(),
         "core-y": IOSParser(core.format(host="core-y", asn=65999)).parse(),
     }
-    # Precondition: the parser really does hand us the string, not an int.
+    # Precondition: the parser hands us an UNRESOLVED member (CCR-0170:
+    # remote_as None + source="inherited"), never a fabricated int.
     neighbor = devices["pg-edge"].bgp_instances[0].neighbors[0]
-    assert neighbor.remote_as == "inherited"
+    assert neighbor.remote_as is None
+    assert neighbor.remote_as_source == "inherited"
 
     builder = TopologyGraphBuilder(devices)
     g = builder.build()

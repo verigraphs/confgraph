@@ -54,7 +54,17 @@ from confgraph.parsers.panos_parser import PANOSParser
 # associate_vrf=True). Observable parse output moves for every NX-OS VTEP with
 # an associate-vrf member; schema also moves, but entrp's schema-less
 # ``digest_key()`` only moves on pbv — same posture as 2/3/4.
-PARSER_BEHAVIOR_VERSION: int = 5
+# 6 (CCR-0170): ``BGPNeighbor.remote_as`` / ``BGPPeerGroup.remote_as`` are
+# ``int | None`` — a model validator normalizes asdot (RFC 5396) to int and
+# REJECTS every other string (the old ``int | str`` union was fail-open:
+# any non-int spelling silently bypassed all AS-agreement checks).  New
+# ``remote_as_source`` provenance field on both models; the CCR-0159
+# "inherited" sentinel and JunOS internal/external string arms retire onto
+# it.  Observable parse output moves for every peer-group member, every
+# asdot config, and every internal/external peer type; schema also moves,
+# but entrp's schema-less ``digest_key()`` only moves on pbv — same
+# posture as 2/3/4/5.
+PARSER_BEHAVIOR_VERSION: int = 6
 
 __all__ = [
     "BaseParser",
