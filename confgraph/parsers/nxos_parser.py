@@ -1066,8 +1066,15 @@ class NXOSParser(IOSParser):
                     neighbor.prefix_list_out = pg.prefix_list_out
                 # CCR-0170: inheritance fills the VALUE only; the
                 # parse-time provenance (source="inherited") stays.
+                # EXCEPT a peer-TYPE group (validation finding 2): the
+                # group has no number to give — the member inherits the
+                # TYPE, or the Idle guard falsely reads it as missing.
                 if neighbor.remote_as is None and pg.remote_as is not None:
                     neighbor.remote_as = pg.remote_as
+                elif (neighbor.remote_as is None
+                        and neighbor.remote_as_source == "inherited"
+                        and pg.remote_as_source in ("internal", "external")):
+                    neighbor.remote_as_source = pg.remote_as_source
                 if neighbor.update_source is None and pg.update_source:
                     neighbor.update_source = pg.update_source
         return instances

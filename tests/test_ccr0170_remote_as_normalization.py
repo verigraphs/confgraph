@@ -110,3 +110,67 @@ class TestJunosPeerTypes:
                   if g.name == "IBGP")
         assert pg.remote_as is None
         assert pg.remote_as_source == "internal"
+
+
+class TestTrailingTokens:
+    """Validation finding 1 (BLOCKER): the AS spelling is the FIRST token —
+    trailing sub-options or inline comments must not abort the device."""
+
+    def test_alternate_as_suboption_survives(self):
+        pc = _parse(
+            "hostname r1\n"
+            "router bgp 65001\n"
+            " neighbor 10.0.0.2 remote-as 65002 alternate-as 65003\n",
+            "ios",
+        )
+        (n,) = pc.bgp_instances[0].neighbors
+        assert n.remote_as == 65002
+        assert n.remote_as_source == "declared"
+
+    def test_inline_comment_survives(self):
+        pc = _parse(
+            "hostname r1\n"
+            "router bgp 65001\n"
+            " neighbor 10.0.0.2 remote-as 65002 ! isp uplink\n",
+            "ios",
+        )
+        (n,) = pc.bgp_instances[0].neighbors
+        assert n.remote_as == 65002
+
+    def test_garbage_first_token_still_fails_closed(self):
+        with pytest.raises(ValueError):
+            from confgraph.parsers.base import parse_remote_as_token
+            parse_remote_as_token("banana 65002")
+
+
+class TestBoundsAndSpelling:
+    def test_decimal_arm_bounded_like_asdot(self):
+        """Validation finding 6: both string arms cap at the 32-bit AS
+        space."""
+        assert normalize_remote_as("4294967295") == 4294967295
+        with pytest.raises(ValueError):
+            normalize_remote_as("4294967296")
+
+    def test_unicode_digits_rejected(self):
+        """Validation finding 9: ASCII digits only."""
+        with pytest.raises(ValueError):
+            normalize_remote_as("٦٥٠٠٢")
+
+
+class TestInheritedPeerType:
+    def test_nxos_template_peer_type_propagates(self):
+        """Validation finding 2: a member inheriting from a peer-TYPE
+        template must carry the TYPE — not read as missing remote-as."""
+        pc = _parse(
+            "hostname n1\n"
+            "feature bgp\n"
+            "router bgp 65001\n"
+            "  template peer EXT\n"
+            "    remote-as external\n"
+            "  neighbor 10.0.0.2\n"
+            "    inherit peer EXT\n",
+            "nxos",
+        )
+        (n,) = pc.bgp_instances[0].neighbors
+        assert n.remote_as is None
+        assert n.remote_as_source == "external"

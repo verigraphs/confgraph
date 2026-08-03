@@ -29,13 +29,18 @@ def normalize_remote_as(v):
         return v
     if isinstance(v, str):
         s = v.strip()
-        if s.isdigit():
-            return int(s)
-        m = _ASDOT.match(s)
-        if m is not None:
-            high, low = int(m.group(1)), int(m.group(2))
-            if high <= 65535 and low <= 65535:
-                return high * 65536 + low
+        # ASCII digits only (str.isdigit is Unicode-aware) and bounded to
+        # the 32-bit AS space — symmetric with the asdot arm.
+        if s.isascii() and s.isdigit():
+            n = int(s)
+            if n <= 4294967295:
+                return n
+        else:
+            m = _ASDOT.match(s)
+            if m is not None:
+                high, low = int(m.group(1)), int(m.group(2))
+                if high <= 65535 and low <= 65535:
+                    return high * 65536 + low
     raise ValueError(
         f"remote_as must be an AS number (int, decimal string, or asdot "
         f"'A.B'); got {v!r}.  Provenance/peer-type spellings "

@@ -254,7 +254,13 @@ def parse_remote_as_token(val: str) -> "tuple[int | None, str | None]":
     uninterpretable spelling fails HERE, at parse time — never a string
     on the field, never a silently unvalidated session.
     """
-    s = val.strip()
+    # FIRST TOKEN ONLY (validation finding 1): callers pass the raw line
+    # remainder, and real configs carry trailing sub-options
+    # ("remote-as 65002 alternate-as 65003") or inline comments.  The AS
+    # spelling is the first token; eager-normalizing the whole remainder
+    # turned any trailing token into a DEVICE-FATAL parse error.
+    parts = val.split()
+    s = parts[0] if parts else val.strip()
     if s in ("internal", "external"):
         return None, s
     return normalize_remote_as(s), "declared"
