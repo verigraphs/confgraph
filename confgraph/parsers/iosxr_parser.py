@@ -35,7 +35,7 @@ from confgraph.models.community_list import (
     ASPathListEntry,
 )
 from confgraph.models.isis import ISISConfig, ISISInterface, ISISRedistribute
-from confgraph.parsers.base import _BASE_KNOWN_PATTERNS, apply_peer_group_command, _default_pg_data
+from confgraph.parsers.base import _BASE_KNOWN_PATTERNS, apply_peer_group_command, _default_pg_data, parse_remote_as_token
 from confgraph.parsers.ios_parser import IOSParser
 
 
@@ -493,6 +493,7 @@ class IOSXRParser(IOSParser):
         """
         nd: dict = {
             "remote_as": None,
+            "remote_as_source": None,
             "peer_group": None,
             "description": None,
             "update_source": None,
@@ -522,10 +523,9 @@ class IOSXRParser(IOSParser):
 
             if text.startswith("remote-as "):
                 val = text.split(None, 1)[1].strip()
-                try:
-                    nd["remote_as"] = int(val)
-                except ValueError:
-                    nd["remote_as"] = val
+                nd["remote_as"], nd["remote_as_source"] = (
+                    parse_remote_as_token(val)
+                )
             elif text.startswith("description "):
                 nd["description"] = text.split(None, 1)[1].strip()
             elif text.startswith("update-source "):
@@ -1856,14 +1856,19 @@ class IOSXRParser(IOSParser):
                 nd["route_map_in"] or nd["route_map_out"] or nd["next_hop_self"]
                 or nd["prefix_list_in"] or nd["prefix_list_out"]
             )
-            if nd["remote_as"] is None and nd["peer_group"] is None:
+            if (nd["remote_as"] is None and nd["remote_as_source"] is None
+                    and nd["peer_group"] is None):
                 if not has_policy:
                     continue
-                nd["remote_as"] = "inherited"
+            # No remote-as stated -> None with source="inherited"
+            # (CCR-0170 — the string sentinel retired).
+            if nd["remote_as"] is None and nd["remote_as_source"] is None:
+                nd["remote_as_source"] = "inherited"
 
             neighbors.append(BGPNeighbor(
                 peer_ip=peer_ip,
-                remote_as=nd["remote_as"] if nd["remote_as"] is not None else "inherited",
+                remote_as=nd["remote_as"],
+                remote_as_source=nd["remote_as_source"],
                 peer_group=nd["peer_group"],
                 description=nd["description"],
                 update_source=nd["update_source"],

@@ -3,7 +3,7 @@
 import re
 from ipaddress import IPv4Address, IPv4Interface, IPv4Network, IPv6Address, IPv6Interface, IPv6Network
 
-from confgraph.parsers.base import BaseParser, PatternSet, apply_peer_group_command, _default_pg_data
+from confgraph.parsers.base import BaseParser, PatternSet, apply_peer_group_command, _default_pg_data, parse_remote_as_token
 from confgraph.utils.interface import normalize_interface_name
 # CCR-0110 E6: the native deletion-op path builder (colon-valued value tails stay
 # ONE segment — the SET convention).  Module-level: change_ir has no top-level
@@ -6337,6 +6337,7 @@ class IOSParser(BaseParser):
                 neighbor_dict[peer_ip_str] = {
                     "peer_ip": peer_ip_str,
                     "remote_as": None,
+                    "remote_as_source": None,
                     "peer_group": None,
                     "description": None,
                     "update_source": None,
@@ -6367,10 +6368,10 @@ class IOSParser(BaseParser):
             # Parse commands
             if command.startswith("remote-as "):
                 as_str = command.replace("remote-as ", "").strip()
-                try:
-                    neighbor_dict[peer_ip_str]["remote_as"] = int(as_str)
-                except ValueError:
-                    neighbor_dict[peer_ip_str]["remote_as"] = as_str
+                (
+                    neighbor_dict[peer_ip_str]["remote_as"],
+                    neighbor_dict[peer_ip_str]["remote_as_source"],
+                ) = parse_remote_as_token(as_str)
             elif command.startswith("peer-group "):
                 pg_name = command.replace("peer-group ", "").strip()
                 neighbor_dict[peer_ip_str]["peer_group"] = pg_name
@@ -6475,18 +6476,27 @@ class IOSParser(BaseParser):
             # the matching base neighbor via _merge_neighbor_fields.
             if (
                 neighbor_data["remote_as"] is None
+                and neighbor_data["remote_as_source"] is None
                 and neighbor_data["peer_group"] is None
                 and not neighbor_data.get("shutdown", False)
             ):
                 continue
 
-            # If no remote-as but has peer-group (or shutdown stub), it inherits
-            remote_as = neighbor_data["remote_as"] if neighbor_data["remote_as"] is not None else "inherited"
+            # If no remote-as but has peer-group (or shutdown stub), it
+            # inherits: remote_as stays None with source="inherited"
+            # (CCR-0170 — the string sentinel retired).
+            remote_as = neighbor_data["remote_as"]
+            remote_as_source = (
+                neighbor_data["remote_as_source"]
+                if remote_as is not None or neighbor_data["remote_as_source"]
+                else "inherited"
+            )
 
             neighbors.append(
                 BGPNeighbor(
                     peer_ip=peer_ip,
                     remote_as=remote_as,
+                    remote_as_source=remote_as_source,
                     peer_group=neighbor_data["peer_group"],
                     description=neighbor_data["description"],
                     update_source=neighbor_data["update_source"],
@@ -7331,7 +7341,8 @@ class IOSParser(BaseParser):
                             continue
                     stub = BGPNeighbor(
                         peer_ip=peer_ip,
-                        remote_as="inherited",
+                        remote_as=None,
+                        remote_as_source="inherited",
                         next_hop_self=data.get("next_hop_self", False),
                         address_families=[af_entry],
                     )
@@ -7397,6 +7408,7 @@ class IOSParser(BaseParser):
                     neighbor_dict[peer_ip_str] = {
                         "peer_ip": peer_ip_str,
                         "remote_as": None,
+                        "remote_as_source": None,
                         "description": None,
                         "route_map_in": None,
                         "route_map_out": None,
@@ -7404,10 +7416,10 @@ class IOSParser(BaseParser):
 
                 if command.startswith("remote-as "):
                     as_str = command.replace("remote-as ", "").strip()
-                    try:
-                        neighbor_dict[peer_ip_str]["remote_as"] = int(as_str)
-                    except ValueError:
-                        neighbor_dict[peer_ip_str]["remote_as"] = as_str
+                    (
+                        neighbor_dict[peer_ip_str]["remote_as"],
+                        neighbor_dict[peer_ip_str]["remote_as_source"],
+                    ) = parse_remote_as_token(as_str)
                 elif command.startswith("description "):
                     neighbor_dict[peer_ip_str]["description"] = command.replace(
                         "description ", ""
@@ -7429,13 +7441,15 @@ class IOSParser(BaseParser):
                     except ValueError:
                         continue
 
-                if neighbor_data["remote_as"] is None:
+                if (neighbor_data["remote_as"] is None
+                        and neighbor_data["remote_as_source"] is None):
                     continue
 
                 vrf_neighbors.append(
                     BGPNeighbor(
                         peer_ip=peer_ip,
                         remote_as=neighbor_data["remote_as"],
+                        remote_as_source=neighbor_data["remote_as_source"],
                         description=neighbor_data["description"],
                         route_map_in=neighbor_data["route_map_in"],
                         route_map_out=neighbor_data["route_map_out"],

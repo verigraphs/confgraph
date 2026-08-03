@@ -224,7 +224,7 @@ neighbor <ip> maximum-prefix <number>
 - ✅ Filter-list in/out
 - ✅ Maximum-prefix
 - ✅ Timers (keepalive/holdtime)
-- ⚠️  **Inheritance:** Neighbors inheriting from peer-groups show `remote_as: "inherited"`
+- ⚠️  **Inheritance:** Neighbors inheriting from peer-groups parse `remote_as: None` with `remote_as_source: "inherited"` (CCR-0170)
 
 #### BGP Peer-Groups
 ```

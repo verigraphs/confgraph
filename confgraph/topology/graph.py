@@ -280,10 +280,10 @@ class TopologyGraphBuilder:
         if len(candidates) == 1:
             return candidates[0]
 
-        # `remote_as` is an int only when the neighbor states one; it is 'inherited'
-        # for a peer-group member and can be 'internal'/'external' elsewhere. A
-        # string can never equal a parsed ASN, and must never appear to.
-        if isinstance(remote_as, int) and not isinstance(remote_as, bool):
+        # `remote_as` is int | None post-CCR-0170 (asdot normalized by the
+        # model validator; provenance/peer-type spellings live on
+        # remote_as_source).  None is the ONLY non-validating state.
+        if remote_as is not None and not isinstance(remote_as, bool):
             matching = [h for h in candidates if self._global_asn(h) == remote_as]
             if len(matching) == 1:
                 return matching[0]

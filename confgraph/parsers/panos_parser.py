@@ -56,7 +56,7 @@ from confgraph.models.crypto import (
 )
 from confgraph.models.panos_zone import PANOSZoneConfig
 
-from confgraph.parsers.base import BaseParser, ParseError
+from confgraph.parsers.base import BaseParser, ParseError, parse_remote_as_token
 from confgraph.parsers.panos_xml import (
     parse_panos_xml, detect_layout, UnrecognizedPANOSLayout,
     DeviceScope, PANOSLayout, PolicyScope, VsysScope,
@@ -610,10 +610,12 @@ class PANOSParser(BaseParser):
                     peer_ip = _safe_addr(peer_ip_str.split("/")[0])
                     if peer_ip is None:
                         continue
-                    try:
-                        remote_as = int(remote_as_str)
-                    except ValueError:
-                        remote_as = remote_as_str  # type: ignore[assignment]
+                    # CCR-0170: decimal or asdot -> int; a peer-TYPE
+                    # spelling would map to (None, type) — PAN-OS emits
+                    # numeric peer-as only, but the seam is shared.
+                    remote_as, remote_as_source = parse_remote_as_token(
+                        remote_as_str
+                    )
 
                     opts = peer.find("connection-options")
                     keepalive = _safe_int(text_val(opts, "keep-alive-interval"))
@@ -631,6 +633,7 @@ class PANOSParser(BaseParser):
                     neighbors.append(BGPNeighbor(
                         peer_ip=peer_ip,
                         remote_as=remote_as,
+                        remote_as_source=remote_as_source,
                         peer_group=pg_name,
                         description=peer.get("name", ""),
                         shutdown=(text_val(peer, "enable") == "no"),

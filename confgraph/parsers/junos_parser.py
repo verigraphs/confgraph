@@ -46,7 +46,7 @@ from confgraph.models.ospf import (
 from confgraph.models.acl import ACLConfig, ACLEntry
 from confgraph.models.static_route import StaticRoute
 
-from confgraph.parsers.base import BaseParser
+from confgraph.parsers.base import BaseParser, parse_remote_as_token
 from confgraph.parsers.junos_hierarchy import parse_junos_config, _is_set_style
 
 
@@ -964,10 +964,16 @@ class JunOSParser(BaseParser):
 
             grp_type = _str_val(grp_data.get("type", ""))
             peer_as_str = _str_val(grp_data.get("peer-as"))
-            try:
-                remote_as: int | str = int(peer_as_str) if peer_as_str else ("internal" if grp_type == "internal" else 0)
-            except ValueError:
-                remote_as = peer_as_str or 0
+            # CCR-0170: peer-as normalizes (decimal or asdot -> int; the old
+            # bare-except stored asdot as a RAW STRING, which bypassed every
+            # AS check downstream); a bare type internal/external carries no
+            # AS number -> None with the type on remote_as_source.
+            if peer_as_str:
+                grp_remote_as, grp_ras_src = parse_remote_as_token(peer_as_str)
+            elif grp_type in ("internal", "external"):
+                grp_remote_as, grp_ras_src = None, grp_type
+            else:
+                grp_remote_as, grp_ras_src = None, None
 
             # What the group itself reports, and what its members inherit — the
             # latter drops the attributes that describe only the group.
@@ -978,7 +984,8 @@ class JunOSParser(BaseParser):
 
             pg = BGPPeerGroup(
                 name=grp_name,
-                remote_as=remote_as if remote_as != 0 else None,
+                remote_as=grp_remote_as,
+                remote_as_source=grp_ras_src,
                 **grp_attrs,
             )
             peer_groups.append(pg)
@@ -995,13 +1002,12 @@ class JunOSParser(BaseParser):
                 except ValueError:
                     continue
 
-                nbr_remote_as = remote_as
+                nbr_remote_as, nbr_ras_src = grp_remote_as, grp_ras_src
                 nbr_remote_as_str = _str_val(nbr_data.get("peer-as"))
                 if nbr_remote_as_str:
-                    try:
-                        nbr_remote_as = int(nbr_remote_as_str)
-                    except ValueError:
-                        pass
+                    nbr_remote_as, nbr_ras_src = parse_remote_as_token(
+                        nbr_remote_as_str
+                    )
 
                 # The peer's effective configuration: inherited group attributes
                 # unless the peer overrides them.
@@ -1009,9 +1015,11 @@ class JunOSParser(BaseParser):
                 rm_in = attrs.get("route_map_in")
                 rm_out = attrs.get("route_map_out")
 
-                # J9: resolve "internal" to the device's own ASN
-                effective_remote_as: int | str
-                if nbr_remote_as == 0 or nbr_remote_as == "internal":
+                # J9: no stated AS (type internal, or a group with neither
+                # peer-as nor type) resolves to the device's own ASN at
+                # parse time — value-preserving vs the old 0/"internal"
+                # arms; remote_as_source keeps the honest provenance.
+                if nbr_remote_as is None:
                     effective_remote_as = asn  # device's own ASN for iBGP
                 else:
                     effective_remote_as = nbr_remote_as
@@ -1042,6 +1050,7 @@ class JunOSParser(BaseParser):
                 neighbors.append(BGPNeighbor(
                     peer_ip=peer_ip,
                     remote_as=effective_remote_as,
+                    remote_as_source=nbr_ras_src,
                     peer_group=grp_name,
                     address_families=[af],
                     **attrs,

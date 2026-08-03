@@ -93,7 +93,7 @@ from confgraph.models.base import OSType, UnrecognizedBlock
 from confgraph.models.parsed_config import ParsedConfig
 from confgraph.models.vrf import VRFConfig
 from confgraph.models.interface import InterfaceConfig
-from confgraph.models.bgp import BGPConfig
+from confgraph.models.bgp import BGPConfig, normalize_remote_as
 from confgraph.models.ospf import OSPFConfig
 from confgraph.models.route_map import RouteMapConfig
 from confgraph.models.prefix_list import PrefixListConfig
@@ -240,6 +240,30 @@ _BASE_BEST_GUESS_KEYWORDS: list[tuple[str, str]] = [
     ("clock",          "clock"),
     ("monitor",        "monitor"),
 ]
+
+
+
+def parse_remote_as_token(val: str) -> "tuple[int | None, str | None]":
+    """Classify one ``remote-as`` token → ``(remote_as, remote_as_source)``
+    (CCR-0170) — the single writer-side seam shared by every parser.
+
+    Peer-TYPE spellings ("internal"/"external") carry no AS number: they
+    map to ``(None, <type>)``.  Everything else is an AS-number spelling
+    and normalizes eagerly (decimal or RFC 5396 asdot) via the model's
+    own normalizer, so parsers always hand ints to the models and an
+    uninterpretable spelling fails HERE, at parse time — never a string
+    on the field, never a silently unvalidated session.
+    """
+    # FIRST TOKEN ONLY (validation finding 1): callers pass the raw line
+    # remainder, and real configs carry trailing sub-options
+    # ("remote-as 65002 alternate-as 65003") or inline comments.  The AS
+    # spelling is the first token; eager-normalizing the whole remainder
+    # turned any trailing token into a DEVICE-FATAL parse error.
+    parts = val.split()
+    s = parts[0] if parts else val.strip()
+    if s in ("internal", "external"):
+        return None, s
+    return normalize_remote_as(s), "declared"
 
 
 class BaseParser(ABC):
@@ -1072,10 +1096,9 @@ def apply_peer_group_command(pg_data: dict, command: str) -> bool:
 
     if command.startswith("remote-as "):
         val = command.replace("remote-as ", "").strip()
-        try:
-            pg_data["remote_as"] = int(val)
-        except ValueError:
-            pg_data["remote_as"] = val
+        pg_data["remote_as"], pg_data["remote_as_source"] = (
+            parse_remote_as_token(val)
+        )
 
     elif command.startswith("description "):
         pg_data["description"] = command.replace("description ", "").strip()
@@ -1196,6 +1219,7 @@ def _default_pg_data(name: str) -> dict:
     return {
         "name": name,
         "remote_as": None,
+        "remote_as_source": None,
         "description": None,
         "update_source": None,
         "next_hop_self": False,

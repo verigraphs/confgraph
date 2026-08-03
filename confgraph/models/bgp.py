@@ -1,8 +1,52 @@
 """BGP configuration models."""
 
+import re
 from ipaddress import IPv4Address, IPv4Network, IPv6Address, IPv6Network
-from pydantic import BaseModel, Field
+from typing import Literal
+
+from pydantic import BaseModel, Field, field_validator
+
 from confgraph.models.base import BaseConfigObject
+
+# asdot AS-number spelling (RFC 5396): "A.B" with both halves 16-bit.
+# [0-9] not \d — \d is Unicode-aware (validation R2-1; ASCII only).
+_ASDOT = re.compile(r"^([0-9]{1,5})\.([0-9]{1,5})$")
+
+
+def normalize_remote_as(v):
+    """Shared remote_as normalizer (CCR-0170) — the single seam that makes
+    the field FAIL-CLOSED.
+
+    ints pass through; strings either normalize to an int (decimal
+    spellings, asdot per RFC 5396) or RAISE.  The legacy string arms —
+    "inherited" provenance and "internal"/"external" peer types — are
+    REJECTED here by design: they live on ``remote_as_source`` now, and a
+    parser passing them through is a bug that must fail at parse time,
+    not silently exempt the neighbor from every AS-agreement check (the
+    pre-CCR ``int | str`` union let ANY non-int spelling — asdot was the
+    measured case — form sessions with no AS validation at all).
+    """
+    if v is None or isinstance(v, int):
+        return v
+    if isinstance(v, str):
+        s = v.strip()
+        # ASCII digits only (str.isdigit is Unicode-aware) and bounded to
+        # the 32-bit AS space — symmetric with the asdot arm.
+        if s.isascii() and s.isdigit():
+            n = int(s)
+            if n <= 4294967295:
+                return n
+        else:
+            m = _ASDOT.match(s)
+            if m is not None:
+                high, low = int(m.group(1)), int(m.group(2))
+                if high <= 65535 and low <= 65535:
+                    return high * 65536 + low
+    raise ValueError(
+        f"remote_as must be an AS number (int, decimal string, or asdot "
+        f"'A.B'); got {v!r}.  Provenance/peer-type spellings "
+        f"('inherited'/'internal'/'external') belong on remote_as_source."
+    )
 
 
 class BGPTimers(BaseModel):
@@ -177,8 +221,25 @@ class BGPNeighbor(BaseModel):
     """BGP neighbor configuration."""
 
     peer_ip: IPv4Address | IPv6Address = Field(..., description="Neighbor IP address")
-    remote_as: int | str = Field(
-        ..., description="Remote AS number (or 'internal'/'external')"
+    # REQUIRED-BUT-NULLABLE (CCR-0170): required-ness is load-bearing —
+    # the entrp merger's proposal-always-wins branch and _reset_field's
+    # required-field no-op both key on the field having NO default.
+    remote_as: int | None = Field(
+        ..., description="Remote AS number (int; None when not stated — see remote_as_source)"
+    )
+    remote_as_source: Literal["declared", "inherited", "internal", "external"] | None = Field(
+        default=None,
+        description=(
+            "Parse-time provenance of remote_as: 'declared' = stated as a "
+            "number; 'inherited' = not stated (may resolve via peer-group/"
+            "template); 'internal'/'external' = stated as a peer TYPE, not "
+            "a number.  Inheritance fills the VALUE only; source keeps the "
+            "parse-time fact."
+        ),
+    )
+
+    _validate_remote_as = field_validator("remote_as", mode="before")(
+        normalize_remote_as
     )
     peer_group: str | None = Field(
         default=None, description="Peer-group name (references BGPPeerGroup)"
@@ -283,8 +344,16 @@ class BGPPeerGroup(BaseModel):
     """
 
     name: str = Field(..., description="Peer-group name")
-    remote_as: int | str | None = Field(
-        default=None, description="Remote AS number (or 'internal'/'external')"
+    remote_as: int | None = Field(
+        default=None, description="Remote AS number (int; see remote_as_source)"
+    )
+    remote_as_source: Literal["declared", "inherited", "internal", "external"] | None = Field(
+        default=None,
+        description="Parse-time provenance of remote_as (see BGPNeighbor).",
+    )
+
+    _validate_remote_as = field_validator("remote_as", mode="before")(
+        normalize_remote_as
     )
     description: str | None = Field(default=None, description="Peer-group description")
     update_source: str | None = Field(

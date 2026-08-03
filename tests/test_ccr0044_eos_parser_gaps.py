@@ -147,8 +147,10 @@ def test_eos_neighbor_keeps_what_the_old_fork_did_parse():
     # password splits into key + encryption type (CCR-0030 bug 4), not one blob
     assert n.password == "0A5C1B0E1D2F"
     assert n.password_encryption_type == "7"
-    # remote-as is inherited from the peer group, not restated on the neighbor
-    assert n.remote_as == "inherited"
+    # remote-as is inherited from the peer group, not restated on the
+    # neighbor (CCR-0170: None + source="inherited", sentinel retired)
+    assert n.remote_as is None
+    assert n.remote_as_source == "inherited"
 
 
 def test_eos_peer_group_two_word_form_and_maximum_routes():
