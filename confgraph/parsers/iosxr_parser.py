@@ -394,6 +394,12 @@ class IOSXRParser(IOSParser):
                     except ValueError:
                         pass
 
+            # IOS-XR dynamic addressing: 'ipv4 address dhcp' (CCR-0192).  The
+            # inherited IOS walk only knows the 'ip address dhcp' spelling, so
+            # the XR spelling is detected here alongside the literal override.
+            if intf_obj.find_child_objects(r"^\s+ipv4\s+address\s+dhcp\b"):
+                intf_cfg.dynamic_address = "dhcp"
+
             # IOS-XR: ipv4 access-group <name> ingress|egress
             for ag_ch in intf_obj.find_child_objects(
                 r"^\s+ipv4\s+access-group\s+\S+\s+(ingress|egress)"

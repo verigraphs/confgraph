@@ -12,7 +12,9 @@ from confgraph.parsers import PARSER_BEHAVIOR_VERSION
 def test_constant_is_a_positive_int_not_bool():
     # bool is a subclass of int; exclude it explicitly.
     assert type(PARSER_BEHAVIOR_VERSION) is int
-    assert PARSER_BEHAVIOR_VERSION >= 1
+    # Monotonic floor — raised in the same commit as each behavior change so a
+    # revert/merge cannot silently roll the constant backwards (last: CCR-0192).
+    assert PARSER_BEHAVIOR_VERSION >= 7
 
 
 def test_constant_is_exported():

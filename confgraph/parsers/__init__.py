@@ -64,7 +64,15 @@ from confgraph.parsers.panos_parser import PANOSParser
 # asdot config, and every internal/external peer type; schema also moves,
 # but entrp's schema-less ``digest_key()`` only moves on pbv — same
 # posture as 2/3/4/5.
-PARSER_BEHAVIOR_VERSION: int = 6
+# 7 (CCR-0192): DHCP interface addressing parses onto the new
+# ``InterfaceConfig.dynamic_address`` field instead of being recognized and
+# discarded (IOS/IOS-XE/EOS/NX-OS ``ip address dhcp``, IOS-XR ``ipv4 address
+# dhcp``, JunOS ``family inet { dhcp; }``, PAN-OS ``<dhcp-client>``).
+# Observable parse output moves for every DHCP-addressed interface; the new
+# field also moves the ParsedConfig JSON schema (so the platform parse cache
+# invalidates independently and a bump is not strictly required), but entrp's
+# schema-less ``digest_key()`` only moves on pbv — same posture as 2/3/4/5/6.
+PARSER_BEHAVIOR_VERSION: int = 7
 
 __all__ = [
     "BaseParser",

@@ -345,6 +345,11 @@ class JunOSParser(BaseParser):
         if unnum_val:
             unnumbered_source = unnum_val.split()[0]  # strip any trailing keywords
 
+        # Dynamic addressing: "family inet { dhcp; }" (CCR-0192).  The bare
+        # leaf parses to an EMPTY dict in the hierarchy, so this is a presence
+        # check — truthiness would miss it.
+        dynamic_address: str | None = "dhcp" if "dhcp" in inet4 else None
+
         return InterfaceConfig(
             object_id=f"interface_{full_name}",
             raw_lines=self._raw_lines_for("interfaces", base_name),
@@ -362,6 +367,7 @@ class JunOSParser(BaseParser):
             acl_in=acl_in,
             acl_out=acl_out,
             unnumbered_source=unnumbered_source,
+            dynamic_address=dynamic_address,
         )
 
     # ------------------------------------------------------------------

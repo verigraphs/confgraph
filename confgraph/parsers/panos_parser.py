@@ -405,6 +405,13 @@ class PANOSParser(BaseParser):
             if first_ip_entry is not None:
                 ip_addr = _safe_iface(first_ip_entry.get("name", ""))
 
+            # Dynamic addressing: <dhcp-client> under layer3 (or directly on a
+            # sub-interface unit, mirroring the <ip> fallback above). CCR-0192.
+            dhcp_el = el.find("layer3/dhcp-client")
+            if dhcp_el is None:
+                dhcp_el = el.find("dhcp-client")
+            dynamic_address = "dhcp" if dhcp_el is not None else None
+
             ipv6_addrs: list[IPv6Interface] = []
             for ip6_el in (el.findall(".//ipv6/addresses/entry") or []):
                 try:
@@ -428,6 +435,7 @@ class PANOSParser(BaseParser):
                 enabled=enabled,
                 ip_address=ip_addr,
                 ipv6_addresses=ipv6_addrs,
+                dynamic_address=dynamic_address,
                 mtu=mtu,
                 zone=zone_of_iface.get(name),
                 virtual_router=vr_of_iface.get(name),

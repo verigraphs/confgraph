@@ -1690,6 +1690,13 @@ class IOSParser(BaseParser):
                     unnum_ch[-1].text, r"^\s+ip\s+unnumbered\s+(\S+)"
                 )
 
+            # Dynamic addressing — 'ip address dhcp' (with or without trailing
+            # client-id/hostname options).  CCR-0192: previously recognized and
+            # discarded; parses onto the shared dynamic_address field.
+            dynamic_address = None
+            if intf_obj.find_child_objects(r"^\s+ip\s+address\s+dhcp\b"):
+                dynamic_address = "dhcp"
+
             # Per-interface CDP
             cdp_enabled = True
             if intf_obj.find_child_objects(r"^\s+no\s+cdp\s+enable"):
@@ -1808,6 +1815,7 @@ class IOSParser(BaseParser):
                     ip_policy_route_map=ip_policy_route_map,
                     crypto_map=crypto_map_name,
                     unnumbered_source=unnumbered_source,
+                    dynamic_address=dynamic_address,
                     cdp_enabled=cdp_enabled,
                     lldp_transmit=lldp_transmit,
                     lldp_receive=lldp_receive,

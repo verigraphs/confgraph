@@ -186,6 +186,29 @@ class InterfaceConfig(BaseConfigObject):
         default=None,
         description="Source interface for IP unnumbered (references another interface)",
     )
+    # Dynamic (non-literal) addressing — the SHARED cross-OS home for the one
+    # operational fact "this interface is addressed, but the address is
+    # acquired at runtime rather than written in the config" (CCR-0192):
+    #   IOS/IOS-XE/EOS/NX-OS  ``ip address dhcp``
+    #   IOS-XR                ``ipv4 address dhcp``
+    #   JunOS                 ``family inet { dhcp; }``
+    #   PAN-OS                ``<layer3><dhcp-client>…``
+    # Before this field existed the parsers recognized these lines and then
+    # DISCARDED them — a DHCP-addressed device was indistinguishable from an
+    # unaddressed one, and CCR-0190's coverage disclosure reported healthy
+    # devices as unreadable.  A new dynamic addressing form (slaac,
+    # ppp-negotiated, …) is a new VALUE of this field — do not add a sibling
+    # field, because every consumer would then grow a clause per form (the
+    # CCR-0129 helper_addresses lesson).  Consumers must not test this field
+    # directly to answer "is this interface addressed?" — that question is
+    # owned by the ``is_addressed`` property below.
+    dynamic_address: str | None = Field(
+        default=None,
+        description=(
+            "Dynamic addressing form for this interface ('dhcp'), all OS "
+            "spellings; None when addressing is literal or absent"
+        ),
+    )
     acl_in: str | None = Field(
         default=None,
         description="Inbound ACL applied via 'ip access-group <name> in'",
@@ -602,6 +625,26 @@ class InterfaceConfig(BaseConfigObject):
     # PAN-OS specific
     zone: str | None = Field(default=None, description="PAN-OS security zone this interface belongs to")
     virtual_router: str | None = Field(default=None, description="PAN-OS virtual router this interface is assigned to")
+
+    @property
+    def is_addressed(self) -> bool:
+        """True iff this interface carries Layer-3 addressing in ANY form.
+
+        The single point of truth for the question "does this interface have
+        addressing?" (CCR-0192).  A plain property, deliberately NOT a pydantic
+        computed_field: it must not appear in model_dump()/schema output, only
+        be reachable structurally (``getattr``) on an instance.  Consumers ask
+        this instead of testing individual fields, so a new addressing form
+        (a new ``dynamic_address`` value, or a genuinely new field added HERE)
+        never requires a consumer change.
+        """
+        return bool(
+            self.ip_address is not None
+            or self.ipv6_addresses
+            or self.secondary_ips
+            or self.unnumbered_source
+            or self.dynamic_address
+        )
 
     class Config:
         """Pydantic model configuration."""
