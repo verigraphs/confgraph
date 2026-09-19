@@ -589,13 +589,17 @@ class IOSXRParser(IOSParser):
 
         return nd
 
-    def _parse_iosxr_neighbor_af_block(self, af_child) -> dict:
-        """Parse a single ``address-family ipv4|ipv6 unicast`` block under a neighbor.
+    @staticmethod
+    def _neighbor_af_defaults() -> dict:
+        """The pristine ``af_data`` template — the SINGLE definition (CCR-0202).
 
-        Used by ``_apply_bgp_af_neighbor_policies`` to build ``BGPNeighborAF``
-        objects.  Returns an af_data dict keyed by ``BGPNeighborAF`` field names.
+        ``_parse_iosxr_neighbor_af_block`` starts from it, and the attach
+        filter in ``_apply_bgp_af_neighbor_policies`` compares the parsed
+        result AGAINST it, so "did this AF block model anything" is an
+        outcome-based comparison instead of a value-shape heuristic. A new
+        field added here is automatically both parseable and attach-relevant.
         """
-        af_data: dict = {
+        return {
             "activate": True,
             "route_map_in": None,
             "route_map_out": None,
@@ -612,6 +616,14 @@ class IOSXRParser(IOSParser):
             "maximum_prefix_threshold": None,
             "maximum_prefix_warning_only": False,
         }
+
+    def _parse_iosxr_neighbor_af_block(self, af_child) -> dict:
+        """Parse a single ``address-family ipv4|ipv6 unicast`` block under a neighbor.
+
+        Used by ``_apply_bgp_af_neighbor_policies`` to build ``BGPNeighborAF``
+        objects.  Returns an af_data dict keyed by ``BGPNeighborAF`` field names.
+        """
+        af_data: dict = self._neighbor_af_defaults()
 
         for policy_child in af_child.all_children:
             cmd = policy_child.text.strip()
@@ -1826,6 +1838,79 @@ class IOSXRParser(IOSParser):
     # BGP neighbors — block syntax "neighbor X\n  remote-as Y"
     # -----------------------------------------------------------------------
 
+    def _emit_bgp_neighbor_submode_negations(
+        self, bgp_or_af_obj, asn, vrf, pg_names
+    ) -> None:
+        """IOS-XR block-form neighbor negations (CCR-0202 / user-test F-12).
+
+        The NX-OS CCR-0112 precedent, XR block shapes: XR expresses per-neighbor
+        negations INSIDE the ``neighbor <ip>`` block — ``no shutdown`` at
+        session level, ``no route-reflector-client`` under ``address-family
+        ipv4|ipv6 <safi>`` — never as flat ``no neighbor X <attr>`` lines, so
+        the base hook (a documented no-op for XR) left every one of them
+        silently vanishing: green "appears contained" on a withdrawal.
+
+        Session-level lines go through the SAME shared ``_emit_bgp_neighbor_no_op``
+        path every other dialect uses. AF sub-block lines carry ``af=(afi,
+        safi)`` so fields that live on ``BGPNeighborAF`` reset AT the AF level:
+        the simulator ORs session and AF flags (route_reflector_client) and XR
+        populates the AF level, so a session-level reset alone is masked by a
+        baseline AF-level True.
+
+        XR SPELLINGS are translated to the shared map's vocabulary before
+        delegating — ``no route-policy RP in|out`` → ``route-map``, ``no
+        prefix-set PS in|out`` → ``prefix-list`` — exactly mirroring the
+        POSITIVE parse (``route-policy`` fills ``route_map_in/out``,
+        ``prefix-set`` fills ``prefix_list_in/out``). Without this, XR's most
+        common per-neighbor attribute negation hit the shared path's
+        skip-silently tail and vanished — the F-12 silent-green class
+        reintroduced inside the very mechanism fixing it (CCR-0202 validation
+        round, finding F2).
+        """
+
+        def _shared_spelling(attr: str) -> str:
+            if attr.startswith("route-policy "):
+                return "route-map " + attr[len("route-policy "):]
+            if attr.startswith("prefix-set "):
+                return "prefix-list " + attr[len("prefix-set "):]
+            return attr
+        for nb_obj in bgp_or_af_obj.find_child_objects(r"^\s+neighbor\s+\S+\s*$"):
+            m = re.match(r"^\s+neighbor\s+(\S+)\s*$", nb_obj.text)
+            if not m:
+                continue
+            peer = m.group(1)
+            try:
+                IPv4Address(peer)
+            except ValueError:
+                try:
+                    IPv6Address(peer)
+                except ValueError:
+                    continue
+
+            # Session-level negations (direct children of the neighbor block)…
+            for child in nb_obj.children:
+                nm = re.match(r"^\s+no\s+(\S.*)$", child.text)
+                if nm:
+                    self._emit_bgp_neighbor_no_op(
+                        peer, _shared_spelling(nm.group(1).strip()),
+                        child, asn, vrf, pg_names,
+                    )
+            # …and address-family sub-block negations, AF-scoped.
+            for child in nb_obj.children:
+                am = re.match(
+                    r"^\s+address-family\s+(ipv4|ipv6)\s+(\S+)", child.text
+                )
+                if not am:
+                    continue
+                af = (am.group(1), am.group(2))
+                for sub in child.children:
+                    nm = re.match(r"^\s+no\s+(\S.*)$", sub.text)
+                    if nm:
+                        self._emit_bgp_neighbor_no_op(
+                            peer, _shared_spelling(nm.group(1).strip()),
+                            sub, asn, vrf, pg_names, af=af,
+                        )
+
     def _parse_bgp_neighbors(self, bgp_obj) -> list[BGPNeighbor]:
         """Parse BGP neighbors from IOS-XR block-style syntax.
 
@@ -1932,17 +2017,23 @@ class IOSXRParser(IOSParser):
                     continue
                 afi, safi = m.group(1), "unicast"
                 af_data = self._parse_iosxr_neighbor_af_block(af_child)
-                # `v is not True` keeps a bare-activate AF block from attaching,
-                # but it also discards blocks whose only modelled content is a
-                # boolean flag. `default-originate` (unconditional) is exactly such
-                # a block — witnessed on-device as a lone child of the neighbor AF
-                # sub-block — so OR it in explicitly rather than letting the
-                # generic filter drop the value we just set. (The same latent drop
-                # affects next-hop-self / route-reflector-client-only AF blocks;
-                # that broader filter fix is out of scope for CCR-0078.)
-                if (
-                    any(v for v in af_data.values() if v and v is not True)
-                    or af_data.get("default_originate")
+                # Attach iff the block MODELLED anything — any field moved off
+                # its template default, ``activate`` excepted (a bare-activate
+                # block must not attach, the CCR-0078 concern). This replaced a
+                # value-shape heuristic (`v and v is not True` + an explicit
+                # default_originate OR) that silently DROPPED any AF block whose
+                # only content is a boolean flag — an XR route reflector's
+                # client AF is exactly ``route-reflector-client`` alone, so RR
+                # membership vanished from the model and both the F-12
+                # withdrawal (CCR-0202) and the baseline RR detection it gates
+                # were invisible. Outcome-based against the single template
+                # (``_neighbor_af_defaults``): a new AF field is attach-relevant
+                # the day it is added, with no edit here.
+                defaults = self._neighbor_af_defaults()
+                if any(
+                    v != defaults[k]
+                    for k, v in af_data.items()
+                    if k != "activate"
                 ):
                     nb.address_families.append(BGPNeighborAF(afi=afi, safi=safi, **af_data))
 
@@ -2606,6 +2697,16 @@ class IOSXRParser(IOSParser):
                 tombstones.append(f"field:dns:domain:{m.group(1)}")
         if parse.find_objects(r"^no\s+domain\s+lookup\s*$"):
             tombstones.append("singleton:dns")
+
+        # --- Registry-driven nested block deletions (CCR-0202) ---
+        # This override never calls super(), so until CCR-0202 every
+        # NESTED_DELETION_RULES row was dead on IOS-XR by construction
+        # (user-test F-12, fourth gap): a nested ``no`` the registry names on
+        # every other OS simply vanished here. Run the SAME shared traversal
+        # the other parsers run — rules whose parent grammar does not occur on
+        # XR (``vrf definition|context``, ``control-plane``) match nothing and
+        # cost nothing.
+        self._collect_nested_rule_tombstones(parse, tombstones)
 
         return tombstones
 

@@ -4891,6 +4891,66 @@ class IOSParser(BaseParser):
 
         return bgp_instances
 
+    def _queue_ospf_network_removal_ops(
+        self,
+        ospf_obj,
+        process_id,
+        ospf_vrf,
+        positive_net_last_line: dict,
+        *,
+        child_pattern: str,
+        extract,
+    ) -> None:
+        """Family 6c: queue ops-only ``no network … area X`` withdrawals (shared walk).
+
+        ONE walk body for every spelling of the removal (CCR-0202): the IOS
+        three-token wildcard form and the EOS CIDR form differ only in grammar
+        and net normalization, so those arrive as ``child_pattern`` + ``extract``
+        (regex match → ``(IPv4Network, area_id)`` or ``None`` for an unparseable
+        operand, which stays blind exactly as before). Everything the two forms
+        must never disagree on lives HERE: the LIST_REMOVE op shape scoped to
+        this instance's (pid, vrf), and the WI-8 ``_readded_later`` suppression —
+        the removal is dropped when the SAME (cidr, area) reappears as a
+        positive line LATER in the block (refresh → re-add wins → device truth
+        and legacy parity). ``positive_net_last_line`` maps ``(str(net),
+        area_id)`` → last positive line number, built by the caller from ITS
+        positive walk so removal matching cannot drift from the positive parse
+        (Appendix O.2). Emits native LIST_REMOVE ops with NO legacy twin
+        (encode_legacy silent) onto ``_pending_native_ospf_ops``.
+        """
+        from confgraph.change_ir import ChangeOp, Verb
+
+        for nnc in ospf_obj.find_child_objects(r"^\s+no\s+network\s+"):
+            nnm = re.match(child_pattern, nnc.text)
+            if not nnm:
+                continue
+            extracted = extract(nnm)
+            if extracted is None:
+                continue
+            rem_net, rem_area = extracted
+            rem_key = (str(rem_net), rem_area)
+            if positive_net_last_line.get(rem_key, -1) > nnc.linenum:
+                continue  # re-added later in the block — removal suppressed
+            if not hasattr(self, "_pending_native_ospf_ops"):
+                self._pending_native_ospf_ops = []
+            self._pending_native_ospf_ops.append(
+                ChangeOp(
+                    verb=Verb.LIST_REMOVE,
+                    path=(
+                        "ospf_instance",
+                        str(process_id),
+                        ospf_vrf or "",
+                        "network",
+                        rem_key[0],
+                        rem_key[1],
+                    ),
+                    value=None,
+                    source_line=nnc.text.strip(),
+                    line_no=nnc.linenum,
+                    origin="native",
+                )
+            )
+
     def parse_ospf(self) -> list[OSPFConfig]:
         """Parse OSPF configurations."""
         from confgraph.change_ir import ChangeOp, Verb
@@ -5052,49 +5112,26 @@ class IOSParser(BaseParser):
                         pass
 
             # Family 6c (CCR Appendix O): ops-only ``no network A W area X``
-            # withdrawal.  The positive walk above never matches a ``no
-            # network`` line and the merged ``network_statements`` list is
-            # additive, so the line is silently dropped by the legacy parser
-            # (no tombstone) — the CONFIRMED capability (network statement →
-            # OSPF interface enablement → adjacency, via igp.py
-            # ``_is_ospf_enabled``).  Emit a native LIST_REMOVE with NO legacy
-            # twin (encode_legacy silent), scoped to this instance's
-            # (pid, vrf), identity (cidr, area) through the SAME _ospf_net
-            # normalization as the positive parse.  SUPPRESSION (WI-8
-            # ``_readded_later`` pattern): the positive SETs carry the block's
-            # first line as provenance (coarse), so suppress the removal when
-            # the SAME (cidr, area) reappears as a positive line LATER in the
-            # block (refresh → re-add wins → device truth and legacy parity).
-            for nnc in ospf_obj.find_child_objects(r"^\s+no\s+network\s+"):
-                nnm = re.match(
-                    r"^\s+no\s+network\s+(\S+)\s+(\S+)\s+area\s+(\S+)", nnc.text
-                )
-                if not nnm:
-                    continue
+            # withdrawal — the shared removal walk, wildcard form. Extraction
+            # goes through the SAME _ospf_net normalization as the positive
+            # parse (Appendix O.2 — removal matching must never drift from the
+            # positive parse); the walk body, suppression and op shape live in
+            # ``_queue_ospf_network_removal_ops`` (CCR-0202), shared with the
+            # EOS override's CIDR form so the two spellings cannot drift.
+            def _extract_wildcard_removal(nnm) -> "tuple[IPv4Network, str] | None":
                 try:
-                    rem_net = _ospf_net(nnm.group(1), nnm.group(2))
+                    return _ospf_net(nnm.group(1), nnm.group(2)), nnm.group(3)
                 except ValueError:
-                    continue
-                rem_key = (str(rem_net), nnm.group(3))
-                if positive_net_last_line.get(rem_key, -1) > nnc.linenum:
-                    continue  # re-added later in the block — removal suppressed
-                self._pending_native_ospf_ops.append(
-                    ChangeOp(
-                        verb=Verb.LIST_REMOVE,
-                        path=(
-                            "ospf_instance",
-                            str(process_id),
-                            ospf_vrf or "",
-                            "network",
-                            rem_key[0],
-                            rem_key[1],
-                        ),
-                        value=None,
-                        source_line=nnc.text.strip(),
-                        line_no=nnc.linenum,
-                        origin="native",
-                    )
-                )
+                    return None
+
+            self._queue_ospf_network_removal_ops(
+                ospf_obj,
+                process_id,
+                ospf_vrf,
+                positive_net_last_line,
+                child_pattern=r"^\s+no\s+network\s+(\S+)\s+(\S+)\s+area\s+(\S+)",
+                extract=_extract_wildcard_removal,
+            )
 
             # Family 6d (CCR Appendix P.3): ops-only ``no area N range A M``
             # withdrawal.  The positive area walk (_parse_ospf_areas) never
@@ -6061,6 +6098,7 @@ class IOSParser(BaseParser):
         asn: int,
         vrf: str | None,
         pg_names: set[str],
+        af: "tuple[str, str] | None" = None,
     ) -> None:
         """Queue the native ChangeOp for one neighbor negation targeting *peer*.
 
@@ -6069,11 +6107,23 @@ class IOSParser(BaseParser):
         attribute (``next-hop-self`` / ``description ...`` / ``route-map RM in``
         …). SINGLE emission path + SINGLE ``_BGP_NEIGHBOR_NO_FIELD_MAP`` registry
         shared by the flat ``no neighbor X <attr>`` walk
-        (``_parse_bgp_neighbor_tombstones``) and the NX-OS indented neighbor
+        (``_parse_bgp_neighbor_tombstones``), the NX-OS indented neighbor
         sub-mode ``no <attr>`` walk (``_emit_bgp_neighbor_submode_negations``),
-        so both spellings emit byte-identical ops.
+        and the IOS-XR override of the same hook, so every spelling emits
+        byte-identical ops.
+
+        *af* (CCR-0202): the ``(afi, safi)`` of the neighbor address-family
+        sub-block the negation appeared in, or None for session level. When set
+        AND the resolved field lives on ``BGPNeighborAF``, the reset is emitted
+        AF-SCOPED — ``(…, "field", "neighbor", <peer>, "address_family", afi,
+        safi, <field>)`` — because the simulator ORs session and AF level
+        (route_reflector_client) and IOS-XR models these flags AT the AF level:
+        a session-level reset alone is masked by a baseline AF-level True. A
+        field that does not live on the AF model flattens to the session-level
+        emission exactly as NX-OS has always done (CCR-0112/CCR-0077 parity).
         """
         from confgraph.change_ir import ChangeOp, Verb
+        from confgraph.models.bgp import BGPNeighborAF
 
         def _emit(tombstone: str, verb: "Verb | None" = None) -> None:
             if verb is None:
@@ -6093,6 +6143,33 @@ class IOSParser(BaseParser):
                     origin="native",
                 )
             )
+
+        def _emit_field(field_name: str) -> None:
+            """One field reset — AF-scoped when the sub-block and model agree."""
+            if af is not None and field_name in BGPNeighborAF.model_fields:
+                self._pending_native_bgp_ops.append(
+                    ChangeOp(
+                        verb=Verb.UNSET,
+                        path=(
+                            "bgp_instance",
+                            str(asn),
+                            vrf or "",
+                            "field",
+                            "neighbor",
+                            peer,  # ONE collapsed segment (E6), as CCR-0148 does
+                            "address_family",
+                            af[0],
+                            af[1],
+                            field_name,
+                        ),
+                        value=None,
+                        source_line=node.text.strip(),
+                        line_no=node.linenum,
+                        origin="native",
+                    )
+                )
+                return
+            _emit(f"field:neighbor:{peer}:{field_name}")
 
         if not attr:
             # "no neighbor X" — full neighbor removal
@@ -6133,17 +6210,17 @@ class IOSParser(BaseParser):
         if attr.startswith("route-map "):
             field = "route_map_in" if attr.endswith(" in") else "route_map_out" if attr.endswith(" out") else None
             if field:
-                _emit(f"field:neighbor:{peer}:{field}")
+                _emit_field(field)
             return
         if attr.startswith("prefix-list "):
             field = "prefix_list_in" if attr.endswith(" in") else "prefix_list_out" if attr.endswith(" out") else None
             if field:
-                _emit(f"field:neighbor:{peer}:{field}")
+                _emit_field(field)
             return
         if attr.startswith("filter-list "):
             field = "filter_list_in" if attr.endswith(" in") else "filter_list_out" if attr.endswith(" out") else None
             if field:
-                _emit(f"field:neighbor:{peer}:{field}")
+                _emit_field(field)
             return
 
         # Family 5b Candidate-B (CCR Appendix I): ``no neighbor GROUP peer-group``
@@ -6158,7 +6235,7 @@ class IOSParser(BaseParser):
             if prefix in ("route-map", "prefix-list", "filter-list"):
                 continue  # already handled above
             if attr == prefix or attr.startswith(prefix + " "):
-                _emit(f"field:neighbor:{peer}:{field_name}")
+                _emit_field(field_name)
                 break
         # Unrecognised attribute — skip silently (never a full-removal tombstone)
 
@@ -7889,6 +7966,84 @@ class IOSParser(BaseParser):
             return f"static:{vrf}:{dest}:{' '.join(nh_tokens)}"
         return f"static:{vrf}:{dest}"
 
+    def _collect_nested_rule_tombstones(self, parse, tombstones: list) -> None:
+        """Traverse NESTED_DELETION_RULES and emit nested ``no`` tombstones/ops.
+
+        THE canonical registry traversal, extracted (CCR-0202) so IOS-XR's
+        ``parse_deletion_commands`` override — which never calls super() — can
+        run the registry too: before this, every NESTED_DELETION_RULES row was
+        dead on XR by construction (user-test F-12, fourth gap). IOS/NX-OS/EOS
+        call it from the shared ``parse_deletion_commands`` exactly where the
+        inline block sat; behavior and emission order are unchanged there.
+        The two native-op queues it can touch are getattr-initialized because
+        the XR caller does not run the IOS method preamble that creates them.
+        """
+        if not hasattr(self, "_pending_native_vrf_ops"):
+            self._pending_native_vrf_ops = []
+        if not hasattr(self, "_pending_native_interface_ops"):
+            self._pending_native_interface_ops = []
+        # Each NestedDeletionRule maps a (parent_block, nested_no_command) pair
+        # to a ``field:<template>`` tombstone consumed by _apply_deletions() →
+        # _del_field() in the merger.  Adding a new nested deletion requires
+        # exactly one new entry in tombstones.NESTED_DELETION_RULES plus one
+        # accessor in merger._FIELD_PATH_ACCESSORS — nothing else changes.
+        from confgraph.tombstones import NESTED_DELETION_RULES
+        for rule in NESTED_DELETION_RULES:
+            for block_obj in parse.find_objects(rule.parent_pattern):
+                pm = re.search(rule.parent_pattern, block_obj.text)
+                if not pm:
+                    continue
+                parent_ctx = {
+                    name: (pm.group(i + 1) or "")
+                    for i, name in enumerate(rule.parent_groups)
+                }
+                for child in block_obj.all_children:
+                    text = child.text.strip()
+                    cm = re.match(rule.child_pattern, text)
+                    if not cm:
+                        continue
+                    child_ctx = {
+                        name: (cm.group(i + 1) or "")
+                        for i, name in enumerate(rule.child_groups)
+                    }
+                    ctx = {**parent_ctx, **child_ctx}
+                    # WI-DB1-B1 (CCR Appendix AA.2): optional per-rule
+                    # normalizer — computes canonical extra template keys
+                    # (e.g. secondary-ip dotted/CIDR → one str(IPv4Interface)
+                    # key); a None return skips the line (unparseable
+                    # operand stays blind, exactly as before the rule).
+                    if rule.derive is not None:
+                        extra = rule.derive(ctx)
+                        if extra is None:
+                            continue
+                        ctx.update(extra)
+                    nested_tombstone = "field:" + rule.template.format(**ctx)
+                    # Change-IR family 7a (CCR Appendix R): the VRF-shaped
+                    # nested removals (route-target / rd — the WI-7 registry
+                    # entries) are queued as NATIVE line-numbered ops and the
+                    # byte-exact tombstone is regenerated FROM the op at this
+                    # same position (single source, the family-4 pattern).
+                    # Non-VRF templates are unchanged.
+                    if rule.template.startswith("vrfs:"):
+                        self._queue_native_vrf_removal(
+                                nested_tombstone, child
+                            )
+                    # Change-IR family 8e (CCR Appendix X): the two
+                    # interface member-removal templates (helper /
+                    # nhrp_nhs) are queued as NATIVE line-numbered
+                    # LIST_REMOVE ops and the byte-exact tombstone is
+                    # regenerated FROM the op at this same position
+                    # (single source, the 7a pattern).  Other templates
+                    # are unchanged.
+                    elif rule.template.startswith("interface:"):
+                        self._queue_native_iface_member_removal(
+                                nested_tombstone, child
+                            )
+                    else:
+                        tombstones.append(nested_tombstone)
+
+
+
     def parse_deletion_commands(self) -> list[str]:
         # Handles:
         #   - ``no vlan <id>``                              → ``vlan:<id>``
@@ -8807,65 +8962,9 @@ class IOSParser(BaseParser):
                         )
 
         # --- Registry-driven nested block deletions ---
-        # Each NestedDeletionRule maps a (parent_block, nested_no_command) pair
-        # to a ``field:<template>`` tombstone consumed by _apply_deletions() →
-        # _del_field() in the merger.  Adding a new nested deletion requires
-        # exactly one new entry in tombstones.NESTED_DELETION_RULES plus one
-        # accessor in merger._FIELD_PATH_ACCESSORS — nothing else changes.
-        from confgraph.tombstones import NESTED_DELETION_RULES
-        for rule in NESTED_DELETION_RULES:
-            for block_obj in parse.find_objects(rule.parent_pattern):
-                pm = re.search(rule.parent_pattern, block_obj.text)
-                if not pm:
-                    continue
-                parent_ctx = {
-                    name: (pm.group(i + 1) or "")
-                    for i, name in enumerate(rule.parent_groups)
-                }
-                for child in block_obj.all_children:
-                    text = child.text.strip()
-                    cm = re.match(rule.child_pattern, text)
-                    if not cm:
-                        continue
-                    child_ctx = {
-                        name: (cm.group(i + 1) or "")
-                        for i, name in enumerate(rule.child_groups)
-                    }
-                    ctx = {**parent_ctx, **child_ctx}
-                    # WI-DB1-B1 (CCR Appendix AA.2): optional per-rule
-                    # normalizer — computes canonical extra template keys
-                    # (e.g. secondary-ip dotted/CIDR → one str(IPv4Interface)
-                    # key); a None return skips the line (unparseable
-                    # operand stays blind, exactly as before the rule).
-                    if rule.derive is not None:
-                        extra = rule.derive(ctx)
-                        if extra is None:
-                            continue
-                        ctx.update(extra)
-                    nested_tombstone = "field:" + rule.template.format(**ctx)
-                    # Change-IR family 7a (CCR Appendix R): the VRF-shaped
-                    # nested removals (route-target / rd — the WI-7 registry
-                    # entries) are queued as NATIVE line-numbered ops and the
-                    # byte-exact tombstone is regenerated FROM the op at this
-                    # same position (single source, the family-4 pattern).
-                    # Non-VRF templates are unchanged.
-                    if rule.template.startswith("vrfs:"):
-                        self._queue_native_vrf_removal(
-                                nested_tombstone, child
-                            )
-                    # Change-IR family 8e (CCR Appendix X): the two
-                    # interface member-removal templates (helper /
-                    # nhrp_nhs) are queued as NATIVE line-numbered
-                    # LIST_REMOVE ops and the byte-exact tombstone is
-                    # regenerated FROM the op at this same position
-                    # (single source, the 7a pattern).  Other templates
-                    # are unchanged.
-                    elif rule.template.startswith("interface:"):
-                        self._queue_native_iface_member_removal(
-                                nested_tombstone, child
-                            )
-                    else:
-                        tombstones.append(nested_tombstone)
+        # (extracted to _collect_nested_rule_tombstones at CCR-0202 so IOS-XR
+        # can traverse the registry too; the walk itself is unchanged.)
+        self._collect_nested_rule_tombstones(parse, tombstones)
 
         # CCR-0110 Phase E4/E5: the family-6 IGP withdrawal ops queued by
         # parse_ospf / parse_eigrp used to drain their byte-exact legacy twins

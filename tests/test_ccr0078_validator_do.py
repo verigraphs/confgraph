@@ -255,10 +255,16 @@ def test_adv_iosxr_mix_nexthopself_and_default_originate():
 
 # =====================================================================
 # GUARD — deviation A: next-hop-self-ONLY / rrc-ONLY IOS-XR AF blocks
-# The shared attach filter drops these both PRE and POST fix. The author's
-# OR-in of default_originate must NOT change that (green pre AND post).
+# HISTORY: at CCR-0078 these two guards pinned the drop as unchanged ("out of
+# scope for CCR-0078", per the filter's own comment). CCR-0202 then fixed the
+# drop itself — the attach filter is outcome-based against the template now,
+# and a flag-only AF block ATTACHES (an XR route reflector's client AF is
+# exactly ``route-reflector-client`` alone; dropping it hid RR membership from
+# the simulator and masked the F-12 withdrawal). The guards now pin the fixed
+# behavior; the bare-activate case CCR-0078 actually cared about is pinned in
+# test_ccr0202_withdrawal_gaps.py::TestXRAfAttachFilter.
 # =====================================================================
-def test_guard_iosxr_nexthopself_only_block_unchanged():
+def test_guard_iosxr_nexthopself_only_block_attaches():
     cfg = """router bgp 64500
  neighbor 203.0.113.9
   remote-as 64600
@@ -266,12 +272,11 @@ def test_guard_iosxr_nexthopself_only_block_unchanged():
    next-hop-self
 """
     nb = _nbrs(_global(IOSXRParser(cfg).parse_bgp()))["203.0.113.9"]
-    # No default-originate present -> the bare-bool block is still filtered out,
-    # exactly as before the fix.
-    assert _ipv4_afs(nb) == []
+    afs = _ipv4_afs(nb)
+    assert len(afs) == 1 and afs[0].next_hop_self is True
 
 
-def test_guard_iosxr_rrclient_only_block_unchanged():
+def test_guard_iosxr_rrclient_only_block_attaches():
     cfg = """router bgp 64500
  neighbor 203.0.113.9
   remote-as 64600
@@ -279,7 +284,8 @@ def test_guard_iosxr_rrclient_only_block_unchanged():
    route-reflector-client
 """
     nb = _nbrs(_global(IOSXRParser(cfg).parse_bgp()))["203.0.113.9"]
-    assert _ipv4_afs(nb) == []
+    afs = _ipv4_afs(nb)
+    assert len(afs) == 1 and afs[0].route_reflector_client is True
 
 
 # GUARD: IOS-XR AF block with a route-policy (string) attaches, as it always did

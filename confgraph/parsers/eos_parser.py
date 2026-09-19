@@ -385,6 +385,9 @@ class EOSParser(IOSParser):
             if inst is None:
                 continue
             existing = set(inst.network_statements)
+            # Last positive line per (cidr, area) — feeds the CIDR removal
+            # walk's re-add suppression below (CCR-0202, the WI-8 pattern).
+            cidr_positive_last_line: dict[tuple[str, str], int] = {}
             # Prefix form only: exactly ``network <prefix> area <id>`` (the
             # trailing ``$`` keeps this disjoint from the inherited three-token
             # wildcard form, which has an extra token before ``area``).
@@ -406,6 +409,37 @@ class EOSParser(IOSParser):
                 if stmt not in existing:
                     inst.network_statements.append(stmt)
                     existing.add(stmt)
+                nkey = (str(net), area_id)
+                cidr_positive_last_line[nkey] = max(
+                    cidr_positive_last_line.get(nkey, -1), nc.linenum
+                )
+
+            # Family 6c, CIDR form (CCR-0202 / user-test F-12): ``no network
+            # 10.30.1.0/24 area 0``. The inherited wildcard removal walk only
+            # matches the three-token form, so the EOS-native CIDR removal
+            # vanished — grammar drift against the Appendix O.2 rule that
+            # removal matching must never drift from the positive parse (the
+            # positive CIDR form above was added without its removal twin).
+            # Same shared walk body, suppression and op shape as IOS
+            # (``_queue_ospf_network_removal_ops``); only the grammar and the
+            # net normalization differ, and both are exactly the positive
+            # parse's own. The last-line map covers the CIDR positives parsed
+            # in THIS loop — the two-token pattern is disjoint from the
+            # inherited three-token walk, which suppresses its own pairs.
+            def _extract_cidr_removal(nnm) -> "tuple[IPv4Network, str] | None":
+                try:
+                    return IPv4Network(nnm.group(1), strict=False), nnm.group(2)
+                except ValueError:
+                    return None
+
+            self._queue_ospf_network_removal_ops(
+                ospf_obj,
+                pid,
+                getattr(inst, "vrf", None),
+                cidr_positive_last_line,
+                child_pattern=r"^\s+no\s+network\s+(\S+)\s+area\s+(\S+)\s*$",
+                extract=_extract_cidr_removal,
+            )
 
         return ospf_instances
 

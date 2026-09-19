@@ -338,10 +338,13 @@ class TestPerOS:
             "field:interface:Vlan100:vrrp_groups:9",
         ]
 
-    def test_iosxr_emits_nothing(self):
-        # XR overrides parse_deletion_commands without super() — exact
-        # parity by absence (Phase 5).  Sub-class A detections likewise do
-        # not fire through XR's own interface negation path.
+    def test_iosxr_emits_through_the_shared_traversal(self):
+        # HISTORY: this used to pin "exact parity by absence" — XR's
+        # parse_deletion_commands override never traversed
+        # NESTED_DELETION_RULES, so every registry row was dead on XR
+        # (user-test F-12, fourth gap). CCR-0202 wired the shared traversal
+        # into the XR override; the pin is now PRESENCE parity: the same
+        # registry rows emit the same ops on XR as everywhere else.
         cfg = (
             "hostname xr1\n"
             "interface GigabitEthernet0/0/0/0\n"
@@ -349,10 +352,12 @@ class TestPerOS:
             " no ip igmp join-group 239.1.1.1\n"
         )
         pc = IOSXRParser(cfg).parse()
-        assert not [
-            t for t in pc.no_commands if t.startswith("field:interface:")
+        removed = sorted(op.path for op in _removals(derive_ops(pc)))
+        assert removed == [
+            ("field", "interface", "GigabitEthernet0/0/0/0", "hsrp_groups", "1"),
+            ("field", "interface", "GigabitEthernet0/0/0/0",
+             "igmp_join_groups", "239.1.1.1"),
         ]
-        assert not _removals(derive_ops(pc))
 
 
 class TestDemoCorpusShape:

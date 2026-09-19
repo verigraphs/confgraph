@@ -102,10 +102,23 @@ NESTED_DELETION_RULES: list[NestedDeletionRule] = [
     # BGP AF redistribute removal
     # Proposal: ``no redistribute ospf 1`` inside ``router bgp / address-family ipv4``
     # Tombstone: ``field:bgp:65001:af:ipv4:redistribute:ospf:1``
+    #
+    # The child pattern tolerates operand tails (CCR-0202 / user-test F-12:
+    # ``no redistribute static route-map RM-STATIC`` vanished while the bare
+    # form worked). Bounded alternation per the CCR-0145 end-anchoring
+    # discipline — never a bare ``.*``. The tail does not reach the template,
+    # so existing forms emit byte-identical tombstones and the operand-bearing
+    # form emits the SAME key as its bare twin. Deliberate semantics caveat:
+    # some IOS trains treat ``no redistribute X route-map Y`` as stripping
+    # only the route-map option; modeling it as full withdrawal is the
+    # outage-conservative reading and the only one the merger can express.
     NestedDeletionRule(
         parent_pattern=r"^router\s+bgp\s+(\d+)\s*$",
         parent_groups=["asn"],
-        child_pattern=r"^no\s+redistribute\s+(\S+)(?:\s+(\d+))?\s*$",
+        child_pattern=(
+            r"^no\s+redistribute\s+(\S+)(?:\s+(\d+))?"
+            r"(?:\s+(?:route-map|metric)\s+\S+)*\s*$"
+        ),
         child_groups=["proto", "pid"],
         template="bgp:{asn}:af:ipv4:redistribute:{proto}:{pid}",
     ),

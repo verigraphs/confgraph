@@ -1161,6 +1161,29 @@ def is_native_bgp_neighbor_af_removal_op(op: "ChangeOp") -> bool:
     )
 
 
+def is_native_bgp_neighbor_af_field_reset_op(op: "ChangeOp") -> bool:
+    """True iff *op* is the CCR-0202 AF-scoped per-neighbor field reset.
+
+    ``UNSET ("bgp_instance", asn, vrf, "field", "neighbor"|"peer_group",
+    <name>, "address_family", afi, safi, <field>)`` — a nested ``no <attr>``
+    inside a neighbor's address-family sub-block (IOS-XR spelling), resetting
+    ONE field on the keyed AF entry. NO legacy twin: the tombstone-string
+    vocabulary never had an AF-scoped neighbor field reset (the same
+    variable-length IPv6-peer reason CCR-0148 built its AF removal
+    ops-directly), so :func:`encode_legacy` must emit NOTHING for it — a
+    ``":".join`` fall-through would mint a string in a vocabulary no consumer
+    ever defined.
+    """
+    return (
+        getattr(op, "origin", "derived") == "native"
+        and op.verb is Verb.UNSET
+        and len(op.path) == 10
+        and op.path[0] == "bgp_instance"
+        and op.path[3] == "field"
+        and op.path[6] == "address_family"
+    )
+
+
 def is_native_bgp_instance_create_op(op: "ChangeOp") -> bool:
     """True iff *op* is the family-5c-B.2 whole-instance CREATE op.
 
@@ -3303,6 +3326,9 @@ def encode_legacy(ops: ChangeSet) -> LegacyArtifacts:
             or is_native_bgp_af_aggregate_removal_op(op)
             or is_native_bgp_af_network_removal_op(op)
             or is_native_bgp_neighbor_af_removal_op(op)
+            # CCR-0202: the AF-scoped neighbor field reset (IOS-XR nested
+            # ``no <attr>`` under a neighbor AF block) — same no-twin posture.
+            or is_native_bgp_neighbor_af_field_reset_op(op)
         ):
             continue
         # Family-6a ops-only ``no net`` (CCR Appendix M): NO legacy twin (the

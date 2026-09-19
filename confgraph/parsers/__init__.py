@@ -72,7 +72,17 @@ from confgraph.parsers.panos_parser import PANOSParser
 # field also moves the ParsedConfig JSON schema (so the platform parse cache
 # invalidates independently and a bump is not strictly required), but entrp's
 # schema-less ``digest_key()`` only moves on pbv — same posture as 2/3/4/5/6.
-PARSER_BEHAVIOR_VERSION: int = 7
+# 8 (CCR-0202): withdrawal-gap fixes move observable parse output on three
+# fronts — the IOS-XR neighbor-AF ATTACH filter is outcome-based (an AF block
+# whose only content is a boolean flag — an RR's ``route-reflector-client``
+# — now attaches instead of being dropped), XR emits neighbor negations and
+# NESTED_DELETION_RULES tombstones/ops for the first time, EOS emits the
+# CIDR-form OSPF network removal, and the redistribute negation rule accepts
+# operand tails.  The attach fix is the sharp case for this constant: it
+# changes parsed MODELS with NO ParsedConfig JSON-schema change whatsoever,
+# so pbv is the ONLY signal that invalidates the platform parse cache and
+# entrp's digest keys for it.
+PARSER_BEHAVIOR_VERSION: int = 8
 
 __all__ = [
     "BaseParser",

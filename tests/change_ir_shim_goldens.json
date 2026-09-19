@@ -269,7 +269,9 @@
    "interface_scoped": {
     "bgp_no_commands": {},
     "interface_no_commands": {},
-    "no_commands": []
+    "no_commands": [
+     "field:interface:GigabitEthernet0/1:helper:10.9.9.9"
+    ]
    },
    "mixed_kitchen_sink": {
     "bgp_no_commands": {
@@ -287,6 +289,7 @@
     "bgp_no_commands": {},
     "interface_no_commands": {},
     "no_commands": [
+     "field:interface:Vlan10:helper:10.0.0.100",
      "singleton:ntp"
     ]
    },
