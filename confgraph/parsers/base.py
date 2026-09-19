@@ -297,6 +297,86 @@ class BaseParser(ABC):
     # JunOS/PAN-OS override _collect_unrecognized_blocks wholesale and ignore this.
     _KNOWN_CHILD_PATTERNS: list[tuple[str, list[str]]] = []
 
+    # ------------------------------------------------------------------
+    # Benign-negation registry (CCR-0203).
+    #
+    # Nested ``no`` grammars whose negation is MODELLED-POSITIVE semantics —
+    # a positive parse method consumes the line into the model (``no
+    # shutdown`` = enabled, ``no passive-interface X`` fills
+    # non_passive_interfaces, ``no neighbor X activate`` parses
+    # activate=False, …) — so no deletion op/tombstone exists and the
+    # fail-closed negation collector below must NOT disclose them. Everything
+    # else is covered OUTCOME-based (the negation-claim ledger: an emission
+    # at line N proves line N was consumed), so this registry exists ONLY for
+    # the consumed-without-emission class. An omission fails NOISY (a benign
+    # line shows up as an unrecognized disclosure) — the safe direction; a
+    # spurious entry fails SILENT, so additions need the same
+    # precision-over-recall care as _KNOWN_CHILD_PATTERNS. Subclasses extend
+    # per OS the way they extend the child-pattern registry. Anchored,
+    # full-line regexes matched against the stripped line.
+    # ------------------------------------------------------------------
+    _KNOWN_BENIGN_NEGATIONS: list[str] = [
+        r"^no\s+shutdown$",
+        # ``no switchport`` is deliberately NOT here (CCR-0203 validation
+        # round): nothing modelled it positively — it is the routed-port
+        # conversion, a REAL withdrawal — so it is CONSUMED now (family-1
+        # UNSET ops in _detect_interface_field_negation_ops) rather than
+        # silenced here or falsely ambered.
+        r"^no\s+auto-summary$",
+        r"^no\s+synchronization$",
+        r"^no\s+passive-interface\s+\S+$",
+        r"^no\s+neighbor\s+\S+\s+activate$",
+        r"^no\s+cdp\s+enable$",
+        r"^no\s+lldp\s+(transmit|receive)$",
+        # ``no ip address`` / ``no ipv4 address`` are deliberately NOT here:
+        # measured (CCR-0203 sweep), NO parser consumes the bare form — no op,
+        # no tombstone, the merged interface keeps its address — so it is a
+        # REAL unapplied withdrawal and silencing it would be exactly the
+        # F-12 silent-green this registry must never cause. It discloses.
+        # (Consuming it properly — a family-1 detection row per OS spelling —
+        # is a named follow-up; the demo corpus contains zero occurrences.)
+    ]
+
+    def _claim_negation(self, obj) -> None:
+        """Record that a walk CONSUMED the negation at *obj*'s line (CCR-0203).
+
+        Needed only where a walk consumes a ``no`` line WITHOUT emitting a
+        line-numbered op (plain string tombstones, refresh-suppression
+        branches) — everything that emits an op is claimed automatically by
+        ``_claimed_negation_line_set``'s queue scan.
+        """
+        if not hasattr(self, "_claimed_negation_lines"):
+            self._claimed_negation_lines = set()
+        self._claimed_negation_lines.add(obj.linenum)
+
+    def _claimed_negation_line_set(self) -> set:
+        """Every line number some walk proved it consumed (CCR-0203).
+
+        OUTCOME-based: the explicit ledger plus a scan over every
+        ``_pending_native_*`` op queue — an op emitted with a real
+        ``line_no`` IS the proof its source line was consumed, and a future
+        emission family joins the claim set by existing, with no edit here.
+        (Positive-line ops land in the set too; harmless — only ``no`` lines
+        ever consult it.)
+        """
+        claimed = set(getattr(self, "_claimed_negation_lines", ()) or ())
+        op_sources = [
+            value
+            for attr, value in vars(self).items()
+            if attr.startswith("_pending_native_") and isinstance(value, list)
+        ]
+        # The ATTACHED stream too (set by parse() before collection): the
+        # Phase-5 derivation walks emit line-detected ops — e.g.
+        # ``no bgp log-neighbor-changes`` → SET(scalar, False) at that line —
+        # directly into pc.native_change_ops, never through a pending queue.
+        op_sources.append(getattr(self, "_attached_native_ops", None) or [])
+        for value in op_sources:
+            for op in value:
+                line_no = getattr(op, "line_no", -1)
+                if isinstance(line_no, int) and line_no >= 0:
+                    claimed.add(line_no)
+        return claimed
+
     def __init__(self, config_text: str, os_type: OSType, syntax: str = "ios"):
         """Initialize parser with configuration text.
 
@@ -593,6 +673,10 @@ class BaseParser(ABC):
         """
         parse = self._get_parse_obj()
         blocks: list[UnrecognizedBlock] = []
+        # CCR-0203: computed ONCE for the whole collection pass — every walk
+        # has already run (parse_deletion_commands is a _PARSE_STEPS entry and
+        # this collector runs after the loop), so the claim set is complete.
+        claimed_negations = self._claimed_negation_line_set()
 
         for obj in parse.find_objects(r"^[^ \t!]"):
             header = obj.text.strip()
@@ -605,6 +689,11 @@ class BaseParser(ABC):
             )
             if claimed:
                 blocks.extend(self._collect_unrecognized_child_lines(obj, header))
+                blocks.extend(
+                    self._collect_undisclosed_negations(
+                        obj, header, claimed_negations
+                    )
+                )
                 continue
 
             raw_lines = [obj.text] + [child.text for child in obj.all_children]
@@ -652,6 +741,51 @@ class BaseParser(ABC):
             if text == "no" or text.startswith("no "):
                 continue  # negations belong to the tombstone registries, never here
             if any(re.match(pattern, text) for pattern in child_patterns):
+                continue
+            flagged.append(UnrecognizedBlock(
+                block_header=f"{header} > {text}",
+                raw_lines=[child.text],
+                best_guess=next(
+                    (label for kw, label in self._BEST_GUESS_KEYWORDS
+                     if kw in text.lower()),
+                    None,
+                ),
+            ))
+        return flagged
+
+    def _collect_undisclosed_negations(
+        self, obj, header: str, claimed_negations: set
+    ) -> list[UnrecognizedBlock]:
+        """Fail-closed nested-negation disclosure (CCR-0203 / user-test F-12).
+
+        Every ``no`` line at ANY depth under a claimed block must be one of:
+        consumed-with-emission (its line number is in the claim set — an op or
+        tombstone actually exists for it), declared benign
+        (``_KNOWN_BENIGN_NEGATIONS`` — modelled-positive semantics), or
+        DISCLOSED here as an ``UnrecognizedBlock`` (→ the engine's
+        UNRECOGNIZED coverage area → ``not_analyzed`` → verdict downgrade).
+
+        Before this, a nested negation no walk matched simply vanished: the
+        positive child collector skipped every ``no`` line ("negations belong
+        to the tombstone registries") while the tombstone walks were
+        match-or-vanish — two fail-open layers deferring to each other, and a
+        withdrawal proposal shipped a green "appears contained" with the area
+        claimed ANALYZED. Walks ``all_children`` (negations only — positives
+        keep the direct-children v1 scope) and runs for every CLAIMED block
+        independent of ``_KNOWN_CHILD_PATTERNS``, so it fires on IOS-XR whose
+        child-pattern registry is empty.
+        """
+        flagged: list[UnrecognizedBlock] = []
+        for child in obj.all_children:
+            text = child.text.strip()
+            if not (text == "no" or text.startswith("no ")):
+                continue
+            if child.linenum in claimed_negations:
+                continue
+            if any(
+                re.match(pattern, text)
+                for pattern in self._KNOWN_BENIGN_NEGATIONS
+            ):
                 continue
             flagged.append(UnrecognizedBlock(
                 block_header=f"{header} > {text}",
@@ -795,7 +929,13 @@ class BaseParser(ABC):
             source_os=self.os_type,
             hostname=hostname,
             raw_config=self.config_text,
-            unrecognized_blocks=self._collect_unrecognized_blocks(),
+            # CCR-0203: collected AFTER _attach_native_change_ops below — the
+            # negation-claim ledger reads line-numbered emissions, and the
+            # Phase-5 derivation walks (line-detected scalar SETs like
+            # ``no bgp log-neighbor-changes`` → SET False) only exist once
+            # ops are attached. Collecting here would falsely disclose every
+            # negation those walks consume.
+            unrecognized_blocks=[],
             **results,
         )
 
@@ -843,6 +983,14 @@ class BaseParser(ABC):
         # subclass post-patches and the M3 backfill above included).
         # Default is a no-op; the IOS-family line-based parsers override.
         self._attach_native_change_ops(pc)
+
+        # CCR-0203: the attached op stream is the final word on which lines
+        # were consumed (the Phase-5 derivation walks emit line-detected ops
+        # that live ONLY here, never in a _pending_native_* queue), so the
+        # unrecognized collection — and its fail-closed negation walk — runs
+        # after it, with those ops visible to the claim scan.
+        self._attached_native_ops = pc.native_change_ops or []
+        pc.unrecognized_blocks = self._collect_unrecognized_blocks()
 
         return pc
 

@@ -213,15 +213,25 @@ class TestKnownChildLinesNotFlagged:
 
 
 class TestCollectorRules:
-    def test_no_lines_never_flagged(self):
-        """Negations are the tombstone surface — never child-line disclosure."""
+    def test_no_lines_the_positive_collector_skips_are_disclosed_by_the_negation_walk(self):
+        """HISTORY: this pinned "negations are the tombstone surface — never
+        child-line disclosure". That contract was one of F-12's two fail-open
+        layers (CCR-0203): the tombstone walks were match-or-vanish, so a
+        negation neither side consumed VANISHED and a withdrawal shipped
+        silent-green. The POSITIVE collector still skips ``no`` lines (that
+        half is unchanged); the fail-closed negation walk now discloses the
+        unconsumed ones instead."""
         config = (
             "router ospf 1\n"
             " no some-unknown-thing enable\n"
             "interface GigabitEthernet0/0\n"
             " no obscure-unparsed-feature\n"
         )
-        assert _child_flags(IOSParser(config)) == []
+        flagged = _child_flags(IOSParser(config))
+        assert sorted(flagged) == [
+            "interface GigabitEthernet0/0 > no obscure-unparsed-feature",
+            "router ospf 1 > no some-unknown-thing enable",
+        ]
 
     def test_grandchildren_not_flagged(self):
         """v1 checks direct children only — sub-block bodies are not descended."""

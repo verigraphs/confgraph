@@ -2638,6 +2638,7 @@ class IOSXRParser(IOSParser):
                         try:
                             dest = IPv4Network(m.group(1), strict=False)
                             tombstones.append(f"static::{dest}")
+                            self._claim_negation(route_child)  # CCR-0203
                         except ValueError:
                             pass
             # VRF routes
@@ -2653,6 +2654,7 @@ class IOSXRParser(IOSParser):
                             try:
                                 dest = IPv4Network(m.group(1), strict=False)
                                 tombstones.append(f"static:{vrf_name}:{dest}")
+                                self._claim_negation(route_child)  # CCR-0203
                             except ValueError:
                                 pass
 

@@ -712,7 +712,44 @@
  "samples": {
   "eos.txt": {
    "bgp_no_commands": {},
-   "interface_no_commands": {},
+   "interface_no_commands": {
+    "Port-Channel10": [
+     "field:interface:Port-Channel10:switchport_mode",
+     "field:interface:Port-Channel10:access_vlan",
+     "field:interface:Port-Channel10:trunk_allowed_vlans",
+     "field:interface:Port-Channel10:trunk_native_vlan"
+    ],
+    "Ethernet1": [
+     "field:interface:Ethernet1:switchport_mode",
+     "field:interface:Ethernet1:access_vlan",
+     "field:interface:Ethernet1:trunk_allowed_vlans",
+     "field:interface:Ethernet1:trunk_native_vlan"
+    ],
+    "Ethernet2": [
+     "field:interface:Ethernet2:switchport_mode",
+     "field:interface:Ethernet2:access_vlan",
+     "field:interface:Ethernet2:trunk_allowed_vlans",
+     "field:interface:Ethernet2:trunk_native_vlan"
+    ],
+    "Ethernet3": [
+     "field:interface:Ethernet3:switchport_mode",
+     "field:interface:Ethernet3:access_vlan",
+     "field:interface:Ethernet3:trunk_allowed_vlans",
+     "field:interface:Ethernet3:trunk_native_vlan"
+    ],
+    "Ethernet4": [
+     "field:interface:Ethernet4:switchport_mode",
+     "field:interface:Ethernet4:access_vlan",
+     "field:interface:Ethernet4:trunk_allowed_vlans",
+     "field:interface:Ethernet4:trunk_native_vlan"
+    ],
+    "Ethernet20": [
+     "field:interface:Ethernet20:switchport_mode",
+     "field:interface:Ethernet20:access_vlan",
+     "field:interface:Ethernet20:trunk_allowed_vlans",
+     "field:interface:Ethernet20:trunk_native_vlan"
+    ]
+   },
    "no_commands": []
   },
   "ios.txt": {
@@ -816,8 +853,45 @@
   "nxos.txt": {
    "bgp_no_commands": {},
    "interface_no_commands": {
+    "Vlan10": [
+     "field:interface:Vlan10:enabled"
+    ],
+    "Vlan20": [
+     "field:interface:Vlan20:enabled"
+    ],
+    "port-channel10": [
+     "field:interface:port-channel10:switchport_mode",
+     "field:interface:port-channel10:access_vlan",
+     "field:interface:port-channel10:trunk_allowed_vlans",
+     "field:interface:port-channel10:trunk_native_vlan"
+    ],
     "Ethernet1/1": [
+     "field:interface:Ethernet1/1:switchport_mode",
+     "field:interface:Ethernet1/1:access_vlan",
+     "field:interface:Ethernet1/1:trunk_allowed_vlans",
+     "field:interface:Ethernet1/1:trunk_native_vlan",
      "field:interface:Ethernet1/1:enabled"
+    ],
+    "Ethernet1/2": [
+     "field:interface:Ethernet1/2:switchport_mode",
+     "field:interface:Ethernet1/2:access_vlan",
+     "field:interface:Ethernet1/2:trunk_allowed_vlans",
+     "field:interface:Ethernet1/2:trunk_native_vlan",
+     "field:interface:Ethernet1/2:enabled"
+    ],
+    "Ethernet1/3": [
+     "field:interface:Ethernet1/3:switchport_mode",
+     "field:interface:Ethernet1/3:access_vlan",
+     "field:interface:Ethernet1/3:trunk_allowed_vlans",
+     "field:interface:Ethernet1/3:trunk_native_vlan",
+     "field:interface:Ethernet1/3:enabled"
+    ],
+    "Ethernet1/4": [
+     "field:interface:Ethernet1/4:switchport_mode",
+     "field:interface:Ethernet1/4:access_vlan",
+     "field:interface:Ethernet1/4:trunk_allowed_vlans",
+     "field:interface:Ethernet1/4:trunk_native_vlan",
+     "field:interface:Ethernet1/4:enabled"
     ],
     "Ethernet1/10": [
      "field:interface:Ethernet1/10:enabled"
@@ -825,23 +899,12 @@
     "Ethernet1/11": [
      "field:interface:Ethernet1/11:enabled"
     ],
-    "Ethernet1/2": [
-     "field:interface:Ethernet1/2:enabled"
-    ],
     "Ethernet1/20": [
+     "field:interface:Ethernet1/20:switchport_mode",
+     "field:interface:Ethernet1/20:access_vlan",
+     "field:interface:Ethernet1/20:trunk_allowed_vlans",
+     "field:interface:Ethernet1/20:trunk_native_vlan",
      "field:interface:Ethernet1/20:enabled"
-    ],
-    "Ethernet1/3": [
-     "field:interface:Ethernet1/3:enabled"
-    ],
-    "Ethernet1/4": [
-     "field:interface:Ethernet1/4:enabled"
-    ],
-    "Vlan10": [
-     "field:interface:Vlan10:enabled"
-    ],
-    "Vlan20": [
-     "field:interface:Vlan20:enabled"
     ]
    },
    "no_commands": []

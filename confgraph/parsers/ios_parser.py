@@ -4589,6 +4589,38 @@ class IOSParser(BaseParser):
 
         ops: list = []
 
+        # Bare ``no switchport`` — the routed-port conversion (CCR-0203
+        # validation round, finding 2): it withdraws the port's ENTIRE L2
+        # personality, and it previously vanished (no op, no tombstone — the
+        # merged port kept its access/trunk fields) while sitting in the
+        # benign-negation registry under a false "modelled-positive"
+        # justification. Consume it as one UNSET per L2 field, so proposals
+        # actually strip the L2 config at merge and the fail-closed negation
+        # walk sees the line claimed by its own ops. (Baselines — NX-OS
+        # renders ``no switchport`` on every routed port — emit these ops
+        # too; baseline ops are never consumed, by the established posture.)
+        for ch in intf_obj.find_child_objects(r"^\s+no\s+switchport\s*$"):
+            for field in (
+                "switchport_mode",
+                "access_vlan",
+                "trunk_allowed_vlans",
+                "trunk_native_vlan",
+            ):
+                ops.append(_unset(field, ch))
+
+        # ``no [ip] vrf forwarding <name>`` (and every subclass spelling —
+        # NX-OS ``no vrf member <name>``): the interface LEAVES its VRF. The
+        # platform's corpus documented this as a verified merge no-op it had
+        # to realize at config level instead (CCR-0203 validation round,
+        # finding 1's sibling); now it resets the binding. The negated grammar
+        # is DERIVED from the positive `_IFACE_VRF_PATTERNS` registry, so the
+        # two spellings sets cannot drift and a subclass dialect is negatable
+        # the day it is added.
+        for pat in self._IFACE_VRF_PATTERNS.patterns:
+            neg = r"^\s+no\s+" + pat.removeprefix(r"^\s+")
+            for ch in intf_obj.find_child_objects(neg):
+                ops.append(_unset("vrf", ch))
+
         # no ip access-group … in / out
         for ch in intf_obj.find_child_objects(r"^\s+no\s+ip\s+access-group\s+"):
             m = re.match(r"^\s+no\s+ip\s+access-group\s+\S+\s+(in|out)", ch.text)
@@ -4930,6 +4962,10 @@ class IOSParser(BaseParser):
             rem_net, rem_area = extracted
             rem_key = (str(rem_net), rem_area)
             if positive_net_last_line.get(rem_key, -1) > nnc.linenum:
+                # CCR-0203: suppressed-by-refresh is CONSUMED (understood and
+                # deliberately dropped), not blind — claim it or the fallback
+                # would amber a semantically-handled line.
+                self._claim_negation(nnc)
                 continue  # re-added later in the block — removal suppressed
             if not hasattr(self, "_pending_native_ospf_ops"):
                 self._pending_native_ospf_ops = []
@@ -5175,6 +5211,7 @@ class IOSParser(BaseParser):
                     continue
                 rkey = (nrm.group(1), str(rng_pfx))
                 if positive_range_last_line.get(rkey, -1) > nrc.linenum:
+                    self._claim_negation(nrc)  # CCR-0203: suppressed == consumed
                     continue  # re-added later in the block — removal suppressed
                 self._pending_native_ospf_ops.append(
                     ChangeOp(
@@ -5378,6 +5415,7 @@ class IOSParser(BaseParser):
                     continue
                 nkey = (nproto, npid or "")
                 if positive_redist_last_line.get(nkey, -1) > nrc.linenum:
+                    self._claim_negation(nrc)  # CCR-0203: suppressed == consumed
                     continue  # re-added later in the block — suppressed
                 _queue_ospf_negation(
                     Verb.LIST_REMOVE, ("redistribute", nkey[0], nkey[1]), nrc
@@ -5439,6 +5477,7 @@ class IOSParser(BaseParser):
                     continue
                 nvkey = (nvm.group(1), nvrid)
                 if positive_vlink_last_line.get(nvkey, -1) > nvc.linenum:
+                    self._claim_negation(nvc)  # CCR-0203: suppressed == consumed
                     continue  # re-added later in the block — suppressed
                 _queue_ospf_negation(
                     Verb.LIST_REMOVE,
@@ -6173,6 +6212,19 @@ class IOSParser(BaseParser):
 
         if not attr:
             # "no neighbor X" — full neighbor removal
+            _emit(f"neighbor:{peer}")
+            return
+
+        # ``no neighbor X remote-as <asn>`` — the OTHER standard IOS spelling
+        # for removing a neighbor (the device treats it as full removal, not a
+        # field reset: remote-as is the neighbor's defining attribute). It was
+        # unmapped and vanished — caught by the CCR-0203 fail-closed sweep
+        # against the platform's realistic corpus (renumber_peering), where
+        # the withdrawal was silently ignored and only the positive re-add
+        # made the change appear to work. Same OBJECT_DELETE emission as the
+        # bare form; a peer-group name in the peer slot no-ops keyed at merge,
+        # the posture every removal takes.
+        if attr == "remote-as" or attr.startswith("remote-as "):
             _emit(f"neighbor:{peer}")
             return
 
@@ -8018,6 +8070,10 @@ class IOSParser(BaseParser):
                             continue
                         ctx.update(extra)
                     nested_tombstone = "field:" + rule.template.format(**ctx)
+                    # CCR-0203: the line is consumed whichever emission branch
+                    # follows (the queue branches also auto-claim via their
+                    # ops' line numbers; the plain-string branch has only this).
+                    self._claim_negation(child)
                     # Change-IR family 7a (CCR Appendix R): the VRF-shaped
                     # nested removals (route-target / rd — the WI-7 registry
                     # entries) are queued as NATIVE line-numbered ops and the
@@ -9652,6 +9708,7 @@ class IOSParser(BaseParser):
                     continue
                 addr = nm.group(1)
                 if positive_net_last_line.get(addr, -1) > nc.linenum:
+                    self._claim_negation(nc)  # CCR-0203: suppressed == consumed
                     continue  # re-added later in the block — removal suppressed
                 self._pending_native_isis_ops.append(
                     ChangeOp(
@@ -10042,6 +10099,7 @@ class IOSParser(BaseParser):
                 except Exception:
                     continue
                 if positive_net_last_line.get(cidr, -1) > nnc.linenum:
+                    self._claim_negation(nnc)  # CCR-0203: suppressed == consumed
                     continue  # re-added later in the block — removal suppressed
                 self._pending_native_eigrp_ops.append(
                     ChangeOp(
@@ -10153,6 +10211,7 @@ class IOSParser(BaseParser):
                     continue  # unknown trailer for a pid-less protocol — blind
                 nkey = (nproto, npid or "")
                 if positive_redist_last_line.get(nkey, -1) > nrc.linenum:
+                    self._claim_negation(nrc)  # CCR-0203: suppressed == consumed
                     continue  # re-added later in the block — removal suppressed
                 op = ChangeOp(
                     verb=Verb.LIST_REMOVE,
