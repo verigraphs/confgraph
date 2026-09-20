@@ -358,7 +358,14 @@ def load_and_parse(
     text = config_path.read_text(encoding="utf-8", errors="replace")
 
     if os_type:
-        detected = OSType(OS_ALIASES.get(os_type.lower(), os_type))
+        # CCR-0207: delegate to `as_os_type` — the single normalizer — instead of an
+        # inline variant that lowercased the alias lookup but NOT the enum fallback
+        # ("IOS_XE" passed as_os_type and crashed here). Unrecognized values raise
+        # the same ValueError type and message shape the direct OSType() call did.
+        normalized = as_os_type(os_type)
+        if normalized is None:
+            raise ValueError(f"{os_type!r} is not a valid OSType")
+        detected = normalized
     else:
         inventory = _load_inventory(log_fn=log_fn)
         if inventory:

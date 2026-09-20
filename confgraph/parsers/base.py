@@ -913,7 +913,19 @@ class BaseParser(ABC):
         Raises:
             ParseError: If any protocol section cannot be parsed.
         """
-        hostname = self._extract_hostname()
+        # CCR-0209: hostname extraction is INSIDE the fail-fast contract. It runs
+        # before the steps loop, and for PAN-OS it is the first touch of the lazy
+        # XML root — malformed documents used to escape here as raw
+        # ElementTree.ParseError / UnrecognizedPANOSLayout(ValueError), invisible
+        # to every consumer classifying on this method's documented ParseError
+        # contract (the platform's device-scoped exclusion among them).
+        try:
+            hostname = self._extract_hostname()
+        except ParseError:
+            raise
+        except Exception as exc:
+            line_number, line_text = self._find_error_context(exc)
+            raise ParseError("hostname", line_number, line_text, exc) from exc
         results: dict[str, Any] = {}
 
         for field, method_name in self._PARSE_STEPS:
