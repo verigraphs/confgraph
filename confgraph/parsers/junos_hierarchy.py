@@ -46,6 +46,32 @@ from typing import Any
 
 
 # ---------------------------------------------------------------------------
+# Idioms the canonical tree cannot represent
+# ---------------------------------------------------------------------------
+#
+# Both renderings can carry statements that CHANGE the configuration database
+# rather than state a value.  The canonical tree holds values only, so folding
+# such a statement in under its own keyword inverts its meaning: a dropped
+# ``delete`` leaves the object present, a folded ``inactive:`` moves the real
+# subtree out from under the extractors.  They are disclosed instead
+# (CCR-0210) — see ``unsupported_lines`` below.
+
+#: JunOS configuration-mode verbs other than ``set``.  This set is the whole
+#: family: adding the next verb is one entry, and it is what routes a document
+#: of nothing but ``delete`` lines to the ``set`` idiom (where it gets
+#: disclosed) instead of to the brace tokenizer, which — the lines carrying no
+#: ``;`` or ``{`` — discards every one of them at EOF and returns an empty tree.
+NON_SET_VERBS: frozenset[str] = frozenset({
+    "delete", "deactivate", "activate", "replace",
+    "rename", "annotate", "insert", "copy",
+})
+
+#: Brace-idiom statement tags — a prefix on an ordinary statement that changes
+#: its STATE rather than its value.
+BRACE_STATEMENT_TAGS: frozenset[str] = frozenset({"inactive:", "replace:"})
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -68,13 +94,39 @@ def parse_junos_config(text: str) -> dict[str, Any]:
     return expand_apply_groups(tree)
 
 
+def unsupported_lines(text: str) -> list[str]:
+    """Config lines in *text* the canonical tree cannot represent, in file order.
+
+    The ``set`` idiom's non-``set`` verbs and the brace idiom's
+    :data:`BRACE_STATEMENT_TAGS` are returned comment-stripped and whitespace-
+    stripped, for the parser to disclose as ``UnrecognizedBlock``\\ s.  Routing
+    is the same :func:`_is_set_style` decision :func:`parse_junos_config`
+    makes, so the two never disagree about which idiom a document is.
+    """
+    if _is_set_style(text):
+        return [
+            line
+            for line, kind in (_classify_set_line(raw) for raw in text.splitlines())
+            if kind == "unsupported"
+        ]
+    return [
+        stripped
+        for stripped in (line.strip() for line in _strip_comments(text).splitlines())
+        if stripped and stripped.split(" ", 1)[0] in BRACE_STATEMENT_TAGS
+    ]
+
+
 def _is_set_style(text: str) -> bool:
-    """Return True if *text* looks like JunOS ``set``-style (flat set commands)."""
+    """Return True if *text* looks like JunOS ``set``-style (flat set commands).
+
+    The whole configuration-mode verb family counts, not just ``set``: a
+    proposal written entirely of ``delete`` lines is the ``set`` idiom too.
+    """
     set_count = 0
     brace_count = 0
     for line in text.splitlines():
         stripped = line.strip()
-        if stripped.startswith("set "):
+        if stripped.startswith("set ") or stripped.split(" ", 1)[0] in NON_SET_VERBS:
             set_count += 1
         if "{" in stripped or "}" in stripped:
             brace_count += 1
@@ -83,6 +135,28 @@ def _is_set_style(text: str) -> bool:
         if brace_count >= 3:
             return False
     return set_count > 0
+
+
+def _classify_set_line(raw_line: str) -> tuple[str, str]:
+    """Classify one line of a ``set``-style document.
+
+    Returns ``(text, kind)`` for the comment-stripped line: ``"set"`` (a
+    statement the canonical tree carries), ``"skip"`` (blank or comment-only)
+    or ``"unsupported"``.  One classification, two consumers —
+    :func:`_parse_set_style` keeps the ``set`` lines and
+    :func:`unsupported_lines` discloses the rest, so a line can never be both
+    dropped and undisclosed.
+    """
+    line = raw_line.strip()
+    # Strip inline ## comments (e.g. the ## SECRET-DATA marker)
+    comment_idx = line.find("##")
+    if comment_idx != -1:
+        line = line[:comment_idx].strip()
+    if not line or line.startswith("#") or line.startswith("/*"):
+        return line, "skip"
+    if line.startswith("set "):
+        return line, "set"
+    return line, "unsupported"
 
 
 def _tokenize_set_line(line: str) -> list[str]:
@@ -132,12 +206,8 @@ def _parse_set_style(text: str) -> dict[str, Any]:
     result: dict[str, Any] = {}
 
     for raw_line in text.splitlines():
-        line = raw_line.strip()
-        # Strip inline ## comments (e.g. the ## SECRET-DATA marker)
-        comment_idx = line.find("##")
-        if comment_idx != -1:
-            line = line[:comment_idx].strip()
-        if not line.startswith("set "):
+        line, kind = _classify_set_line(raw_line)
+        if kind != "set":
             continue
 
         parts = _tokenize_set_line(line[4:])  # strip leading 'set '
@@ -175,12 +245,15 @@ def _fold_brackets(parts: list[str]) -> list[str | list[str]]:
 # Tokenizer
 # ---------------------------------------------------------------------------
 
+def _strip_comments(text: str) -> str:
+    """Remove JunOS comments — C-style ``/* … */`` spans and ``#``-to-EOL."""
+    text = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
+    return re.sub(r"#[^\n]*", "", text)
+
+
 def _tokenize(text: str) -> list[str]:
     """Tokenise JunOS config text into a flat list of string tokens."""
-    # Strip C-style block comments
-    text = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
-    # Strip shell-style line comments
-    text = re.sub(r"#[^\n]*", "", text)
+    text = _strip_comments(text)
 
     tokens: list[str] = []
     i = 0

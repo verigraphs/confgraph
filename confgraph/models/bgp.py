@@ -472,7 +472,16 @@ class BGPConfig(BaseConfigObject):
     neighbors, peer groups, address families, and policies.
     """
 
-    asn: int = Field(..., description="BGP autonomous system number")
+    asn: int | None = Field(
+        ...,
+        description=(
+            "BGP autonomous system number. None = the source idiom did not "
+            "state one (a JunOS 'set' proposal need not restate "
+            "'routing-options autonomous-system'); the merger then matches the "
+            "instance on its remaining identity rather than on a fabricated AS "
+            "(CCR-0212). Required-but-nullable: a parser must say which."
+        ),
+    )
     router_id: IPv4Address | None = Field(
         default=None, description="BGP router ID"
     )

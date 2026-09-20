@@ -82,7 +82,20 @@ from confgraph.parsers.panos_parser import PANOSParser
 # changes parsed MODELS with NO ParsedConfig JSON-schema change whatsoever,
 # so pbv is the ONLY signal that invalidates the platform parse cache and
 # entrp's digest keys for it.
-PARSER_BEHAVIOR_VERSION: int = 8
+# 9 (CCR-0210 + CCR-0212, co-landed): two JunOS honesty changes plus a PAN-OS
+# message fix. CCR-0210 — the non-``set`` verb family (``delete``,
+# ``deactivate``, …) and the brace idiom's ``inactive:`` / ``replace:``
+# statement tags are DISCLOSED as UnrecognizedBlocks instead of being dropped,
+# and ``_is_set_style`` counts the verb family so a delete-only proposal routes
+# to the set idiom rather than becoming a garbage brace subtree. Observable
+# parse output moves for every JunOS document carrying such a line, with NO
+# ParsedConfig JSON-schema change — the sharp case pbv exists for. CCR-0212 —
+# ``BGPConfig.asn`` is ``int | None`` and the JunOS parser emits None instead of
+# fabricating AS 0 when ``routing-options autonomous-system`` is absent (the
+# iBGP peer's inherited ``remote_as`` follows it to None); the schema also moves,
+# but entrp's schema-less ``digest_key()`` only moves on pbv — same posture as
+# 2/3/4/5/6/7.
+PARSER_BEHAVIOR_VERSION: int = 9
 
 __all__ = [
     "BaseParser",

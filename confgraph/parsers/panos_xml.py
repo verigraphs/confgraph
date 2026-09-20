@@ -19,11 +19,43 @@ from xml.etree import ElementTree
 from xml.etree.ElementTree import Element
 
 
+#: What a PAN-OS document has to be.  Stated at the first touch of the text so
+#: the operator reads the requirement, not ElementTree's opinion of column 0
+#: (CCR-0210).  CCR-0209 already funnels the escape into a ParseError; this is
+#: the message the funnel would otherwise have nothing useful to carry.
+PANOS_DOCUMENT_REQUIREMENT = (
+    "PAN-OS proposals and configs must be a full <config> XML document; "
+    "set-CLI syntax is not supported"
+)
+
+
 def parse_panos_xml(text: str) -> Element:
-    """Parse PAN-OS XML config text and return the root <config> element."""
+    """Parse PAN-OS XML config text and return the root <config> element.
+
+    Raises:
+        ParseError: *text* is not a well-formed XML document.
+    """
     # Strip XML namespace declarations that can confuse ElementTree
     text = re.sub(r'\s+xmlns[^=]*="[^"]*"', '', text)
-    return ElementTree.fromstring(text)
+    try:
+        return ElementTree.fromstring(text)
+    except ElementTree.ParseError as exc:
+        from confgraph.parsers.base import ParseError
+
+        line_number, _ = getattr(exc, "position", (0, 0))
+        lines = text.splitlines()
+        line_text = lines[line_number - 1] if 0 < line_number <= len(lines) else ""
+        # Input that never opened a tag is a DIFFERENT mistake from a document
+        # that opened one badly: the first needs the requirement, the second
+        # needs ElementTree's position.
+        detail = (
+            f"{PANOS_DOCUMENT_REQUIREMENT} ({exc})"
+            if not text.lstrip().startswith("<")
+            else f"PAN-OS document is not well-formed XML: {exc}"
+        )
+        raise ParseError(
+            "panos-document", line_number, line_text, ValueError(detail)
+        ) from exc
 
 
 def find_device(root: Element) -> Element | None:

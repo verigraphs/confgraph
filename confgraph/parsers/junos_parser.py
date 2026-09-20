@@ -47,7 +47,9 @@ from confgraph.models.acl import ACLConfig, ACLEntry
 from confgraph.models.static_route import StaticRoute
 
 from confgraph.parsers.base import BaseParser, parse_remote_as_token
-from confgraph.parsers.junos_hierarchy import parse_junos_config, _is_set_style
+from confgraph.parsers.junos_hierarchy import (
+    parse_junos_config, unsupported_lines, _is_set_style,
+)
 
 
 class JunOSParser(BaseParser):
@@ -88,8 +90,27 @@ class JunOSParser(BaseParser):
         return None
 
     def _collect_unrecognized_blocks(self) -> list[UnrecognizedBlock]:
-        """JunOS uses a different structure; skip CiscoConfParse-based scan."""
-        return []
+        """Disclose the lines the canonical tree cannot represent (CCR-0210).
+
+        The CiscoConfParse-based scan in ``BaseParser`` does not apply here, but
+        the disclosure CONTRACT does: one block per line, ``block_header`` the
+        line itself and ``best_guess`` inferred from the shared keyword table,
+        exactly as the IOS-family child-line walk emits them.  JunOS's
+        non-``set`` verbs and ``inactive:`` / ``replace:`` tags mean the OPPOSITE
+        of being dropped, so silence here is a semantic inversion, not a gap.
+        """
+        return [
+            UnrecognizedBlock(
+                block_header=line,
+                raw_lines=[line],
+                best_guess=next(
+                    (label for kw, label in self._BEST_GUESS_KEYWORDS
+                     if kw in line.lower()),
+                    None,
+                ),
+            )
+            for line in unsupported_lines(self.config_text)
+        ]
 
     def parse(self) -> "ParsedConfig":
         """Override to back-fill BGP update_source.
@@ -805,11 +826,16 @@ class JunOSParser(BaseParser):
         """
         hier = self._get_hierarchy()
         ro = hier.get("routing-options", {}) if isinstance(hier.get("routing-options"), dict) else {}
-        global_asn_str = _str_val(ro.get("autonomous-system")) or "0"
+        # CCR-0212: absent stays ABSENT.  ``autonomous-system`` lives outside
+        # ``protocols bgp``, so a proposal that edits BGP alone never restates
+        # it; fabricating AS 0 here made every such proposal miss the merger's
+        # instance match and graft a phantom process.
+        global_asn_str = _str_val(ro.get("autonomous-system"))
+        global_asn: int | None
         try:
-            global_asn = int(global_asn_str)
+            global_asn = int(global_asn_str) if global_asn_str else None
         except ValueError:
-            global_asn = 0
+            global_asn = None
 
         router_id_str = _str_val(ro.get("router-id"))
 
@@ -947,7 +973,7 @@ class JunOSParser(BaseParser):
     def _parse_bgp_block(
         self,
         bgp_data: dict[str, Any],
-        asn: int,
+        asn: int | None,
         router_id_str: str | None,
         vrf: str | None,
     ) -> BGPConfig | None:
