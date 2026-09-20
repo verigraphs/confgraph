@@ -6,6 +6,15 @@ The JunOS parser (`confgraph.parsers.junos_parser.JunOSParser`) parses Juniper J
 
 Both **brace-style** (hierarchical) and **set-style** config formats exist in JunOS, and both are device-emitted (`show configuration` and `show configuration | display set`). As of the unified brace/set rewrite (2026-07-12), **both forms are parsed** — they are two renderings of one configuration database, so the tokenizer folds them into exactly the same canonical tree. The input form is auto-detected (`_is_set_style`); no manual conversion is required.
 
+> **Additive statements only.** "Both forms are parsed" describes the statements that
+> *build* configuration. The non-`set` configuration verbs — `delete`, `deactivate`,
+> `activate`, `replace`, `rename`, `annotate`, `insert`, `copy` — and the brace statement
+> tags `inactive:` and `replace:` are **not** applied. Since CCR-0210 they are collected
+> into `unrecognized_blocks` so a consumer can disclose them; before that they were
+> dropped silently. Nothing removes, deactivates or reorders configuration as a result of
+> parsing a JunOS document, so a proposal using those verbs does not simulate — see
+> [Parser Limitations](#parser-limitations) item 9.
+
 Configuration-group inheritance (`groups` / `apply-groups` / `apply-groups-except`) is **expanded during parse** (2026-07-12, `confgraph.parsers.junos_groups.expand_apply_groups`), so every extractor downstream sees the **effective** configuration rather than the unexpanded form `show configuration` prints.
 
 **Class:** `confgraph.parsers.junos_parser.JunOSParser`
@@ -605,6 +614,17 @@ ParsedConfig                                  Standard model used by all OS type
 6. **AAA / DNS / DHCP** — Not parsed.
 7. **Policy-statement full semantics** — Complex if/then/else constructs and `apply-path` are best-effort; from the `from` block only `prefix-list`, `community`, `as-path` references are extracted, and from `then` only `local-preference`, `metric`, and `community add/set/delete`.
 8. **Firewall filter — `except` exclusions** — a per-prefix `except` modifier is dropped rather than emitted (the entry over-matches instead of inverting meaning — CCR-0036). A multi-prefix term is expanded to the cross product of (source, destination) prefixes because `ACLEntry` holds a single source/destination each.
+9. **Deletion and the other non-`set` verbs — DISCLOSED, never applied.** `delete`,
+   `deactivate`, `activate`, `replace`, `rename`, `annotate`, `insert` and `copy`, plus
+   the brace statement tags `inactive:` and `replace:`, are recognized as *unsupported
+   content* and collected into `unrecognized_blocks` (CCR-0210,
+   `junos_hierarchy.NON_SET_VERBS` / `BRACE_STATEMENT_TAGS`). They are never executed
+   against the tree: parsing a document containing `delete protocols bgp group EXT`
+   yields a configuration in which that group is still present. An unknown verb is
+   disclosed the same way (fail-closed), so the list above bounds what is *named*, not
+   what is caught. Consequently JunOS proposals are **additive only** — `no_commands` is
+   always empty for this parser and no tombstone is ever emitted. Actually simulating
+   these verbs is tracked as CCR-0214 and is not implemented.
 
 ---
 

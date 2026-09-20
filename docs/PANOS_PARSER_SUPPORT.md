@@ -4,6 +4,19 @@
 
 The PAN-OS parser (`confgraph.parsers.panos_parser.PANOSParser`) parses Palo Alto Networks PAN-OS device configurations in XML format. Unlike all other parsers, it does **not** use `CiscoConfParse` — PAN-OS configurations are XML documents, not line-oriented text. Instead it uses a lightweight XML navigation helper (`confgraph.parsers.panos_xml`) built on Python's standard `xml.etree.ElementTree`.
 
+> **Full `<config>` XML documents only — set-CLI is not supported.** PAN-OS also has a
+> `set`-style CLI syntax (`set rulebase security rules R1 action allow`). This parser does
+> not read it, and since CCR-0210 non-XML input raises `ParseError` naming the
+> requirement ("PAN-OS proposals and configs must be a full `<config>` XML document;
+> set-CLI syntax is not supported") rather than failing obscurely at line 0.
+>
+> There is no deletion *verb*, but that does **not** mean removals are impossible: a
+> restated block is authoritative and replaces its previous contents wholesale, so a
+> proposal restating the security rulebase without one of its rules **does remove that
+> rule — silently**, with nothing collected into `unrecognized_blocks` and no tombstone
+> emitted. Leaving a block out of the document entirely is the opposite case and removes
+> nothing. See [Parser Limitations](#parser-limitations) item 9.
+
 Two document layouts are read (CCR-0034 / CCR-0041): a **local firewall** export (`devices/entry/{deviceconfig,network,vsys/entry}`) and a **Panorama** export (device-group `pre`/`post`-rulebase, `shared` rulebase, and network/vsys config nested inside `template` entries). Layout is decided exactly once by `panos_xml.detect_layout`, which hands every parse method a layout-neutral view (device / vsys / policy scopes) so no method ever asks "am I Panorama?". A document in neither known layout raises `ParseError` rather than returning an empty model — "this firewall has no rules" and "this firewall's rules are in a place we don't read" must not look the same.
 
 **Class:** `confgraph.parsers.panos_parser.PANOSParser`
@@ -656,6 +669,24 @@ ParsedConfig                      Standard model used by all OS types
 6. **GlobalProtect VPN** — Not parsed (GlobalProtect-satellite IPSec tunnels are recognized only insofar as they are *skipped* by the tunnel-underlay binding).
 7. **Decryption policies** — Not parsed.
 8. **High Availability (HA)** — HA configuration is not parsed.
+9. **set-CLI input, and SILENT removal by block replacement.** The accepted input is a
+   full `<config>` XML document; set-CLI text is refused with `ParseError` naming that
+   requirement (CCR-0210, `panos_xml.PANOS_DOCUMENT_REQUIREMENT`). There is no deletion
+   *channel*: `parse_deletion_commands` is not overridden, so `no_commands` is always
+   empty, and `_collect_unrecognized_blocks` returns `[]`, so nothing is ever disclosed.
+   The consequence for a *proposal* is not "removals are impossible" but something more
+   dangerous — removals happen with no record:
+   - **Restating a block removes what the restatement omits.** PAN-OS security rules parse
+     into `acls`, which the merger treats as a whole-object replace field, so a proposal
+     restating the rulebase with 1 of the baseline's 2 rules yields a merged ACL of 1
+     entry. Nothing is disclosed and no tombstone is emitted, so the dropped rule is
+     invisible in the result. Measured 2026-09-20 (CCR-0213 validation).
+   - **Omitting a block entirely removes nothing.** A document with no `<rulebase>` at all
+     leaves the baseline rulebase intact — this is the case that made "PAN-OS cannot
+     express removals" look true.
+
+   Treat every block a PAN-OS proposal restates as the complete intended contents of that
+   block.
 
 ---
 
