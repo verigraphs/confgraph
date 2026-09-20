@@ -26,7 +26,10 @@ class RIPRedistribute(BaseModel):
 class RIPConfig(BaseConfigObject):
     """RIP process configuration."""
 
-    version: int = Field(default=2, description="RIP version (1 or 2)")
+    version: int | None = Field(
+        default=None,
+        description="RIP version (1 or 2); None when the config does not state it",
+    )
     networks: list[IPv4Network] = Field(default_factory=list, description="Network statements")
     passive_interface_default: bool = Field(default=False, description="All interfaces passive by default")
     passive_interfaces: list[str] = Field(default_factory=list, description="Explicitly passive interfaces")

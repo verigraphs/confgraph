@@ -10343,7 +10343,7 @@ class IOSParser(BaseParser):
         for rip_obj in parse.find_objects(r"^router\s+rip$"):
             raw_lines, line_numbers = self._get_raw_lines_and_line_numbers(rip_obj)
 
-            version = 1
+            version = None
             vc = rip_obj.find_child_objects(r"^\s+version\s+(\d)")
             if vc:
                 v = self._extract_match(vc[0].text, r"^\s+version\s+(\d)")
@@ -11043,7 +11043,7 @@ class IOSParser(BaseParser):
             if not m:
                 continue
             cm_type = m.group(1)
-            match_type = m.group(2) or "match-all"
+            match_type = m.group(2)
             name = m.group(3)
             raw_lines, line_numbers = self._get_raw_lines_and_line_numbers(cm_obj)
 
@@ -12865,7 +12865,7 @@ class IOSParser(BaseParser):
             if len(vlan_ids) == 1:
                 vid = vlan_ids[0]
                 name: str | None = None
-                state = "active"
+                state: str | None = None
                 vn_segment: int | None = None
 
                 for child in obj.children:

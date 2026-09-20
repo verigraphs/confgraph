@@ -240,7 +240,7 @@ class GraphBuilder:
         for eigrp in p.eigrp_instances:
             _add("eigrp_instance", str(eigrp.as_number), {"as_number": eigrp.as_number}, obj=eigrp)
         for rip in p.rip_instances:
-            _add("rip_instance", "rip", {"version": rip.version}, obj=rip)
+            _add("rip_instance", "rip", {"version": rip.version or ""}, obj=rip)
         for isis in p.isis_instances:
             _add("isis_instance", isis.tag, {"tag": isis.tag}, obj=isis)
         for sr in p.static_routes:

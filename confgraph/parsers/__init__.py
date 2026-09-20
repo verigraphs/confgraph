@@ -95,7 +95,20 @@ from confgraph.parsers.panos_parser import PANOSParser
 # iBGP peer's inherited ``remote_as`` follows it to None); the schema also moves,
 # but entrp's schema-less ``digest_key()`` only moves on pbv — same posture as
 # 2/3/4/5/6/7.
-PARSER_BEHAVIOR_VERSION: int = 9
+# 10 (CCR-0211): three fabricated defaults retire — ``RIPConfig.version``,
+# ``VLANEntry.state`` and ``ClassMapConfig.match_type`` are set only when the
+# config states them (the IOS walk stamped 1, "active" and "match-all"
+# unconditionally).  Under the new field-level keyed merge a fabricated default
+# is indistinguishable from an explicit restate, so ``version 2`` over a
+# baseline ``version 1`` — or ``class-map match-all X`` over a ``match-any``
+# baseline — silently lost.  Observable parse output moves for every
+# IOS/IOS-XE/EOS/NX-OS config with a ``router rip`` block, a VLAN block that
+# omits ``state``, or a ``class-map`` line that omits the mode — the COVERED
+# fidelity family, which is why this is a bump and not a schema-only change.
+# Persisted baseline snapshots are invalidated by the pbv move itself (it is a
+# digest-key component), which subsumes the Tier-A digest shift these fields
+# cause.
+PARSER_BEHAVIOR_VERSION: int = 10
 
 __all__ = [
     "BaseParser",

@@ -655,11 +655,10 @@ def interface_list_replace_fields() -> frozenset[str]:
 #   None      — value-identity union lists (the member IS its key:
 #               ``str(item)`` — dotted-quad / CIDR / group string).
 #   Callable  — keyed-object lists (FHRP groups by ``group_number``).
-# ``glbp_groups`` is keyed here for op identity even though its legacy
-# merge is the generic ATOMIC replace (it is absent from
-# ``_IFACE_INCREMENTAL_LISTS`` — pre-existing asymmetry vs hsrp/vrrp,
-# preserved: the batched reconstruction rebuilds the FULL list, so the
-# atomic arm sees exactly the legacy proposal list).
+# ``glbp_groups`` is keyed here exactly like its hsrp/vrrp twins, and the
+# engine keys it identically in ``_IFACE_INCREMENTAL_LISTS`` — all three are
+# FIELD-LEVEL keyed merges since CCR-0211, so a partial group restate keeps
+# the siblings the proposal did not mention.
 # ``ospf_message_digest_keys`` (dict[int, str]) is handled beside this
 # registry — key = ``str(key_id)``, value = the md5 string.
 _IFACE_MEMBER_KEYS: dict[str, "Callable[[Any], str] | None"] = {
@@ -816,8 +815,13 @@ def service_entity_list_fields() -> frozenset[str]:
     The top-level ParsedConfig collections whose WI-8 whole-entity removal
     walks carry the ``_readded_later`` suppression guard: IP SLA operations
     (``no ip sla <id>``), object tracks (``no track <id>``) and EEM applets
-    (``no event manager applet <name>``).  Their merge semantics are keyed
-    whole-object replace (``_SIMPLE_LIST_FIELDS`` in the engine merger).
+    (``no event manager applet <name>``).  Their merge semantics come from the
+    engine merger's two list registries, which the native replay reads through
+    the same helper as the batched pass: object tracks and EEM applets are keyed
+    FIELD-LEVEL (``_FIELDLEVEL_LIST_FIELDS``, CCR-0211 — a partial restate keeps
+    the siblings), IP SLA stays keyed whole-object replace
+    (``_SIMPLE_LIST_FIELDS``; IOS refuses in-place modification, so the only
+    legal idiom is a full restate after ``no ip sla <id>``).
     """
     return frozenset({"ip_sla_operations", "object_tracks", "eem_applets"})
 

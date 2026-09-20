@@ -10,11 +10,25 @@ class VLANEntry(BaseModel):
 
     vlan_id: int = Field(..., description="VLAN ID (1–4094)")
     name: str | None = Field(default=None, description="VLAN name")
-    state: str = Field(default="active", description="'active' or 'suspend'")
+    state: str | None = Field(
+        default=None,
+        description="'active' or 'suspend'; None when the config does not state it",
+    )
     vn_segment: int | None = Field(
         default=None,
         description="VXLAN VNI mapped to this VLAN (NX-OS 'vn-segment')",
     )
+
+
+def vlan_is_active(entry: VLANEntry) -> bool:
+    """A VLAN with no stated ``state`` is active on the device.
+
+    ``state`` is None when the config never said ``state active|suspend``
+    (CCR-0211: a fabricated "active" is indistinguishable from an explicit
+    restate under field-level merge).  Every active-VLAN test reads through
+    here so the unstated case cannot drift between call sites.
+    """
+    return entry.state != "suspend"
 
 
 class VTPConfig(BaseConfigObject):

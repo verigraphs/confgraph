@@ -19,7 +19,10 @@ class ClassMapConfig(BaseConfigObject):
         default=None,
         description="Type qualifier from 'class-map type <X> ...' (e.g. 'control-plane', 'qos', 'queuing'); None for the plain untyped form",
     )
-    match_type: str = Field(default="match-all", description="Match logic: match-all or match-any")
+    match_type: str | None = Field(
+        default=None,
+        description="Match logic: 'match-all' or 'match-any'; None when the config does not state it",
+    )
     matches: list[ClassMapMatch] = Field(default_factory=list, description="Match criteria")
 
     class Config:
