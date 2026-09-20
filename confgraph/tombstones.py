@@ -86,6 +86,17 @@ def _derive_secondary_cidr(ctx: dict) -> "dict[str, Any] | None":
         return None
 
 
+def _derive_line_type(ctx: dict) -> "dict[str, Any] | None":
+    """Canonical ``LineType`` value for a line-block tombstone key.
+
+    ``line con 0`` and ``line console 0`` are the same block; the merge
+    identity stores ``console``.  Mirrors the ``no line …`` walk's
+    normalization so both spellings produce the same key.
+    """
+    raw = ctx.get("raw_type", "")
+    return {"line_type": "console" if raw.startswith("con") else raw}
+
+
 # ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
@@ -315,5 +326,37 @@ NESTED_DELETION_RULES: list[NestedDeletionRule] = [
         child_pattern=r"^no\s+service-policy\s+input\s+(\S+)\s*$",
         child_groups=["pm"],
         template="control_plane:service_policy_input",
+    ),
+    # CCR-0211 follow-up — the two sub-block removals that used to arrive as a
+    # side effect of wholesale keyed replace.  Once the merge became
+    # field-level, omitting an attribute correctly stopped removing it (as on
+    # the device), which left these two real `no` commands with no way in: both
+    # parsed to an UnrecognizedBlock and were never applied.
+    #
+    # Proposal: ``no class VOICE`` inside ``policy-map EDGE``
+    # Tombstone: ``field:policy_maps:EDGE:classes:VOICE``
+    # Typed forms (``policy-map type …``) stay blind ($-anchor), matching the
+    # positive-parse and ``no class-map`` boundary.
+    NestedDeletionRule(
+        parent_pattern=r"^policy-map\s+(\S+)\s*$",
+        parent_groups=["pm"],
+        child_pattern=r"^no\s+class\s+(\S+)\s*$",
+        child_groups=["cls"],
+        template="policy_maps:{pm}:classes:{cls}",
+    ),
+    # Proposal: ``no access-class [<acl>] in|out`` inside ``line vty 0 4``
+    # Tombstone: ``field:lines:vty:0:access_class_in``
+    # The ACL name anchors the grammar ONLY — a scalar reset is unconditional
+    # on the device, so the template drops it (the CoPP precedent above).  The
+    # key must byte-match the merge identity ``(line_type, first_line)``, so
+    # the derive hook normalizes the ``con``/``console`` spellings exactly as
+    # the ``no line …`` walk does.
+    NestedDeletionRule(
+        parent_pattern=r"^line\s+(con(?:sole)?|vty|aux|tty)\s+(\d+)(?:\s+\d+)?\s*$",
+        parent_groups=["raw_type", "first"],
+        child_pattern=r"^no\s+access-class\s+(?:\S+\s+)?(in|out)\s*$",
+        child_groups=["dir"],
+        template="lines:{line_type}:{first}:access_class_{dir}",
+        derive=_derive_line_type,
     ),
 ]
