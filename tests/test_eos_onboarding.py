@@ -78,7 +78,9 @@ class TestEOSOSPFArea:
         )
         iface = self._iface(cfg, "Ethernet1")
         assert iface is not None
-        assert iface.ospf_area == "0.0.0.0"
+        # CCR-0227: area IDs are stored canonical (decimal); the config
+        # still spells it as the vendor does.
+        assert iface.ospf_area == "0"
 
     def test_ospf_area_non_zero(self):
         cfg = (
@@ -88,7 +90,7 @@ class TestEOSOSPFArea:
         )
         iface = self._iface(cfg, "Ethernet1")
         assert iface is not None
-        assert iface.ospf_area == "0.0.0.1"
+        assert iface.ospf_area == "1"
 
     def test_no_ospf_area_defaults_none(self):
         cfg = (

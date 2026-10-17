@@ -242,7 +242,9 @@ router ospf 3
 
 def test_eos_ospf_area_default_cost_and_bfd_default():
     o = EOSParser(EOS_OSPF).parse().ospf_instances[0]
-    area = next(a for a in o.areas if a.area_id == "0.0.0.7")
+    # CCR-0227: area IDs are stored canonical (decimal); the config
+    # still spells it as the vendor does.
+    area = next(a for a in o.areas if a.area_id == "7")
 
     assert area.default_cost == 25
     assert area.area_type == "totally_stub"

@@ -179,7 +179,9 @@ def test_nxos_ospf_vrf_instance_via_shared_traversal():
     assert vrf_inst is not None
     assert vrf_inst.process_id == 7
     assert str(vrf_inst.router_id) == "10.9.9.9"
-    assert [a.area_id for a in vrf_inst.areas] == ["0.0.0.9"]
+    # CCR-0227: area IDs are stored canonical (decimal); the config
+    # still spells it as the vendor does.
+    assert [a.area_id for a in vrf_inst.areas] == ["9"]
     assert len(vrf_inst.redistribute) == 1
 
 

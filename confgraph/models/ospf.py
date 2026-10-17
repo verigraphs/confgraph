@@ -2,8 +2,9 @@
 
 from enum import Enum
 from ipaddress import IPv4Address, IPv4Network
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from confgraph.models.base import BaseConfigObject
+from confgraph.utils.ospf import canonical_area_id
 
 
 class OSPFAreaType(str, Enum):
@@ -159,12 +160,24 @@ class OSPFInterfaceConfig(BaseModel):
         default=None, description="BFD detection multiplier"
     )
 
+    # CCR-0227: area-ID storage point 1 of 4.
+    _canonical_area = field_validator("area_id", mode="before")(
+        canonical_area_id
+    )
+
 
 class OSPFArea(BaseModel):
     """OSPF area configuration."""
 
     area_id: str = Field(
-        ..., description="Area ID (e.g., '0', '0.0.0.1', '10')"
+        ...,
+        description=(
+            "Area ID, CANONICALIZED to the decimal spelling (CCR-0227): the "
+            "NX-OS/JunOS '0.0.0.0' and the IOS/IOS-XR '0' are the same area on "
+            "hardware and are the same key here. Dotted quads convert to their "
+            "32-bit decimal ('0.0.0.51' -> '51'); anything else is stored as "
+            "written."
+        ),
     )
     area_type: OSPFAreaType = Field(
         default=OSPFAreaType.NORMAL, description="Area type"
@@ -218,6 +231,11 @@ class OSPFArea(BaseModel):
     filter_list_out: str | None = Field(
         default=None,
         description="Prefix-list name filtering Type-3 LSAs sent out of this area (outbound from area)",
+    )
+
+    # CCR-0227: area-ID storage point 2 of 4.
+    _canonical_area = field_validator("area_id", mode="before")(
+        canonical_area_id
     )
 
     class Config:
@@ -326,7 +344,11 @@ class OSPFConfig(BaseConfigObject):
     )
     network_statements: list[tuple[IPv4Network, str]] = Field(
         default_factory=list,
-        description="Network statements (network, wildcard, area) - IOS style",
+        description=(
+            "Network statements (network, area) - IOS style. The area half is "
+            "canonicalized exactly like every other area-ID storage point "
+            "(CCR-0227)."
+        ),
     )
     shutdown: bool = Field(
         default=False, description="OSPF process shutdown"
@@ -340,6 +362,14 @@ class OSPFConfig(BaseConfigObject):
     bfd_all_interfaces: bool = Field(
         default=False, description="BFD enabled on all OSPF interfaces"
     )
+
+    # CCR-0227: area-ID storage point 3 of 4 — the area half of each
+    # statement. ``mode="after"`` so the tuples are already built; the
+    # network half is untouched.
+    @field_validator("network_statements", mode="after")
+    @classmethod
+    def _canonical_statement_areas(cls, value):
+        return [(net, canonical_area_id(area)) for net, area in value]
 
     class Config:
         """Pydantic model configuration."""

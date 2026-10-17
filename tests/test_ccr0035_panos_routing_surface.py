@@ -388,16 +388,18 @@ def test_address_family_identifier_is_not_the_protocol(bgp):
 
 def test_ospf_area_type_is_read_from_the_child_element_name(parsed):
     areas = {a.area_id: a for a in parsed.ospf_instances[0].areas}
-    assert areas["0.0.0.0"].area_type == OSPFAreaType.NORMAL
-    assert areas["0.0.0.7"].area_type == OSPFAreaType.STUB
-    assert areas["0.0.0.7"].default_cost == 30       # type/stub/default-route/advertise/metric
-    assert areas["0.0.0.7"].stub_no_summary is False
+    # CCR-0227: area IDs are stored canonical (decimal); the config
+    # still spells it as the vendor does.
+    assert areas["0"].area_type == OSPFAreaType.NORMAL
+    assert areas["7"].area_type == OSPFAreaType.STUB
+    assert areas["7"].default_cost == 30       # type/stub/default-route/advertise/metric
+    assert areas["7"].stub_no_summary is False
 
 
 def test_accept_summary_no_is_the_totally_stubby_area(parsed):
     """PAN-OS has no `no-summary` keyword: a stub area with
     <accept-summary>no</accept-summary> behaves as a TSA, per the vendor doc."""
-    area = next(a for a in parsed.ospf_instances[0].areas if a.area_id == "0.0.0.8")
+    area = next(a for a in parsed.ospf_instances[0].areas if a.area_id == "8")
     assert area.area_type == OSPFAreaType.TOTALLY_STUB
     assert area.stub_no_summary is True
     assert area.default_cost is None                 # <default-route><disable/>
@@ -408,7 +410,7 @@ def test_ospf_interface_metric_comes_from_inside_the_area(parsed):
     is <metric> on the interface entry nested in the area."""
     iface = next(i for i in parsed.interfaces if i.name == "ethernet1/8")
     assert iface.ospf_cost == 45
-    assert iface.ospf_area == "0.0.0.0"
+    assert iface.ospf_area == "0"
     # CCR-0222: ospf_passive is tri-state and reads None here. The area's
     # OSPFInterfaceConfig.passive is still a plain `bool = False`, so a
     # PAN-OS <passive>no</passive> is indistinguishable from "unstated" at

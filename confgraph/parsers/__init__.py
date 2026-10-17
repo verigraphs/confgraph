@@ -119,7 +119,19 @@ from confgraph.parsers.panos_parser import PANOSParser
 # that op's line provenance (CCR-0203 ledger).  No ParsedConfig JSON-schema
 # change beyond the field's own type, so pbv is what invalidates the platform
 # parse cache and entrp's digest keys.
-PARSER_BEHAVIOR_VERSION: int = 11
+# 12 (CCR-0227): OSPF area IDs are CANONICALIZED at parse to the decimal
+# spelling, by one shared ``canonical_area_id`` applied via model validators on
+# all four storage points (OSPFArea.area_id, OSPFInterfaceConfig.area_id,
+# InterfaceConfig.ospf_area, the area half of OSPFConfig.network_statements).
+# `0.0.0.0` and `0` are the same area on hardware; stored raw they were two
+# keys, so every mixed-vendor estate (NX-OS/JunOS dotted, IOS/IOS-XR decimal)
+# modelled one real area as two — no adjacency across the spellings and wrong
+# ABR/inter-area computation. Observable parse output moves for every config
+# that spells an area as a dotted quad, with NO ParsedConfig JSON-schema
+# change — the sharp case this constant exists for. Decimal is canonical
+# precisely so the existing tombstone/golden keys (`ospf:1:area:0:...`) do not
+# move.
+PARSER_BEHAVIOR_VERSION: int = 12
 
 __all__ = [
     "BaseParser",

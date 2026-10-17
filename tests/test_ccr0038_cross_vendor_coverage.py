@@ -248,7 +248,9 @@ def test_junos_ospf_metric_is_the_cost_and_bfd_reaches_the_interface():
 
     assert ge.ospf_cost == 100
     assert ge.ospf_network_type == "p2p"
-    assert ge.ospf_area == "0.0.0.0"
+    # CCR-0227: area IDs are stored canonical (decimal); the config
+    # still spells it as the vendor does.
+    assert ge.ospf_area == "0"
     assert ge.bfd_interval == 300
     assert ge.bfd_multiplier == 3
 
@@ -321,7 +323,7 @@ def test_panos_ospf_area_interface_settings_reach_the_interface():
     assert eth.ospf_cost == 100
     assert eth.ospf_priority == 42
     assert eth.ospf_network_type == "p2p"   # <link-type><p2p/></link-type>
-    assert eth.ospf_area == "0.0.0.0"
+    assert eth.ospf_area == "0"
     # CCR-0222: tri-state — None, not False. <passive>no</passive> lands in
     # OSPFInterfaceConfig.passive, still a plain `bool = False`, so the
     # back-fill cannot tell it from "unstated" and declines to write.

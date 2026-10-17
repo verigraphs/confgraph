@@ -2,8 +2,9 @@
 
 from enum import Enum
 from ipaddress import IPv4Address, IPv4Interface, IPv6Interface
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from confgraph.models.base import BaseConfigObject
+from confgraph.utils.ospf import canonical_area_id
 
 
 class InterfaceType(str, Enum):
@@ -355,7 +356,11 @@ class InterfaceConfig(BaseConfigObject):
     )
     ospf_area: str | None = Field(
         default=None,
-        description="OSPF area ID",
+        description=(
+            "OSPF area ID, CANONICALIZED to the decimal spelling (CCR-0227) "
+            "so a '0.0.0.0' interface and a '0' interface are in the same "
+            "area here, as they are on hardware."
+        ),
     )
     ospf_cost: int | None = Field(
         default=None,
@@ -658,6 +663,11 @@ class InterfaceConfig(BaseConfigObject):
             or self.unnumbered_source
             or self.dynamic_address
         )
+
+    # CCR-0227: area-ID storage point 4 of 4.
+    _canonical_area = field_validator("ospf_area", mode="before")(
+        canonical_area_id
+    )
 
     class Config:
         """Pydantic model configuration."""

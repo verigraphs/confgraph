@@ -13,6 +13,7 @@ from confgraph.models.bgp import (
     BGPBestpathOptions,
 )
 from confgraph.models.ospf import OSPFConfig
+from confgraph.utils.ospf import canonical_area_id
 from confgraph.models.qos import ControlPlaneConfig
 from confgraph.models.interface import InterfaceFlowMonitor, StormControlLevel, VRRPGroup
 from confgraph.models.netflow import (
@@ -488,7 +489,11 @@ class NXOSParser(IOSParser):
                 )
                 if m:
                     intf_cfg.ospf_process_id = int(m.group(1))
-                    intf_cfg.ospf_area = m.group(2)
+                    # CCR-0227: assignment to an already-built model skips
+                    # pydantic validation, so this post-patch calls the
+                    # canonicalizer the field validator would have — NX-OS is
+                    # the dotted-quad vendor that makes it matter.
+                    intf_cfg.ospf_area = canonical_area_id(m.group(2))
 
             # NX-OS storm-control: "storm-control {broadcast|multicast|unicast}
             # level <threshold>". The threshold is a bandwidth percentage by

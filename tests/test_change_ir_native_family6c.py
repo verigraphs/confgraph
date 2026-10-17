@@ -93,7 +93,9 @@ def test_ospf_redistribute_key_protocol_pid():
 def test_ospf_network_key_is_cidr_and_area():
     pc = _parse("router ospf 1\n network 10.0.0.0 0.0.255.255 area 0.0.0.5\n")
     stmt = pc.ospf_instances[0].network_statements[0]
-    assert ospf_network_key(stmt) == ("10.0.0.0/16", "0.0.0.5")
+    # CCR-0227: area IDs are stored canonical (decimal); the config
+    # still spells it as the vendor does.
+    assert ospf_network_key(stmt) == ("10.0.0.0/16", "5")
 
 
 # --- positive decomposition ------------------------------------------------

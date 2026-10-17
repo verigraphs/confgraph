@@ -14,6 +14,7 @@ from confgraph.parsers.base import (
 from confgraph.models.base import OSType, UnrecognizedBlock
 from confgraph.models.line import LineType
 from confgraph.models.ospf import OSPFConfig
+from confgraph.utils.ospf import canonical_area_id
 from confgraph.models.bgp import BGPConfig, BGPNeighborAF
 from confgraph.models.prefix_list import PrefixListConfig, PrefixListEntry
 from confgraph.models.static_route import StaticRoute
@@ -306,7 +307,10 @@ class EOSParser(IOSParser):
                     ospf_area_children[0].text,
                 )
                 if am:
-                    intf_cfg.ospf_area = am.group(1)
+                    # CCR-0227: assignment to an already-built model skips
+                    # pydantic validation — canonicalize as the field
+                    # validator would.
+                    intf_cfg.ospf_area = canonical_area_id(am.group(1))
 
             # VARP: "ip virtual-router address <ip>". A device emits ONE LINE
             # PER ADDRESS, so accumulate rather than overwrite
@@ -397,7 +401,10 @@ class EOSParser(IOSParser):
                 m = re.match(r"^\s+network\s+(\S+)\s+area\s+(\S+)\s*$", nc.text)
                 if not m:
                     continue
-                prefix_str, area_id = m.group(1), m.group(2)
+                # CCR-0227: this appends into a LIVE model's list, which runs
+                # no field validator — canonicalize here as the validator on
+                # OSPFConfig.network_statements would.
+                prefix_str, area_id = m.group(1), canonical_area_id(m.group(2))
                 try:
                     net = IPv4Network(prefix_str, strict=False)
                 except ValueError:

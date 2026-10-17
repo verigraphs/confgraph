@@ -10,6 +10,7 @@ from confgraph.utils.interface import normalize_interface_name
 # confgraph imports, so this cannot cycle (the other change_ir names in this file
 # stay lazily imported at their call sites, unchanged).
 from confgraph.change_ir import _native_deletion_path
+from confgraph.utils.ospf import canonical_area_id
 from confgraph.models.base import OSType
 from confgraph.models.vrf import VRFConfig
 from confgraph.models.interface import (
@@ -5410,6 +5411,19 @@ class IOSParser(BaseParser):
             def _queue_ospf_negation(verb, path_tail, child):
                 # CCR-0110 Phase E4/E5: queue the native op only; op-primary
                 # parsers no longer persist the deprecated no_commands string.
+                #
+                # CCR-0227: the area segment of an area-scoped path comes from
+                # the proposal TEXT, while the positive member ops key off the
+                # stored (canonical) ``area.area_id`` — so canonicalize it
+                # here, at the one point every OSPF negation op is built. A
+                # `no area 0.0.0.1 stub` must address the same area a
+                # `no area 1 stub` does, because the device does.
+                if len(path_tail) > 1 and path_tail[0] == "area":
+                    path_tail = (
+                        "area",
+                        canonical_area_id(path_tail[1]),
+                        *path_tail[2:],
+                    )
                 self._pending_native_ospf_ops.append(
                     ChangeOp(
                         verb=verb,

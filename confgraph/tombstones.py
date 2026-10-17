@@ -86,6 +86,19 @@ def _derive_secondary_cidr(ctx: dict) -> "dict[str, Any] | None":
         return None
 
 
+def _derive_area_id(ctx: dict) -> "dict[str, Any] | None":
+    """Canonical OSPF area-ID key for an area-scoped tombstone (CCR-0227).
+
+    Areas are stored canonical (``0.0.0.1`` -> ``1``), and the POSITIVE
+    member ops read the stored value, so a deletion key built from the raw
+    proposal text would address an area that no longer exists under that
+    spelling. One normalizer, the same one the models use.
+    """
+    from confgraph.utils.ospf import canonical_area_id
+
+    return {"area_id": canonical_area_id(ctx["area_id"])}
+
+
 def _derive_line_type(ctx: dict) -> "dict[str, Any] | None":
     """Canonical ``LineType`` value for a line-block tombstone key.
 
@@ -162,6 +175,7 @@ NESTED_DELETION_RULES: list[NestedDeletionRule] = [
         child_pattern=r"^no\s+area\s+(\S+)\s+stub",
         child_groups=["area_id"],
         template="ospf:{pid}:area:{area_id}:stub_reset",
+        derive=_derive_area_id,
     ),
     # OSPF area type reset — 'no area N nssa' / 'no area N nssa no-summary'
     # Proposal: ``no area 2 nssa`` inside ``router ospf 1``
@@ -173,6 +187,7 @@ NESTED_DELETION_RULES: list[NestedDeletionRule] = [
         child_pattern=r"^no\s+area\s+(\S+)\s+nssa",
         child_groups=["area_id"],
         template="ospf:{pid}:area:{area_id}:nssa_reset",
+        derive=_derive_area_id,
     ),
     # VRF route-target removals (CCR confgraph_vrf_rt_removal_tombstones.md).
     # The WI-4 merge made route_target_* lists ADDITIVE (device-faithful), so

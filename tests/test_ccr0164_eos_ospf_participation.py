@@ -55,14 +55,16 @@ def test_prefix_form_network_statements_parsed():
     stmts = ospf[0].network_statements
 
     # Same shape as the IOS wildcard form: (IPv4Network, area-id str).
-    assert (IPv4Network("10.10.2.0/24"), "0.0.0.0") in stmts
-    assert (IPv4Network("10.10.3.0/24"), "0.0.0.1") in stmts
+    # CCR-0227: area IDs are stored canonical (decimal); the config
+    # still spells it as the vendor does.
+    assert (IPv4Network("10.10.2.0/24"), "0") in stmts
+    assert (IPv4Network("10.10.3.0/24"), "1") in stmts
     # Both statements land — the second `network` line is not lost.
     assert len(stmts) == 2
 
     # Area id captured verbatim in the dotted spelling EOS emits.
     areas = {area for _, area in stmts}
-    assert areas == {"0.0.0.0", "0.0.0.1"}
+    assert areas == {"0", "1"}
 
 
 def test_single_instance_binds_ospf_process_id():
@@ -72,8 +74,8 @@ def test_single_instance_binds_ospf_process_id():
     eth1 = next(i for i in intfs if i.name == "Ethernet1")
 
     # ospf_area already parsed by the existing handler...
-    assert lo0.ospf_area == "0.0.0.0"
-    assert eth1.ospf_area == "0.0.0.0"
+    assert lo0.ospf_area == "0"
+    assert eth1.ospf_area == "0"
     # ...and now the single instance's id is bound so enrollment can gate on it.
     assert lo0.ospf_process_id == 1
     assert eth1.ospf_process_id == 1
@@ -92,7 +94,7 @@ interface Ethernet1
 """
     intfs = EOSParser(cfg).parse_interfaces()
     eth1 = next(i for i in intfs if i.name == "Ethernet1")
-    assert eth1.ospf_area == "0.0.0.0"
+    assert eth1.ospf_area == "0"
     assert eth1.ospf_process_id is None
 
 
@@ -103,7 +105,7 @@ def test_zero_instance_leaves_process_id_none():
 """
     intfs = EOSParser(cfg).parse_interfaces()
     eth1 = next(i for i in intfs if i.name == "Ethernet1")
-    assert eth1.ospf_area == "0.0.0.0"
+    assert eth1.ospf_area == "0"
     assert eth1.ospf_process_id is None
 
 
@@ -124,6 +126,6 @@ def test_mixed_forms_coexist():
 """
     ospf = EOSParser(cfg).parse_ospf()
     stmts = set(ospf[0].network_statements)
-    assert (IPv4Network("10.10.2.0/24"), "0.0.0.0") in stmts
-    assert (IPv4Network("192.168.0.0/24"), "0.0.0.1") in stmts
+    assert (IPv4Network("10.10.2.0/24"), "0") in stmts
+    assert (IPv4Network("192.168.0.0/24"), "1") in stmts
     assert len(stmts) == 2
