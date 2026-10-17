@@ -409,7 +409,15 @@ def test_ospf_interface_metric_comes_from_inside_the_area(parsed):
     iface = next(i for i in parsed.interfaces if i.name == "ethernet1/8")
     assert iface.ospf_cost == 45
     assert iface.ospf_area == "0.0.0.0"
-    assert iface.ospf_passive is False
+    # CCR-0222: ospf_passive is tri-state and reads None here. The area's
+    # OSPFInterfaceConfig.passive is still a plain `bool = False`, so a
+    # PAN-OS <passive>no</passive> is indistinguishable from "unstated" at
+    # the back-fill's source and the walk declines to write it. Consumers
+    # read None exactly as they read the old False (fall back to the
+    # process-level passive config, which PAN-OS never populates); carrying
+    # the explicit no through would need OSPFInterfaceConfig.passive to go
+    # tri-state too — a disclosed follow-up, not this fix.
+    assert iface.ospf_passive is None
 
 
 # ---------------------------------------------------------------------------

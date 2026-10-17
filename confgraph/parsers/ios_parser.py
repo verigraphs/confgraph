@@ -1266,7 +1266,7 @@ class IOSParser(BaseParser):
             ospf_hello_interval = None
             ospf_dead_interval = None
             ospf_network_type = None
-            ospf_passive = False
+            ospf_passive = None
             ospf_authentication = None
             ospf_authentication_key = None
             ospf_message_digest_keys = {}
@@ -1379,6 +1379,28 @@ class IOSParser(BaseParser):
             # ip ospf mtu-ignore
             if intf_obj.find_child_objects(r"^\s+ip\s+ospf\s+mtu-ignore"):
                 ospf_mtu_ignore = True
+
+            # ip ospf passive-interface / no ip ospf passive-interface
+            #
+            # CCR-0222: BOTH polarities are value-bearing state, so the
+            # negation parses to an explicit False — it is the per-interface
+            # override of a process-level `passive-interface default`, the
+            # NX-OS hardening pattern, and on hardware the interface-level
+            # word is final.  Hence the tri-state field: None means the
+            # interface said nothing and the process-level config decides.
+            # `$`-anchored both ways (disjoint from any operand-bearing
+            # spelling) with last-line-wins, exactly like every sibling
+            # `ip ospf *` scalar above.  This is the SHARED walk — NX-OS and
+            # EOS inherit it through super().parse_interfaces(); the
+            # process-level `passive-interface` spelling is parsed by the
+            # OSPF-process walks and is untouched by this.
+            ospf_passive_children = intf_obj.find_child_objects(
+                r"^\s+(?:no\s+)?ip\s+ospf\s+passive-interface\s*$"
+            )
+            if ospf_passive_children:
+                ospf_passive = not re.match(
+                    r"^\s*no\s+", ospf_passive_children[-1].text
+                )
 
             # Tunnel attributes
             tunnel_source = None
@@ -1893,6 +1915,11 @@ class IOSParser(BaseParser):
         "ospf_dead_interval": r"^\s+ip\s+ospf\s+dead-interval\s+",
         "ospf_network_type": r"^\s+ip\s+ospf\s+network\s+",
         "ospf_mtu_ignore": r"^\s+ip\s+ospf\s+mtu-ignore\s*$",
+        # CCR-0222: both polarities — the SET op for an explicit False must
+        # carry the `no ip ospf passive-interface` line, which is also what
+        # claims that negation for the CCR-0203 ledger (consumed, not
+        # disclosed).
+        "ospf_passive": r"^\s+(?:no\s+)?ip\s+ospf\s+passive-interface\s*$",
         "cdp_enabled": r"^\s+(?:no\s+)?cdp\s+enable\s*$",
         "lldp_transmit": r"^\s+(?:no\s+)?lldp\s+transmit\s*$",
         "lldp_receive": r"^\s+(?:no\s+)?lldp\s+receive\s*$",

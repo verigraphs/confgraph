@@ -322,7 +322,13 @@ def test_panos_ospf_area_interface_settings_reach_the_interface():
     assert eth.ospf_priority == 42
     assert eth.ospf_network_type == "p2p"   # <link-type><p2p/></link-type>
     assert eth.ospf_area == "0.0.0.0"
-    assert eth.ospf_passive is False        # <passive>no</passive>
+    # CCR-0222: tri-state — None, not False. <passive>no</passive> lands in
+    # OSPFInterfaceConfig.passive, still a plain `bool = False`, so the
+    # back-fill cannot tell it from "unstated" and declines to write.
+    # Consumers treat None identically (fall back to the process-level
+    # passive config); a tri-state OSPFInterfaceConfig.passive is the
+    # disclosed follow-up.
+    assert eth.ospf_passive is None
 
 
 def test_panos_does_not_assert_an_invented_ospf_process_id():

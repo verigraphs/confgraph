@@ -956,16 +956,23 @@ class BaseParser(ABC):
         # (explicitly named in passive_interfaces or non_passive_interfaces,
         # or whose ospf_process_id matches). Never infer passive for L2 ports
         # or interfaces not in any OSPF process — correctness over coverage.
+        #
+        # CCR-0222: every stamp here is guarded on ``ospf_passive is None``.
+        # The field is tri-state, and a non-None value means the INTERFACE
+        # block itself spoke (`[no] ip ospf passive-interface`) — which on
+        # hardware overrides anything the process says. Without the guard
+        # this walk clobbers the explicit False and the override vanishes
+        # again, one layer down.
         if pc.ospf_instances and pc.interfaces:
             intf_by_name = {i.name: i for i in pc.interfaces}
             for ospf in pc.ospf_instances:
                 for name in ospf.passive_interfaces:
                     intf = intf_by_name.get(name)
-                    if intf:
+                    if intf and intf.ospf_passive is None:
                         intf.ospf_passive = True
                 for name in ospf.non_passive_interfaces:
                     intf = intf_by_name.get(name)
-                    if intf:
+                    if intf and intf.ospf_passive is None:
                         intf.ospf_passive = False
                 # For default-passive, only mark interfaces that belong to
                 # this process (ospf_process_id matches or listed in an area)
@@ -975,6 +982,8 @@ class BaseParser(ABC):
                         area_intfs.update(area.interfaces)
                     non_passive_set = set(ospf.non_passive_interfaces)
                     for intf in pc.interfaces:
+                        if intf.ospf_passive is not None:
+                            continue  # the interface block already decided
                         if intf.name in non_passive_set:
                             continue  # already handled above
                         if intf.name in area_intfs or intf.ospf_process_id == ospf.process_id:
@@ -1036,6 +1045,27 @@ class BaseParser(ABC):
         ("bfd_multiplier",     "bfd_multiplier"),
     )
 
+    @staticmethod
+    def _is_model_default(obj, field_name: str, value) -> bool:
+        """True when *value* is still *field_name*'s model-declared default.
+
+        The single "has this field been set?" test for the back-fill walks
+        (CCR-0222). Identity first so the singletons (``None``, ``False``)
+        match exactly; equality only within the same type, so an explicitly
+        parsed ``0`` is never read as a default ``False``.
+        """
+        field_info = type(obj).model_fields.get(field_name)
+        if field_info is None:
+            return value is None
+        default = (
+            field_info.default_factory()
+            if field_info.default_factory is not None
+            else field_info.default
+        )
+        if value is default:
+            return True
+        return type(value) is type(default) and value == default
+
     def _backfill_ospf_interface_settings(self, pc: ParsedConfig) -> None:
         """Carry ``area > interface`` OSPF settings out to ``InterfaceConfig``.
 
@@ -1077,14 +1107,25 @@ class BaseParser(ABC):
                             continue
                         # Never clobber a value the interface block itself set.
                         #
-                        # Compared with `is`, not `in (None, False)`: in Python
-                        # `0 == False`, so a membership test would read an
-                        # explicitly parsed ZERO as "unset" and overwrite it.
-                        # `ip ospf priority 0` is a real, meaningful value — it
-                        # says "never become DR" — and silently promoting it to a
-                        # back-filled 33 would invert the operator's intent.
+                        # "Unset" means "still holds the field's MODEL-DECLARED
+                        # default", read off the model rather than hard-coded as
+                        # None-or-False (CCR-0222): `ospf_passive` is tri-state
+                        # with default None, so a False there is an EXPLICIT
+                        # `no ip ospf passive-interface` and must survive, while
+                        # a False in a default-False field (`ospf_mtu_ignore`)
+                        # is still unset. Behaviour-identical for every other
+                        # row — no default-None field in the table can hold
+                        # False, and no default-False field can hold None.
+                        #
+                        # Compared with `is` before `==`, not `in (None, False)`:
+                        # in Python `0 == False`, so a plain equality test would
+                        # read an explicitly parsed ZERO as "unset" and overwrite
+                        # it. `ip ospf priority 0` is a real, meaningful value —
+                        # it says "never become DR" — and silently promoting it
+                        # to a back-filled 33 would invert the operator's intent.
+                        # The type check keeps `0` distinct from `False`.
                         current = getattr(intf, dst_field, None)
-                        if current is not None and current is not False:
+                        if not self._is_model_default(intf, dst_field, current):
                             continue
                         setattr(intf, dst_field, value)
 

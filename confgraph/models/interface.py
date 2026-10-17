@@ -377,9 +377,22 @@ class InterfaceConfig(BaseConfigObject):
         default=None,
         description="OSPF network type ('point-to-point', 'broadcast', etc.)",
     )
-    ospf_passive: bool = Field(
-        default=False,
-        description="OSPF passive interface",
+    ospf_passive: bool | None = Field(
+        default=None,
+        description=(
+            "OSPF passive interface. TRI-STATE (CCR-0222, the CCR-0165 "
+            "``activate`` precedent): True = this interface is passive "
+            "(an interface-level ``ip ospf passive-interface``, or the "
+            "process-level passive config back-filled by the M3 walk); "
+            "False = EXPLICITLY non-passive (``no ip ospf passive-interface`` "
+            "— the per-interface override of a process-level "
+            "``passive-interface default``); None = NOT STATED on the "
+            "interface, so the consumer falls back to the process-level "
+            "passive config. A bool default of False could not express the "
+            "override at all: the M3 back-fill clobbered it, a field-level "
+            "merge could never overlay it (the CCR-0211 disease), and no "
+            "Change-IR SET op was emitted for it."
+        ),
     )
     ospf_authentication: str | None = Field(
         default=None,

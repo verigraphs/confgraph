@@ -441,7 +441,10 @@ class TestM3OSPFPassive:
         g0 = next(i for i in pc.interfaces if i.name == "GigabitEthernet0/0")
         g1 = next(i for i in pc.interfaces if i.name == "GigabitEthernet0/1")
         assert g0.ospf_passive is True
-        assert g1.ospf_passive is False
+        # CCR-0222: tri-state. Gi0/1 is in the process but NOTHING said
+        # anything about its passivity — neither the interface block nor a
+        # process-level list — so it is None (unstated), not False.
+        assert g1.ospf_passive is None
 
     def test_passive_interface_default(self):
         cfg = (
@@ -482,9 +485,11 @@ class TestM3OSPFPassive:
         g0 = next(i for i in pc.interfaces if i.name == "GigabitEthernet0/0")
         g2 = next(i for i in pc.interfaces if i.name == "GigabitEthernet0/2")
         assert g0.ospf_passive is True
-        assert g2.ospf_passive is False
+        # CCR-0222: the L2 port is outside every OSPF process, so the
+        # back-fill still does not reach it — it stays unstated (None).
+        assert g2.ospf_passive is None
 
-    def test_no_ospf_leaves_passive_false(self):
+    def test_no_ospf_leaves_passive_unstated(self):
         cfg = (
             "interface GigabitEthernet0/0\n"
             " ip address 10.0.0.1 255.255.255.0\n"
@@ -492,7 +497,9 @@ class TestM3OSPFPassive:
         )
         pc = IOSParser(cfg).parse()
         g0 = next(i for i in pc.interfaces if i.name == "GigabitEthernet0/0")
-        assert g0.ospf_passive is False
+        # CCR-0222: no OSPF anywhere in the config — nothing stated the
+        # field, so it is None (the tri-state "not stated"), not False.
+        assert g0.ospf_passive is None
 
 
 # ---------------------------------------------------------------------------

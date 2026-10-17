@@ -108,7 +108,18 @@ from confgraph.parsers.panos_parser import PANOSParser
 # Persisted baseline snapshots are invalidated by the pbv move itself (it is a
 # digest-key component), which subsumes the Tier-A digest shift these fields
 # cause.
-PARSER_BEHAVIOR_VERSION: int = 10
+# 11 (CCR-0222): ``InterfaceConfig.ospf_passive`` becomes tri-state
+# (``bool | None``, default None) and the shared interface walk extracts BOTH
+# polarities of the per-interface ``[no] ip ospf passive-interface`` override
+# (NX-OS/EOS inherit it).  Observable parse output moves three ways: every
+# interface that says nothing now reads None rather than False; an interface
+# exempted from a process-level ``passive-interface default`` reads an explicit
+# False and gains a native SET op for it (False != the new default); and the
+# ``no`` line it was emitting as an UnrecognizedBlock disappears, claimed by
+# that op's line provenance (CCR-0203 ledger).  No ParsedConfig JSON-schema
+# change beyond the field's own type, so pbv is what invalidates the platform
+# parse cache and entrp's digest keys.
+PARSER_BEHAVIOR_VERSION: int = 11
 
 __all__ = [
     "BaseParser",
