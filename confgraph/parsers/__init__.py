@@ -131,7 +131,21 @@ from confgraph.parsers.panos_parser import PANOSParser
 # change — the sharp case this constant exists for. Decimal is canonical
 # precisely so the existing tombstone/golden keys (`ospf:1:area:0:...`) do not
 # move.
-PARSER_BEHAVIOR_VERSION: int = 12
+# 13 (CCR-0227 completion): the two OPS-ONLY area-scoped removals —
+# ``no network A W area <aid>`` (and the EOS ``no network A/M area <aid>``
+# twin) and ``no area <aid> range A M`` — build their LIST_REMOVE key
+# directly in the parser rather than through the tombstone registry, and were
+# left spelling the area as the proposal wrote it while 12 made storage
+# canonical. A dotted withdrawal therefore addressed an area that no longer
+# existed under that spelling and removed NOTHING, silently — including the
+# dotted-baseline/dotted-proposal pair that worked before 12. The removal key
+# and the refresh-suppression map on both sides of each walk are now
+# canonical. Observable parse output moves (those op paths) with no schema
+# change. Bumped rather than riding 12 — unreleased though 12 is, the rule in
+# this module's header is per-commit and not optional for a qualifying
+# change, and deciding otherwise would mean re-deriving "was the predecessor
+# released?" at every review.
+PARSER_BEHAVIOR_VERSION: int = 13
 
 __all__ = [
     "BaseParser",

@@ -4980,6 +4980,18 @@ class IOSParser(BaseParser):
         """
         from confgraph.change_ir import ChangeOp, Verb
 
+        # CCR-0227: areas are STORED canonical, so both sides of this walk must
+        # speak the canonical spelling — the removal key, which the merger
+        # compares against stored ``network_statements``, and the caller's
+        # positive map, whose keys come from its own walk (IOS builds them raw
+        # from the regex, EOS canonical). Normalizing both HERE, where
+        # everything the two spellings must never disagree on already lives,
+        # keeps suppression and removal from splitting on the spelling.
+        positive_net_last_line = {
+            (net, canonical_area_id(area)): line
+            for (net, area), line in positive_net_last_line.items()
+        }
+
         for nnc in ospf_obj.find_child_objects(r"^\s+no\s+network\s+"):
             nnm = re.match(child_pattern, nnc.text)
             if not nnm:
@@ -4988,7 +5000,7 @@ class IOSParser(BaseParser):
             if extracted is None:
                 continue
             rem_net, rem_area = extracted
-            rem_key = (str(rem_net), rem_area)
+            rem_key = (str(rem_net), canonical_area_id(rem_area))
             if positive_net_last_line.get(rem_key, -1) > nnc.linenum:
                 # CCR-0203: suppressed-by-refresh is CONSUMED (understood and
                 # deliberately dropped), not blind — claim it or the fallback
@@ -5214,16 +5226,28 @@ class IOSParser(BaseParser):
             # (area_id, prefix) reappears as a positive range line LATER in
             # the block (refresh → re-add wins → device truth and legacy
             # parity).
+            #
+            # ONE key builder for both walks (CCR-0227): the area half is
+            # canonicalized, because the merger looks the area up by its
+            # STORED id, and the suppression map and the removal must agree
+            # on the spelling or a refresh stops suppressing its own removal.
+            # Returns None on an unparseable mask — dropped on BOTH walks, as
+            # before.
+            def _range_key(m) -> "tuple[str, str] | None":
+                try:
+                    prefix = IPv4Network(f"{m.group(2)}/{m.group(3)}")
+                except ValueError:
+                    return None
+                return canonical_area_id(m.group(1)), str(prefix)
+
             positive_range_last_line: dict[tuple[str, str], int] = {}
             for rc in ospf_obj.find_child_objects(r"^\s+area\s+\S+\s+range\s+"):
                 rm = re.match(r"^\s+area\s+(\S+)\s+range\s+(\S+)\s+(\S+)", rc.text)
                 if not rm:
                     continue
-                try:
-                    rng_pfx = IPv4Network(f"{rm.group(2)}/{rm.group(3)}")
-                except ValueError:
+                rkey = _range_key(rm)
+                if rkey is None:
                     continue
-                rkey = (rm.group(1), str(rng_pfx))
                 positive_range_last_line[rkey] = max(
                     positive_range_last_line.get(rkey, -1), rc.linenum
                 )
@@ -5233,11 +5257,9 @@ class IOSParser(BaseParser):
                 )
                 if not nrm:
                     continue
-                try:
-                    rng_pfx = IPv4Network(f"{nrm.group(2)}/{nrm.group(3)}")
-                except ValueError:
+                rkey = _range_key(nrm)
+                if rkey is None:
                     continue
-                rkey = (nrm.group(1), str(rng_pfx))
                 if positive_range_last_line.get(rkey, -1) > nrc.linenum:
                     self._claim_negation(nrc)  # CCR-0203: suppressed == consumed
                     continue  # re-added later in the block — removal suppressed

@@ -271,3 +271,86 @@ def test_decimal_spelled_deletions_are_unchanged():
         "field:ospf:1:area:1:stub_reset",
         "field:ospf:1:area:2:nssa_reset",
     ]
+
+
+# ---------------------------------------------------------------------------
+# The OPS-ONLY area-scoped removals. These never pass through the tombstone
+# registry — they build a LIST_REMOVE path directly — so they are a SECOND
+# entry point into the deletion path and need the same canonicalization.
+# The merge-side proof (does the removal actually apply?) lives in
+# confgraph-entrp: tests/test_ccr0227_area_removal_matrix.py.
+# ---------------------------------------------------------------------------
+
+
+def _ios_removal_ops(area: str):
+    cfg = (
+        "router ospf 1\n"
+        f" area {area} range 10.1.0.0 255.255.0.0\n"
+        f" network 10.0.0.0 0.0.0.255 area {area}\n"
+        f" no area {area} range 10.2.0.0 255.255.0.0\n"
+        f" no network 10.9.0.0 0.0.0.255 area {area}\n"
+        "!\n"
+    )
+    return [
+        op.path for op in IOSParser(cfg).parse().native_change_ops
+        if op.path[0] == "ospf_instance"
+    ]
+
+
+def test_network_removal_op_carries_the_canonical_area():
+    for spelling in ("0.0.0.1", "1"):
+        paths = _ios_removal_ops(spelling)
+        assert ("ospf_instance", "1", "", "network", "10.9.0.0/24", "1") in paths, spelling
+
+
+def test_area_range_removal_op_carries_the_canonical_area():
+    for spelling in ("0.0.0.1", "1"):
+        paths = _ios_removal_ops(spelling)
+        assert (
+            "ospf_instance", "1", "", "area", "1", "range", "10.2.0.0/16",
+        ) in paths, spelling
+
+
+def test_eos_cidr_network_removal_op_carries_the_canonical_area():
+    """The EOS CIDR form shares the removal walk — zero extra code."""
+    for spelling in ("0.0.0.1", "1"):
+        cfg = (
+            "router ospf 1\n"
+            f"   no network 10.9.0.0/24 area {spelling}\n"
+            "!\n"
+        )
+        paths = [
+            op.path for op in EOSParser(cfg).parse().native_change_ops
+            if op.path[0] == "ospf_instance"
+        ]
+        assert ("ospf_instance", "1", "", "network", "10.9.0.0/24", "1") in paths, spelling
+
+
+def test_removal_suppression_survives_a_spelling_difference():
+    """A re-added network must still suppress its own removal.
+
+    The suppression map and the removal key are built by different walks, so
+    they have to agree on the spelling — canonicalizing one and not the other
+    silently un-suppresses the removal.
+    """
+    for pos, neg in (("0.0.0.1", "0.0.0.1"), ("0.0.0.1", "1"), ("1", "0.0.0.1")):
+        cfg = (
+            "router ospf 1\n"
+            f"   no network 10.0.0.0/24 area {neg}\n"
+            f"   network 10.0.0.0/24 area {pos}\n"
+            "!\n"
+        )
+        paths = [
+            op.path for op in EOSParser(cfg).parse().native_change_ops
+            if op.path[0] == "ospf_instance" and op.verb.name == "LIST_REMOVE"
+        ]
+        assert paths == [], (pos, neg)
+
+
+def test_a_genuinely_different_area_is_not_removed():
+    """Canonicalization must not make unrelated areas collide."""
+    paths = _ios_removal_ops("0.0.0.1")
+    assert ("ospf_instance", "1", "", "network", "10.9.0.0/24", "2") not in paths
+    assert (
+        "ospf_instance", "1", "", "area", "2", "range", "10.2.0.0/16",
+    ) not in paths
