@@ -145,7 +145,21 @@ from confgraph.parsers.panos_parser import PANOSParser
 # this module's header is per-commit and not optional for a qualifying
 # change, and deciding otherwise would mean re-deriving "was the predecessor
 # released?" at every review.
-PARSER_BEHAVIOR_VERSION: int = 13
+# 14 (CCR-0217): the JunOS brace branch of ``unsupported_lines`` is fail-closed
+# on the parse OUTCOME — a document routed to the brace tokenizer that yields
+# an EMPTY canonical tree while carrying at least one non-blank
+# comment-stripped line discloses those lines as UnrecognizedBlocks instead of
+# returning silence. The hole was the document with no JunOS idiom in it at all
+# (Cisco ``no`` commands, an IOS ``interface`` block): zero set-family lines
+# routes it brace-ward, every statement is discarded at EOF for want of a ``;``
+# or ``{``, and the result read "no recognized configuration change" for text
+# that plainly requested one — the last silent arm of CCR-0210's fail-closed
+# story, modulo the CCR-0236 mixed-document residual. Observable parse output
+# moves for every such document, with NO ParsedConfig JSON-schema change — the
+# sharp case this constant exists for. Comment-only and whitespace-only
+# documents carry no content and stay silent; ``inactive:``-only documents
+# parse non-empty and keep their existing tag disclosure.
+PARSER_BEHAVIOR_VERSION: int = 14
 
 __all__ = [
     "BaseParser",

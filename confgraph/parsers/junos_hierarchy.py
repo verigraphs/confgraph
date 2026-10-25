@@ -89,8 +89,7 @@ def parse_junos_config(text: str) -> dict[str, Any]:
     if _is_set_style(text):
         tree = _parse_set_style(text)
     else:
-        tokens = _tokenize(text)
-        tree, _ = _parse_block(tokens, 0)
+        tree = _parse_brace_style(text)
     return expand_apply_groups(tree)
 
 
@@ -102,6 +101,15 @@ def unsupported_lines(text: str) -> list[str]:
     stripped, for the parser to disclose as ``UnrecognizedBlock``\\ s.  Routing
     is the same :func:`_is_set_style` decision :func:`parse_junos_config`
     makes, so the two never disagree about which idiom a document is.
+
+    The brace branch is additionally fail-closed on the PARSE OUTCOME
+    (CCR-0217).  A document carrying no JunOS idiom at all — Cisco ``no``
+    commands, an IOS ``interface`` block, anything an operator on a mixed
+    fleet might paste — reaches the brace tokenizer, which drops every
+    statement that never reaches a ``;`` or ``{`` and returns an empty tree.
+    So the question "was anything represented?" is asked of the tree rather
+    than of a list of foreign keywords to recognize: content in, nothing out,
+    disclose the content.  The next foreign idiom costs no code.
     """
     if _is_set_style(text):
         return [
@@ -109,10 +117,15 @@ def unsupported_lines(text: str) -> list[str]:
             for line, kind in (_classify_set_line(raw) for raw in text.splitlines())
             if kind == "unsupported"
         ]
-    return [
+    content = [
         stripped
         for stripped in (line.strip() for line in _strip_comments(text).splitlines())
-        if stripped and stripped.split(" ", 1)[0] in BRACE_STATEMENT_TAGS
+        if stripped
+    ]
+    if content and not _parse_brace_style(text):
+        return content
+    return [
+        line for line in content if line.split(" ", 1)[0] in BRACE_STATEMENT_TAGS
     ]
 
 
@@ -217,6 +230,17 @@ def _parse_set_style(text: str) -> dict[str, Any]:
         _merge_at_path(result, _fold_brackets(parts), {})
 
     return result
+
+
+def _parse_brace_style(text: str) -> dict[str, Any]:
+    """Convert JunOS brace-style config into the canonical tree.
+
+    The tree as the tokenizer builds it, BEFORE group expansion — the form
+    :func:`unsupported_lines` asks about, since expansion only ever fills a
+    tree in and so cannot answer "did this document state anything at all?".
+    """
+    tree, _ = _parse_block(_tokenize(text), 0)
+    return tree
 
 
 def _fold_brackets(parts: list[str]) -> list[str | list[str]]:
