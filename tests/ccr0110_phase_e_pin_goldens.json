@@ -1,0 +1,1113 @@
+{
+ "IOS": {
+  "changeset": [
+   {
+    "verb": "OBJECT_DELETE",
+    "path": [
+     "field",
+     "ip_sla_operations",
+     "5"
+    ],
+    "origin": "native"
+   },
+   {
+    "verb": "OBJECT_DELETE",
+    "path": [
+     "field",
+     "object_tracks",
+     "9"
+    ],
+    "origin": "native"
+   },
+   {
+    "verb": "OBJECT_DELETE",
+    "path": [
+     "field",
+     "eem_applets",
+     "OLD"
+    ],
+    "origin": "native"
+   },
+   {
+    "verb": "UNSET",
+    "path": [
+     "field",
+     "banners",
+     "motd"
+    ],
+    "origin": "native"
+   },
+   {
+    "verb": "LIST_REMOVE",
+    "path": [
+     "static",
+     "",
+     "10.0.0.0/24",
+     "192.0.2.1"
+    ],
+    "origin": "native"
+   },
+   {
+    "verb": "LIST_REMOVE",
+    "path": [
+     "static",
+     "CUST",
+     "10.1.0.0/16"
+    ],
+    "origin": "native"
+   },
+   {
+    "verb": "OBJECT_DELETE",
+    "path": [
+     "process",
+     "isis",
+     "DEADTAG"
+    ],
+    "origin": "native"
+   },
+   {
+    "verb": "OBJECT_DELETE",
+    "path": [
+     "process",
+     "eigrp",
+     "44"
+    ],
+    "origin": "native"
+   },
+   {
+    "verb": "OBJECT_DELETE",
+    "path": [
+     "process",
+     "ospf",
+     "3"
+    ],
+    "origin": "native"
+   },
+   {
+    "verb": "OBJECT_DELETE",
+    "path": [
+     "field",
+     "vrfs",
+     "GUEST"
+    ],
+    "origin": "native"
+   },
+   {
+    "verb": "LIST_REMOVE",
+    "path": [
+     "field",
+     "ntp",
+     "server",
+     "9.9.9.9"
+    ],
+    "origin": "native"
+   },
+   {
+    "verb": "LIST_REMOVE",
+    "path": [
+     "field",
+     "snmp",
+     "community",
+     "PUBLIC"
+    ],
+    "origin": "native"
+   },
+   {
+    "verb": "LIST_REMOVE",
+    "path": [
+     "field",
+     "nat",
+     "pool",
+     "NP"
+    ],
+    "origin": "native"
+   },
+   {
+    "verb": "OBJECT_DELETE",
+    "path": [
+     "vlan",
+     "100"
+    ],
+    "origin": "native"
+   },
+   {
+    "verb": "OBJECT_DELETE",
+    "path": [
+     "acl",
+     "DEAD"
+    ],
+    "origin": "native"
+   },
+   {
+    "verb": "LIST_REMOVE",
+    "path": [
+     "route-map",
+     "RM-EDGE",
+     "seq",
+     "20"
+    ],
+    "origin": "native"
+   },
+   {
+    "verb": "LIST_REMOVE",
+    "path": [
+     "prefix-list",
+     "PL",
+     "seq",
+     "5"
+    ],
+    "origin": "native"
+   },
+   {
+    "verb": "OBJECT_DELETE",
+    "path": [
+     "field",
+     "class_maps",
+     "CM"
+    ],
+    "origin": "native"
+   },
+   {
+    "verb": "OBJECT_DELETE",
+    "path": [
+     "interface",
+     "Loopback9"
+    ],
+    "origin": "native"
+   },
+   {
+    "verb": "OBJECT_DELETE",
+    "path": [
+     "process",
+     "bgp",
+     "65010"
+    ],
+    "origin": "derived"
+   },
+   {
+    "verb": "UNRECOGNIZED",
+    "path": [
+     "unrecognized"
+    ],
+    "origin": "derived"
+   },
+   {
+    "verb": "UNRECOGNIZED",
+    "path": [
+     "unrecognized"
+    ],
+    "origin": "derived"
+   },
+   {
+    "verb": "UNRECOGNIZED",
+    "path": [
+     "unrecognized"
+    ],
+    "origin": "derived"
+   },
+   {
+    "verb": "UNRECOGNIZED",
+    "path": [
+     "unrecognized"
+    ],
+    "origin": "derived"
+   },
+   {
+    "verb": "UNRECOGNIZED",
+    "path": [
+     "unrecognized"
+    ],
+    "origin": "derived"
+   },
+   {
+    "verb": "UNRECOGNIZED",
+    "path": [
+     "unrecognized"
+    ],
+    "origin": "derived"
+   },
+   {
+    "verb": "UNRECOGNIZED",
+    "path": [
+     "unrecognized"
+    ],
+    "origin": "derived"
+   },
+   {
+    "verb": "UNRECOGNIZED",
+    "path": [
+     "unrecognized"
+    ],
+    "origin": "derived"
+   },
+   {
+    "verb": "UNRECOGNIZED",
+    "path": [
+     "unrecognized"
+    ],
+    "origin": "derived"
+   },
+   {
+    "verb": "UNRECOGNIZED",
+    "path": [
+     "unrecognized"
+    ],
+    "origin": "derived"
+   },
+   {
+    "verb": "UNRECOGNIZED",
+    "path": [
+     "unrecognized"
+    ],
+    "origin": "derived"
+   },
+   {
+    "verb": "UNRECOGNIZED",
+    "path": [
+     "unrecognized"
+    ],
+    "origin": "derived"
+   },
+   {
+    "verb": "UNRECOGNIZED",
+    "path": [
+     "unrecognized"
+    ],
+    "origin": "derived"
+   },
+   {
+    "verb": "UNRECOGNIZED",
+    "path": [
+     "unrecognized"
+    ],
+    "origin": "derived"
+   },
+   {
+    "verb": "UNRECOGNIZED",
+    "path": [
+     "unrecognized"
+    ],
+    "origin": "derived"
+   },
+   {
+    "verb": "UNRECOGNIZED",
+    "path": [
+     "unrecognized"
+    ],
+    "origin": "derived"
+   },
+   {
+    "verb": "UNRECOGNIZED",
+    "path": [
+     "unrecognized"
+    ],
+    "origin": "derived"
+   },
+   {
+    "verb": "UNRECOGNIZED",
+    "path": [
+     "unrecognized"
+    ],
+    "origin": "derived"
+   },
+   {
+    "verb": "UNRECOGNIZED",
+    "path": [
+     "unrecognized"
+    ],
+    "origin": "derived"
+   },
+   {
+    "verb": "UNRECOGNIZED",
+    "path": [
+     "unrecognized"
+    ],
+    "origin": "derived"
+   }
+  ],
+  "containers": {
+   "no_commands": [
+    "process:bgp:65010"
+   ],
+   "interface_no_commands": {},
+   "bgp_no_commands": {}
+  }
+ },
+ "NXOS": {
+  "changeset": [
+   {
+    "verb": "OBJECT_DELETE",
+    "path": [
+     "field",
+     "ip_sla_operations",
+     "5"
+    ],
+    "origin": "native"
+   },
+   {
+    "verb": "OBJECT_DELETE",
+    "path": [
+     "field",
+     "object_tracks",
+     "9"
+    ],
+    "origin": "native"
+   },
+   {
+    "verb": "OBJECT_DELETE",
+    "path": [
+     "field",
+     "eem_applets",
+     "OLD"
+    ],
+    "origin": "native"
+   },
+   {
+    "verb": "UNSET",
+    "path": [
+     "field",
+     "banners",
+     "motd"
+    ],
+    "origin": "native"
+   },
+   {
+    "verb": "LIST_REMOVE",
+    "path": [
+     "static",
+     "",
+     "10.0.0.0/24",
+     "192.0.2.1"
+    ],
+    "origin": "native"
+   },
+   {
+    "verb": "LIST_REMOVE",
+    "path": [
+     "static",
+     "CUST",
+     "10.1.0.0/16"
+    ],
+    "origin": "native"
+   },
+   {
+    "verb": "OBJECT_DELETE",
+    "path": [
+     "process",
+     "isis",
+     "DEADTAG"
+    ],
+    "origin": "native"
+   },
+   {
+    "verb": "OBJECT_DELETE",
+    "path": [
+     "process",
+     "eigrp",
+     "44"
+    ],
+    "origin": "native"
+   },
+   {
+    "verb": "OBJECT_DELETE",
+    "path": [
+     "process",
+     "ospf",
+     "3"
+    ],
+    "origin": "native"
+   },
+   {
+    "verb": "OBJECT_DELETE",
+    "path": [
+     "field",
+     "vrfs",
+     "GUEST"
+    ],
+    "origin": "native"
+   },
+   {
+    "verb": "LIST_REMOVE",
+    "path": [
+     "field",
+     "ntp",
+     "server",
+     "9.9.9.9"
+    ],
+    "origin": "native"
+   },
+   {
+    "verb": "LIST_REMOVE",
+    "path": [
+     "field",
+     "snmp",
+     "community",
+     "PUBLIC"
+    ],
+    "origin": "native"
+   },
+   {
+    "verb": "LIST_REMOVE",
+    "path": [
+     "field",
+     "nat",
+     "pool",
+     "NP"
+    ],
+    "origin": "native"
+   },
+   {
+    "verb": "OBJECT_DELETE",
+    "path": [
+     "vlan",
+     "100"
+    ],
+    "origin": "native"
+   },
+   {
+    "verb": "OBJECT_DELETE",
+    "path": [
+     "acl",
+     "DEAD"
+    ],
+    "origin": "native"
+   },
+   {
+    "verb": "LIST_REMOVE",
+    "path": [
+     "route-map",
+     "RM-EDGE",
+     "seq",
+     "20"
+    ],
+    "origin": "native"
+   },
+   {
+    "verb": "LIST_REMOVE",
+    "path": [
+     "prefix-list",
+     "PL",
+     "seq",
+     "5"
+    ],
+    "origin": "native"
+   },
+   {
+    "verb": "OBJECT_DELETE",
+    "path": [
+     "field",
+     "class_maps",
+     "CM"
+    ],
+    "origin": "native"
+   },
+   {
+    "verb": "OBJECT_DELETE",
+    "path": [
+     "interface",
+     "Loopback9"
+    ],
+    "origin": "native"
+   },
+   {
+    "verb": "OBJECT_DELETE",
+    "path": [
+     "process",
+     "bgp",
+     "65010"
+    ],
+    "origin": "derived"
+   },
+   {
+    "verb": "UNRECOGNIZED",
+    "path": [
+     "unrecognized"
+    ],
+    "origin": "derived"
+   },
+   {
+    "verb": "UNRECOGNIZED",
+    "path": [
+     "unrecognized"
+    ],
+    "origin": "derived"
+   },
+   {
+    "verb": "UNRECOGNIZED",
+    "path": [
+     "unrecognized"
+    ],
+    "origin": "derived"
+   },
+   {
+    "verb": "UNRECOGNIZED",
+    "path": [
+     "unrecognized"
+    ],
+    "origin": "derived"
+   },
+   {
+    "verb": "UNRECOGNIZED",
+    "path": [
+     "unrecognized"
+    ],
+    "origin": "derived"
+   },
+   {
+    "verb": "UNRECOGNIZED",
+    "path": [
+     "unrecognized"
+    ],
+    "origin": "derived"
+   },
+   {
+    "verb": "UNRECOGNIZED",
+    "path": [
+     "unrecognized"
+    ],
+    "origin": "derived"
+   },
+   {
+    "verb": "UNRECOGNIZED",
+    "path": [
+     "unrecognized"
+    ],
+    "origin": "derived"
+   },
+   {
+    "verb": "UNRECOGNIZED",
+    "path": [
+     "unrecognized"
+    ],
+    "origin": "derived"
+   },
+   {
+    "verb": "UNRECOGNIZED",
+    "path": [
+     "unrecognized"
+    ],
+    "origin": "derived"
+   },
+   {
+    "verb": "UNRECOGNIZED",
+    "path": [
+     "unrecognized"
+    ],
+    "origin": "derived"
+   },
+   {
+    "verb": "UNRECOGNIZED",
+    "path": [
+     "unrecognized"
+    ],
+    "origin": "derived"
+   },
+   {
+    "verb": "UNRECOGNIZED",
+    "path": [
+     "unrecognized"
+    ],
+    "origin": "derived"
+   },
+   {
+    "verb": "UNRECOGNIZED",
+    "path": [
+     "unrecognized"
+    ],
+    "origin": "derived"
+   },
+   {
+    "verb": "UNRECOGNIZED",
+    "path": [
+     "unrecognized"
+    ],
+    "origin": "derived"
+   },
+   {
+    "verb": "UNRECOGNIZED",
+    "path": [
+     "unrecognized"
+    ],
+    "origin": "derived"
+   },
+   {
+    "verb": "UNRECOGNIZED",
+    "path": [
+     "unrecognized"
+    ],
+    "origin": "derived"
+   },
+   {
+    "verb": "UNRECOGNIZED",
+    "path": [
+     "unrecognized"
+    ],
+    "origin": "derived"
+   },
+   {
+    "verb": "UNRECOGNIZED",
+    "path": [
+     "unrecognized"
+    ],
+    "origin": "derived"
+   },
+   {
+    "verb": "UNRECOGNIZED",
+    "path": [
+     "unrecognized"
+    ],
+    "origin": "derived"
+   }
+  ],
+  "containers": {
+   "no_commands": [
+    "process:bgp:65010"
+   ],
+   "interface_no_commands": {},
+   "bgp_no_commands": {}
+  }
+ },
+ "EOS": {
+  "changeset": [
+   {
+    "verb": "OBJECT_DELETE",
+    "path": [
+     "field",
+     "ip_sla_operations",
+     "5"
+    ],
+    "origin": "native"
+   },
+   {
+    "verb": "OBJECT_DELETE",
+    "path": [
+     "field",
+     "object_tracks",
+     "9"
+    ],
+    "origin": "native"
+   },
+   {
+    "verb": "OBJECT_DELETE",
+    "path": [
+     "field",
+     "eem_applets",
+     "OLD"
+    ],
+    "origin": "native"
+   },
+   {
+    "verb": "UNSET",
+    "path": [
+     "field",
+     "banners",
+     "motd"
+    ],
+    "origin": "native"
+   },
+   {
+    "verb": "LIST_REMOVE",
+    "path": [
+     "static",
+     "",
+     "10.0.0.0/24",
+     "192.0.2.1"
+    ],
+    "origin": "native"
+   },
+   {
+    "verb": "LIST_REMOVE",
+    "path": [
+     "static",
+     "CUST",
+     "10.1.0.0/16"
+    ],
+    "origin": "native"
+   },
+   {
+    "verb": "OBJECT_DELETE",
+    "path": [
+     "process",
+     "isis",
+     "DEADTAG"
+    ],
+    "origin": "native"
+   },
+   {
+    "verb": "OBJECT_DELETE",
+    "path": [
+     "process",
+     "eigrp",
+     "44"
+    ],
+    "origin": "native"
+   },
+   {
+    "verb": "OBJECT_DELETE",
+    "path": [
+     "process",
+     "ospf",
+     "3"
+    ],
+    "origin": "native"
+   },
+   {
+    "verb": "OBJECT_DELETE",
+    "path": [
+     "field",
+     "vrfs",
+     "GUEST"
+    ],
+    "origin": "native"
+   },
+   {
+    "verb": "LIST_REMOVE",
+    "path": [
+     "field",
+     "ntp",
+     "server",
+     "9.9.9.9"
+    ],
+    "origin": "native"
+   },
+   {
+    "verb": "LIST_REMOVE",
+    "path": [
+     "field",
+     "snmp",
+     "community",
+     "PUBLIC"
+    ],
+    "origin": "native"
+   },
+   {
+    "verb": "LIST_REMOVE",
+    "path": [
+     "field",
+     "nat",
+     "pool",
+     "NP"
+    ],
+    "origin": "native"
+   },
+   {
+    "verb": "OBJECT_DELETE",
+    "path": [
+     "vlan",
+     "100"
+    ],
+    "origin": "native"
+   },
+   {
+    "verb": "OBJECT_DELETE",
+    "path": [
+     "acl",
+     "DEAD"
+    ],
+    "origin": "native"
+   },
+   {
+    "verb": "LIST_REMOVE",
+    "path": [
+     "route-map",
+     "RM-EDGE",
+     "seq",
+     "20"
+    ],
+    "origin": "native"
+   },
+   {
+    "verb": "LIST_REMOVE",
+    "path": [
+     "prefix-list",
+     "PL",
+     "seq",
+     "5"
+    ],
+    "origin": "native"
+   },
+   {
+    "verb": "OBJECT_DELETE",
+    "path": [
+     "field",
+     "class_maps",
+     "CM"
+    ],
+    "origin": "native"
+   },
+   {
+    "verb": "OBJECT_DELETE",
+    "path": [
+     "interface",
+     "Loopback9"
+    ],
+    "origin": "native"
+   },
+   {
+    "verb": "OBJECT_DELETE",
+    "path": [
+     "process",
+     "bgp",
+     "65010"
+    ],
+    "origin": "derived"
+   },
+   {
+    "verb": "UNRECOGNIZED",
+    "path": [
+     "unrecognized"
+    ],
+    "origin": "derived"
+   },
+   {
+    "verb": "UNRECOGNIZED",
+    "path": [
+     "unrecognized"
+    ],
+    "origin": "derived"
+   },
+   {
+    "verb": "UNRECOGNIZED",
+    "path": [
+     "unrecognized"
+    ],
+    "origin": "derived"
+   },
+   {
+    "verb": "UNRECOGNIZED",
+    "path": [
+     "unrecognized"
+    ],
+    "origin": "derived"
+   },
+   {
+    "verb": "UNRECOGNIZED",
+    "path": [
+     "unrecognized"
+    ],
+    "origin": "derived"
+   },
+   {
+    "verb": "UNRECOGNIZED",
+    "path": [
+     "unrecognized"
+    ],
+    "origin": "derived"
+   },
+   {
+    "verb": "UNRECOGNIZED",
+    "path": [
+     "unrecognized"
+    ],
+    "origin": "derived"
+   },
+   {
+    "verb": "UNRECOGNIZED",
+    "path": [
+     "unrecognized"
+    ],
+    "origin": "derived"
+   },
+   {
+    "verb": "UNRECOGNIZED",
+    "path": [
+     "unrecognized"
+    ],
+    "origin": "derived"
+   },
+   {
+    "verb": "UNRECOGNIZED",
+    "path": [
+     "unrecognized"
+    ],
+    "origin": "derived"
+   },
+   {
+    "verb": "UNRECOGNIZED",
+    "path": [
+     "unrecognized"
+    ],
+    "origin": "derived"
+   },
+   {
+    "verb": "UNRECOGNIZED",
+    "path": [
+     "unrecognized"
+    ],
+    "origin": "derived"
+   },
+   {
+    "verb": "UNRECOGNIZED",
+    "path": [
+     "unrecognized"
+    ],
+    "origin": "derived"
+   },
+   {
+    "verb": "UNRECOGNIZED",
+    "path": [
+     "unrecognized"
+    ],
+    "origin": "derived"
+   },
+   {
+    "verb": "UNRECOGNIZED",
+    "path": [
+     "unrecognized"
+    ],
+    "origin": "derived"
+   },
+   {
+    "verb": "UNRECOGNIZED",
+    "path": [
+     "unrecognized"
+    ],
+    "origin": "derived"
+   },
+   {
+    "verb": "UNRECOGNIZED",
+    "path": [
+     "unrecognized"
+    ],
+    "origin": "derived"
+   },
+   {
+    "verb": "UNRECOGNIZED",
+    "path": [
+     "unrecognized"
+    ],
+    "origin": "derived"
+   },
+   {
+    "verb": "UNRECOGNIZED",
+    "path": [
+     "unrecognized"
+    ],
+    "origin": "derived"
+   },
+   {
+    "verb": "UNRECOGNIZED",
+    "path": [
+     "unrecognized"
+    ],
+    "origin": "derived"
+   }
+  ],
+  "containers": {
+   "no_commands": [
+    "process:bgp:65010"
+   ],
+   "interface_no_commands": {},
+   "bgp_no_commands": {}
+  }
+ },
+ "IOSXR": {
+  "changeset": [
+   {
+    "verb": "OBJECT_DELETE",
+    "path": [
+     "process",
+     "ospf",
+     "3"
+    ],
+    "origin": "derived"
+   },
+   {
+    "verb": "OBJECT_DELETE",
+    "path": [
+     "process",
+     "bgp",
+     "65010"
+    ],
+    "origin": "derived"
+   },
+   {
+    "verb": "OBJECT_DELETE",
+    "path": [
+     "process",
+     "isis",
+     "DEADTAG"
+    ],
+    "origin": "derived"
+   },
+   {
+    "verb": "OBJECT_DELETE",
+    "path": [
+     "route-map",
+     "RP"
+    ],
+    "origin": "derived"
+   },
+   {
+    "verb": "OBJECT_DELETE",
+    "path": [
+     "prefix-list",
+     "PS"
+    ],
+    "origin": "derived"
+   },
+   {
+    "verb": "UNSET",
+    "path": [
+     "singleton",
+     "ntp"
+    ],
+    "origin": "derived"
+   },
+   {
+    "verb": "UNRECOGNIZED",
+    "path": [
+     "unrecognized"
+    ],
+    "origin": "derived"
+   },
+   {
+    "verb": "UNRECOGNIZED",
+    "path": [
+     "unrecognized"
+    ],
+    "origin": "derived"
+   },
+   {
+    "verb": "UNRECOGNIZED",
+    "path": [
+     "unrecognized"
+    ],
+    "origin": "derived"
+   },
+   {
+    "verb": "UNRECOGNIZED",
+    "path": [
+     "unrecognized"
+    ],
+    "origin": "derived"
+   },
+   {
+    "verb": "UNRECOGNIZED",
+    "path": [
+     "unrecognized"
+    ],
+    "origin": "derived"
+   },
+   {
+    "verb": "UNRECOGNIZED",
+    "path": [
+     "unrecognized"
+    ],
+    "origin": "derived"
+   }
+  ],
+  "containers": {
+   "no_commands": [
+    "process:ospf:3",
+    "process:bgp:65010",
+    "process:isis:DEADTAG",
+    "route-map:RP",
+    "prefix-list:PS",
+    "singleton:ntp"
+   ],
+   "interface_no_commands": {},
+   "bgp_no_commands": {}
+  }
+ }
+}
