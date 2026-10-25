@@ -154,10 +154,25 @@ class TestLegitimateCorporaAreUntouched:
 
     def test_a_delete_only_document_still_routes_set_style(self):
         """Routing is still the single ``_is_set_style`` decision: the
-        verb-family document never reaches the brace branch at all."""
-        cfg = "delete protocols bgp group EXT neighbor 10.0.0.1\n"
-        assert _is_set_style(cfg) is True
-        assert _disclosed(cfg) == [cfg.strip()]
+        verb-family document never reaches the brace branch at all.
+
+        [[CCR-0214]] moved the MODELLED half of that document off the
+        disclosure channel and onto the op channel, so the disclosure arm is
+        pinned here on a path the deletion registry does not carry.  Both arms
+        are asserted, because what this test is really about is that neither
+        document reached the brace tokenizer — and a document that did would
+        produce no ops AND no disclosure, which is exactly the shape the two
+        assertions together rule out."""
+        modelled = "delete protocols bgp group EXT neighbor 10.0.0.1\n"
+        assert _is_set_style(modelled) is True
+        assert [op.path for op in JunOSParser(modelled).parse().native_change_ops] == [
+            ("bgp_instance", "", "", "neighbor", "10.0.0.1")
+        ]
+        assert _disclosed(modelled) == []
+
+        unmodelled = "delete policy-options policy-statement EXPORT-ALL\n"
+        assert _is_set_style(unmodelled) is True
+        assert _disclosed(unmodelled) == [unmodelled.strip()]
 
     def test_a_stray_foreign_line_inside_a_set_document_is_unchanged(self):
         """The set idiom's own catch-all still owns that case."""

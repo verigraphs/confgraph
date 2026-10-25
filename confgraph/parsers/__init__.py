@@ -159,7 +159,24 @@ from confgraph.parsers.panos_parser import PANOSParser
 # sharp case this constant exists for. Comment-only and whitespace-only
 # documents carry no content and stay silent; ``inactive:``-only documents
 # parse non-empty and keep their existing tag disclosure.
-PARSER_BEHAVIOR_VERSION: int = 14
+# 15 (CCR-0214): JunOS ``delete`` / ``deactivate`` statements on MODELLED
+# paths compile to native change ops instead of being disclosed. JunOS emitted
+# no deletion artifact of any kind before this — no tombstones (the grammar is
+# Cisco syntax throughout) and no ops — so a withdrawal, the most outage-prone
+# change class on the OS, could only ever be reported as content the engine
+# could not read. The modelled set is one declarative table
+# (``parsers/junos_deletions.py``): a BGP neighbour, a whole BGP group, a
+# static route, an interface unit. Every path outside it stays on the CCR-0210
+# disclosure channel, so nothing became silent and nothing is half-applied;
+# ``deactivate`` compiles to the same op as ``delete`` because an inactive
+# subtree makes no contribution to the running configuration, which is the
+# only configuration the model holds. Observable parse output moves for any
+# JunOS document carrying one of those statements —
+# ``native_change_ops`` gains entries and ``unrecognized_blocks`` loses the
+# matching lines — with NO ParsedConfig JSON-schema change. No BASELINE moves:
+# a saved configuration states no deletion verb (the brace idiom has none),
+# and the ``inactive:`` statement tag is untouched and still disclosed.
+PARSER_BEHAVIOR_VERSION: int = 15
 
 __all__ = [
     "BaseParser",

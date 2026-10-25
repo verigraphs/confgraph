@@ -66,6 +66,23 @@ NON_SET_VERBS: frozenset[str] = frozenset({
     "rename", "annotate", "insert", "copy",
 })
 
+#: The subset of :data:`NON_SET_VERBS` that REMOVES configuration, and so can
+#: be expressed as a change op instead of only disclosed (CCR-0214).
+#:
+#: ``deactivate`` is in here with ``delete`` because the two have the same
+#: effect on the RUNNING configuration, which is the only configuration this
+#: model holds: an inactive subtree does not contribute to it.  The config
+#: DATABASE keeps a deactivated subtree and ``delete`` does not, but confgraph
+#: renders no JunOS text from the model, so that distinction has nowhere to
+#: leak to.  ``activate`` is NOT here and cannot be: restoring an inactive
+#: subtree needs the inactive content, which the model never held.
+#:
+#: Membership here only says "this verb removes something".  WHICH removals
+#: compile is decided in one place — the path registry in
+#: :mod:`confgraph.parsers.junos_deletions` — and everything it does not match
+#: stays on the CCR-0210 disclosure channel.
+DELETION_VERBS: frozenset[str] = frozenset({"delete", "deactivate"})
+
 #: Brace-idiom statement tags — a prefix on an ordinary statement that changes
 #: its STATE rather than its value.
 BRACE_STATEMENT_TAGS: frozenset[str] = frozenset({"inactive:", "replace:"})
@@ -110,12 +127,20 @@ def unsupported_lines(text: str) -> list[str]:
     So the question "was anything represented?" is asked of the tree rather
     than of a list of foreign keywords to recognize: content in, nothing out,
     disclose the content.  The next foreign idiom costs no code.
+
+    ``delete`` / ``deactivate`` lines are returned here TOO, even though some
+    of them now compile to change ops (CCR-0214).  This function is the
+    fail-closed answer on its own — a caller that compiles nothing discloses
+    everything — and :class:`~confgraph.parsers.junos_parser.JunOSParser`
+    subtracts exactly the lines it compiled, so the modelled/unmodelled
+    partition is applied in ONE place and no line can end up both compiled and
+    disclosed, or neither.
     """
     if _is_set_style(text):
         return [
             line
             for line, kind in (_classify_set_line(raw) for raw in text.splitlines())
-            if kind == "unsupported"
+            if kind in ("unsupported", "deletion")
         ]
     content = [
         stripped
@@ -153,12 +178,24 @@ def _is_set_style(text: str) -> bool:
 def _classify_set_line(raw_line: str) -> tuple[str, str]:
     """Classify one line of a ``set``-style document.
 
-    Returns ``(text, kind)`` for the comment-stripped line: ``"set"`` (a
-    statement the canonical tree carries), ``"skip"`` (blank or comment-only)
-    or ``"unsupported"``.  One classification, two consumers —
-    :func:`_parse_set_style` keeps the ``set`` lines and
-    :func:`unsupported_lines` discloses the rest, so a line can never be both
-    dropped and undisclosed.
+    Returns ``(text, kind)`` for the comment-stripped line:
+
+    ``"set"``
+        a statement the canonical tree carries;
+    ``"deletion"``
+        a :data:`DELETION_VERBS` statement — it REMOVES configuration, so it
+        may compile to a change op (CCR-0214);
+    ``"skip"``
+        blank or comment-only;
+    ``"unsupported"``
+        everything else.
+
+    One classification, three consumers — :func:`_parse_set_style` keeps the
+    ``set`` lines, :func:`deletion_statements` hands the deletions to the op
+    emitter, and :func:`unsupported_lines` discloses everything the tree
+    cannot represent.  A line can never be both dropped and undisclosed, and
+    the router stays model-blind: it says a line removes something, never
+    whether the model can express that removal.
     """
     line = raw_line.strip()
     # Strip inline ## comments (e.g. the ## SECRET-DATA marker)
@@ -169,7 +206,40 @@ def _classify_set_line(raw_line: str) -> tuple[str, str]:
         return line, "skip"
     if line.startswith("set "):
         return line, "set"
+    if line.split(" ", 1)[0] in DELETION_VERBS:
+        return line, "deletion"
     return line, "unsupported"
+
+
+def deletion_statements(text: str) -> list[tuple[int, str, tuple[str, ...]]]:
+    """Every ``delete`` / ``deactivate`` statement in *text*, in file order.
+
+    Returns ``(line_no, line, path)`` triples — the 1-based config line number,
+    the comment-stripped line, and the statement's CANONICAL TOKEN PATH: the
+    tokens after the verb, tokenized by exactly the function that tokenizes a
+    ``set`` line (:func:`_tokenize_set_line`), because ``delete A B C`` and
+    ``set A B C`` address the same node of the same tree.  That is the whole
+    reason deletion support costs a path registry rather than a second parser.
+
+    Bracketed runs are left as their literal ``[`` / ``]`` tokens rather than
+    folded: a bracketed deletion addresses several nodes at once, no registry
+    row claims a path containing a bracket token, and so it falls through to
+    disclosure — fail-closed, which is the right default for a removal.
+
+    Brace-idiom documents return nothing: the brace rendering has no deletion
+    verb (its nearest equivalent, the ``inactive:`` statement tag, stays
+    disclosed — see :data:`BRACE_STATEMENT_TAGS`).
+    """
+    if not _is_set_style(text):
+        return []
+    out: list[tuple[int, str, tuple[str, ...]]] = []
+    for line_no, raw in enumerate(text.splitlines(), start=1):
+        line, kind = _classify_set_line(raw)
+        if kind != "deletion":
+            continue
+        _verb, _, remainder = line.partition(" ")
+        out.append((line_no, line, tuple(_tokenize_set_line(remainder))))
+    return out
 
 
 def _tokenize_set_line(line: str) -> list[str]:

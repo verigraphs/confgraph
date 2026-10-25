@@ -48,7 +48,7 @@ from confgraph.models.static_route import StaticRoute
 
 from confgraph.parsers.base import BaseParser, parse_remote_as_token
 from confgraph.parsers.junos_hierarchy import (
-    parse_junos_config, unsupported_lines, _is_set_style,
+    deletion_statements, parse_junos_config, unsupported_lines, _is_set_style,
 )
 
 
@@ -67,6 +67,9 @@ class JunOSParser(BaseParser):
         self._config_lines: list[str] = config_text.splitlines()
         # 1b: populated by _parse_bgp_block(); maps peer_ip → local-address IP str
         self._bgp_local_addresses: dict[str, str] = {}
+        # CCR-0214: the deletion lines _attach_native_change_ops turned into
+        # ops, so _collect_unrecognized_blocks can subtract exactly those.
+        self._compiled_deletion_lines: list[str] = []
 
     # ------------------------------------------------------------------
     # Hierarchy access
@@ -98,19 +101,79 @@ class JunOSParser(BaseParser):
         exactly as the IOS-family child-line walk emits them.  JunOS's
         non-``set`` verbs and ``inactive:`` / ``replace:`` tags mean the OPPOSITE
         of being dropped, so silence here is a semantic inversion, not a gap.
+
+        CCR-0214 subtracts the deletion lines that ``_attach_native_change_ops``
+        COMPILED — and only those.  ``unsupported_lines`` still returns every
+        deletion, so this subtraction is the one and only place the
+        modelled/unmodelled partition is applied: a deletion is disclosed
+        unless an op was built for it, which makes "the registry grew a row"
+        the single reason a line stops being disclosed.  Both lists come from
+        the same ``_classify_set_line`` pass, so they cannot disagree about
+        which lines exist; removing matches one at a time keeps a repeated
+        statement honest (two identical lines, two ops, two subtractions).
         """
-        return [
-            UnrecognizedBlock(
-                block_header=line,
-                raw_lines=[line],
-                best_guess=next(
-                    (label for kw, label in self._BEST_GUESS_KEYWORDS
-                     if kw in line.lower()),
-                    None,
-                ),
+        remaining = list(self._compiled_deletion_lines)
+        blocks: list[UnrecognizedBlock] = []
+        for line in unsupported_lines(self.config_text):
+            if line in remaining:
+                remaining.remove(line)
+                continue
+            blocks.append(
+                UnrecognizedBlock(
+                    block_header=line,
+                    raw_lines=[line],
+                    best_guess=next(
+                        (label for kw, label in self._BEST_GUESS_KEYWORDS
+                         if kw in line.lower()),
+                        None,
+                    ),
+                )
             )
-            for line in unsupported_lines(self.config_text)
-        ]
+        return blocks
+
+    def _attach_native_change_ops(self, pc: "ParsedConfig") -> None:
+        """Compile ``delete`` / ``deactivate`` statements to change ops (CCR-0214).
+
+        JunOS used to emit no deletion artifact of any kind — no tombstones
+        (the whole tombstone grammar is Cisco syntax) and no ops — so a
+        withdrawal could only ever be disclosed, never simulated.  This is the
+        emitter.  It is deliberately thin: ``junos_hierarchy`` already hands
+        over each statement's canonical token path, and
+        :mod:`confgraph.parsers.junos_deletions` owns the only model knowledge
+        involved, so what is left here is the scope the proposal states and the
+        bookkeeping of which lines were compiled.
+
+        Called by ``BaseParser.parse`` BEFORE ``_collect_unrecognized_blocks``
+        (the CCR-0203 claim-scan ordering), which is what lets the disclosure
+        pass subtract the compiled lines.
+        """
+        from confgraph.parsers.junos_deletions import DeletionScope, compile_deletion
+
+        scope = DeletionScope(asn=self._stated_autonomous_system(), vrf="")
+        ops: list[Any] = []
+        compiled: list[str] = []
+        for line_no, line, path in deletion_statements(self.config_text):
+            op = compile_deletion(path, scope, source_line=line, line_no=line_no)
+            if op is None:
+                continue  # unmodelled path — _collect_unrecognized_blocks discloses it
+            ops.append(op)
+            compiled.append(line)
+        self._compiled_deletion_lines = compiled
+        pc.native_change_ops = ops
+
+    def _stated_autonomous_system(self) -> str:
+        """The ASN this document states, or ``""`` when it states none.
+
+        Read off the canonical tree rather than off the parsed BGP instances:
+        a pure-deletion proposal has no ``protocols bgp`` block to hang an
+        instance on, yet may still restate ``routing-options
+        autonomous-system`` — and a proposal that restates neither must produce
+        the sentinel, not a fabricated number ([[CCR-0212]]).
+        """
+        routing_options = self._get_hierarchy().get("routing-options", {})
+        if not isinstance(routing_options, dict):
+            return ""
+        return _str_val(routing_options.get("autonomous-system")) or ""
 
     def parse(self) -> "ParsedConfig":
         """Override to back-fill BGP update_source.
