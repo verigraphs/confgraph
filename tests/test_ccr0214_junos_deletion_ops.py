@@ -23,7 +23,7 @@ What these pin, in the order they matter:
     baseline parse moves.
 
 Run only these tests:
-    uv run pytest tests/test_ccr0214_junos_deletion_ops.py
+    uv run --extra dev pytest tests/test_ccr0214_junos_deletion_ops.py
 """
 
 from __future__ import annotations
@@ -38,10 +38,16 @@ from confgraph.parsers.junos_deletions import (
     JUNOS_DELETION_RULES,
     DeletionScope,
     JunOSDeletionRule,
+    collides_with_later_set,
     compile_deletion,
     match_rule,
 )
-from confgraph.parsers.junos_hierarchy import DELETION_VERBS, deletion_statements
+from confgraph.parsers.junos_hierarchy import (
+    DELETION_VERBS,
+    NON_SET_VERBS,
+    deletion_statements,
+    set_statements,
+)
 from confgraph.parsers.junos_parser import JunOSParser
 
 # ---------------------------------------------------------------- the oracle
@@ -84,8 +90,21 @@ EXPECTED_INVENTORY: tuple[tuple[tuple, str, str, tuple[str, ...]], ...] = (
 )
 
 
+#: The same configuration in the brace rendering — which has no deletion verb,
+#: and so can never produce one, which is why no BASELINE parse moves.
+BRACE_DOC = (
+    "protocols {\n    bgp {\n        group EXT {\n"
+    "            neighbor 10.0.0.1 {\n                peer-as 65001;\n"
+    "            }\n        }\n    }\n}\n"
+)
+
+
 def _ops(cfg: str):
     return JunOSParser(cfg).parse().native_change_ops or []
+
+
+def _shapes(cfg: str) -> list[tuple[str, tuple[str, ...]]]:
+    return [(op.verb.value, op.path) for op in _ops(cfg)]
 
 
 def _disclosed(cfg: str) -> list[str]:
@@ -137,6 +156,167 @@ class TestTheRegistryInventory:
     def test_no_two_rows_share_a_pattern(self):
         patterns = [rule.pattern for rule in JUNOS_DELETION_RULES]
         assert len(set(patterns)) == len(patterns)
+
+
+class TestTheVerbSetIsPinned:
+    """The membership of :data:`DELETION_VERBS` is a SEMANTIC claim, not a list.
+
+    Promoting a verb into it makes that verb compile to a removal, and the two
+    complementary parametrizations elsewhere in the suite move the verb between
+    halves rather than failing — so adding ``activate`` passed every test in
+    every repo while inverting the meaning of the statement: a request to
+    RESTORE an inactive subtree would have been simulated as a removal, on the
+    modelled paths, silently. Found in validation; this is the pin.
+    """
+
+    def test_exactly_delete_and_deactivate_compile(self):
+        assert DELETION_VERBS == {"delete", "deactivate"}
+
+    def test_every_removal_verb_is_part_of_the_disclosed_verb_family(self):
+        """The removal set is a SUBSET of the family, never a sibling list: the
+        family decides routing, this decides compilation, and a verb outside
+        the family would reach neither."""
+        assert DELETION_VERBS < NON_SET_VERBS
+
+    def test_activate_is_not_a_removal_verb(self):
+        """Named rather than left implicit, because it is the one verb that
+        looks like it belongs: it is in the family, it is about the same
+        inactive/active state ``deactivate`` is about, and it is the exact
+        mutation that slipped through. Restoring an inactive subtree needs the
+        subtree's contents, which the model — holding only the running
+        configuration — never had."""
+        assert "activate" not in DELETION_VERBS
+        cfg = "activate protocols bgp group RR neighbor 10.0.0.1\n"
+        assert _ops(cfg) == []
+        assert _disclosed(cfg) == [cfg.strip()]
+
+
+# ------------------------------------------------------- rewrite vs removal
+
+
+class TestARewriteIsNotARemoval:
+    """A ``delete`` the same document later re-states is a stanza REWRITE.
+
+    JunOS applies candidate statements in order, so ``delete`` followed by
+    ``set`` under the same path re-creates the thing with new contents. The
+    model cannot hold "removed and then re-created differently", and applying
+    the removal alone reports a confident teardown of something the device
+    would still have — which is how the two commonest JunOS rewrite idioms
+    (rebuild a BGP group, move a static route to a new next-hop) read before
+    this guard. They now disclose, which is the honest answer and the one the
+    pre-CCR-0214 engine gave.
+    """
+
+    GROUP_REWRITE = (
+        "delete protocols bgp group RR\n"
+        "set protocols bgp group RR type internal\n"
+        "set protocols bgp group RR neighbor 10.255.0.9\n"
+    )
+    STATIC_MOVE = (
+        "delete routing-options static route 10.99.0.0/24\n"
+        "set routing-options static route 10.99.0.0/24 next-hop 10.0.18.9\n"
+    )
+    UNIT_REWRITE = (
+        "delete interfaces ge-0/0/0 unit 0\n"
+        "set interfaces ge-0/0/0 unit 0 family inet address 10.9.9.9/30\n"
+    )
+
+    @pytest.mark.parametrize(
+        "cfg",
+        [GROUP_REWRITE, STATIC_MOVE, UNIT_REWRITE],
+        ids=["group-rebuild", "static-next-hop-move", "interface-unit-rebuild"],
+    )
+    def test_a_restated_removal_discloses_instead_of_compiling(self, cfg):
+        assert _ops(cfg) == []
+        assert _disclosed(cfg) == [cfg.splitlines()[0]]
+
+    def test_the_set_lines_around_it_still_parse(self):
+        """Disclosing the removal must not cost the rest of the document."""
+        pc = JunOSParser(self.GROUP_REWRITE).parse()
+        assert [pg.name for b in pc.bgp_instances for pg in b.peer_groups] == ["RR"]
+        assert [
+            str(n.peer_ip) for b in pc.bgp_instances for n in b.neighbors
+        ] == ["10.255.0.9"]
+
+    def test_order_is_load_bearing_set_then_delete_still_removes(self):
+        """The reverse order is a REMOVAL on a device — written, then withdrawn
+        — and the deletion op already produces exactly that. Guarding it too
+        would throw away a correct answer, so the guard reads line numbers and
+        not just paths."""
+        cfg = (
+            "set protocols bgp group RR neighbor 10.255.0.1 peer-as 64512\n"
+            "delete protocols bgp group RR neighbor 10.255.0.1\n"
+        )
+        assert _shapes(cfg) == [
+            ("object_delete", ("bgp_instance", "", "", "neighbor", "10.255.0.1"))
+        ]
+        assert _disclosed(cfg) == []
+
+    def test_a_set_at_a_diverging_path_is_not_a_collision(self):
+        """Sharing an ancestor is not re-stating. Here the removal is genuine
+        and the edit beside it is unrelated, so the removal must still
+        simulate — this is the over-trigger the guard has to avoid."""
+        cfg = (
+            "delete protocols bgp group RR neighbor 10.255.0.1\n"
+            "set protocols bgp group RR type external\n"
+        )
+        assert _shapes(cfg) == [
+            ("object_delete", ("bgp_instance", "", "", "neighbor", "10.255.0.1"))
+        ]
+        assert _disclosed(cfg) == []
+
+    def test_a_set_on_a_different_object_entirely_is_not_a_collision(self):
+        cfg = (
+            "delete interfaces ge-0/0/0 unit 0\n"
+            "set interfaces ge-0/0/1 unit 0 family inet address 10.9.9.9/30\n"
+        )
+        assert _shapes(cfg) == [("object_delete", ("interface", "ge-0/0/0.0"))]
+        assert _disclosed(cfg) == []
+
+    def test_a_deeper_delete_under_a_restated_parent_still_compiles(self):
+        """``set`` at a SHALLOWER path than the deletion does not re-create
+        what was deleted: creating the group and then removing a member from
+        it is a removal, and the member never comes back."""
+        cfg = (
+            "delete protocols bgp group RR neighbor 10.255.0.1\n"
+            "set protocols bgp group RR\n"
+        )
+        assert _shapes(cfg) == [
+            ("object_delete", ("bgp_instance", "", "", "neighbor", "10.255.0.1"))
+        ]
+
+    def test_the_collision_predicate_reads_prefixes_and_order_directly(self):
+        """The rule stated once, away from the parser, so its two halves are
+        separable: prefix-or-equal on the path, strictly later in the file."""
+        path = ("protocols", "bgp", "group", "RR")
+        later_child = [(9, "", ("protocols", "bgp", "group", "RR", "type", "internal"))]
+        later_exact = [(9, "", ("protocols", "bgp", "group", "RR"))]
+        later_sibling = [(9, "", ("protocols", "bgp", "group", "EXT"))]
+        later_ancestor = [(9, "", ("protocols", "bgp"))]
+        earlier_child = [(1, "", ("protocols", "bgp", "group", "RR", "type", "internal"))]
+
+        assert collides_with_later_set(path, 5, later_child) is True
+        assert collides_with_later_set(path, 5, later_exact) is True
+        assert collides_with_later_set(path, 5, later_sibling) is False
+        assert collides_with_later_set(path, 5, later_ancestor) is False
+        assert collides_with_later_set(path, 5, earlier_child) is False
+        assert collides_with_later_set(path, 5, []) is False
+
+    def test_set_statements_mirrors_deletion_statements(self):
+        """The comparability the guard rests on: both sides come from one
+        classification pass and one tokenizer, so a ``set`` and a ``delete``
+        naming the same node produce the SAME tuple."""
+        cfg = (
+            "delete protocols bgp group RR neighbor 10.255.0.1\n"
+            "set protocols bgp group RR neighbor 10.255.0.1 peer-as 64512\n"
+        )
+        (_dn, _dl, dpath), = deletion_statements(cfg)
+        (_sn, _sl, spath), = set_statements(cfg)
+        assert dpath == ("protocols", "bgp", "group", "RR", "neighbor", "10.255.0.1")
+        assert spath[: len(dpath)] == dpath
+
+    def test_a_brace_document_offers_no_set_statements(self):
+        assert set_statements(BRACE_DOC) == []
 
 
 # ------------------------------------------------------------- the positives
@@ -372,13 +552,8 @@ class TestNothingElseMoved:
         """The brace rendering has no deletion verb, so a saved configuration
         — which is the only thing written in braces — can never produce one.
         That is why no BASELINE parse moves under this change."""
-        cfg = (
-            "protocols {\n    bgp {\n        group EXT {\n"
-            "            neighbor 10.0.0.1 {\n                peer-as 65001;\n"
-            "            }\n        }\n    }\n}\n"
-        )
-        assert deletion_statements(cfg) == []
-        assert _ops(cfg) == []
+        assert deletion_statements(BRACE_DOC) == []
+        assert _ops(BRACE_DOC) == []
 
     def test_an_inactive_tag_is_still_only_disclosed(self):
         """The documented asymmetry: the set-idiom ``deactivate`` simulates,

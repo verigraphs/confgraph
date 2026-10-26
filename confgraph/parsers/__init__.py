@@ -176,7 +176,22 @@ from confgraph.parsers.panos_parser import PANOSParser
 # matching lines — with NO ParsedConfig JSON-schema change. No BASELINE moves:
 # a saved configuration states no deletion verb (the brace idiom has none),
 # and the ``inactive:`` statement tag is untouched and still disclosed.
-PARSER_BEHAVIOR_VERSION: int = 15
+# 16 (CCR-0214, validation round 1 finding R1): a JunOS removal that the SAME
+# document later re-states no longer compiles — it falls back to the CCR-0210
+# disclosure channel. JunOS applies candidate statements in order, so
+# ``delete protocols bgp group RR`` followed by ``set protocols bgp group RR …``
+# rebuilds the group rather than removing it, and the same idiom moves a static
+# route to a new next-hop. Those are the two commonest JunOS rewrite idioms, and
+# compiling the deletion alone reported a confident teardown of something the
+# device would still have — measured in validation as a CRITICAL full-teardown
+# verdict on a group rebuild. The guard is order-aware (``set`` strictly AFTER
+# the deletion line, at an equal or deeper path): the reverse order really is a
+# removal on a device, so it still compiles. Observable parse output moves for
+# any JunOS document mixing a removal with a later restatement of the same
+# path — ``native_change_ops`` loses that op and ``unrecognized_blocks`` gains
+# the line back — with NO ParsedConfig JSON-schema change, and no baseline
+# motion (a saved configuration states no deletion verb).
+PARSER_BEHAVIOR_VERSION: int = 16
 
 __all__ = [
     "BaseParser",

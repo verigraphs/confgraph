@@ -45,6 +45,12 @@ Deliberately OUT of the table, each for a stated reason rather than oversight:
 ``delete routing-instances CUST …``
     every row below addresses the global routing instance; a routing-instance
     scope needs the vrf captured out of the path, which is one more row shape.
+a removal the same document later RE-STATES
+    ``delete … group RR`` followed by ``set … group RR …`` is a stanza
+    rewrite, not a removal — see :func:`collides_with_later_set`. This one is
+    not about the table's coverage: the path IS modelled, and the statement
+    still does not compile, because what the document means as a whole is
+    something the model cannot hold.
 ``activate`` / ``replace`` / ``rename`` / ``insert`` / ``copy`` / the brace
     ``inactive:`` and ``replace:`` statement tags
     not removals, or not expressible from a model that holds only the running
@@ -63,6 +69,7 @@ __all__ = [
     "DeletionScope",
     "JunOSDeletionRule",
     "JUNOS_DELETION_RULES",
+    "collides_with_later_set",
     "compile_deletion",
     "match_rule",
 ]
@@ -224,6 +231,53 @@ def match_rule(
         )
         return rule, captures
     return None
+
+
+def collides_with_later_set(
+    path: tuple[str, ...],
+    line_no: int,
+    set_statements: list[tuple[int, str, tuple[str, ...]]],
+) -> bool:
+    """True when this deletion is really half of a stanza REWRITE.
+
+    JunOS applies the statements in a candidate configuration IN ORDER, so
+
+        delete protocols bgp group RR
+        set protocols bgp group RR type internal
+        set protocols bgp group RR neighbor 10.255.0.9
+
+    does not remove the group — it rebuilds it, and the sessions that survive
+    the commit are the ones the new statements describe.  Same for the standard
+    way to move a static route (``delete`` it, then ``set`` it with a new
+    next-hop).  Those are the two commonest JunOS rewrite idioms, and the model
+    has no way to express "removed and then re-created with different
+    contents": applying the deletion alone reports a confident teardown of
+    something the device would still have.  So a deletion in that shape does
+    not compile at all, and falls back to the disclosure channel — the project
+    rule that a wrong simulation is worse than an honest "could not read this".
+
+    ORDER IS LOAD-BEARING, which is why this takes *line_no* rather than just
+    comparing paths. The reverse document order
+
+        set    protocols bgp group RR neighbor 10.255.0.1 peer-as 64512
+        delete protocols bgp group RR neighbor 10.255.0.1
+
+    is a REMOVAL on a device — the statement is written and then withdrawn —
+    and the deletion op already produces exactly that, so guarding it too would
+    throw away a correct answer. Only a ``set`` AFTER the deletion line
+    collides.
+
+    Collision is "equal to, or a prefix of": a ``set`` deeper under the deleted
+    path re-creates it (``delete … group RR`` then
+    ``set … group RR type internal``), while a ``set`` that merely shares an
+    ANCESTOR does not (``delete … group RR neighbor 10.0.0.1`` beside
+    ``set … group RR type external`` is a genuine removal plus an unrelated
+    edit, and the paths diverge before either ends).
+    """
+    return any(
+        set_line_no > line_no and set_path[: len(path)] == path
+        for set_line_no, _line, set_path in set_statements
+    )
 
 
 def compile_deletion(

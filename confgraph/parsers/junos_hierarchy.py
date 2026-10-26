@@ -230,12 +230,40 @@ def deletion_statements(text: str) -> list[tuple[int, str, tuple[str, ...]]]:
     verb (its nearest equivalent, the ``inactive:`` statement tag, stays
     disclosed — see :data:`BRACE_STATEMENT_TAGS`).
     """
+    return _statements_of_kind(text, "deletion")
+
+
+def set_statements(text: str) -> list[tuple[int, str, tuple[str, ...]]]:
+    """Every ``set`` statement in *text*, in file order, shaped like a deletion.
+
+    The exact mirror of :func:`deletion_statements`, from the same
+    classification pass and the same tokenizer, so the two kinds of statement
+    produce COMPARABLE paths.  That comparability is the point: a ``delete``
+    and a later ``set`` under the same path are a stanza REWRITE, which the
+    model cannot represent, and recognizing one means comparing the two paths
+    (:func:`confgraph.parsers.junos_deletions.collides_with_later_set`).
+
+    Tokens only — no bracket folding and no tree building — because the
+    comparison is positional.  :func:`_parse_set_style` remains the function
+    that turns these lines into the canonical tree; this one never does.
+    """
+    return _statements_of_kind(text, "set")
+
+
+def _statements_of_kind(
+    text: str, kind: str
+) -> list[tuple[int, str, tuple[str, ...]]]:
+    """``(line_no, line, token path)`` for every line of one classification.
+
+    The path is the tokens AFTER the leading verb, so ``set`` and ``delete``
+    lines addressing the same node yield the same tuple.
+    """
     if not _is_set_style(text):
         return []
     out: list[tuple[int, str, tuple[str, ...]]] = []
     for line_no, raw in enumerate(text.splitlines(), start=1):
-        line, kind = _classify_set_line(raw)
-        if kind != "deletion":
+        line, line_kind = _classify_set_line(raw)
+        if line_kind != kind:
             continue
         _verb, _, remainder = line.partition(" ")
         out.append((line_no, line, tuple(_tokenize_set_line(remainder))))

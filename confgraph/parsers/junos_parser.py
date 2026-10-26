@@ -48,7 +48,8 @@ from confgraph.models.static_route import StaticRoute
 
 from confgraph.parsers.base import BaseParser, parse_remote_as_token
 from confgraph.parsers.junos_hierarchy import (
-    deletion_statements, parse_junos_config, unsupported_lines, _is_set_style,
+    deletion_statements, parse_junos_config, set_statements, unsupported_lines,
+    _is_set_style,
 )
 
 
@@ -146,13 +147,26 @@ class JunOSParser(BaseParser):
         Called by ``BaseParser.parse`` BEFORE ``_collect_unrecognized_blocks``
         (the CCR-0203 claim-scan ordering), which is what lets the disclosure
         pass subtract the compiled lines.
+
+        A deletion the same document later RE-STATES does not compile either
+        — that document is a stanza rewrite rather than a removal, and
+        ``collides_with_later_set`` is where that is decided.  Both reasons a
+        statement may fail to compile converge here on the same outcome:
+        no op, so the line stays disclosed.
         """
-        from confgraph.parsers.junos_deletions import DeletionScope, compile_deletion
+        from confgraph.parsers.junos_deletions import (
+            DeletionScope,
+            collides_with_later_set,
+            compile_deletion,
+        )
 
         scope = DeletionScope(asn=self._stated_autonomous_system(), vrf="")
+        sets = set_statements(self.config_text)
         ops: list[Any] = []
         compiled: list[str] = []
         for line_no, line, path in deletion_statements(self.config_text):
+            if collides_with_later_set(path, line_no, sets):
+                continue  # a rewrite, not a removal — disclosed, never guessed at
             op = compile_deletion(path, scope, source_line=line, line_no=line_no)
             if op is None:
                 continue  # unmodelled path — _collect_unrecognized_blocks discloses it
