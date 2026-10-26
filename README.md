@@ -101,6 +101,19 @@ See [`docs/CLI_USAGE.md`](docs/CLI_USAGE.md) for all commands, options, and exam
 
 Contributions welcome — new parsers, bug fixes, additional protocol coverage. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) to get started.
 
+### Running the tests
+
+```bash
+uv run --extra dev pytest
+```
+
+**The `--extra dev` is not optional.** `pytest` is an optional dependency (see
+`[project.optional-dependencies]`), so a bare `uv run pytest` falls back to
+whatever `pytest` is on your `PATH` — which runs the suite against a different
+environment and fails well over a thousand tests for reasons that have nothing
+to do with your change. There is no error message saying so; it just looks like
+you broke everything.
+
 ## License
 
 Apache 2.0
