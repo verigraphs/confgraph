@@ -28,13 +28,24 @@ class PhysicalLink:
       "cdp"             — from CDP neighbor data
       "lldp"            — from LLDP neighbor data
       "mac-arp"         — validated via MAC-ARP correlation (supplementary only)
+      "upload"          — supplied by the operator (an export from their source
+                          of truth / NMS / IPAM, or a topology file)
+      "synth"           — INFERRED, not observed: synthesized from two devices
+                          having interfaces on a shared L3 subnet
+
+    The "synth" value is load-bearing rather than merely informative, so a
+    producer must label an inferred link honestly.  Consumers distinguish
+    supplied cabling from inference on this field alone — the simulator's
+    link-vs-config consistency checks deliberately say nothing about a "synth"
+    link, because a warning citing one would be the engine disputing its own
+    inference rather than disclosing an input it cannot trust.
     """
 
     device_a: str
     port_a: str           # canonical long-form logical interface on device_a
     device_b: str
     port_b: str           # canonical long-form logical interface on device_b
-    source: str           # "cdp" | "lldp" | "mac-arp"
+    source: str           # "cdp" | "lldp" | "mac-arp" | "upload" | "synth"
     member_count: int = 1
 
 
