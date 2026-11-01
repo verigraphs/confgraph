@@ -41,3 +41,33 @@ def canonical_area_id(value):
     return str(
         (octets[0] << 24) | (octets[1] << 16) | (octets[2] << 8) | octets[3]
     )
+
+
+def canonical_process_id(value):
+    """Return *value*'s canonical OSPF process identity — digit or verbatim.
+
+    An OSPF process identifier is a NUMBER on IOS/IOS-XE and a WORD — an
+    "instance tag" — on NX-OS, IOS-XR and EOS (``router ospf UNDERLAY``), so
+    both the process and the interface model it as ``int | str``. Every
+    producer must therefore agree on WHICH spelling it stores, because the
+    consumers decide membership by EQUALITY: the parser's own passive-default
+    walk (``BaseParser.parse``) and the engine's ``_ospf_member`` both ask
+    ``ospf.process_id == iface.ospf_process_id``. A producer storing ``"1"``
+    where another stores ``1`` partitions one process in two exactly as the
+    area-id drift above did (CCR-0239).
+
+    The rule: a digit string becomes its ``int``, anything else — a tag,
+    ``None``, a non-string — is returned unchanged. This normalizes a
+    spelling; it never rejects or invents one.
+
+    Deliberately ``str.isdigit()`` and not ``[0-9]``, unlike
+    :func:`canonical_area_id` above: this mirrors the existing producers
+    byte-for-byte so the helper can never disagree with one. Those producers
+    still carry the rule inline (``ios_parser.parse_ospf``,
+    ``EOSParser.parse_ospf``, ``IOSXRParser.parse_ospf``); migrating them onto
+    this helper edits the shared IOS base class and is a follow-up, not part
+    of CCR-0239.
+    """
+    if isinstance(value, str) and value.isdigit():
+        return int(value)
+    return value

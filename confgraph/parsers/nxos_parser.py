@@ -13,7 +13,7 @@ from confgraph.models.bgp import (
     BGPBestpathOptions,
 )
 from confgraph.models.ospf import OSPFConfig
-from confgraph.utils.ospf import canonical_area_id
+from confgraph.utils.ospf import canonical_area_id, canonical_process_id
 from confgraph.models.qos import ControlPlaneConfig
 from confgraph.models.interface import InterfaceFlowMonitor, StormControlLevel, VRRPGroup
 from confgraph.models.netflow import (
@@ -23,7 +23,7 @@ from confgraph.models.netflow import (
     NetFlowRecord,
 )
 from confgraph.models.static_route import StaticRoute
-from confgraph.parsers.base import _BASE_KNOWN_PATTERNS, apply_peer_group_command, _default_pg_data, parse_remote_as_token
+from confgraph.parsers.base import PatternSet, _BASE_KNOWN_PATTERNS, apply_peer_group_command, _default_pg_data, parse_remote_as_token
 from confgraph.parsers.ios_parser import IOSParser
 from confgraph.parsers.iosxr_parser import _AFTransparentBlock
 
@@ -113,6 +113,29 @@ class NXOSParser(IOSParser):
     # which the shared body regex already handles (the seconds group is optional).
     _LINE_HEADER_PATTERNS = IOSParser._LINE_HEADER_PATTERNS.extended(
         r"^line\s+(?P<type>vty|console)\s*$",
+    )
+
+    # CCR-0239 — the interface's OSPF enrollment line. NX-OS spells the process
+    # identifier as an INSTANCE TAG, which is a word and not only a number
+    # (``ip router ospf UNDERLAY area 0.0.0.0``; device-emitted, n9kv 10.3(8)),
+    # so the tag group is ``\S+`` exactly as the shared process-header set
+    # ``_OSPF_PROC_PATTERNS`` already is. Accepting digits only enrolled no
+    # interface at all on a named-instance device — silently, because the line
+    # is claimed and so never disclosed as unparsed.
+    #
+    # Declared once and used twice (``.union`` to locate the child line,
+    # ``.match`` to extract it), which is also what retires the second copy of
+    # this regex that used to sit three lines below the first.
+    _IFACE_OSPF_ENROLL_PATTERNS = PatternSet(
+        r"^\s+ip\s+router\s+ospf\s+(?P<pid>\S+)\s+area\s+(?P<area>\S+)",
+    )
+
+    # CCR-0239 — ``router ospf <instance-tag> vrf <name>``, the header-qualified
+    # VRF form re-scanned in parse_ospf below. Same tag widening; the header
+    # itself is located with the BASE's _OSPF_PROC_PATTERNS rather than a third
+    # spelling of "router ospf <something>".
+    _OSPF_PROC_VRF_PATTERNS = PatternSet(
+        r"^router\s+ospf\s+(?P<pid>\S+)\s+vrf\s+(?P<vrf>\S+)",
     )
 
     def __init__(self, config_text: str):
@@ -478,22 +501,26 @@ class NXOSParser(IOSParser):
                         intf_cfg.helper_addresses.append(addr)
 
             # NX-OS OSPF: "ip router ospf PROC area AREA" (slightly different
-            # from IOS "ip ospf PROC area AREA")
+            # from IOS "ip ospf PROC area AREA"). PROC is an instance TAG on
+            # NX-OS — see _IFACE_OSPF_ENROLL_PATTERNS (CCR-0239).
             ospf_router_children = intf_obj.find_child_objects(
-                r"^\s+ip\s+router\s+ospf\s+(\d+)\s+area\s+(\S+)"
+                self._IFACE_OSPF_ENROLL_PATTERNS.union
             )
             if ospf_router_children:
-                m = re.search(
-                    r"^\s+ip\s+router\s+ospf\s+(\d+)\s+area\s+(\S+)",
-                    ospf_router_children[0].text,
+                m = self._IFACE_OSPF_ENROLL_PATTERNS.match(
+                    ospf_router_children[0].text
                 )
                 if m:
-                    intf_cfg.ospf_process_id = int(m.group(1))
+                    # The process identity is stored with the SAME
+                    # digit-or-verbatim rule the process header uses, because
+                    # membership downstream is decided by equality against
+                    # OSPFConfig.process_id (CCR-0239).
+                    intf_cfg.ospf_process_id = canonical_process_id(m.group("pid"))
                     # CCR-0227: assignment to an already-built model skips
                     # pydantic validation, so this post-patch calls the
                     # canonicalizer the field validator would have — NX-OS is
                     # the dotted-quad vendor that makes it matter.
-                    intf_cfg.ospf_area = canonical_area_id(m.group(2))
+                    intf_cfg.ospf_area = canonical_area_id(m.group("area"))
 
             # NX-OS storm-control: "storm-control {broadcast|multicast|unicast}
             # level <threshold>". The threshold is a bandwidth percentage by
@@ -1093,14 +1120,17 @@ class NXOSParser(IOSParser):
         instances = super().parse_ospf()
         parse = self._get_parse_obj()
 
-        # Re-scan to pick up VRF from the process header line
-        ospf_objs = parse.find_objects(r"^router\s+ospf\s+(\d+)")
+        # Re-scan to pick up VRF from the process header line. Both the header
+        # lookup and the extraction take a string instance tag (CCR-0239): the
+        # lookup REUSES the base's process-header set, the extraction adds only
+        # the ``vrf <name>`` qualifier.
+        ospf_objs = parse.find_objects(self._OSPF_PROC_PATTERNS.union)
         for ospf_obj in ospf_objs:
-            m = re.search(r"^router\s+ospf\s+(\d+)\s+vrf\s+(\S+)", ospf_obj.text)
+            m = self._OSPF_PROC_VRF_PATTERNS.match(ospf_obj.text)
             if not m:
                 continue
-            process_id = int(m.group(1))
-            vrf_name = m.group(2)
+            process_id = canonical_process_id(m.group("pid"))
+            vrf_name = m.group("vrf")
             for inst in instances:
                 if inst.process_id == process_id and inst.vrf is None:
                     inst.vrf = vrf_name
