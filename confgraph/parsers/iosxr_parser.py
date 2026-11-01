@@ -78,6 +78,26 @@ _AF_HEADER_RE = re.compile(r"^\s*address-family\s+\S+")
 _AF_SPLICE_RE = re.compile(r"^\s*address-family\s+ipv4\s+unicast\b")
 
 
+# CCR-0240. The ONE spelling of the IOS-XR OSPF `passive` line, shared by the
+# scope reader (_read_iosxr_passive) and the `area > interface` body vocabulary
+# table (_OSPF_AREA_IFACE_PATTERNS) so the two cannot drift into disagreeing
+# about which lines count.
+#
+# `disable` is a FIRST-CLASS VALUE, not the absence of `enable`: its whole job is
+# to override a passive inherited from an enclosing scope, which is how an XR
+# estate hardened with a process-wide `passive enable` exempts its uplinks.  A
+# model that encoded `disable` as absence could not express that exemption.
+#
+# The optional keyword is deliberate tolerance.  Cisco's command reference marks
+# both `disable` and `enable` "(Optional)" and its own example TYPES a bare
+# `passive`, while the running-config emits the keyword
+# (syntax-corpus/iosxr/ospf.yaml -> `passive`, status doc-only: `passive disable`
+# is witnessed in a device transcript, the literal `passive enable` is not).  A
+# bare `passive` means passive ON, matching the typed form's documented meaning.
+_IOSXR_PASSIVE_PATTERN = r"^\s+passive(?:\s+(?P<val>enable|disable))?\s*$"
+_IOSXR_PASSIVE_RE = re.compile(_IOSXR_PASSIVE_PATTERN)
+
+
 class _AFTransparentBlock:
     """A read-through view of an IOS-XR block that reads *through* its
     ``address-family ipv4 unicast`` sub-block — and only that one.
@@ -785,6 +805,41 @@ class IOSXRParser(IOSParser):
     # OSPF — interfaces nested under area blocks
     # -----------------------------------------------------------------------
 
+    @staticmethod
+    def _read_iosxr_passive(obj) -> bool | None:
+        """Scope-local OSPF ``passive`` as a TRI-STATE (CCR-0240).
+
+        ``True`` = this scope says passive, ``False`` = this scope says
+        explicitly NOT passive (``passive disable``), ``None`` = this scope said
+        nothing, so the question belongs to the enclosing scope.
+
+        The tri-state is the whole mechanism.  IOS-XR makes ``passive``
+        inheritable at four scopes — router (process), VRF, area and interface —
+        and the vendor states the chain outright: *"If this command is not
+        specified in interface configuration mode, then the interface adopts the
+        passive parameter specified by the area.  If this command is not
+        specified in area configuration mode, then the interface adopts the
+        passive parameter specified for the process.  If this command is not
+        specified at any level, then the passive parameter is disabled"*
+        (ASR9000 routing command reference, "passive (OSPF)"; Command Modes:
+        Interface / Area / Router / VRF).  A two-valued read cannot tell "not
+        specified here" from "specified off", and collapsing the two is exactly
+        the bug: the exempted uplink becomes indistinguishable from a
+        suppressed one.
+
+        Direct children only.  ``obj.children`` rather than
+        ``find_child_objects`` because an ``area N`` block's descendants include
+        its ``interface X`` sub-blocks, whose ``passive`` belongs to the
+        interface and must not be read as the area's.  Last line wins, which is
+        what a device does with a repeated statement.
+        """
+        state: bool | None = None
+        for child in obj.children:
+            m = _IOSXR_PASSIVE_RE.match(child.text)
+            if m:
+                state = m.group("val") != "disable"
+        return state
+
     def parse_ospf(self) -> list[OSPFConfig]:
         """Parse OSPF configurations for IOS-XR.
 
@@ -828,13 +883,27 @@ class IOSXRParser(IOSParser):
                 if v:
                     auto_cost_ref_bw = int(v)
 
-            # Passive interface default (IOS-XR: per-interface "passive enable")
-            passive_interface_default = False
-            passive_interfaces: list[str] = []
-            non_passive_interfaces: list[str] = []
+            # Passive, at PROCESS scope (CCR-0240). `passive enable` / `passive
+            # disable` as a direct child of `router ospf N` is the default every
+            # area and interface inherits; it used to be hardwired False, so the
+            # standard XR hardening idiom ("suppress everywhere, re-enable per
+            # uplink") read as nothing suppressed anywhere.
+            #
+            # `passive_interface_default` carries the PROCESS-scope answer only —
+            # a tri-state None means nothing was specified at this level, which
+            # the vendor defines as not passive.  Area- and interface-scope
+            # overrides are resolved per interface into the two lists below, so
+            # the engine's resolver gets the right answer under either branch of
+            # `passive_interface_default`.
+            process_passive = self._read_iosxr_passive(ospf_obj)
+            passive_interface_default = process_passive is True
 
             # Parse areas — IOS-XR has "area N" stanzas with nested interfaces
-            areas, passive_interfaces = self._parse_ospf_areas_iosxr(ospf_obj, process_id)
+            areas, passive_interfaces, non_passive_interfaces = (
+                self._parse_ospf_areas_iosxr(
+                    ospf_obj, process_id, passive_default=process_passive
+                )
+            )
 
             # Redistribution
             redistribute = self._parse_ospf_redistribute_iosxr(ospf_obj)
@@ -1008,7 +1077,27 @@ class IOSXRParser(IOSParser):
             except ValueError:
                 pass
 
-        areas, passive_interfaces = self._parse_ospf_areas_iosxr(vrf_obj, process_id)
+        # CCR-0240. `passive` is legal in VRF configuration mode as well as
+        # router/area/interface mode, and a VRF sub-block sits INSIDE the process
+        # block — so the inherited default here is the VRF's own setting if it has
+        # one, else the enclosing `router ospf N`'s.  Threading the process scope
+        # through is not optional: without it a process-wide `passive enable`
+        # would apply to the global instance's interfaces and silently vanish for
+        # the VRF's, which is the same defect in a second place.
+        parent = getattr(vrf_obj, "parent", None)
+        process_passive = (
+            self._read_iosxr_passive(parent)
+            if parent is not None and parent is not vrf_obj
+            else None
+        )
+        vrf_passive = self._read_iosxr_passive(vrf_obj)
+        passive_default = vrf_passive if vrf_passive is not None else process_passive
+
+        areas, passive_interfaces, non_passive_interfaces = (
+            self._parse_ospf_areas_iosxr(
+                vrf_obj, process_id, passive_default=passive_default
+            )
+        )
         redistribute = self._parse_ospf_redistribute_iosxr(vrf_obj)
 
         return OSPFConfig(
@@ -1020,20 +1109,36 @@ class IOSXRParser(IOSParser):
             vrf=vrf_name,
             router_id=router_id,
             areas=areas,
+            passive_interface_default=passive_default is True,
             passive_interfaces=passive_interfaces,
+            non_passive_interfaces=non_passive_interfaces,
             redistribute=redistribute,
         )
 
     def _parse_ospf_areas_iosxr(
-        self, ospf_obj, process_id: int | str | None = None
-    ) -> tuple[list[OSPFArea], list[str]]:
+        self,
+        ospf_obj,
+        process_id: int | str | None = None,
+        *,
+        passive_default: bool | None = None,
+    ) -> tuple[list[OSPFArea], list[str], list[str]]:
         """Parse OSPF areas with nested interface blocks (IOS-XR style).
 
-        Returns a tuple of (areas, passive_interfaces).
+        ``passive_default`` is the ``passive`` state inherited from the enclosing
+        scope as a tri-state (``None`` = nothing specified above), already
+        resolved by the caller down the process → VRF chain.
+
+        Returns a tuple of (areas, passive_interfaces, non_passive_interfaces).
+        Both lists are populated from the RESOLVED per-interface state, so the
+        engine's resolver is correct under either branch of
+        ``passive_interface_default`` — it asks ``name not in
+        non_passive_interfaces`` when the default is passive and ``name in
+        passive_interfaces`` when it is not (CCR-0240).
         """
         areas: list[OSPFArea] = []
         area_dict: dict[str, dict] = {}
         passive_interfaces: list[str] = []
+        non_passive_interfaces: list[str] = []
 
         area_children = ospf_obj.find_child_objects(r"^\s+area\s+(\S+)")
         for area_child in area_children:
@@ -1136,6 +1241,12 @@ class IOSXRParser(IOSParser):
                     except ValueError:
                         pass
 
+            # Passive, at AREA scope (CCR-0240) — overrides the process/VRF
+            # default for this area's interfaces, and is itself overridden by an
+            # interface-scope statement.
+            area_passive = self._read_iosxr_passive(area_child)
+            area_default = area_passive if area_passive is not None else passive_default
+
             # Interfaces nested under area
             for intf_child in area_child.find_child_objects(r"^\s+interface\s+(\S+)"):
                 intf_name = self._extract_match(intf_child.text, r"^\s+interface\s+(\S+)")
@@ -1143,24 +1254,39 @@ class IOSXRParser(IOSParser):
                     continue
                 if intf_name not in area_dict[area_id]["interfaces"]:
                     area_dict[area_id]["interfaces"].append(intf_name)
-                # IOS-XR marks passive with "passive enable" inside the interface block
-                if intf_child.find_child_objects(r"^\s+passive\s+enable"):
+
+                # Resolve the inheritance chain: interface ?? area ?? VRF ??
+                # process.  `passive disable` here is the uplink exemption and
+                # resolves to an explicit False, which is a different fact from
+                # "nobody said" (None) — the first lands in
+                # non_passive_interfaces so the engine can un-gate the uplink
+                # against a passive default, the second lands in neither list
+                # because no scope made a claim.
+                intf_passive = self._read_iosxr_passive(intf_child)
+                resolved = intf_passive if intf_passive is not None else area_default
+                if resolved is True:
                     if intf_name not in passive_interfaces:
                         passive_interfaces.append(intf_name)
+                elif resolved is False:
+                    if intf_name not in non_passive_interfaces:
+                        non_passive_interfaces.append(intf_name)
+
                 area_dict[area_id]["interface_settings"][intf_name] = (
                     self._parse_ospf_area_interface(
-                        intf_child, intf_name, area_id, process_id
+                        intf_child, intf_name, area_id, process_id,
+                        passive=resolved,
                     )
                 )
 
         for area_data in area_dict.values():
             areas.append(OSPFArea(**area_data))
 
-        return areas, passive_interfaces
+        return areas, passive_interfaces, non_passive_interfaces
 
     # IOS-XR OSPF `area > interface` body → OSPFInterfaceConfig field. One row per
-    # setting; the regex's `val` group is the value, or the row is a bare flag
-    # (no group) whose presence means True.
+    # setting; the regex's `val` group is the value — cast by _OSPF_INT_FIELDS or
+    # read as an enable/disable keyword by _OSPF_ENABLE_DISABLE_FIELDS — or the row
+    # is a bare flag (no group) whose presence means True.
     #
     # This is the extraction half of CCR-0038 Theme 2. The ATTRIBUTION half — the
     # part that used to be missing entirely on IOS-XR, and duplicated per-OS on
@@ -1177,10 +1303,12 @@ class IOSXRParser(IOSParser):
         ("authentication", r"^\s+authentication\s+(?P<val>message-digest|null)\s*$"),
         ("bfd_interval",   r"^\s+bfd\s+minimum-interval\s+(?P<val>\d+)\s*$"),
         ("bfd_multiplier", r"^\s+bfd\s+multiplier\s+(?P<val>\d+)\s*$"),
+        # `<setting> enable | disable` — the keyword IS the value, so `disable`
+        # is parsed as False rather than dropped on the floor (CCR-0240).
+        ("passive",        _IOSXR_PASSIVE_PATTERN),
         # Bare flags — presence is the value.
         ("bfd",            r"^\s+bfd\s+fast-detect\s*$"),
         ("mtu_ignore",     r"^\s+mtu-ignore\s+enable\s*$"),
-        ("passive",        r"^\s+passive\s+enable\s*$"),
     )
 
     _OSPF_INT_FIELDS = frozenset({
@@ -1188,9 +1316,18 @@ class IOSXRParser(IOSParser):
         "bfd_interval", "bfd_multiplier",
     })
 
+    # Rows whose `val` group is an IOS-XR `enable`/`disable` keyword rather than a
+    # scalar: `enable` (or the keyword's absence, which is legal when typed) means
+    # True and `disable` means False.  A sibling of _OSPF_INT_FIELDS, so the
+    # (N+1)th enable/disable-valued setting is one row in the table plus one entry
+    # here — not a branch in the loop.  [[CCR-0240]]
+    _OSPF_ENABLE_DISABLE_FIELDS = frozenset({"passive"})
+
     def _parse_ospf_area_interface(
         self, intf_child, intf_name: str, area_id: str,
         process_id: int | str | None = None,
+        *,
+        passive: bool | None = None,
     ) -> OSPFInterfaceConfig:
         """One ``area N > interface NAME`` block → OSPFInterfaceConfig.
 
@@ -1202,6 +1339,15 @@ class IOSXRParser(IOSParser):
         settings = OSPFInterfaceConfig(
             name=intf_name, area_id=area_id, process_id=process_id
         )
+        # CCR-0240: `passive` is seeded with the RESOLVED state the caller worked
+        # out down the process → VRF → area → interface chain, before the body is
+        # read.  An interface-scope `passive` line then overwrites it with the
+        # same answer (the caller derived `passive` from that very line), so the
+        # seed is what makes an INHERITED passive visible on an interface whose
+        # own block is silent — the model field is a plain bool and has no way to
+        # say "ask my area".
+        if passive is not None:
+            settings.passive = passive
         for child in intf_child.children:
             text = child.text
             for field, pattern in self._OSPF_AREA_IFACE_PATTERNS:
@@ -1210,7 +1356,13 @@ class IOSXRParser(IOSParser):
                     continue
                 if "val" in m.groupdict():
                     raw = m.group("val")
-                    value: object = int(raw) if field in self._OSPF_INT_FIELDS else raw
+                    if field in self._OSPF_ENABLE_DISABLE_FIELDS:
+                        # `enable`, or the keyword omitted entirely, means True.
+                        value: object = raw != "disable"
+                    elif field in self._OSPF_INT_FIELDS:
+                        value = int(raw)
+                    else:
+                        value = raw
                 else:
                     value = True  # bare flag
                 setattr(settings, field, value)
