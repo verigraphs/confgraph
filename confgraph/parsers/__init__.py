@@ -191,7 +191,22 @@ from confgraph.parsers.panos_parser import PANOSParser
 # path — ``native_change_ops`` loses that op and ``unrecognized_blocks`` gains
 # the line back — with NO ParsedConfig JSON-schema change, and no baseline
 # motion (a saved configuration states no deletion verb).
-PARSER_BEHAVIOR_VERSION: int = 16
+# 17 (CCR-0239 + CCR-0240, bump landed late — caught at the v0.3.9 release
+# audit, 2026-11-06): both landings changed parse output without moving this
+# constant, so PBV-16 parse-cache blobs minted before them could be served as
+# hits carrying the pre-fix models. CCR-0239: NX-OS named OSPF instance tags
+# (``ip router ospf CORE area …``) enroll their interfaces — previously the
+# named-instance spelling bound nothing, so those interfaces were
+# OSPF-invisible. CCR-0240: IOS-XR OSPF passive resolves at all four scopes
+# (process default, area, interface ``passive enable`` AND ``passive
+# disable``) — previously the process-scope default was hardwired False and
+# ``passive disable`` was not in the vocabulary, so suppressed interfaces
+# formed phantom adjacencies while exempted uplinks read as suppressed.
+# Observable parse output moves for any NX-OS config using named instance
+# tags and any IOS-XR config using process/area-scope passive — BASELINES
+# included (both spellings exist in saved configurations). No ParsedConfig
+# JSON-schema change.
+PARSER_BEHAVIOR_VERSION: int = 17
 
 __all__ = [
     "BaseParser",
