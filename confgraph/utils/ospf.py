@@ -61,12 +61,24 @@ def canonical_process_id(value):
     spelling; it never rejects or invents one.
 
     Deliberately ``str.isdigit()`` and not ``[0-9]``, unlike
-    :func:`canonical_area_id` above: this mirrors the existing producers
-    byte-for-byte so the helper can never disagree with one. Those producers
-    still carry the rule inline (``ios_parser.parse_ospf``,
-    ``EOSParser.parse_ospf``, ``IOSXRParser.parse_ospf``); migrating them onto
-    this helper edits the shared IOS base class and is a follow-up, not part
-    of CCR-0239.
+    :func:`canonical_area_id` above: this mirrors the producers it replaced
+    byte-for-byte, so the helper could never disagree with one at the point of
+    migration.
+
+    **Every producer now goes through here** (CCR-0242): ``parse_ospf`` and the
+    interface walk in the shared IOS base, ``_parse_ospf_vrf_instances``,
+    ``EOSParser`` (×2) and ``IOSXRParser``. No inline copy of the rule remains.
+    That matters because the identity is only ever *compared*, never
+    interpreted: ``BaseParser.parse``'s passive-default walk and the engine's
+    ``_ospf_member`` both ask ``ospf.process_id == iface.ospf_process_id``, so
+    a producer storing ``"1"`` where another stores ``1`` partitions one
+    process in two.
+
+    Normalizing is not enough on its own — the LOCATING pattern has to hand
+    over the whole token. ``IOSParser._OSPF_PROC_PATTERNS``' digit arm is
+    anchored for exactly that reason: a digit-leading tag (``router ospf
+    100x``) was prefix-matched to ``100`` before the rule ever ran, so the two
+    sides disagreed while both called this function.
     """
     if isinstance(value, str) and value.isdigit():
         return int(value)

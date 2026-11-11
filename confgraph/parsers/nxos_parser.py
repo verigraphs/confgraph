@@ -24,7 +24,11 @@ from confgraph.models.netflow import (
 )
 from confgraph.models.static_route import StaticRoute
 from confgraph.parsers.base import PatternSet, _BASE_KNOWN_PATTERNS, apply_peer_group_command, _default_pg_data, parse_remote_as_token
-from confgraph.parsers.ios_parser import IOSParser
+from confgraph.parsers.ios_parser import (
+    IOSParser,
+    _OSPF_VRF_SUB_BLOCK,
+    _OSPF_VRF_SUB_BLOCK_DIGESTED,
+)
 from confgraph.parsers.iosxr_parser import _AFTransparentBlock
 
 
@@ -75,6 +79,21 @@ class NXOSParser(IOSParser):
             (r"^evpn\s*$", [r"^vni\s+\d+\s+l2\b"]),
         ]
     )
+
+    # CCR-0246: NX-OS is the OS whose ``parse_ospf`` CALLS the shared
+    # ``_parse_ospf_vrf_instances``, so it is the OS where an OSPF ``vrf``
+    # sub-block's body is genuinely digested — and therefore the only OS
+    # entitled to claim those lines as known.  The base registers the same
+    # sub-block with an EMPTY list (nothing is read there), so this REPLACES
+    # that entry rather than appending to it; a second, non-OSPF base entry
+    # would have to be carried over too, which
+    # ``test_ccr0246_nxos_ospf_vrf_subblock.py`` pins mechanically.
+    _KNOWN_SUB_BLOCK_PATTERNS: list[tuple[str, str, list[str]]] = [
+        (block, sub, _OSPF_VRF_SUB_BLOCK_DIGESTED)
+        if (block, sub) == _OSPF_VRF_SUB_BLOCK
+        else (block, sub, known)
+        for block, sub, known in IOSParser._KNOWN_SUB_BLOCK_PATTERNS
+    ]
 
     # CCR-0038 Theme 1 — the NX-OS dialect of the shared VRF body vocabulary.
     # The CLI token that applies a route-map to VRF import/export is the bare

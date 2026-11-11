@@ -14,7 +14,7 @@ from confgraph.parsers.base import (
 from confgraph.models.base import OSType, UnrecognizedBlock
 from confgraph.models.line import LineType
 from confgraph.models.ospf import OSPFConfig
-from confgraph.utils.ospf import canonical_area_id
+from confgraph.utils.ospf import canonical_area_id, canonical_process_id
 from confgraph.models.bgp import BGPConfig, BGPNeighborAF
 from confgraph.models.prefix_list import PrefixListConfig, PrefixListEntry
 from confgraph.models.static_route import StaticRoute
@@ -345,8 +345,9 @@ class EOSParser(IOSParser):
         for proc_obj in parse.find_objects(r"^router\s+ospf\s+\d+\b"):
             pm = re.match(r"^router\s+ospf\s+(\S+)", proc_obj.text)
             if pm:
-                pid_str = pm.group(1)
-                ospf_pids.append(int(pid_str) if pid_str.isdigit() else pid_str)
+                # CCR-0242 consolidation: the shared digit-or-verbatim
+                # normalizer, not a local copy of the rule.
+                ospf_pids.append(canonical_process_id(pm.group(1)))
         if len(ospf_pids) == 1:
             single_pid = ospf_pids[0]
             for intf_cfg in interfaces:
@@ -384,7 +385,7 @@ class EOSParser(IOSParser):
             pid_str = hdr.group("pid") if hdr else None
             if not pid_str:
                 continue
-            pid: int | str = int(pid_str) if pid_str.isdigit() else pid_str
+            pid: int | str = canonical_process_id(pid_str)
             inst = by_pid.get(pid)
             if inst is None:
                 continue

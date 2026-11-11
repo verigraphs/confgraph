@@ -37,6 +37,7 @@ from confgraph.models.community_list import (
 from confgraph.models.isis import ISISConfig, ISISInterface, ISISRedistribute
 from confgraph.parsers.base import _BASE_KNOWN_PATTERNS, apply_peer_group_command, _default_pg_data, parse_remote_as_token
 from confgraph.parsers.ios_parser import IOSParser
+from confgraph.utils.ospf import canonical_process_id
 
 
 # IOS-XR patterns differ from IOS: different VRF, route-policy, prefix-set, etc.
@@ -213,6 +214,16 @@ class IOSXRParser(IOSParser):
     # known-child lists would false-flag consumed lines. Needs an XR-specific
     # registry — see CCR confgraph_unrecognized_child_lines_in_claimed_blocks.md.
     _KNOWN_CHILD_PATTERNS: list[tuple[str, list[str]]] = []
+
+    # The sub-block registry (CCR-0246) opts out for the same reason, and more
+    # strongly: an XR ``vrf`` sub-block under ``router ospf`` holds ``area``
+    # sub-blocks with their own nested ``interface`` children, every one of them
+    # consumed by _parse_ospf_areas_iosxr, so the inherited NX-OS-shaped known
+    # list would false-flag consumed lines two levels down. XR's own per-VRF
+    # scalar gap — its _build_ospf_vrf_instance override reads neither
+    # ``auto-cost`` nor ``shutdown`` in VRF scope — is a SEPARATE finding in XR
+    # spellings, not something to disclose with an NX-OS vocabulary.
+    _KNOWN_SUB_BLOCK_PATTERNS: list[tuple[str, str, list[str]]] = []
 
     # CCR-0038 Theme 1 — the IOS-XR dialect of the shared VRF body vocabulary.
     # XR names a *route-policy*, not a route-map, and puts the verb first:
@@ -858,7 +869,7 @@ class IOSXRParser(IOSParser):
             if not process_id_str:
                 continue
 
-            process_id: int | str = int(process_id_str) if process_id_str.isdigit() else process_id_str
+            process_id: int | str = canonical_process_id(process_id_str)
             raw_lines, line_numbers = self._get_raw_lines_and_line_numbers(ospf_obj)
 
             # Router ID

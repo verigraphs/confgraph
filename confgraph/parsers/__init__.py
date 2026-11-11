@@ -206,7 +206,55 @@ from confgraph.parsers.panos_parser import PANOSParser
 # tags and any IOS-XR config using process/area-scope passive — BASELINES
 # included (both spellings exist in saved configurations). No ParsedConfig
 # JSON-schema change.
-PARSER_BEHAVIOR_VERSION: int = 17
+# 18 (CCR-0246, disclosure half): lines inside an OSPF ``vrf`` sub-block that
+# the sub-block walk does not digest are DISCLOSED as UnrecognizedBlocks
+# ("router ospf 77 > vrf RED > auto-cost reference-bandwidth 20000") instead of
+# vanishing. The positive child-line collector read direct children only, while
+# ``^vrf\b`` was a listed known child of ``router ospf`` — so claiming the
+# sub-block header silenced its whole body, and a config carrying a nested
+# routing statement parsed byte-identically to one carrying none. Mechanism is
+# a new registry one level down (``_KNOWN_SUB_BLOCK_PATTERNS``), empty by
+# default and opted out of on IOS-XR. Observable parse output moves for every
+# NX-OS config that scopes OSPF per VRF — ``unrecognized_blocks`` gains rows,
+# which the engine reads as UNRECOGNIZED coverage — with NO ParsedConfig
+# JSON-schema change, the sharp case this constant exists for.
+# 19 (CCR-0246, parsing half): five statements inside an OSPF ``vrf`` sub-block
+# are READ into the vrf-scoped instance — ``passive-interface default``,
+# ``shutdown``, ``max-metric router-lsa [on-startup]``, ``auto-cost
+# reference-bandwidth`` and the ``log-adjacency-changes detail`` qualifier.
+# They were discarded, so a per-VRF process that was administratively down,
+# drained for maintenance or hardened against adjacencies modelled as a plain
+# running process: the simulator reported an OSPF adjacency, and reachability,
+# across a link where the hardware forms none. Both scopes now go through ONE
+# extraction (``_parse_ospf_scope_scalars``). Observable parse output moves for
+# every NX-OS config carrying one of these lines in VRF scope, and in one
+# further place: a vrf-scoped instance with NO ``log-adjacency-changes``
+# statement now reads the parser-absence ``False`` its process-level twin has
+# always read, instead of the model default ``True`` — the documented trap,
+# applied symmetrically, which is also what the engine's merger assumes for
+# every instance. The disclosure rows PBV 18 added for these five lines
+# disappear, claimed by the parse. No ParsedConfig JSON-schema change.
+# 20 (CCR-0242): named OSPF process ids survive the three shared-IOS-base walks
+# every subclass inherits. (1) ``_parse_ospf_vrf_instances`` located and
+# extracted the process with a digit-only pattern, so on a named-instance device
+# the per-VRF OSPF instance was NOT CREATED AT ALL — absent, not
+# mis-attributed, and therefore indistinguishable downstream from a device with
+# no OSPF in that VRF. It is the form a Nexus emits natively and the norm on
+# IOS-XR, the two OSes that call the helper. (2) ``parse_ospf`` read the
+# header-qualified VRF with a digit-only pid, so a named process lost its
+# ``vrf`` qualifier and its networks were attributed to the global table.
+# (3) the Change-IR interface-op provenance for ``ospf_process_id`` was
+# digit-only, so a named enrollment's SET op quoted the block header instead of
+# the enrollment line (provenance only — path and value were correct). All of
+# them now normalize through ``canonical_process_id``, which also absorbs the
+# four remaining inline copies of the digit-or-verbatim rule (``parse_ospf``,
+# the base interface walk, EOS ×2, IOS-XR) — producers that disagree on which
+# spelling they store partition one process in two, because every consumer
+# decides membership by equality. Observable parse output moves for any NX-OS or
+# IOS-XR config with a named process and a per-VRF OSPF scope, and for any named
+# header-qualified process; plain IOS/IOS-XE is unmoved (digit-only was never
+# broken there). No ParsedConfig JSON-schema change.
+PARSER_BEHAVIOR_VERSION: int = 20
 
 __all__ = [
     "BaseParser",

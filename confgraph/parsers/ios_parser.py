@@ -10,7 +10,7 @@ from confgraph.utils.interface import normalize_interface_name
 # confgraph imports, so this cannot cycle (the other change_ir names in this file
 # stay lazily imported at their call sites, unchanged).
 from confgraph.change_ir import _native_deletion_path
-from confgraph.utils.ospf import canonical_area_id
+from confgraph.utils.ospf import canonical_area_id, canonical_process_id
 from confgraph.models.base import OSType
 from confgraph.models.vrf import VRFConfig
 from confgraph.models.interface import (
@@ -109,6 +109,57 @@ from confgraph.models.netflow import NetFlowConfig, NetFlowDestination
 # are unsure about are listed too ("unsure -> known"). The lists cover IOS/IOS-XE plus
 # the NX-OS/EOS forms, since those parsers inherit this registry. "no ..." lines are
 # skipped by the collector itself (tombstone surface) and never need listing.
+# Known DIRECT child lines of a registered SUB-BLOCK — _IOS_KNOWN_CHILD_PATTERNS
+# one level deeper (see BaseParser._KNOWN_SUB_BLOCK_PATTERNS for the collector
+# rules and the fail-open shape this closes).
+#
+# CCR-0246: NX-OS scopes a routing process to a VRF with a ``vrf NAME``
+# sub-block under ``router ospf <tag>``, and ``^vrf\b`` is a listed known child
+# of ``router ospf`` below — so claiming the header silenced the entire body.
+#
+# **A known list is a claim that the line is DIGESTED, so it must be scoped to
+# the parser that digests it.**  ``_parse_ospf_vrf_instances`` lives in this
+# base class but is CALLED only by the NX-OS and IOS-XR ``parse_ospf``
+# overrides — IOS/IOS-XE (and EOS, which inherits this walk) express a per-VRF
+# process in the process HEADER, so a nested ``vrf`` sub-block yields no
+# instance there and NOTHING inside it is read.  The entry below therefore
+# registers the sub-block with an EMPTY known list: the body is reached, and
+# every line in it discloses, which is the truth on those OSes.  Registering
+# the digested vocabulary here instead would have had EOS silence a nested
+# ``shutdown`` while disclosing an unknown knob beside it — a NEW false claim of
+# comprehension, on the one feature whose entire purpose is honest disclosure.
+# NX-OS, the OS that actually calls the builder, registers the vocabulary
+# (``_OSPF_VRF_SUB_BLOCK_DIGESTED`` below) in place of this entry.
+_OSPF_VRF_SUB_BLOCK: tuple[str, str] = (r"^router\s+ospf\b", r"^vrf\s+\S+\s*$")
+
+# What ``_build_ospf_vrf_instance`` + ``_parse_ospf_scope_scalars`` ACTUALLY
+# digest from an OSPF ``vrf NAME`` sub-block — a SUBSET of the process-level
+# vocabulary, because every other per-process statement a Nexus accepts in this
+# scope is still dropped and must therefore disclose.  Copying the
+# ``router ospf`` list below would silence exactly those drops, which is why
+# each entry is spelled as narrowly as the walk reads it:
+# ``^passive-interface\s+default`` and not ``^passive-interface``, since the
+# per-interface form is NOT read into the vrf-scoped instance and widening the
+# entry would hide a per-interface suppression — the same silent drop one
+# statement over.  Defined beside the methods that read it so the list and the
+# walk move together; registered by whichever OS calls them.
+_OSPF_VRF_SUB_BLOCK_DIGESTED: list[str] = [
+    r"^router-id\b",
+    r"^area\b",
+    r"^redistribute\b",
+    # The five _parse_ospf_scope_scalars reads in this scope (CCR-0246).
+    r"^log-adjacency-changes\b",
+    r"^auto-cost\s+reference-bandwidth\b",
+    r"^passive-interface\s+default\b",
+    r"^max-metric\s+router-lsa\b",
+    r"^shutdown\s*$",
+]
+
+_IOS_KNOWN_SUB_BLOCK_PATTERNS: list[tuple[str, str, list[str]]] = [
+    (*_OSPF_VRF_SUB_BLOCK, []),
+]
+
+
 _IOS_KNOWN_CHILD_PATTERNS: list[tuple[str, list[str]]] = [
     (r"^router\s+ospf\b", [
         r"^router-id\b",
@@ -355,6 +406,9 @@ class IOSParser(BaseParser):
     """
 
     _KNOWN_CHILD_PATTERNS: list[tuple[str, list[str]]] = _IOS_KNOWN_CHILD_PATTERNS
+    _KNOWN_SUB_BLOCK_PATTERNS: list[tuple[str, str, list[str]]] = (
+        _IOS_KNOWN_SUB_BLOCK_PATTERNS
+    )
 
     # ------------------------------------------------------------------
     # CCR-0031 per-command pattern sets. Each dialect is one data entry;
@@ -470,8 +524,20 @@ class IOSParser(BaseParser):
 
     # OSPF process header: numeric process id and string process tag
     # (NX-OS "router ospf UNDERLAY", IOS-XR "router ospf CORE").
+    # OSPF process header: a numeric id and a string instance tag.  The digit
+    # arm is ANCHORED TO THE WHOLE TOKEN — ``(?=\s|$)`` and not a bare ``\d+``
+    # — because a digit-LEADING tag is legal (``router ospf 100x`` on NX-OS)
+    # and an unanchored ``\d+`` prefix-matched it to ``100``, while the
+    # interface walk kept ``'100x'``.  Two producers then stored two
+    # identities for one process and every consumer that decides membership by
+    # equality saw it as two processes: the interface enrolled in nothing, and
+    # (since CCR-0242) a per-VRF instance was minted carrying the truncated
+    # id.  With the anchor the digit arm fails on ``100x`` and the tag arm
+    # keeps it verbatim.  Both arms feed ``canonical_process_id``, so the
+    # digit arm is a documentation of the numeric dialect rather than a
+    # behavioural fork.
     _OSPF_PROC_PATTERNS = PatternSet(
-        r"^router\s+ospf\s+(?P<pid>\d+)",
+        r"^router\s+ospf\s+(?P<pid>\d+)(?=\s|$)",
         r"^router\s+ospf\s+(?P<pid>\S+)",
     )
 
@@ -1283,7 +1349,16 @@ class IOSParser(BaseParser):
                     ospf_area_children[-1].text,
                 )
                 if match:
-                    ospf_process_id = int(match.group(1))
+                    # CCR-0242 consolidation: through canonical_process_id, the
+                    # one named home for the digit-or-verbatim rule, rather than
+                    # a fifth inline spelling of it.  The capture stays \d+ —
+                    # IOS-XE process ids are numeric and no OS emits
+                    # ``ip ospf <tag> area`` (NX-OS writes
+                    # ``ip router ospf <tag> area``, handled by its own override
+                    # since CCR-0239), so widening it here would add a surface
+                    # no device produces.  Behaviour is unchanged by
+                    # construction: a digit string canonicalizes to its int.
+                    ospf_process_id = canonical_process_id(match.group(1))
                     ospf_area = match.group(2)
 
             # ip ospf cost
@@ -1910,7 +1985,16 @@ class IOSParser(BaseParser):
         "mpls_ip": r"^\s+mpls\s+ip\b",
         "ospf_cost": r"^\s+ip\s+ospf\s+cost\s+",
         "ospf_area": r"^\s+ip\s+(?:router\s+)?ospf\s+(?:\S+\s+)?area\s+",
-        "ospf_process_id": r"^\s+ip\s+(?:router\s+)?ospf\s+\d+\s+area\s+",
+        # CCR-0242 site 3: \S+ and not \d+.  The NX-OS spelling this entry
+        # covers (``ip router ospf <tag> area <id>``) takes an instance TAG, so
+        # for a named enrollment the SET op fell back to the block header —
+        # ``interface Ethernet1/1`` — while the ``ospf_area`` entry above
+        # quoted the same line correctly.  Path and value were always right, so
+        # this is provenance only; a generated change script that quotes
+        # source_line back to an operator quoted the wrong line.  The token is
+        # REQUIRED here, unlike ospf_area's optional group: a line with no pid
+        # token cannot be what set this field.
+        "ospf_process_id": r"^\s+ip\s+(?:router\s+)?ospf\s+\S+\s+area\s+",
         "ospf_priority": r"^\s+ip\s+ospf\s+priority\s+",
         "ospf_hello_interval": r"^\s+ip\s+ospf\s+hello-interval\s+",
         "ospf_dead_interval": r"^\s+ip\s+ospf\s+dead-interval\s+",
@@ -5027,6 +5111,73 @@ class IOSParser(BaseParser):
                 )
             )
 
+    def _parse_ospf_scope_scalars(self, obj) -> dict:
+        """Read the per-process OSPF scalars that are legal in ANY OSPF scope.
+
+        *obj* is a ``router ospf`` block **or** one of its ``vrf NAME``
+        sub-blocks — every pattern here is ``^\\s+``-anchored and every lookup
+        is ``find_child_objects`` (direct children only), so the same walk reads
+        whichever scope it is handed and neither scope can see the other's
+        lines.
+
+        **CCR-0246: one extraction, not two.** These five statements mean the
+        same thing in a ``vrf`` sub-block as at process level, and the
+        vrf-scoped instance read NONE of them — it carried the model defaults,
+        so a per-VRF process that was shut, drained (``max-metric router-lsa``)
+        or hardened (``passive-interface default``) modelled as a plain running
+        process. Teaching the sub-block builder its own copy of the walk would
+        make the two scopes agree today and drift at the next statement; the
+        scope equivalence the tests assert is this function being the only
+        reader.
+
+        ``log_adjacency_changes`` is presence-detected here, which means
+        parser-absence ``False`` against a model default of ``True`` — the
+        documented trap (the engine's creation seed handles it by name). That
+        is deliberate: the process scope has always read it this way and the
+        merger assumes it, so the vrf scope joining it removes an asymmetry
+        rather than adding one. Fixing the trap is a change to BOTH scopes, by
+        construction.
+
+        Returns a dict keyed by ``OSPFConfig`` field name, so a caller splices
+        it in with ``**``.
+        """
+        auto_cost_ref_bw = None
+        auto_cost_children = obj.find_child_objects(
+            r"^\s+auto-cost\s+reference-bandwidth\s+(\d+)"
+        )
+        if auto_cost_children:
+            auto_cost_ref_bw = int(
+                self._extract_match(
+                    auto_cost_children[0].text,
+                    r"^\s+auto-cost\s+reference-bandwidth\s+(\d+)",
+                )
+            )
+
+        max_metric_router_lsa = False
+        max_metric_router_lsa_on_startup: int | None = None
+        mm_children = obj.find_child_objects(r"^\s+max-metric\s+router-lsa")
+        if mm_children:
+            max_metric_router_lsa = True
+            m = re.search(r"on-startup\s+(\d+)", mm_children[0].text)
+            if m:
+                max_metric_router_lsa_on_startup = int(m.group(1))
+
+        return {
+            "log_adjacency_changes": len(
+                obj.find_child_objects(r"^\s+log-adjacency-changes")
+            ) > 0,
+            "log_adjacency_changes_detail": len(
+                obj.find_child_objects(r"^\s+log-adjacency-changes\s+detail")
+            ) > 0,
+            "auto_cost_reference_bandwidth": auto_cost_ref_bw,
+            "passive_interface_default": len(
+                obj.find_child_objects(r"^\s+passive-interface\s+default")
+            ) > 0,
+            "max_metric_router_lsa": max_metric_router_lsa,
+            "max_metric_router_lsa_on_startup": max_metric_router_lsa_on_startup,
+            "shutdown": len(obj.find_child_objects(r"^\s+shutdown\s*$")) > 0,
+        }
+
     def parse_ospf(self) -> list[OSPFConfig]:
         """Parse OSPF configurations."""
         from confgraph.change_ir import ChangeOp, Verb
@@ -5052,10 +5203,13 @@ class IOSParser(BaseParser):
             if not process_id_str:
                 continue
 
-            process_id: int | str = int(process_id_str) if process_id_str.isdigit() else process_id_str
-            # Capture VRF from "router ospf <pid> vrf <name>" (IOS VRF-Lite style)
+            process_id: int | str = canonical_process_id(process_id_str)
+            # Capture VRF from "router ospf <pid> vrf <name>" (IOS VRF-Lite
+            # style).  CCR-0242 site 2: the pid token is \S+, not \d+ — a named
+            # process lost its header VRF qualifier and read as a default-VRF
+            # process, so its networks were attributed to the global table.
             ospf_vrf = self._extract_match(
-                ospf_obj.text, r"^router\s+ospf\s+\d+\s+vrf\s+(\S+)"
+                ospf_obj.text, r"^router\s+ospf\s+\S+\s+vrf\s+(\S+)"
             )  # None when no VRF qualifier
             raw_lines, line_numbers = self._get_raw_lines_and_line_numbers(ospf_obj)
 
@@ -5069,14 +5223,12 @@ class IOSParser(BaseParser):
                 except ValueError:
                     pass
 
-            # Log adjacency changes
-            log_adjacency_changes = len(
-                ospf_obj.find_child_objects(r"^\s+log-adjacency-changes")
-            ) > 0
-
-            log_adjacency_changes_detail = len(
-                ospf_obj.find_child_objects(r"^\s+log-adjacency-changes\s+detail")
-            ) > 0
+            # The scope-level scalars (log-adjacency-changes [detail],
+            # auto-cost reference-bandwidth, passive-interface default,
+            # max-metric router-lsa [on-startup], shutdown) come from the ONE
+            # walk shared with the ``vrf NAME`` sub-block builder — see
+            # _parse_ospf_scope_scalars (CCR-0246).
+            scope_scalars = self._parse_ospf_scope_scalars(ospf_obj)
 
             # Family 6c (CCR Appendix O.1) — THE TRAP: ``log_adjacency_changes``
             # has model default True but parser-absence False (the presence walk
@@ -5107,24 +5259,6 @@ class IOSParser(BaseParser):
                         origin="native",
                     )
                 )
-
-            # Auto-cost reference bandwidth
-            auto_cost_ref_bw = None
-            auto_cost_children = ospf_obj.find_child_objects(
-                r"^\s+auto-cost\s+reference-bandwidth\s+(\d+)"
-            )
-            if auto_cost_children:
-                auto_cost_ref_bw = int(
-                    self._extract_match(
-                        auto_cost_children[0].text,
-                        r"^\s+auto-cost\s+reference-bandwidth\s+(\d+)",
-                    )
-                )
-
-            # Passive interface default
-            passive_interface_default = len(
-                ospf_obj.find_child_objects(r"^\s+passive-interface\s+default")
-            ) > 0
 
             # Passive interfaces
             passive_interfaces = []
@@ -5295,16 +5429,6 @@ class IOSParser(BaseParser):
             )
 
             # Default-information originate
-            # Max-metric router-lsa
-            max_metric_router_lsa = False
-            max_metric_router_lsa_on_startup: int | None = None
-            mm_children = ospf_obj.find_child_objects(r"^\s+max-metric\s+router-lsa")
-            if mm_children:
-                max_metric_router_lsa = True
-                m = re.search(r"on-startup\s+(\d+)", mm_children[0].text)
-                if m:
-                    max_metric_router_lsa_on_startup = int(m.group(1))
-
             default_info_originate = False
             default_info_always = False
             default_info_metric: int | None = None
@@ -5390,9 +5514,6 @@ class IOSParser(BaseParser):
                 v = self._extract_match(lsa_ch[0].text, r"timers\s+throttle\s+lsa\s+all\s+(\d+)")
                 if v:
                     lsa_all = int(v)
-
-            # Shutdown
-            ospf_shutdown = len(ospf_obj.find_child_objects(r"^\s+shutdown\s*$")) > 0
 
             # Graceful restart
             graceful_restart = len(ospf_obj.find_child_objects(r"^\s+graceful-restart\s*$")) > 0
@@ -5598,17 +5719,12 @@ class IOSParser(BaseParser):
                     process_id=process_id,
                     vrf=ospf_vrf,
                     router_id=router_id,
-                    log_adjacency_changes=log_adjacency_changes,
-                    log_adjacency_changes_detail=log_adjacency_changes_detail,
-                    auto_cost_reference_bandwidth=auto_cost_ref_bw,
-                    passive_interface_default=passive_interface_default,
+                    **scope_scalars,
                     passive_interfaces=passive_interfaces,
                     non_passive_interfaces=non_passive_interfaces,
                     network_statements=network_statements,
                     areas=areas,
                     redistribute=redistribute,
-                    max_metric_router_lsa=max_metric_router_lsa,
-                    max_metric_router_lsa_on_startup=max_metric_router_lsa_on_startup,
                     default_information_originate=default_info_originate,
                     default_information_originate_always=default_info_always,
                     default_information_originate_metric=default_info_metric,
@@ -5624,7 +5740,6 @@ class IOSParser(BaseParser):
                     timers_throttle_spf_min=spf_min,
                     timers_throttle_spf_max=spf_max,
                     timers_throttle_lsa_all=lsa_all,
-                    shutdown=ospf_shutdown,
                     graceful_restart=graceful_restart,
                     graceful_restart_helper=graceful_restart_helper,
                     bfd_all_interfaces=bfd_all,
@@ -7877,13 +7992,30 @@ class IOSParser(BaseParser):
         (overridable per OS for flat vs nested area syntax).  The IOS-XE
         ``router ospf N vrf NAME`` header form is handled by ``parse_ospf`` and
         produces no nested ``vrf`` block, so there is no double-count.
+
+        **Called by the NX-OS and IOS-XR overrides only** — IOS/IOS-XE express a
+        per-VRF process in the process header, so a nested ``vrf`` sub-block is
+        not an IOS-XE construct and gets no instance there.
+
+        CCR-0242: the locate-and-extract went through a digit-only pattern, so
+        on a named-instance device the per-VRF instance was not created at all —
+        absent rather than mis-attributed, and silently, which is
+        indistinguishable downstream from a device with no OSPF in that VRF.
+        Named instances are routine on exactly the two OSes that call this
+        (NX-OS data-center fabrics, IOS-XR). It now locates through the shared
+        ``_OSPF_PROC_PATTERNS`` set — the same one ``parse_ospf`` uses, so the
+        two walks cannot disagree about which lines are OSPF processes — and
+        normalizes through ``canonical_process_id`` rather than ``int()``,
+        because consumers decide membership by EQUALITY against whatever the
+        interface walk stored.
         """
         instances: list[OSPFConfig] = []
-        for ospf_obj in parse.find_objects(r"^router\s+ospf\s+(\d+)"):
-            pid_str = self._extract_match(ospf_obj.text, r"^router\s+ospf\s+(\d+)")
+        for ospf_obj in parse.find_objects(self._OSPF_PROC_PATTERNS.union):
+            hdr = self._OSPF_PROC_PATTERNS.match(ospf_obj.text)
+            pid_str = hdr.group("pid") if hdr else None
             if not pid_str:
                 continue
-            process_id = int(pid_str)
+            process_id = canonical_process_id(pid_str)
             for vrf_name, vrf_obj in self._iter_router_vrf_blocks(ospf_obj):
                 instances.append(
                     self._build_ospf_vrf_instance(process_id, vrf_name, vrf_obj)
@@ -7894,6 +8026,12 @@ class IOSParser(BaseParser):
         """Build one OSPFConfig for a ``vrf NAME`` block (IOS flat-area syntax).
 
         IOS-XR overrides this to use its nested ``area > interface`` area parser.
+
+        The per-process scalars come from ``_parse_ospf_scope_scalars`` — the
+        SAME walk ``parse_ospf`` runs at process scope (CCR-0246), so the two
+        scopes cannot disagree about a statement that means the same thing in
+        both. Anything that walk does not read is disclosed by
+        ``_KNOWN_SUB_BLOCK_PATTERNS`` rather than dropped.
         """
         raw_lines, line_numbers = self._get_raw_lines_and_line_numbers(vrf_obj)
 
@@ -7919,6 +8057,7 @@ class IOSParser(BaseParser):
             router_id=router_id,
             areas=areas,
             redistribute=redistribute,
+            **self._parse_ospf_scope_scalars(vrf_obj),
         )
 
     def parse_static_routes(self) -> list[StaticRoute]:

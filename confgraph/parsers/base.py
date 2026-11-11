@@ -297,6 +297,35 @@ class BaseParser(ABC):
     # JunOS/PAN-OS override _collect_unrecognized_blocks wholesale and ignore this.
     _KNOWN_CHILD_PATTERNS: list[tuple[str, list[str]]] = []
 
+    # Sub-block registry — _KNOWN_CHILD_PATTERNS one level deeper (CCR-0246).
+    #
+    # The collector above reads DIRECT children only, so a line inside a
+    # sub-block ("router ospf 77" > "vrf RED" > "auto-cost reference-bandwidth
+    # 20000") is a grandchild and invisible to it — while the sub-block HEADER
+    # is itself a listed known child, so claiming the header silenced its whole
+    # body. That is how NX-OS dropped most statements inside an OSPF "vrf"
+    # sub-block with `unrecognized_blocks` empty: a config carrying the nested
+    # auto-cost line and one carrying nothing parsed byte-identically.
+    #
+    # Each entry is (block-header pattern, sub-block header pattern, [known
+    # child patterns]). For every claimed top-level block whose header matches,
+    # every DIRECT child matching the sub-block pattern has ITS direct children
+    # checked, and a line matching none of the known patterns is disclosed as
+    # "<block header> > <sub-block header> > <child line>" — both scopes named,
+    # because "a line was lost" is not actionable without "from which VRF".
+    #
+    # Same rules as _KNOWN_CHILD_PATTERNS — direct children of the sub-block
+    # only, "no ..." lines never flagged here (_collect_undisclosed_negations
+    # owns negations at every depth already), PRECISION OVER RECALL. One
+    # difference, deliberate: the known list names what the SUB-BLOCK's walk
+    # digests, which is a SUBSET of the parent block's vocabulary — listing the
+    # parent's lists here would re-silence exactly the drops this registry
+    # exists to disclose.
+    #
+    # Default empty = mechanism off, per OS, independent of the registry above:
+    # an OS may run one and not the other (IOS-XR opts out of both).
+    _KNOWN_SUB_BLOCK_PATTERNS: list[tuple[str, str, list[str]]] = []
+
     # ------------------------------------------------------------------
     # Benign-negation registry (CCR-0203).
     #
@@ -663,13 +692,18 @@ class BaseParser(ABC):
     def _collect_unrecognized_blocks(self) -> list[UnrecognizedBlock]:
         """Collect config the parse_* methods did not claim.
 
-        Two walks:
+        Walks, each with its own registry on the class:
           1. top-level (non-indented, non-comment) lines that match no pattern in
              _KNOWN_TOP_LEVEL_PATTERNS — the whole block is unrecognized;
           2. direct child lines of CLAIMED blocks registered in
              _KNOWN_CHILD_PATTERNS that match no known child pattern — the line is
              unrecognized even though the block is parsed (see the registry
-             docstring on the class).
+             docstring on the class);
+          3. one level deeper, the direct children of sub-blocks registered in
+             _KNOWN_SUB_BLOCK_PATTERNS — the body of a sub-block whose header is
+             a claimed child (CCR-0246);
+          4. ``no`` lines at ANY depth under a claimed block that no walk proved
+             it consumed (_collect_undisclosed_negations, CCR-0203).
         """
         parse = self._get_parse_obj()
         blocks: list[UnrecognizedBlock] = []
@@ -689,6 +723,9 @@ class BaseParser(ABC):
             )
             if claimed:
                 blocks.extend(self._collect_unrecognized_child_lines(obj, header))
+                blocks.extend(
+                    self._collect_unrecognized_sub_block_lines(obj, header)
+                )
                 blocks.extend(
                     self._collect_undisclosed_negations(
                         obj, header, claimed_negations
@@ -733,6 +770,18 @@ class BaseParser(ABC):
         if child_patterns is None:
             return []
 
+        return self._flag_unknown_children(obj, header, child_patterns)
+
+    def _flag_unknown_children(
+        self, obj, header: str, child_patterns: list[str]
+    ) -> list[UnrecognizedBlock]:
+        """Disclose *obj*'s direct children that match none of *child_patterns*.
+
+        The one flagging loop, shared by the claimed-block walk above and the
+        sub-block walk below (CCR-0246) — so the two depths can never drift on
+        what they skip (blanks, comments, ``no`` lines) or on the shape of the
+        record they emit.
+        """
         flagged: list[UnrecognizedBlock] = []
         for child in obj.children:  # direct children only — see registry docstring
             text = child.text.strip()
@@ -751,6 +800,37 @@ class BaseParser(ABC):
                     None,
                 ),
             ))
+        return flagged
+
+    def _collect_unrecognized_sub_block_lines(
+        self, obj, header: str
+    ) -> list[UnrecognizedBlock]:
+        """Flag lines inside a registered SUB-BLOCK of a claimed block (CCR-0246).
+
+        One level below ``_collect_unrecognized_child_lines``. For each
+        ``_KNOWN_SUB_BLOCK_PATTERNS`` entry whose block pattern matches *header*,
+        every direct child of *obj* matching the entry's sub-block pattern has
+        its own direct children checked against that entry's known list, and the
+        disclosure header names BOTH scopes — on a multi-tenant device "a line
+        was dropped" is not actionable without "from which per-VRF process".
+
+        Nothing here is reachable unless the OS registers an entry, and the
+        sub-block header itself stays claimed by the walk above, so an OS that
+        registers nothing is bit-identical.
+        """
+        flagged: list[UnrecognizedBlock] = []
+        for block_pattern, sub_pattern, child_patterns in self._KNOWN_SUB_BLOCK_PATTERNS:
+            if not re.match(block_pattern, header):
+                continue
+            for sub in obj.children:  # direct children only, as one level up
+                sub_text = sub.text.strip()
+                if not re.match(sub_pattern, sub_text):
+                    continue
+                flagged.extend(
+                    self._flag_unknown_children(
+                        sub, f"{header} > {sub_text}", child_patterns
+                    )
+                )
         return flagged
 
     def _collect_undisclosed_negations(
