@@ -254,7 +254,43 @@ from confgraph.parsers.panos_parser import PANOSParser
 # IOS-XR config with a named process and a per-VRF OSPF scope, and for any named
 # header-qualified process; plain IOS/IOS-XE is unmoved (digit-only was never
 # broken there). No ParsedConfig JSON-schema change.
-PARSER_BEHAVIOR_VERSION: int = 20
+# 21 (CCR-0250): IOS-XR ``route-policy`` conversion stops hardcoding
+# ``action="permit"``. RPL dispositions are STATEMENTS — ``drop`` discards and
+# stops, ``done`` accepts and stops, ``pass`` accepts and CONTINUES — and a route
+# that reaches the end of a policy without a pass/done is dropped. So
+# ``parse_route_maps`` now emits real deny sequences, carries the non-terminal
+# marker on the new ``RouteMapSequence.continuation``, and tags the arms of one
+# if/elseif/else chain with the new ``RouteMapSequence.exclusive_group`` — the
+# arms used to MERGE into one sequence's clause list and be ANDed, so an elseif
+# arm's set-clauses landed on the if arm's routes. ``RouteMapConfig`` also gains
+# ``untranslated_constructs``, the whitelist's record of what the converter could
+# not translate (empty = fully represented), which the engine reads to refuse to
+# deny on an incomplete reading. Also under 21: ``set community <x> additive``
+# carries the ``additive`` keyword through instead of dropping it, and a
+# parameterised ``route-policy NAME($p)`` now names the policy ``NAME`` rather
+# than ``NAME($p)``. Observable parse output moves for every IOS-XR config with a
+# route-policy; no other OS is touched (the converter is XR-only — IOS/EOS/NX-OS
+# route-maps already carry per-entry permit/deny and keep terminal semantics).
+# The three new model fields also move the ParsedConfig JSON schema (so the
+# platform parse cache invalidates independently and a bump is not strictly
+# required), but entrp's schema-less ``digest_key()`` only moves on pbv — same
+# posture as 2/3/4/5/6/7.
+# Still 21 (CCR-0250 round 2, same undelivered change — one bump, one commit): the
+# RPL conversion also (a) treats `!` FOLLOWED BY ANYTHING as a comment, where it
+# previously admitted only a bare `!` and recorded `! block bogons` as an
+# untranslated construct — which made one commented policy lossy and therefore
+# leniently permitted, re-committing the defect this CCR fixes; (b) gives every
+# RPL_ACTIONS row a STRUCTURAL operand class in place of ``\S+``, so
+# ``set local-preference $lp`` and friends land in untranslated_constructs instead
+# of parsing clean and being swallowed by the engine's ``int()``; (c) UNWRAPS the
+# RPL inline community set, so ``set community (65000:100)`` stores the member
+# ``65000:100`` rather than the unmatched literal ``(65000:100)``; (d) reads the
+# second operand of ``prepend as-path <asn> <count>`` as the REPEAT COUNT it is
+# (expanded; a count outside XR's documented 1-63 lands lossy and is never
+# clamped), where it was previously emitted as a second ASN; and (e) marks an
+# unterminated ``if`` lossy rather than emitting the arms it managed to read as a
+# complete policy. Observable parse output moves again for IOS-XR only.
+PARSER_BEHAVIOR_VERSION: int = 21
 
 __all__ = [
     "BaseParser",

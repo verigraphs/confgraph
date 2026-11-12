@@ -1,6 +1,7 @@
 """Cisco IOS-XR configuration parser."""
 
 import re
+from dataclasses import dataclass
 from ipaddress import IPv4Address, IPv4Interface, IPv4Network, IPv6Address, IPv6Interface
 
 from confgraph.models.base import OSType
@@ -38,6 +39,360 @@ from confgraph.models.isis import ISISConfig, ISISInterface, ISISRedistribute
 from confgraph.parsers.base import _BASE_KNOWN_PATTERNS, apply_peer_group_command, _default_pg_data, parse_remote_as_token
 from confgraph.parsers.ios_parser import IOSParser
 from confgraph.utils.ospf import canonical_process_id
+
+
+# ---------------------------------------------------------------------------
+# RPL (Routing Policy Language) dispatch tables  [[CCR-0250]]
+# ---------------------------------------------------------------------------
+# IOS-XR does not write a permit/deny keyword per sequence. It writes a small
+# imperative language whose DISPOSITIONS are statements, and whose structure is
+# if/elseif/else. `parse_route_maps` converts that to flat RouteMapSequence
+# entries, and the conversion is driven by the two registries below rather than
+# by a chain of if/elif in the walker.
+#
+# THE DESIGN TEST, stated so the next change can be measured against it: adding
+# support for one more RPL condition or action must be ONE ROW HERE and no edit
+# to the walker's control flow. [[CCR-0244]] (`as-path in`) is the next such
+# change and is specified as exactly that.
+#
+# WHITELIST, NOT BLACKLIST. Every row's regex is ANCHORED over the whole
+# construct text and its operand class is STRUCTURAL — a set name where a set
+# name belongs, digits where a number belongs, an enumeration where the grammar
+# enumerates. So a parameter (`$prefix_set`, `set local-preference $lp`) and any
+# shape nobody anticipated fail to match ANY row and land in
+# RouteMapConfig.untranslated_constructs by construction. There is no list of
+# unsupported spellings to keep up to date, and `\S+` appears in no row —
+# round 1 used it on the action side, and `set local-preference $lp` then parsed
+# to a confident, silently-wrong no-op when the engine's int() swallowed it.
+#
+# THE PARENTHESIS IS NOT A BANNED CHARACTER, IT IS A GRAMMAR. RPL's INLINE SET is
+# written parenthesised, and `set community (64512:4242)` is the standard
+# spelling rather than an exotic one — refusing it would make nearly every real
+# XR set-community lossy. The community rows parse the inline set properly and
+# unwrap its members; it is `(` in a position where the grammar has no set that
+# falls through to lossy.
+#
+# A row may also match the SHAPE and still refuse the VALUE: a builder that
+# returns None means "I recognise this construct and cannot represent this
+# operand", and the statement goes lossy rather than being coerced. That is how
+# `prepend as-path <asn> <count>` handles a count outside XR's 1-63 range —
+# clamping would fabricate a device behaviour.
+
+_RPL_SET_NAME = r"[A-Za-z0-9_.:-]+"
+# An inline-set body: one or more members, no nesting and no parameters.
+_RPL_INLINE_SET = r"[^()$]+"
+_RPL_PREPEND_MAX = 63  # XR's documented repeat-count ceiling for `prepend as-path`
+
+
+@dataclass(frozen=True)
+class RPLVerdict:
+    """A disposition produced by an RPL action row.
+
+    `action` is the permit/deny value written to RouteMapSequence.action, and
+    `continuation` the non-terminal marker. The pairing lives in the row rather
+    than in the walker so the encoding is readable at the point of definition.
+    """
+
+    action: str
+    continuation: str | None
+
+
+# `drop` discards and stops; `done` accepts and stops; `pass` marks the route as
+# passing and evaluation CONTINUES. The end-of-policy default (drop anything no
+# pass/done reached) is the ENGINE's rule, not a sequence's — nothing is
+# synthesised here, because the model stays faithful to what the device holds.
+_RPL_DROP = RPLVerdict(action="deny", continuation=None)
+_RPL_DONE = RPLVerdict(action="permit", continuation=None)
+_RPL_PASS = RPLVerdict(action="permit", continuation="pass")
+# An arm whose statements run out without a disposition: evaluation continues
+# after `endif` with no verdict recorded. action="permit" is deliberate — see
+# RouteMapSequence.continuation: it is the value that makes a reader of `action`
+# alone behave exactly as it did before `continuation` existed.
+_RPL_FALLTHROUGH = RPLVerdict(action="permit", continuation="fallthrough")
+
+
+def _rpl_match(match_type: str):
+    """Build a condition row handler emitting a single-valued RouteMapMatch."""
+    return lambda m: RouteMapMatch(match_type=match_type, values=[m.group("name")])
+
+
+# One row per RPL CONDITION. Key = the condition's leading keywords as the device
+# writes them (also what gets recorded as untranslated when a near-miss occurs);
+# value = (anchored regex over the whole condition text, builder -> RouteMapMatch).
+RPL_CONDITIONS: dict[str, tuple[re.Pattern, object]] = {
+    "destination in": (
+        re.compile(rf"^destination\s+in\s+(?P<name>{_RPL_SET_NAME})$"),
+        _rpl_match("ip address prefix-list"),
+    ),
+    "community matches-any": (
+        re.compile(rf"^community\s+matches-any\s+(?P<name>{_RPL_SET_NAME})$"),
+        _rpl_match("community"),
+    ),
+    # [[CCR-0244]] adds exactly one row here:
+    #   "as-path in": (re.compile(rf"^as-path\s+in\s+(?P<name>{_RPL_SET_NAME})$"),
+    #                  _rpl_match("as-path")),
+}
+
+
+def _rpl_set(set_type: str, group: str = "value"):
+    """Build an action row handler emitting a single-valued RouteMapSet."""
+    return lambda m: RouteMapSet(set_type=set_type, values=[m.group(group)])
+
+
+def _rpl_community(m: "re.Match") -> RouteMapSet:
+    """`set community { <set-name> | (<member>[, <member>…]) } [additive]`.
+
+    The inline set's members are UNWRAPPED — the parentheses are RPL's syntax for
+    "here is a set", not part of any member's value, and a consumer comparing
+    `(65000:100)` against a route's `65000:100` matches nothing. `additive` is
+    carried in the values because the engine implements additive semantics and a
+    row that ate the keyword and dropped it would be the silent loss this
+    whitelist exists to prevent.
+    """
+    inline = m.group("inline")
+    if inline is not None:
+        values = [v.strip() for v in inline.split(",") if v.strip()]
+    else:
+        values = [m.group("named")]
+    if m.group("additive"):
+        values.append("additive")
+    return RouteMapSet(set_type="community", values=values)
+
+
+def _rpl_prepend(m: "re.Match") -> "RouteMapSet | None":
+    """`prepend as-path <asn> [<count>]` — the second operand is a REPEAT COUNT.
+
+    It is not a second ASN, which is how round 1 read it (`prepend as-path 65000 1`
+    produced the AS-path `65000 1 …`). The count is expanded here so the engine's
+    existing "prepend each value" loop stays untouched.
+
+    A count outside XR's documented 1-63 range returns None: the row recognises the
+    construct and cannot represent this operand, so the statement goes lossy.
+    Clamping to 63 would invent a device behaviour the config does not describe.
+    """
+    asn, count = m.group("asn"), m.group("count")
+    if count is None:
+        return RouteMapSet(set_type="as-path prepend", values=[asn])
+    n = int(count)
+    if not 1 <= n <= _RPL_PREPEND_MAX:
+        return None
+    return RouteMapSet(set_type="as-path prepend", values=[asn] * n)
+
+
+# One row per RPL ACTION: the three dispositions, then the set-clauses the
+# converter understands. A row returns an RPLVerdict or a RouteMapSet and the
+# walker dispatches on the type, so a disposition and a set-clause are one table
+# rather than two parallel ones.
+#
+# NOT HERE, DELIBERATELY (each lands in untranslated_constructs and is disclosed
+# rather than silently dropped): `set tag`, `set weight`, `set next-hop`,
+# `delete community`, `suppress-route`, `apply`. Adding any of them is one row —
+# and a corpus movement to pre-declare, which is why they are not in [[CCR-0250]].
+RPL_ACTIONS: dict[str, tuple[re.Pattern, object]] = {
+    "drop": (re.compile(r"^drop$"), lambda m: _RPL_DROP),
+    "done": (re.compile(r"^done$"), lambda m: _RPL_DONE),
+    "pass": (re.compile(r"^pass$"), lambda m: _RPL_PASS),
+    # Numeric operands are DIGITS, not `\S+`. `set local-preference $lp` must land
+    # lossy; with `\S+` it parsed clean and the engine's int() then swallowed it,
+    # leaving the attribute untouched and nothing disclosed.
+    "set local-preference": (
+        re.compile(r"^set\s+local-preference\s+(?P<value>\d+)$"),
+        _rpl_set("local-preference"),
+    ),
+    # XR writes `set med`; `set metric` is accepted and normalised to the same
+    # RouteMapSet type the engine's MED handling reads. The sign is part of the
+    # grammar (relative adjustment) and the engine implements it.
+    "set med": (
+        re.compile(r"^set\s+(?:med|metric)\s+(?P<value>[+-]?\d+)$"), _rpl_set("metric")
+    ),
+    "set community": (
+        re.compile(
+            rf"^set\s+community\s+"
+            rf"(?:\((?P<inline>{_RPL_INLINE_SET})\)|(?P<named>{_RPL_SET_NAME}))"
+            rf"(?P<additive>\s+additive)?$"
+        ),
+        _rpl_community,
+    ),
+    # The origin attribute is a three-value enumeration, so the row enumerates it.
+    "set origin": (
+        re.compile(r"^set\s+origin\s+(?P<value>igp|egp|incomplete)$"), _rpl_set("origin")
+    ),
+    "prepend as-path": (
+        re.compile(r"^prepend\s+as-path\s+(?P<asn>\d+)(?:\s+(?P<count>\d+))?$"),
+        _rpl_prepend,
+    ),
+}
+
+# Structural keywords the walker consumes itself. Listed here so that the
+# whitelist check has ONE notion of "consumed": a line is lossy iff no structural
+# keyword, no condition row and no action row claimed it.
+_RPL_IF = re.compile(r"^if\s+(?P<cond>.+?)\s+then$")
+_RPL_ELSEIF = re.compile(r"^elseif\s+(?P<cond>.+?)\s+then$")
+_RPL_ELSE = re.compile(r"^else$")
+_RPL_ENDIF = re.compile(r"^endif$")
+# A COMMENT IS `!` FOLLOWED BY ANYTHING — the whole class, not the bare token.
+# Round 1 matched only a bare `!`, so `! block bogons` landed in the lossy list,
+# the policy went lenient, and one operator comment re-committed the very defect
+# [[CCR-0250]] fixes. Deliberately NOT widened past this: `#` is not IOS-XR
+# comment syntax, and `remark` / `description` are not RPL verbs, so both stay
+# correctly lossy rather than being waved through with comments.
+_RPL_IGNORABLE = re.compile(r"^(?:!.*|end-policy)?$")
+
+
+def _record_untranslated(untranslated: list[str], construct: str) -> None:
+    """Append *construct* to the lossy list, preserving order and deduplicating."""
+    if construct not in untranslated:
+        untranslated.append(construct)
+
+
+def _rpl_statement_label(text: str) -> str:
+    """Name an unconvertible STATEMENT by its leading two tokens.
+
+    ``set weight 100`` records as ``set weight`` and ``apply CUSTOMER-IN`` as
+    ``apply CUSTOMER-IN``. Two tokens is where RPL's verbs end: it keeps the
+    construct identifiable without repeating a policy once per differing operand
+    value, and without carrying addresses out of the config into a report.
+    """
+    tokens = text.split()
+    return " ".join(tokens[:2]) if len(tokens) > 1 else text
+
+
+def _convert_rpl_condition(
+    cond: str, untranslated: list[str]
+) -> "RouteMapMatch | None":
+    """Translate one RPL condition via :data:`RPL_CONDITIONS`, or record it lossy.
+
+    The condition text is recorded IN FULL when no row claims it, because for a
+    condition the operator is the information: ``destination in A and B`` and
+    ``destination in A`` differ in exactly the part a verb-only label would drop.
+    """
+    for pattern, build in RPL_CONDITIONS.values():
+        m = pattern.match(cond)
+        if m:
+            return build(m)
+    _record_untranslated(untranslated, cond)
+    return None
+
+
+def _convert_rpl_statement(text: str, untranslated: list[str]):
+    """Translate one RPL statement via :data:`RPL_ACTIONS`, or record it lossy.
+
+    A builder returning None means the row recognised the construct but cannot
+    represent this operand (see :func:`_rpl_prepend`). That is a lossy outcome, not
+    a reason to try the next row — the construct HAS been identified.
+    """
+    for pattern, build in RPL_ACTIONS.values():
+        m = pattern.match(text)
+        if m:
+            converted = build(m)
+            if converted is not None:
+                return converted
+            break
+    _record_untranslated(untranslated, _rpl_statement_label(text))
+    return None
+
+
+def _convert_rpl_body(
+    body: list[str], untranslated: list[str]
+) -> list[RouteMapSequence]:
+    """Walk an RPL policy body into flat sequences.
+
+    The body is read as a list of ARMS. An arm is a condition (or no condition,
+    for statements outside any ``if``) plus the statements that run when it is
+    chosen. One ``if``/``elseif``/``else`` chain yields one group of arms sharing
+    an ``exclusive_group``; statements before the first ``if`` or after ``endif``
+    yield ungrouped arms that are always evaluated.
+
+    The walker itself knows only the four structural keywords. Everything else
+    goes through the dispatch tables, which is what makes "add a condition" a
+    one-row change — see the registries at the top of this module.
+    """
+    # (match_clauses, statements, group_id); group_id None = unconditional arm
+    arms: list[tuple[list[RouteMapMatch], list[str], int | None]] = []
+    group_id = 0
+    current_group: int | None = None
+    current: tuple[list[RouteMapMatch], list[str], int | None] | None = None
+
+    def _open(matches: list[RouteMapMatch], group: int | None) -> None:
+        nonlocal current
+        current = (matches, [], group)
+        arms.append(current)
+
+    for text in body:
+        if _RPL_IGNORABLE.match(text):
+            continue
+
+        if m := _RPL_IF.match(text):
+            if current_group is not None:
+                # Nested if: representing it would need a condition tree, which
+                # flat sequences do not have. Lossy, and the walker stops trying
+                # to read structure rather than guessing at it.
+                _record_untranslated(untranslated, "nested if")
+                continue
+            group_id += 1
+            current_group = group_id
+            clause = _convert_rpl_condition(m.group("cond"), untranslated)
+            _open([clause] if clause else [], current_group)
+            continue
+
+        if m := _RPL_ELSEIF.match(text):
+            if current_group is None:
+                _record_untranslated(untranslated, "elseif outside if")
+                continue
+            clause = _convert_rpl_condition(m.group("cond"), untranslated)
+            _open([clause] if clause else [], current_group)
+            continue
+
+        if _RPL_ELSE.match(text):
+            if current_group is None:
+                _record_untranslated(untranslated, "else outside if")
+                continue
+            _open([], current_group)
+            continue
+
+        if _RPL_ENDIF.match(text):
+            current_group = None
+            current = None
+            continue
+
+        if current is None:
+            _open([], None)
+        current[1].append(text)
+
+    if current_group is not None:
+        # The body ended inside an `if` chain. Whatever closes it — an `endif` and
+        # possibly more arms and statements — is not in what we read, so the arms
+        # we did build are an incomplete picture of the policy. Claiming full
+        # comprehension over a truncated structure is the same error as claiming it
+        # over an untranslated verb.
+        _record_untranslated(untranslated, "unterminated if")
+
+    sequences: list[RouteMapSequence] = []
+    for matches, statements, group in arms:
+        set_clauses: list[RouteMapSet] = []
+        verdict = _RPL_FALLTHROUGH
+        for text in statements:
+            converted = _convert_rpl_statement(text, untranslated)
+            if isinstance(converted, RouteMapSet):
+                set_clauses.append(converted)
+            elif isinstance(converted, RPLVerdict):
+                if converted.continuation is None:
+                    # drop / done end the policy here; anything the arm says after
+                    # a terminal disposition is dead on the device too.
+                    verdict = converted
+                    break
+                verdict = converted
+        if not matches and not set_clauses and verdict is _RPL_FALLTHROUGH:
+            continue  # an arm that says nothing contributes no sequence
+        sequences.append(RouteMapSequence(
+            sequence=(len(sequences) + 1) * 10,
+            action=verdict.action,
+            continuation=verdict.continuation,
+            exclusive_group=group,
+            match_clauses=matches,
+            set_clauses=set_clauses,
+        ))
+    return sequences
 
 
 # IOS-XR patterns differ from IOS: different VRF, route-policy, prefix-set, etc.
@@ -1435,100 +1790,47 @@ class IOSXRParser(IOSParser):
     # -----------------------------------------------------------------------
 
     def parse_route_maps(self) -> list[RouteMapConfig]:
-        """Parse IOS-XR route-policy blocks and map them to RouteMapConfig.
+        """Convert IOS-XR ``route-policy`` blocks to :class:`RouteMapConfig`.
 
-        The full policy body is stored as raw set/match entries so that
-        the dependency graph can reference policy names without needing
-        to interpret the if/then/else language.
+        RPL is a small imperative language, not a list of permit/deny entries, so
+        the conversion is a translation rather than a transcription. Three facts
+        drive it ([[CCR-0250]]; Cisco IOS-XR Routing Configuration Guide, RPL
+        chapter):
+
+        * ``drop`` discards and stops; ``done`` accepts and stops; ``pass`` marks
+          the route as passing and evaluation **continues**.
+        * A route that reaches the end of the policy without a ``pass`` or
+          ``done`` is **dropped**. That rule belongs to the engine — nothing is
+          synthesised into ``sequences`` to express it, because the model stays
+          faithful to the statements the device actually holds.
+        * The arms of one ``if``/``elseif``/``else`` chain are **alternatives**.
+          Flat first-match-wins sequences cannot say that once a sequence is
+          non-terminal, so the arms carry a shared ``exclusive_group``.
+
+        Every construct is matched against :data:`RPL_CONDITIONS` and
+        :data:`RPL_ACTIONS`; whatever no row claims is recorded by name in
+        ``RouteMapConfig.untranslated_constructs`` and the policy becomes lossy.
+        A lossy policy is still converted as far as it was understood — the
+        consumer's contract is that it may not DENY on an incomplete reading.
         """
         route_maps: list[RouteMapConfig] = []
         parse = self._get_parse_obj()
 
         rp_objs = parse.find_objects(r"^route-policy\s+(\S+)")
         for rp_obj in rp_objs:
-            rp_name = self._extract_match(rp_obj.text, r"^route-policy\s+(\S+)")
+            rp_name = self._extract_match(rp_obj.text, r"^route-policy\s+([^\s(]+)")
             if not rp_name:
                 continue
 
             raw_lines, line_numbers = self._get_raw_lines_and_line_numbers(rp_obj)
+            untranslated: list[str] = []
+            if "(" in rp_obj.text:
+                # A parameterised policy is instantiated per call site with values
+                # this parser never sees, so its body is only half the policy.
+                _record_untranslated(untranslated, "route-policy parameters")
 
-            # Extract match/set clauses as best-effort from the policy body.
-            # Handles IOS-XR if/then/else by emitting two RouteMapSequences:
-            #   seq 10: match + if-branch sets
-            #   seq 20: no match (catch-all) + else-branch sets
-            match_clauses: list[RouteMapMatch] = []
-            if_set_clauses: list[RouteMapSet] = []
-            else_set_clauses: list[RouteMapSet] = []
-            in_else = False
-
-            def _parse_set(text: str, target: list[RouteMapSet]) -> None:
-                if text.startswith("set local-preference "):
-                    val = self._extract_match(text, r"set local-preference (\S+)")
-                    if val:
-                        target.append(RouteMapSet(set_type="local-preference", values=[val]))
-                elif text.startswith("set med ") or text.startswith("set metric "):
-                    val = self._extract_match(text, r"set (?:med|metric) (\S+)")
-                    if val:
-                        target.append(RouteMapSet(set_type="metric", values=[val]))
-                elif text.startswith("set community "):
-                    val = self._extract_match(text, r"set community (\S+)")
-                    if val:
-                        target.append(RouteMapSet(set_type="community", values=[val]))
-                elif text.startswith("prepend as-path "):
-                    vals = text.replace("prepend as-path ", "").split()
-                    target.append(RouteMapSet(set_type="as-path prepend", values=vals))
-                elif text.startswith("set origin "):
-                    val = self._extract_match(text, r"set origin (\S+)")
-                    if val:
-                        target.append(RouteMapSet(set_type="origin", values=[val]))
-
-            for child in rp_obj.all_children:
-                text = child.text.strip()
-                if text == "else":
-                    in_else = True
-                elif text in ("endif", "end-policy"):
-                    in_else = False
-                elif text.startswith("if destination in "):
-                    dest = self._extract_match(text, r"if destination in (\S+)")
-                    if dest:
-                        match_clauses.append(
-                            RouteMapMatch(match_type="ip address prefix-list", values=[dest])
-                        )
-                elif text.startswith("if community matches-any "):
-                    comm_set = self._extract_match(text, r"if community matches-any (\S+)")
-                    if comm_set:
-                        match_clauses.append(
-                            RouteMapMatch(match_type="community", values=[comm_set])
-                        )
-                elif text.startswith("set ") or text.startswith("prepend as-path "):
-                    target = else_set_clauses if in_else else if_set_clauses
-                    _parse_set(text, target)
-
-            sequences: list[RouteMapSequence] = []
-            if match_clauses:
-                # Sequence 10: the if-branch (match + its set clauses)
-                sequences.append(RouteMapSequence(
-                    sequence=10,
-                    action="permit",
-                    match_clauses=match_clauses,
-                    set_clauses=if_set_clauses,
-                ))
-                # Sequence 20: the else-branch (catch-all, no match clause)
-                if else_set_clauses:
-                    sequences.append(RouteMapSequence(
-                        sequence=20,
-                        action="permit",
-                        match_clauses=[],
-                        set_clauses=else_set_clauses,
-                    ))
-            else:
-                # No if/then — simple policy with no match clause
-                sequences.append(RouteMapSequence(
-                    sequence=10,
-                    action="permit",
-                    match_clauses=[],
-                    set_clauses=if_set_clauses,
-                ))
+            body = [child.text.strip() for child in rp_obj.all_children]
+            sequences = _convert_rpl_body(body, untranslated)
 
             route_maps.append(
                 RouteMapConfig(
@@ -1538,6 +1840,7 @@ class IOSXRParser(IOSParser):
                     line_numbers=line_numbers,
                     name=rp_name,
                     sequences=sequences,
+                    untranslated_constructs=untranslated,
                 )
             )
 

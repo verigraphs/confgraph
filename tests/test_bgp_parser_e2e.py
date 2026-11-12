@@ -131,9 +131,18 @@ route-map PREPEND-LOOP permit 10
 !
 """
 
+    # FIXTURE REPAIRED 2026-11-11 ([[CCR-0250]] round 2), declared by name. This is the
+    # SECOND copy of the same device-invalid line — confgraph-entrp's
+    # tests/test_bgp_parser_e2e.py carries the other, and both are repaired identically.
+    #
+    # It used to read `prepend as-path 65200 65200`, written as though RPL took a list of
+    # ASNs the way the IOS fixture above does. XR's second operand is a REPEAT COUNT with
+    # a documented range of 1-63, so 65200 is a line a device rejects. An out-of-range
+    # count is not representable and is never clamped, so leaving it would have made the
+    # policy lossy and emitted no as-path set clause at all.
     _IOSXR_CFG = """\
 route-policy PREPEND-LOOP
-  prepend as-path 65200 65200
+  prepend as-path 65200 2
 end-policy
 !
 """
