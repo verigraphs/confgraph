@@ -136,3 +136,18 @@ class ASPathListConfig(BaseConfigObject):
         default_factory=list,
         description="AS-path list entries",
     )
+    untranslated_constructs: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Members this set contains that the parser recognised as PRESENT but could "
+            "not express as a pattern, NAMED IN FULL (\"length eq 5\", "
+            "\"neighbor-is '65001'\"), not merely counted. Same WHITELIST semantics as "
+            "RouteMapConfig.untranslated_constructs: the parser enumerates the member "
+            "forms it can represent and every other form lands here, so an EMPTY list "
+            "is a positive claim that 'entries' is the whole set. A member recorded "
+            "here has NO entry — storing a non-pattern as a pattern is worse than "
+            "recording its absence, because a non-pattern COMPILES and then matches "
+            "nothing, which defeats the guard that would otherwise have reported it "
+            "([[CCR-0244]])."
+        ),
+    )

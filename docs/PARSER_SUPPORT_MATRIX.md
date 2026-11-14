@@ -83,7 +83,7 @@ Notes:
 
 Notes:
 - IOS-XR community-lists override handles `community-set` / `extcommunity-set` syntax
-- IOS-XR AS-path lists override handles `as-path-set` syntax
+- IOS-XR AS-path lists override handles `as-path-set` syntax: `ios-regex '…'` members are unwrapped to the bare pattern (CCR-0244); non-pattern member forms (`dfa-regex`, `length`, `neighbor-is`, …) are named in `ASPathListConfig.untranslated_constructs` instead of being stored
 - EOS ACL override handles optional `standard` keyword and CIDR notation
 - **NX-OS ACLs (CCR-0086):** the shared-base `parse_acls()` now reads IPv4 / IPv6 / MAC access-lists (`ACLConfig.family`), `object-group` blocks (`parse_object_groups()` → `ParsedConfig.object_groups`), `addrgroup` / `portgroup` references in ACEs (`ACLEntry.source_group` / `destination_group`), and standalone `remark` entries — all inherited by NX-OS unchanged. NX-OS ACLs are therefore still `✅ (inherited)`, but now with multi-family + object-group coverage.
 - **JunOS ACLs:** improved firewall-filter parsing — `firewall { filter … }` and `firewall { family F { filter … } }`, per-term action and address/protocol/port match conditions

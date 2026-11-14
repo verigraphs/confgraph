@@ -277,7 +277,22 @@ end-set
 **IOS-XR-Specific Differences:**
 
 - `as-path-set NAME` / `end-set` blocks replace IOS `ip as-path access-list`
-- Entries use `ios-regex` keyword
+- Entries use the `ios-regex` keyword, which is XR's own statement that the quoted body
+  is the Cisco regex dialect. The keyword and the quotes are **unwrapped**: the entry
+  stores the bare pattern (`_65001_`), so the engine's Cisco-dialect translation applies
+  unchanged. Storing the wrapper made every XR AS-path policy a silent no-op, because
+  the wrapper compiles as a regex and matches nothing ([[CCR-0244]]).
+- The other member forms RPL allows — `dfa-regex`, `length`, `unique-length`,
+  `neighbor-is`, `originates-from`, `passes-through` — are **not** patterns, have no
+  field in this model, and are therefore named in
+  `ASPathListConfig.untranslated_constructs` with no entry stored, rather than stored as
+  a string that silently compiles.
+- Members may be written one per line or several comma-separated on one line (RPL makes
+  the newline after a comma optional); both read the same, and a comma inside the quotes
+  stays part of the pattern.
+- `if as-path in <set> then` converts to a `RouteMapMatch(match_type="as-path")`; every
+  other `as-path` operator (`is-local`, `length`, `neighbor-is`, …) has no row and makes
+  the policy lossy.
 
 **Parsing Status:** ✅ Overridden — `parse_as_path_lists()` maps `as-path-set`/`end-set` to `ASPathListConfig`
 

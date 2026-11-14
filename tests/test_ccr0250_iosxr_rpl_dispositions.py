@@ -238,8 +238,17 @@ def test_an_unknown_statement_is_named_not_silently_dropped():
         ("community matches-any (65000:100)", "community matches-any (65000:100)"),
         # a parameter: nor a dollar sign
         ("destination in $customer_prefixes", "destination in $customer_prefixes"),
-        # a condition nobody has written a row for at all
-        ("as-path in AS-CUSTOMERS", "as-path in AS-CUSTOMERS"),
+        # a condition nobody has written a row for at all.
+        # This case USED to be `as-path in AS-CUSTOMERS`; [[CCR-0244]] gave that
+        # condition a row (2026-11-14), so it is no longer an example of one that has
+        # none. `rib-has-route in` is a real RPL condition with no row and no model
+        # field, which is what this case is here to measure.
+        ("rib-has-route in PS-A", "rib-has-route in PS-A"),
+        # ...and the operand half of the same claim, for the condition that NOW has a
+        # row: a `$`-parameterised set name must still miss it. Kept here beside its
+        # siblings so the whitelist's operand discipline is asserted per condition,
+        # not only for the one being added.
+        ("as-path in $as_set", "as-path in $as_set"),
     ],
 )
 def test_an_unrepresentable_condition_is_recorded_in_full(condition, recorded):
@@ -302,8 +311,14 @@ def test_the_registries_are_the_only_vocabulary_and_adding_one_is_one_row():
 
     Pinned as the shape of the tables rather than as prose, so a change that reopens the
     walker's control flow to add a condition fails here instead of at review.
+
+    `as-path in` DISCHARGED that design test ([[CCR-0244]], 2026-11-14): one row here,
+    no edit to the walker. It is listed below rather than left out so that this pin
+    keeps meaning "the tables are the whole vocabulary".
     """
-    assert set(RPL_CONDITIONS) == {"destination in", "community matches-any"}
+    assert set(RPL_CONDITIONS) == {
+        "destination in", "community matches-any", "as-path in",
+    }
     assert set(RPL_ACTIONS) == {
         "drop", "done", "pass",
         "set local-preference", "set med", "set community", "set origin",

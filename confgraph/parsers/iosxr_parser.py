@@ -128,10 +128,77 @@ RPL_CONDITIONS: dict[str, tuple[re.Pattern, object]] = {
         re.compile(rf"^community\s+matches-any\s+(?P<name>{_RPL_SET_NAME})$"),
         _rpl_match("community"),
     ),
-    # [[CCR-0244]] adds exactly one row here:
-    #   "as-path in": (re.compile(rf"^as-path\s+in\s+(?P<name>{_RPL_SET_NAME})$"),
-    #                  _rpl_match("as-path")),
+    # [[CCR-0244]]. `as-path` is the match type `apply_policy` already dispatches on,
+    # resolving the name against parsed.as_path_lists — which is where an
+    # `as-path-set` lands. Every other `as-path` OPERATOR (`is-local`, `length`,
+    # `neighbor-is`, `passes-through`, `originates-from`) is a different condition
+    # with no row, so it stays lossy; this row claims `in` and nothing else.
+    "as-path in": (
+        re.compile(rf"^as-path\s+in\s+(?P<name>{_RPL_SET_NAME})$"),
+        _rpl_match("as-path"),
+    ),
 }
+
+# One row per RPL AS-PATH-SET MEMBER FORM  [[CCR-0244]]. Keyed by the member's
+# leading keyword as the device writes it; value = an anchored regex whose
+# `pattern` group is the bare pattern to store.
+#
+# WHITELIST, for the same reason the condition and action tables are one: XR's
+# `ios-regex` is XR's own statement that the member IS the Cisco dialect, so once
+# unwrapped the engine-side translation handles it with no further work. Every
+# OTHER member form the grammar allows — `dfa-regex` (a different regex dialect),
+# `length`, `unique-length`, `neighbor-is`, `originates-from`, `passes-through` —
+# is not a Cisco-dialect pattern, and this model has no field that means any of
+# them. There is deliberately NO LIST of them here: a member no row claims is
+# DISCLOSED through ASPathListConfig.untranslated_constructs and stored as
+# nothing, so a form nobody anticipated discloses itself.
+#
+# THAT ASYMMETRY IS THE WHOLE DEFECT. Before this, every member was stored
+# verbatim as the entry's regex, so `ios-regex '_64702_'` reached the matcher as a
+# literal string. It COMPILES — hence no warning from the compile guard — and
+# matches nothing, because no AS path contains the text `ios-regex`. A stored
+# non-pattern is worse than a recorded absence precisely because it defeats the
+# guard that would otherwise have reported it.
+_RPL_AS_PATH_MEMBERS: dict[str, re.Pattern] = {
+    # The quotes are RPL's string syntax, not part of the pattern. The body is
+    # `[^']*`, NOT `.*`: a single-quoted RPL token cannot contain the delimiter, and
+    # a greedy `.*` spans from the FIRST quote to the LAST one on the line — so
+    # `ios-regex '_64500_', ios-regex '_64501_'` stored the pattern
+    # `_64500_', ios-regex '_64501_`, a confident non-pattern that compiles and
+    # matches nothing. That is this CCR's own defect, re-committed by the operand
+    # class. The body is otherwise unconstrained: what is between the quotes is a
+    # regex in a dialect the engine owns, and a narrower class here would make the
+    # parser a second, disagreeing judge of what a valid pattern is.
+    "ios-regex": re.compile(r"^ios-regex\s+'(?P<pattern>[^']*)'$"),
+}
+
+
+def _split_rpl_members(line: str) -> list[str]:
+    """Split one RPL set body line into members, on commas OUTSIDE the quotes.
+
+    The comma is RPL's member separator and a newline after it is OPTIONAL — the
+    config guide states that one or more new lines *can* follow a comma separator in
+    a named AS path set — so one emitted line may legally carry several members, and
+    no readable source establishes which layout a device prints
+    (``syntax-corpus/iosxr/routing-policy.yaml`` header: the only sanctioned fetcher
+    collapses newlines, destroying exactly that distinction).
+
+    Splitting on EVERY comma, as ``_parse_iosxr_set_members`` does for community
+    sets, is wrong here: an AS-path regex may contain a comma — ``_64702,_`` is a
+    legal pattern — and a blind split corrupts it. Honouring the quotes is correct
+    under both candidate layouts and assumes nothing about either.
+    """
+    members: list[str] = []
+    start = 0
+    in_quote = False
+    for i, ch in enumerate(line):
+        if ch == "'":
+            in_quote = not in_quote
+        elif ch == "," and not in_quote:
+            members.append(line[start:i].strip())
+            start = i + 1
+    members.append(line[start:].strip())
+    return [m for m in members if m]
 
 
 def _rpl_set(set_type: str, group: str = "value"):
@@ -1931,7 +1998,27 @@ class IOSXRParser(IOSParser):
     # -----------------------------------------------------------------------
 
     def parse_as_path_lists(self) -> list[ASPathListConfig]:
-        """Parse IOS-XR as-path-set blocks and map to ASPathListConfig."""
+        """Parse IOS-XR as-path-set blocks and map to ASPathListConfig.
+
+        Each member is UNWRAPPED through :data:`_RPL_AS_PATH_MEMBERS` before it is
+        stored: `ios-regex '_64702_'` becomes the entry regex `_64702_`, the bare
+        Cisco-dialect pattern the engine's own translation then reads. The keyword
+        and the quotes are RPL syntax and were previously stored as part of the
+        pattern, which made every XR AS-path policy a silent no-op ([[CCR-0244]]).
+
+        The parser's job ENDS at unwrapping. No dialect translation happens here —
+        `_` is a word-boundary metacharacter on the device and a literal underscore
+        in Python, and that rewrite lives in the engine's matcher, applied to every
+        OS that writes this dialect. Re-doing it here would give the same pattern
+        two owners.
+
+        A member no row claims is stored as NOTHING and recorded in
+        ``untranslated_constructs`` in full — see the registry's comment for why
+        disclosure beats a stored non-pattern. Member boundaries come from
+        :func:`_split_rpl_members`, which honours the quotes, so both emitted
+        layouts (one member per line, or several comma-separated on one) read the
+        same and a pattern containing a comma survives either.
+        """
         as_path_lists: list[ASPathListConfig] = []
         parse = self._get_parse_obj()
 
@@ -1943,12 +2030,26 @@ class IOSXRParser(IOSParser):
 
             raw_lines, line_numbers = self._get_raw_lines_and_line_numbers(aps_obj)
             entries: list[ASPathListEntry] = []
+            untranslated: list[str] = []
 
             for child in aps_obj.all_children:
-                text = child.text.strip().rstrip(",")
+                text = child.text.strip()
                 if not text or text in ("end-set",):
                     continue
-                entries.append(ASPathListEntry(action="permit", regex=text))
+                for member in _split_rpl_members(text):
+                    if member == "end-set":
+                        continue
+                    for member_pattern in _RPL_AS_PATH_MEMBERS.values():
+                        m = member_pattern.match(member)
+                        if m:
+                            entries.append(
+                                ASPathListEntry(
+                                    action="permit", regex=m.group("pattern")
+                                )
+                            )
+                            break
+                    else:
+                        _record_untranslated(untranslated, member)
 
             as_path_lists.append(
                 ASPathListConfig(
@@ -1958,6 +2059,7 @@ class IOSXRParser(IOSParser):
                     line_numbers=line_numbers,
                     name=aps_name,
                     entries=entries,
+                    untranslated_constructs=untranslated,
                 )
             )
 

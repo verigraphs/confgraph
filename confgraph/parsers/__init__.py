@@ -290,7 +290,27 @@ from confgraph.parsers.panos_parser import PANOSParser
 # clamped), where it was previously emitted as a second ASN; and (e) marks an
 # unterminated ``if`` lossy rather than emitting the arms it managed to read as a
 # complete policy. Observable parse output moves again for IOS-XR only.
-PARSER_BEHAVIOR_VERSION: int = 21
+# 22 (CCR-0244): IOS-XR ``as-path-set`` members are UNWRAPPED. `ios-regex '_64702_'`
+# stores the bare pattern ``_64702_`` where it previously stored the whole RPL
+# wrapper — keyword, quotes and all — as the entry's regex. The wrapper COMPILES as
+# a regex and matches nothing (no AS path contains the text ``ios-regex``), so the
+# compile guard never fired and every IOS-XR AS-path policy was a silent no-op:
+# deny-lists failed open, permit-lists failed closed. Once unwrapped, the engine's
+# existing Cisco-dialect translation (CCR-0003) applies with no further change. A
+# member form that is not a Cisco-dialect pattern (``dfa-regex``, ``length``,
+# ``neighbor-is``, ``originates-from``, ``passes-through``) is now stored as NOTHING
+# and NAMED in the new ``ASPathListConfig.untranslated_constructs`` — a stored
+# non-pattern is worse than a recorded absence, because it is the thing that
+# defeated the guard. Also under 22, and the half that makes the unwrap reach a
+# verdict: ``RPL_CONDITIONS`` gains its ``as-path in`` row, so an
+# ``if as-path in SET then`` condition converts to a ``RouteMapMatch`` instead of
+# making the whole policy lossy. Observable parse output moves for IOS-XR configs
+# with an ``as-path-set`` or an ``as-path in`` condition; no other OS is touched.
+# Consequence to expect rather than diagnose: a policy whose ONLY untranslated
+# construct was ``as-path in`` now has an EMPTY lossy list, so the engine stops
+# evaluating it leniently and applies real RPL semantics including the implicit
+# end-of-policy drop. The new model field also moves ParsedConfig's JSON schema.
+PARSER_BEHAVIOR_VERSION: int = 22
 
 __all__ = [
     "BaseParser",
